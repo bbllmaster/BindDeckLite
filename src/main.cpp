@@ -51,7 +51,7 @@ static NoopStream g_nullPrintC3;
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.0.3"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -66,15 +66,23 @@ static NoopStream g_nullPrintC3;
 // === Hardware =============================================================
 #define NUM_BUTTONS 9
 #define NUM_INPUTS  10          // 9 buttons + encoder push (index 9)
+// Bumped when the default pin map changes, so a board that keeps its NVS across
+// an OTA adopts the corrected wiring instead of the old stored pins.
+#define CFG_SCHEMA  2
 
 #ifdef TARGET_ESP32C3
   // ESP32-C3 usable GPIOs: 0-10, 20, 21. Flash uses 11-17, USB-CDC 18/19.
-  // With the OLED gone, the freed pins (4, 5) let 9 buttons + EC11 fit:
+  //
+  // BindDeckLite C3 board wiring (WS-278, confirmed by the hardware owner):
+  //   9 buttons  -> GPIO0..GPIO8   (button 1..9)
+  //   EC11 push  -> GPIO10         (10th independent button, BTN index 9)
+  //   EC11 A/B   -> GPIO20/GPIO21
+  // Note: GPIO8/GPIO9 are C3 strapping pins; button 9 sits on GPIO8, so do not
+  // hold it while powering on (the ROM would enter download mode instead).
   #define ENCODER_CLK 20
   #define ENCODER_DT  21
-  #define ENCODER_SW   1
-  // 9 buttons: the old eight defaults + GPIO4 (the old OLED SDA, now free).
-  static const int DEFAULT_BUTTON_PINS[NUM_BUTTONS] = {0, 2, 3, 4, 6, 7, 8, 9, 10};
+  #define ENCODER_SW  10
+  static const int DEFAULT_BUTTON_PINS[NUM_BUTTONS] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
 #else
   // Classic ESP32: encoder on 18/19/5 as before; GPIO4 was the menu key and
   // GPIO21 the OLED SDA - both are now free and become the ninth button and
@@ -188,6 +196,7 @@ static void applyButtonPins() {
 static void saveConfig() {
   preferences.begin("binddecklite", false);
   preferences.putInt("encMode", encMode);
+  preferences.putInt("cfgVer", CFG_SCHEMA);
   preferences.putBool("sleepEnabled", sleepEnabled);
   preferences.putULong("sleepTimeoutMs", sleepTimeoutMs);
   preferences.putString("tz", tzString);
@@ -225,13 +234,20 @@ static void loadConfig() {
     tzString[sizeof(tzString) - 1] = '\0';
   }
 
+  int schema = preferences.getInt("cfgVer", 1);
+  bool staleSchema = (schema < CFG_SCHEMA);
+
   int loaded[NUM_BUTTONS];
   bool bad = false;
   for (int i = 0; i < NUM_BUTTONS; i++) {
     char k[10];
     snprintf(k, sizeof(k), "pin%d", i);
-    loaded[i] = preferences.getInt(k, DEFAULT_BUTTON_PINS[i]);
+    loaded[i] = staleSchema ? DEFAULT_BUTTON_PINS[i]
+                            : preferences.getInt(k, DEFAULT_BUTTON_PINS[i]);
     if (!isValidButtonPin(loaded[i])) bad = true;
+  }
+  if (staleSchema) {
+    log_e("[cfg] pin schema v%d -> v%d: using the board defaults", schema, CFG_SCHEMA);
   }
   if (isValidPinSet(loaded)) {
     for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = loaded[i];
@@ -246,6 +262,9 @@ static void loadConfig() {
     buttonKeys[i] = preferences.getInt(k, DEFAULT_KEYS[i]);
   }
   preferences.end();
+  if (staleSchema) {
+    saveConfig();   // persist the corrected pin map + new schema version
+  }
   log_e("[cfg] enc=%d sleep=%d/%lums", encMode, (int)sleepEnabled, sleepTimeoutMs);
 }
 

@@ -332,7 +332,7 @@ function renderDeviceMeta() {
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
 
   const hint = chip === "C3" || chip === "ESP32C3"
-    ? "C3 可用：0-10、20、21；避开 11-17（Flash）与 18/19（USB）。编码器固定 20/21/1。"
+    ? "C3 预设：按键 GPIO0-8、编码器按压 GPIO10、编码器 A/B=GPIO20/21；避开 11-17（Flash）与 18/19（USB）。"
     : "经典 ESP32：避开 6-11（Flash）与 34-39（仅输入）。编码器固定 18/19/5。";
   $("#pinHint").textContent = hint;
 }

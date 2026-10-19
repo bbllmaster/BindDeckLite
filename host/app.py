@@ -53,7 +53,7 @@ _config = {"devices": {}, "settings": {"actions_enabled": True, "udp_fallback": 
 # --- defaults -------------------------------------------------------------
 DEFAULT_PINS = {
     "ESP32": [13, 12, 14, 27, 32, 33, 25, 26, 4],
-    "C3": [0, 2, 3, 4, 6, 7, 8, 9, 10],
+    "C3": [0, 1, 2, 3, 4, 5, 6, 7, 8],
 }
 DEFAULT_KEYS = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9]
 DEFAULT_LABELS = ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22"]
