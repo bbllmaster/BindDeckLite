@@ -103,24 +103,29 @@ def save_config():
         print("[app] config save failed:", e)
 
 
+def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
+    """A fresh default configuration for one deck (ESP32 or C3 pin map)."""
+    return {
+        "name": name,
+        "chip": chip,
+        "pins": list(DEFAULT_PINS.get(chip, DEFAULT_PINS["ESP32"])),
+        "keys": [
+            {"code": DEFAULT_KEYS[i], "label": DEFAULT_LABELS[i],
+             "action": {"type": "none", "value": "", "macro": []}}
+            for i in range(10)
+        ],
+        "encoder": {"mode": 0},
+        "sleep": {"enabled": True, "minutes": 5},
+        "tz": "CET-1CEST,M3.5.0,M10.5.0/3",
+    }
+
+
 def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
     """Return (creating if necessary) the per-device configuration."""
     with _lock:
         cfg = _config["devices"].get(dev_id)
         if cfg is None:
-            cfg = {
-                "name": name or dev_id,
-                "chip": chip or "ESP32",
-                "pins": list(DEFAULT_PINS.get(chip or "ESP32", DEFAULT_PINS["ESP32"])),
-                "keys": [
-                    {"code": DEFAULT_KEYS[i], "label": DEFAULT_LABELS[i],
-                     "action": {"type": "none", "value": "", "macro": []}}
-                    for i in range(10)
-                ],
-                "encoder": {"mode": 0},
-                "sleep": {"enabled": True, "minutes": 5},
-                "tz": "CET-1CEST,M3.5.0,M10.5.0/3",
-            }
+            cfg = new_device_cfg(chip or "ESP32", name or dev_id)
             _config["devices"][dev_id] = cfg
             save_config()
         else:
@@ -412,6 +417,11 @@ def api_status():
                        for k, v in last.items()},
         "event_seq": _event_seq,
     })
+
+
+@app.route("/api/defaults")
+def api_defaults():
+    return jsonify(new_device_cfg("ESP32", ""))
 
 
 @app.route("/api/scan")

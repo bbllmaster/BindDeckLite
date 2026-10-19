@@ -30,6 +30,7 @@ const state = {
   logSeq: 0,
   dirty: false,
   saveTimer: null,
+  preview: false,
 };
 
 async function api(path, opts = {}) {
@@ -65,6 +66,18 @@ async function pollStatus() {
         await selectDevice(preferred.dev_id);
       } else {
         state.selected = null;
+        if (!state.preview) {
+          state.preview = true;
+          try {
+            state.cfg = await api("/api/defaults");
+            renderKeys();
+            renderEncoder();
+            renderPins();
+            renderDeviceMeta();
+          } catch (_) {
+            /* ignore */
+          }
+        }
         renderDevices();
       }
     } else {
@@ -81,7 +94,7 @@ async function pollStatus() {
     } else {
       $("#statusDot").className = "dot bad";
       $("#statusText").textContent = "未发现设备";
-      $("#statusSub").textContent = connected ? `${connected} 台已连接` : "请给设备上电";
+      $("#statusSub").textContent = state.preview ? "显示默认配置（预览）" : "请给设备上电";
     }
     highlightKeys(s.last_press || {});
   } catch (e) {
@@ -117,6 +130,7 @@ function renderDevices() {
 
 async function selectDevice(devId) {
   state.selected = devId;
+  state.preview = false;
   localStorage.setItem("binddecklite.device", devId);
   renderDevices();
   try {
@@ -144,6 +158,7 @@ function renderKeys() {
   const grid = $("#keyGrid");
   grid.innerHTML = "";
   if (!state.cfg) return;
+  $("#keyHint").textContent = state.preview ? "预览 · 未连接设备" : "共 10 个输入";
   const keys = state.cfg.keys || [];
   for (let i = 0; i < 10; i++) {
     const item = keys[i] || { code: 0, label: "?", action: { type: "none", value: "" } };
@@ -276,7 +291,7 @@ function highlightKeys(lastPress) {
   const idx = p ? p.index : -1;
   const fresh = p && p.age < 0.9;
   $$(".keycard").forEach((card) => {
-    card.classList.toggle("press", fresh && parseInt(card.dataset.idx, 10) === idx);
+    card.classList.toggle("press", !!(fresh && parseInt(card.dataset.idx, 10) === idx));
   });
 }
 
@@ -309,7 +324,7 @@ function renderDeviceMeta() {
   const fw = state.cfg.fw || {};
   $("#chipBadge").textContent = chip;
   $("#deviceMeta").innerHTML = `
-    <div><span>设备</span><b>${escapeHtml(state.cfg.name || state.selected)}</b></div>
+    <div><span>设备</span><b>${escapeHtml(state.cfg.name || state.selected || "—")}</b></div>
     <div><span>固件</span><b>${escapeHtml(fw.version || "—")}</b></div>
     <div><span>编译</span><b class="mono">${escapeHtml(fw.build || "—")}</b></div>
     <div><span>输入</span><b>9 键 + EC11</b></div>`;
@@ -373,7 +388,10 @@ async function saveConfig() {
 }
 
 async function applyConfig() {
-  if (!state.selected) return;
+  if (!state.selected) {
+    toast("未连接设备，当前只是默认配置预览", "bad");
+    return;
+  }
   await saveConfig();
   try {
     const r = await api(`/api/apply/${encodeURIComponent(state.selected)}`, { method: "POST" });
@@ -482,6 +500,12 @@ async function init() {
   $("#btnRefresh").onclick = () => devAction("refresh", "已请求设备配置");
   $("#btnPortal").onclick = () => devAction("portal", "设备将重启进入配网模式");
   $("#btnReboot").onclick = () => devAction("reboot", "设备重启中");
+
+  const initialTab = new URLSearchParams(location.search).get("tab");
+  if (initialTab) {
+    const tab = document.querySelector(`.tab[data-tab="${initialTab}"]`);
+    if (tab) tab.click();
+  }
 
   await pollStatus();
   setInterval(pollStatus, 1200);

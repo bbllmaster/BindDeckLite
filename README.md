@@ -96,6 +96,8 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 
 `host/` 是重新设计的控制台（Flask + 原生 JS，无构建步骤）：
 
+![上位机界面](docs/screenshot.png)
+
 - 自动发现并连接所有 `BindDeckLite-XXXX`
 - 10 个输入（9 键 + 编码器按压）的 HID 键码与上位机动作
 - 编码器 5 种模式（音量 / 缩放 / 标签页 / 撤销重做 / 应用音量）
