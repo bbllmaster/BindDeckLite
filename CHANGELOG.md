@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.7 — 2026-10-19
+
+- **C3 日志改走 USB CDC**：GPIO20/21 是本板编码器的 A/B 相（也是 UART0 的默认引脚），
+  之前的 `log_e` 全部输出到 UART0，等于发给了编码器，CDC 口什么也看不到。
+  现在 C3 环境编译时加 `-DARDUINO_USB_CDC_ON_BOOT=1 -DARDUINO_USB_MODE=1`，
+  `Serial` 即 USB Serial/JTAG，`log_e` 重定向到 CDC（`Serial.printf`），
+  `setTxTimeoutMs(0)` 保证没有主机时也不会阻塞启动。
+- 诊断包也同步改为 CDC 输出。
+
 ## 2026-10-19 — 16 MB 板启动问题定位
 
 - 现场 16 MB C3 板在 bootloader 阶段静默复位（`entry 0x403cc710` 后立刻 `rst:0x3`），

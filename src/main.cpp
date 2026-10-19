@@ -33,25 +33,20 @@
 #include <esp_efuse.h>
 #include <time.h>
 
-// === ESP32-C3: keep UART0 off the encoder pins =============================
-// The C3 console is USB-CDC. Serial.begin() would drive GPIO21 (UART0 TX) and
-// break the encoder's DT line, so provide a no-op Print on that target.
+// === ESP32-C3 console =====================================================
+// On this board GPIO20/21 are the EC11 A/B lines (UART0's default pins), so the
+// firmware must NOT use UART0 for logging. The C3 is built with
+// -DARDUINO_USB_CDC_ON_BOOT=1, which makes `Serial` the USB Serial/JTAG (CDC)
+// port; the app's logs and the diag output therefore appear on the same CDC
+// port as the ROM banner, and the encoder pins stay untouched.
 #ifdef TARGET_ESP32C3
-class NoopStream : public Print {
-public:
-  void begin(unsigned long) {}
-  void setTimeout(unsigned long) {}
-  int available() { return 0; }
-  String readStringUntil(char) { return String(); }
-  size_t write(uint8_t) override { return 1; }
-  size_t write(const uint8_t* b, size_t n) override { (void)b; return n; }
-};
-static NoopStream g_nullPrintC3;
-#define Serial g_nullPrintC3
+  #undef log_e
+  #define log_e(fmt, ...) \
+      do { Serial.printf("[%8lu] " fmt "\r\n", (unsigned long)millis(), ##__VA_ARGS__); } while (0)
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.6"
+#define FW_VERSION "1.0.7"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -702,6 +697,10 @@ static void applyDeviceIdentity() {
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(10);
+#ifdef TARGET_ESP32C3
+  // USB CDC: never block the boot if the host is not reading the port.
+  Serial.setTxTimeoutMs(0);
+#endif
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
   pinMode(ENCODER_SW, INPUT_PULLUP);
