@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.3.0 — 2026-10-19
+
+- **应用迁移到 Arduino core 3.x**：`platformio.ini` 改用 pioarduino 平台包
+  `55.03.312`（Arduino 3.3.12 / ESP-IDF 5.5.5）。`esp32dev` / `esp32c3` / `esp32c3_2mb` /
+  `esp32c3_16mb` 四个环境与分区表保持不变。
+- **NimBLE-Arduino 升级到 2.x**（`^2.1.0`，本次构建为 2.5.1）：
+  - `NimBLEServerCallbacks::onConnect/onDisconnect` 改为 `(NimBLEServer*, NimBLEConnInfo&)` /
+    `(NimBLEServer*, NimBLEConnInfo&, int)`，原来的两个断开回调合并为一个；
+  - `NimBLECharacteristicCallbacks::onSubscribe/onWrite` 改用 `NimBLEConnInfo&`，
+    地址取自 `connInfo.getAddress()`；
+  - HID API 改名：`setManufacturer` / `setPnp` / `setHidInfo` / `setReportMap` /
+    `getInputReport` / `getDeviceInfoService` / `getHidService`；
+  - 服务统一由 `NimBLEServer::start()` 启动（`startServices()` 与 `NimBLEService::start()`
+    在 2.x 已弃用）；
+  - `setPower(ESP_PWR_LVL_P9)` → `setPower(9)`；
+  - 2.x 移除了 `getSubscribedCount()`，CFG TX 特征改为在 `onSubscribe` 里自行跟踪订阅状态。
+- `main.cpp`：`esp_efuse_mac_get_default()` → `esp_read_mac(mac, ESP_MAC_WIFI_STA)`（`esp_mac.h`）。
+- **bootloader 用同一套 ESP-IDF 5.5.5 重编**（`bl_idf/`：`CONFIG_SPI_FLASH_ROM_IMPL=y`、
+  16 MB flash 头、DIO 40 MHz，13.2 KB）。`tools/build_release.py` 打包 16 MB 镜像时自动使用它，
+  并校验镜像头确实是 16 MB。
+- 协议（`CFG:*` / `CMD:*` / `BTN:*` / `ENC:*`）、引脚映射、CDC 日志、配网门户与 OTA 均未改变。
+
 ## v1.2.0 — 2026-10-19
 
 - 新增 **16 MB 布局**镜像：bootloader 以 `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` 构建（头部 flash size = 16 MB），

@@ -48,6 +48,11 @@ BindDeckLite 是 [BindDeck](https://github.com/bbllmaster/BindDeck) 的精简版
 
 依赖 [PlatformIO](https://platformio.org/)。
 
+固件基于 **Arduino core 3.x**：`platformio.ini` 通过 URL 固定
+[pioarduino](https://github.com/pioarduino/platform-espressif32) 平台 `55.03.312`
+（Arduino 3.3.12 / ESP-IDF 5.5.5），BLE 使用 **NimBLE-Arduino 2.x**。首次构建会自动下载
+对应的平台、工具链与依赖库。
+
 ```bash
 pio run -e esp32dev          # 经典 ESP32
 pio run -e esp32c3           # ESP32-C3（4 MB，带 OTA）
@@ -56,6 +61,20 @@ pio run -e esp32dev -t upload
 ```
 
 > **Flash 容量必须匹配**：分区表里任何分区的结束地址超过芯片实际容量，bootloader 会判定整张表无效并静默复位（Arduino 2.0.17 的 bootloader 日志级别为 None）。4 MB 表含 `app1@0x200000`，2 MB 模块请用 `esp32c3_2mb`。
+
+### 16 MB 模块的 bootloader
+
+Arduino 自带的 bootloader 是按 4 MB flash 编译的，16 MB 模块会静默复位（WS-278）。
+`bl_idf/` 用同一套 ESP-IDF 5.5.5 单独构建 16 MB bootloader（`CONFIG_SPI_FLASH_ROM_IMPL=y`、
+16 MB flash 头、DIO 40 MHz）：
+
+```bash
+pio run -d bl_idf -e idf        # -> bl_idf/.pio/build/idf/bootloader.bin
+```
+
+`tools/build_release.py` 打包 `c3_16mb` 的 merged 镜像时会自动构建并使用它，并校验镜像头
+确实是 16 MB；`pio run -e esp32c3_16mb -t upload` 仍会用 Arduino 自带的 4 MB bootloader，
+**16 MB 板请刷 merged 包**（从 `0x0` 写入）。
 
 ### 发布包
 
