@@ -233,6 +233,22 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
 
+/* ---------- launch action / desktop shell ---------- */
+.browse-row { display: flex; align-items: center; gap: 6px; }
+.browse-row input {
+  flex: 1; min-width: 0;
+  background: #0e131d; border: 1px solid var(--line); color: var(--text);
+  border-radius: 9px; padding: 8px 10px; font-size: 12px; font-family: inherit; outline: none;
+}
+.browse-row input:focus { border-color: var(--accent-dim); }
+.browse-row .btn { flex: none; }
+.browse-row .btn:disabled { opacity: 0.65; cursor: wait; }
+.desk-badge {
+  font-size: 10px; font-weight: 500; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px;
+  margin-left: 6px; vertical-align: middle;
+}
+
 /* ---------- encoder modes ---------- */
 .mode-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 .mode-card {

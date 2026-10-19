@@ -1,0 +1,6 @@
+# Extra dependencies for the desktop shell (tray icon, native dialogs).
+# Only needed for `python app.py --desktop` and for building the exe;
+# `run.sh` / `run.bat` keep working with just requirements.txt.
+pystray>=0.19.5
+pillow>=10.0
+keyboard>=0.13.5; sys_platform == "win32"
