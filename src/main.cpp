@@ -46,7 +46,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "1.0.8"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -217,8 +217,10 @@ static void loadConfig() {
   for (int i = 0; i < NUM_INPUTS; i++) buttonKeys[i] = DEFAULT_KEYS[i];
   for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = DEFAULT_BUTTON_PINS[i];
 
-  if (!preferences.begin("binddecklite", true)) {
-    log_e("[cfg] NVS namespace missing - defaults");
+  // Open read-write so the namespace is created on a blank device; a read-only
+  // open returns NOT_FOUND on first boot and produced the nvs_open errors.
+  if (!preferences.begin("binddecklite", false)) {
+    log_e("[cfg] NVS unavailable - defaults only");
     return;
   }
   encMode = preferences.getInt("encMode", 0);

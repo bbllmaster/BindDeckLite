@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.8 — 2026-10-19
+
+- 修复首次启动的 NVS 噪音：`loadConfig()` 改用读写方式打开命名空间，空白设备首启即创建，
+  不再出现 `nvs_open failed: NOT_FOUND` / `nvs_get_blob len fail`。
+- 分区表新增 `coredump` 分区（4 MB: `0x3F0000`；16 MB: `0xFF0000`；2 MB: `0x1F0000`），
+  消除启动时 `esp_core_dump_flash: No core dump partition found!`，崩溃时可保存 core dump。
+- 现场验证：v1.0.7 已在 16 MB C3 板上启动，BLE 广播 `BindDeckLite-95B4` 并能被主机连接。
+
 ## v1.0.7 — 2026-10-19
 
 - **C3 日志改走 USB CDC**：GPIO20/21 是本板编码器的 A/B 相（也是 UART0 的默认引脚），
