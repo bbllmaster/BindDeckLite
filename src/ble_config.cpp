@@ -8,7 +8,7 @@ BleConfigService bleConfig;
 // A single write can carry one or more lines; process by line so the PC app can
 // either write one command per write or batch several separated by '\n'.
 class CfgRxCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c) override {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*connInfo*/) override {
     std::string v = c->getValue();
     String data(v.c_str());
     data.trim();
@@ -22,6 +22,16 @@ class CfgRxCallbacks : public NimBLECharacteristicCallbacks {
       if (nl == -1) break;
       start = nl + 1;
     }
+  }
+};
+
+// NimBLE 2.x no longer exposes a per-characteristic subscriber count, so the
+// TX characteristic tracks its own subscription state.
+static volatile bool s_txSubscribed = false;
+
+class CfgTxCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* /*ch*/, NimBLEConnInfo& /*connInfo*/, uint16_t subValue) override {
+    s_txSubscribed = (subValue & 0x0003) != 0;
   }
 };
 
@@ -42,8 +52,10 @@ bool BleConfigService::begin(NimBLEServer* server) {
       BLE_CFG_TX_UUID,
       NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC, 512);
   rx->setCallbacks(new CfgRxCallbacks());
+  tx->setCallbacks(new CfgTxCallbacks());
 
-  svc->start();
+  // NimBLE 2.x starts all services from NimBLEServer::start(); the per-service
+  // start() is a deprecated no-op and is called by the owner after begin().
   _rx = rx;
   _tx = tx;
   ESP_LOGE("BIND", "[cfg] service %s rx=%d tx=%d",
@@ -59,6 +71,5 @@ void BleConfigService::notify(const String& data) {
 }
 
 bool BleConfigService::subscribed() {
-  NimBLECharacteristic* tx = (NimBLECharacteristic*)_tx;
-  return tx && tx->getSubscribedCount() > 0;
+  return s_txSubscribed;
 }

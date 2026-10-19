@@ -30,7 +30,7 @@
 #include <esp_timer.h>
 #include <esp_log.h>
 #include <nvs_flash.h>
-#include <esp_efuse.h>
+#include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
 
 // === ESP32-C3 console =====================================================
@@ -46,7 +46,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -685,7 +685,9 @@ static void ensureNvs() {
 
 static void applyDeviceIdentity() {
   uint8_t mac[6];
-  if (esp_efuse_mac_get_default(mac) != ESP_OK) memset(mac, 0, sizeof(mac));
+  // ESP-IDF 5.x: esp_efuse_mac_get_default() is no longer the portable entry
+  // point for the station MAC; esp_read_mac() covers every target.
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) memset(mac, 0, sizeof(mac));
   char suffix[5];
   snprintf(suffix, sizeof(suffix), "%02X%02X", mac[4], mac[5]);
   g_devId = suffix;

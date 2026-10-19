@@ -123,14 +123,14 @@ static void getOrCreateIrk(uint8_t irk[16]) {
 // WS-275: HID input-report subscription tracking. Only reports (0x0001) or
 // indications (0x0002) in subValue mean "this central wants HID input".
 class HidReportCB : public NimBLECharacteristicCallbacks {
-  void onSubscribe(NimBLECharacteristic* ch, ble_gap_conn_desc* desc, uint16_t subValue) override {
-    if (desc == nullptr) return;
-    const uint16_t conn = desc->conn_handle;
+  // NimBLE 2.x passes a NimBLEConnInfo reference instead of the GAP descriptor.
+  void onSubscribe(NimBLECharacteristic* ch, NimBLEConnInfo& connInfo, uint16_t subValue) override {
+    const uint16_t conn = connInfo.getConnHandle();
 
     if (!(subValue & 0x0003)) {   // subscription cleared
       if (conn == s_hid_conn) {
         ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s unsubscribed -> none",
-                 conn, NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+                 conn, connInfo.getAddress().toString().c_str());
         s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
       }
       return;
@@ -139,19 +139,19 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
     if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
       s_hid_conn = conn;
       ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (char=0x%04X sub=0x%04X)",
-               conn, NimBLEAddress(desc->peer_ota_addr).toString().c_str(),
+               conn, connInfo.getAddress().toString().c_str(),
                ch ? ch->getHandle() : 0, subValue);
     } else if (conn != s_hid_conn) {
       // First subscriber wins for the whole session; a second central (phone)
       // is acknowledged but never receives HID input.
       ESP_LOGE("BIND", "[ble] HID extra subscriber conn=0x%04X addr=%s ignored (primary=0x%04X)",
-               conn, NimBLEAddress(desc->peer_ota_addr).toString().c_str(), s_hid_conn);
+               conn, connInfo.getAddress().toString().c_str(), s_hid_conn);
     }
   }
 };
 
 class HidServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s) override {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& /*connInfo*/) override {
     // NimBLE allows several centrals (Windows HID plus the config app). Track
     // the *count*, not a single bool: otherwise closing the config app clears
     // the flag while HID is still up and every button press stops working
@@ -168,7 +168,11 @@ class HidServerCB : public NimBLEServerCallbacks {
       adv->stop();
     }
   }
-  void onDisconnect(NimBLEServer* s) override {
+  // WS-275: when the primary HID host goes away, stop sending reports until a
+  // new central subscribes. Do NOT promote an already-connected second host
+  // (the phone that just connected) - that would hand it control exactly when
+  // the user put the PC away.
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int /*reason*/) override {
     // NimBLE removes the peer before invoking this callback, so the count here
     // is "centrals still attached". Only re-advertise once the last one is gone.
     s_connected = s && s->getConnectedCount() > 0;
@@ -178,15 +182,10 @@ class HidServerCB : public NimBLEServerCallbacks {
     ESP_LOGE("BIND", "[ble] disconnected n=%d%s",
              (int)(s ? s->getConnectedCount() : 0),
              s_connected ? " (still connected)" : " -> re-advertising");
-  }
-  // WS-275: when the primary HID host goes away, stop sending reports until a
-  // new central subscribes. Do NOT promote an already-connected second host
-  // (the phone that just connected) - that would hand it control exactly when
-  // the user put the PC away.
-  void onDisconnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
-    if (desc && desc->conn_handle == s_hid_conn) {
+
+    if (connInfo.getConnHandle() == s_hid_conn) {
       ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s disconnected -> none",
-               desc->conn_handle, NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+               connInfo.getConnHandle(), connInfo.getAddress().toString().c_str());
       s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
     }
   }
@@ -220,7 +219,7 @@ void BleKeyboard::begin() {
   ESP_LOGE("BIND", "[ble] IRK fp=%02X%02X set=%d", irk[0], irk[1], irkRc);
 
   NimBLEDevice::setMTU(517);                                      // room for long CFG lines
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);                         // max TX power
+  NimBLEDevice::setPower(9);                                      // +9 dBm, max TX power
   // Bonding + LEGACY pairing, no MITM: the C3 has no display/keypad, and
   // requiring MITM is exactly what made the t-vk build unusable.
   NimBLEDevice::setSecurityAuth(true, false, false);
@@ -230,7 +229,7 @@ void BleKeyboard::begin() {
   _server->setCallbacks(new HidServerCB());
 
   _hid = new NimBLEHIDDevice(_server);
-  _hid->manufacturer(_man);
+  _hid->setManufacturer(_man);
 
   // --- unique HID identity (WS-273) ---------------------------------------
   // Every deck used to expose the exact same VID/PID/version (1234:5678:0100)
@@ -245,32 +244,34 @@ void BleKeyboard::begin() {
     uid = (uint16_t)strtoul(dash + 1, nullptr, 16);
   }
   const uint16_t pid = (uint16_t)(0x5600 | (uid & 0x00FF));
-  _hid->pnp(0x02, 0x1234, pid, 0x0100);
+  _hid->setPnp(0x02, 0x1234, pid, 0x0100);
 
-  NimBLEService* dis = _hid->deviceInfo();   // 0x180A
+  NimBLEService* dis = _hid->getDeviceInfoService();   // 0x180A
   NimBLECharacteristic* cModel = dis->createCharacteristic((uint16_t)0x2A24, NIMBLE_PROPERTY::READ);
   cModel->setValue((uint8_t*)_name, strlen(_name));
   NimBLECharacteristic* cSerial = dis->createCharacteristic((uint16_t)0x2A25, NIMBLE_PROPERTY::READ);
   cSerial->setValue((uint8_t*)_name, strlen(_name));
 
-  _hid->hidInfo(0x00, 0x01);
-  _hid->reportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
-  _inputKbd      = _hid->inputReport(1);
-  _inputConsumer = _hid->inputReport(2);
+  _hid->setHidInfo(0x00, 0x01);
+  _hid->setReportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
+  _inputKbd      = _hid->getInputReport(1);
+  _inputConsumer = _hid->getInputReport(2);
   // WS-275: learn which central is the HID host (the first to subscribe).
   HidReportCB* reportCB = new HidReportCB();
   _inputKbd->setCallbacks(reportCB);
   _inputConsumer->setCallbacks(reportCB);
   _hid->setBatteryLevel(_battery);
-  // Create the CFG/CMD service on the same server BEFORE services are started.
+  // Create the CFG/CMD service on the same server BEFORE the GATT server starts.
   bool cfgOk = bleConfig.begin(_server);
   ESP_LOGE("BIND", "[ble] cfg service: %s", cfgOk ? "created" : "FAILED");
-  _hid->startServices();
+  // NimBLE 2.x: the server starts every registered service; the per-service
+  // start calls and NimBLEHIDDevice::startServices() are deprecated.
+  _server->start();
   ESP_LOGE("BIND", "[ble] services started, advertising");
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->setAppearance(HID_KEYBOARD);
-  adv->addServiceUUID(_hid->hidService()->getUUID());
+  adv->addServiceUUID(_hid->getHidService()->getUUID());
   // NimBLEDevice::init(_name) only sets the GAP Device Name (0x2A00) - it does
   // NOT put the name in the advertising data. Without setName() every deck
   // advertises as an anonymous HID device, Windows cannot tell a second deck
