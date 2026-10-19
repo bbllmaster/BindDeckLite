@@ -46,7 +46,7 @@ TARGETS = {
         "flash_freq": "80m",
         "flash_size": "2MB",
         "bootloader_offset": "0x0",
-        "boot_app0_offset": None,
+        "boot_app0_offset": "0xd000",
     },
 }
 
