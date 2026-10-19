@@ -31,6 +31,7 @@ const state = {
   dirty: false,
   saveTimer: null,
   preview: false,
+  desktop: null,
 };
 
 async function api(path, opts = {}) {
@@ -257,7 +258,55 @@ function renderActionInput(holder, item, card) {
     action.value = input.value;
     markDirty();
   };
-  holder.appendChild(input);
+  if (action.type !== "launch") {
+    holder.appendChild(input);
+    return;
+  }
+
+  // 启动程序 / 文件：文本框 + 原生文件选择器 + 最近使用过的路径
+  const row = document.createElement("div");
+  row.className = "browse-row";
+  const listId = "launch-recents-" + (card ? card.dataset.idx : "x");
+  const list = document.createElement("datalist");
+  list.id = listId;
+  fillRecentOptions(list);
+  input.setAttribute("list", listId);
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn tiny browse";
+  btn.textContent = "浏览…";
+  btn.title = "调用系统文件选择器";
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = "选择中…";
+    try {
+      const res = await fetch("/api/browse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "file" }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        toast(data.error || "无法打开系统文件选择器", "bad");
+        return;
+      }
+      if (data.path) {
+        input.value = data.path;
+        action.value = data.path;
+        markDirty();
+        await refreshDesktop();
+        syncLaunchRecents();
+      }
+    } catch (e) {
+      toast("文件选择失败：" + (e.message || e), "bad");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "浏览…";
+    }
+  };
+  row.append(input, btn, list);
+  holder.appendChild(row);
 }
 
 function formatMacro(steps) {
@@ -360,6 +409,56 @@ function renderPins() {
   }
 }
 
+/* ---------------- desktop shell ---------------- */
+
+async function refreshDesktop() {
+  try {
+    state.desktop = await api("/api/desktop");
+    renderDesktop();
+  } catch (_) {
+    /* 旧版后端或未就绪：静默忽略 */
+  }
+}
+
+function renderDesktop() {
+  const d = state.desktop;
+  if (!d) return;
+  const badge = $("#desktopMode");
+  badge.textContent = d.frozen ? "打包版 exe" : d.desktop_mode ? "托盘模式" : "源码运行";
+
+  const auto = d.autostart || {};
+  const toggle = $("#autostartToggle");
+  toggle.checked = !!auto.enabled;
+  toggle.disabled = !auto.supported;
+  $("#minimizedToggle").checked = !!d.start_minimized;
+
+  const bits = [];
+  if (d.tray_active) bits.push("托盘图标在任务栏右下角：单击显示控制台，右键可显示 / 退出");
+  else if (d.desktop_mode) bits.push("托盘不可用，程序在后台运行");
+  else bits.push("当前由 run.sh / python app.py 启动，没有托盘图标；打包版双击即带托盘");
+  if (auto.supported) {
+    bits.push(`开机自启动${auto.enabled ? "已开启" : "未开启"}（${auto.method}）`);
+  } else {
+    bits.push("开机自启动不可用");
+  }
+  if (auto.error || d.error) bits.push(auto.error || d.error);
+  $("#desktopHint").textContent = bits.join("；") + "。";
+  if (auto.detail) $("#desktopHint").title = auto.detail;
+}
+
+async function updateDesktop(patch) {
+  const res = await fetch("/api/desktop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.error || "设置失败");
+  state.desktop = data;
+  renderDesktop();
+  return data;
+}
+
 /* ---------------- dirty / save ---------------- */
 
 function markDirty() {
@@ -429,6 +528,20 @@ async function pollLog() {
 
 /* ---------------- misc ---------------- */
 
+function fillRecentOptions(list) {
+  const recents = (state.desktop && state.desktop.recent_paths) || [];
+  list.innerHTML = "";
+  recents.forEach((p) => {
+    const o = document.createElement("option");
+    o.value = p;
+    list.appendChild(o);
+  });
+}
+
+function syncLaunchRecents() {
+  $$("datalist[id^='launch-recents-']").forEach(fillRecentOptions);
+}
+
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -487,6 +600,31 @@ async function init() {
     state.cfg.sleep.minutes = Math.max(1, parseInt(e.target.value, 10) || 5);
     markDirty();
   };
+  $("#autostartToggle").onchange = async (e) => {
+    const target = e.target;
+    const want = target.checked;
+    target.disabled = true;
+    try {
+      await updateDesktop({ autostart: want });
+      toast(want ? "已开启开机自启动" : "已关闭开机自启动", "ok");
+    } catch (err) {
+      target.checked = !want;
+      toast("设置开机自启动失败：" + err.message, "bad");
+    } finally {
+      const auto = (state.desktop && state.desktop.autostart) || {};
+      target.disabled = !auto.supported;
+    }
+  };
+  $("#minimizedToggle").onchange = async (e) => {
+    const want = e.target.checked;
+    try {
+      await updateDesktop({ start_minimized: want });
+      toast(want ? "开机启动时收进托盘" : "开机启动时打开控制台");
+    } catch (err) {
+      e.target.checked = !want;
+      toast(err.message, "bad");
+    }
+  };
   const devAction = async (act, okText) => {
     if (!state.selected) return;
     try {
@@ -507,6 +645,7 @@ async function init() {
     if (tab) tab.click();
   }
 
+  await refreshDesktop();
   await pollStatus();
   setInterval(pollStatus, 1200);
   setInterval(pollLog, 800);

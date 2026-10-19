@@ -14,10 +14,16 @@ Responsibilities
   add-on, not a requirement.
 
 Run:  python app.py            (opens http://127.0.0.1:8788)
+      python app.py --desktop  (tray mode: console hidden, 显示 / 退出 menu)
+      python app.py --file-dialog file   (internal: native picker child)
+
+The frozen Windows build (``BindDeckLite.exe``) always starts in desktop mode;
+see ``desktop.py`` and ``autostart.py`` for the tray and login-start bits.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import socket
@@ -30,14 +36,40 @@ from collections import deque
 
 from flask import Flask, jsonify, render_template, request
 
+import autostart
+import desktop
 from ble_link import BleLinkManager
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-PORT = int(os.environ.get("BINDDECKLITE_PORT", "8788"))
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Same vendor service as the firmware's ble_config.cpp (shared protocol).
-CONTROL_SERVICE = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
+
+def _writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write-test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _data_dir() -> str:
+    """Persistent data (config/ble cache) — next to the exe, else LOCALAPPDATA."""
+    if not getattr(sys, "frozen", False):
+        return SOURCE_DIR
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    if _writable(exe_dir):
+        return exe_dir
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        candidate = os.path.join(base, "BindDeckLite")
+        if _writable(candidate):
+            return candidate
+    fallback = os.path.join(os.path.expanduser("~"), ".binddecklite")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
 
 
 def _resource_root() -> str:
@@ -56,6 +88,12 @@ def _resource_root() -> str:
 
 
 RESOURCE_ROOT = _resource_root()
+DATA_DIR = _data_dir()
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+PORT = int(os.environ.get("BINDDECKLITE_PORT", "8788"))
+
+# Same vendor service as the firmware's ble_config.cpp (shared protocol).
+CONTROL_SERVICE = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
 
 app = Flask(__name__,
             static_folder=os.path.join(RESOURCE_ROOT, "static"),
@@ -68,7 +106,12 @@ _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
 _ping_sent = {}           # dev_id -> monotonic send time
 _udp_sock = None
-_config = {"devices": {}, "settings": {"actions_enabled": True, "udp_fallback": True}}
+_config = {"devices": {}, "settings": {
+    "actions_enabled": True,
+    "udp_fallback": True,
+    "start_minimized": True,
+    "recent_paths": [],
+}}
 
 # --- defaults -------------------------------------------------------------
 DEFAULT_PINS = {
@@ -176,7 +219,7 @@ def add_event(kind: str, text: str, dev_id: str = "", level: str = "info"):
 
 # --- BLE ------------------------------------------------------------------
 ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
-                     cache_path=os.path.join(APP_DIR, "ble_cache.json"))
+                     cache_path=os.path.join(DATA_DIR, "ble_cache.json"))
 
 
 def _on_line(dev_id: str, line: str):
@@ -506,6 +549,63 @@ def api_settings():
     return jsonify({"ok": True, "settings": _config["settings"]})
 
 
+# --- desktop / shell integration -----------------------------------------
+def desktop_payload() -> dict:
+    with _lock:
+        recent = list(_config["settings"].get("recent_paths") or [])
+        start_minimized = bool(_config["settings"].get("start_minimized", True))
+    return {
+        "platform": sys.platform,
+        "frozen": desktop.is_frozen(),
+        "desktop_mode": bool(desktop.STATE.get("desktop")),
+        "tray_active": bool(desktop.STATE.get("tray_active")),
+        "url": desktop.STATE.get("url") or f"http://127.0.0.1:{PORT}",
+        "error": desktop.STATE.get("error") or "",
+        "autostart": autostart.status(),
+        "start_minimized": start_minimized,
+        "recent_paths": recent,
+    }
+
+
+@app.route("/api/desktop", methods=["GET", "POST"])
+def api_desktop():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "start_minimized" in data:
+            value = bool(data["start_minimized"])
+            with _lock:
+                _config["settings"]["start_minimized"] = value
+            save_config()
+            # Keep the login entry in sync when autostart is already enabled.
+            if autostart.status().get("enabled"):
+                autostart.enable(minimized=value)
+        if "autostart" in data:
+            want = bool(data["autostart"])
+            with _lock:
+                minimized = bool(_config["settings"].get("start_minimized", True))
+            result = autostart.enable(minimized) if want else autostart.disable()
+            if not result.get("ok"):
+                return jsonify({"ok": False, "error": result.get("error", "设置失败"),
+                                **desktop_payload()}), 500
+            add_event("desktop", "已开启开机自启动" if want else "已关闭开机自启动", level="ok")
+    return jsonify({"ok": True, **desktop_payload()})
+
+
+@app.route("/api/browse", methods=["POST"])
+def api_browse():
+    data = request.get_json(silent=True) or {}
+    result = desktop.browse(data.get("kind") or "file")
+    if result.get("ok") and result.get("path"):
+        path = result["path"]
+        with _lock:
+            recent = [p for p in (_config["settings"].get("recent_paths") or []) if p != path]
+            recent.insert(0, path)
+            _config["settings"]["recent_paths"] = recent[:8]
+        save_config()
+        add_event("desktop", "已选择文件: " + path, level="ok")
+    return jsonify(result), (200 if result.get("ok") else 503)
+
+
 @app.route("/api/log")
 def api_log():
     since = request.args.get("since", "0")
@@ -524,18 +624,54 @@ def api_keycodes():
                     "defaults": {"pins": DEFAULT_PINS, "keys": DEFAULT_KEYS}})
 
 
-def main():
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(prog="BindDeckLite", description="BindDeckLite 上位机")
+    parser.add_argument("--desktop", "--tray", dest="desktop", action="store_true",
+                        help="在系统托盘运行（隐藏控制台窗口）")
+    parser.add_argument("--minimized", action="store_true",
+                        help="启动时不打开浏览器（托盘模式）")
+    parser.add_argument("--no-tray", dest="no_tray", action="store_true",
+                        help="桌面模式但不创建托盘图标")
+    parser.add_argument("--file-dialog", choices=("file", "dir"), help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    if args.file_dialog:
+        return desktop.dialog_main(args.file_dialog)
+
+    if desktop.is_frozen():
+        # A windowed exe has no console; keep prints in a log file next to config.
+        desktop.setup_stdio(os.path.join(DATA_DIR, "host.log"))
+
+    url = f"http://127.0.0.1:{PORT}"
+    desktop_mode = (args.desktop or desktop.is_frozen()
+                    or os.environ.get("BINDDECKLITE_DESKTOP") == "1")
+    if desktop_mode and desktop.port_in_use(PORT):
+        # Second double-click: focus the running instance instead of failing.
+        print(f"[app] already running at {url}, opening browser")
+        desktop.open_url(url)
+        return 0
+
     load_config()
     started = ble.start()
     if not started:
         add_event("error", "BLE 不可用: " + str(ble.error), level="warn")
         print("[app] BLE unavailable:", ble.error)
-    url = f"http://127.0.0.1:{PORT}"
     print(f"[app] BindDeckLite host running at {url}")
+
+    if desktop_mode:
+        return desktop.run_desktop(app, PORT, url,
+                                   start_minimized=bool(args.minimized),
+                                   use_tray=not args.no_tray,
+                                   log_path=os.path.join(DATA_DIR, "host.log"))
+
     if os.environ.get("BINDDECKLITE_NO_BROWSER") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

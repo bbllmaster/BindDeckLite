@@ -141,6 +141,27 @@ python app.py
 - 设备同时只能被一个 BLE central 作为 HID 主机，配置通道是同一连接上的第二个 GATT 服务，不需要断开。
 - 上位机配置保存在 `host/config.json`（运行时生成，不入库）。
 
+### Windows 桌面版（exe / 托盘 / 开机自启动）
+
+在 Windows 上运行 `host/build_exe.bat`，得到单文件 `host\dist\BindDeckLite.exe`（Python 3.12 x64，目标机器无需安装 Python）：
+
+```bat
+cd host
+build_exe.bat
+```
+
+- exe 隐藏控制台窗口：双击后直接打开浏览器，并在任务栏右下角放一个托盘图标。
+- 托盘菜单：**显示控制台**（单击托盘图标同样打开）与 **退出 BindDeckLite**。关闭浏览器标签页不会退出程序，退出请用托盘菜单。
+- 重复双击 exe 不会启动第二份：检测到 8788 端口已监听时只打开浏览器。
+- 「设备 → 桌面应用」可开关 **开机自启动** 与 **开机启动时最小化到托盘**。自启动方式：
+  Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写 `~/.config/autostart/binddecklite.desktop`，macOS 写 `~/Library/LaunchAgents/com.binddecklite.host.plist`。
+- 配置、BLE 缓存与日志保存在 exe 同目录（目录不可写时退到 `%LOCALAPPDATA%\BindDeckLite`）：`config.json`、`ble_cache.json`、`host.log`。
+- 源码模式也能体验托盘：`python app.py --desktop`；`--minimized` 表示不自动打开浏览器。`run.sh` / `run.bat` 行为不变（控制台运行，无托盘）。
+
+> PyInstaller 不支持交叉编译，exe 必须在 Windows 上构建。仓库里的
+> `.github/workflows/build-host-exe.yml` 可手动触发，构建完成后从 Actions 页面下载
+> `BindDeckLite-windows` 产物。
+
 ### 上位机动作
 
 每个按键可单独配置：
@@ -148,7 +169,7 @@ python app.py
 | 类型 | 说明 |
 |------|------|
 | 仅 HID 按键 | 设备自己发键，上位机不做任何事 |
-| 启动程序 / 文件 | 本地路径，Windows 用 `os.startfile` |
+| 启动程序 / 文件 | 本地路径；可用「浏览…」调系统文件对话框，最近用过的路径会出现在输入框候选里（Windows 用 `os.startfile`） |
 | 打开网址 | 默认浏览器 |
 | 执行命令 | `shell=True`，请只填可信命令 |
 | 媒体键 | 音量 / 播放 / 上下曲（需 `keyboard`） |
@@ -166,11 +187,20 @@ python app.py
 │   ├── nimble_hid.*       # NimBLE HID + 唯一身份 / IRK（复用 BindDeck）
 │   └── ble_config.*       # BLE CFG/CMD 服务（复用 BindDeck）
 ├── host/
-│   ├── app.py             # 上位机后端
+│   ├── app.py             # 上位机后端（--desktop 进入托盘模式）
+│   ├── desktop.py         # 托盘图标、控制台隐藏、原生文件对话框
+│   ├── autostart.py       # 开机自启动（注册表 / XDG / LaunchAgent）
+│   ├── app.spec           # PyInstaller 打包配置
+│   ├── build_exe.bat      # Windows 一键打包 exe
+│   ├── requirements.txt           # 运行必需（Flask / bleak）
+│   ├── requirements-desktop.txt   # 托盘与文件对话框（pystray / pillow）
+│   ├── requirements-build.txt     # 打包依赖（含 PyInstaller）
 │   ├── ble_link.py        # BLE 扫描 / 多设备连接（复用 BindDeck）
+│   ├── assets/app.ico     # exe / 托盘图标（python tools/make_icon.py 生成）
 │   ├── templates/index.html
 │   └── static/{app.js,style.css}
 ├── tools/build_release.py # 构建 merged + OTA 发布包
+├── tools/make_icon.py     # 生成 host/assets/app.ico（纯标准库）
 └── docs/protocol.md
 ```
 

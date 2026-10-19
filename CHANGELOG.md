@@ -1,5 +1,17 @@
 # Changelog
 
+## 上位机桌面版 — 2026-10-19
+
+- 新增 `host/app.spec` + `host/build_exe.bat`：PyInstaller 打包单文件 `BindDeckLite.exe`
+  （windowed、无控制台、带 `host/assets/app.ico`），`templates/`、`static/`、图标一并内嵌。
+- 新增 `host/desktop.py`：系统托盘（显示控制台 / 退出）、启动时隐藏控制台、重复双击只打开浏览器、
+  `--file-dialog` 原生文件对话框子进程。打包版默认进入托盘模式，源码可用 `python app.py --desktop`。
+- 新增 `host/autostart.py`：开机自启动（Windows `HKCU\...\Run`、Linux XDG autostart、macOS LaunchAgent），
+  「设备 → 桌面应用」可开关，并可选择开机启动时直接收进托盘。
+- 按键配置「启动程序 / 文件」增加「浏览…」按钮（系统文件选择器），最近 8 条路径作为输入候选。
+- 配置 / BLE 缓存 / 日志路径适配打包：exe 同目录优先，不可写时退到 `%LOCALAPPDATA%\BindDeckLite`。
+- `run.sh` / `run.bat` 与 BLE、配置下发、按键、编码器、休眠、日志逻辑保持不变。
+
 ## v1.3.0 — 2026-10-19
 
 - **应用迁移到 Arduino core 3.x**：`platformio.ini` 改用 pioarduino 平台包
