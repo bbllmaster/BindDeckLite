@@ -51,7 +51,7 @@ static NoopStream g_nullPrintC3;
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.5"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3

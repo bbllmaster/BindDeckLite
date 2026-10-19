@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.5 — 2026-10-19
+
+- 新增 **ESP32-C3 2 MB Flash** 变体（`esp32c3_2mb`）：单 app 槽、无 OTA。
+  IDF 的 `esp_partition_table_verify()` 会逐项检查 `offset + size <= chip_size`，任何一项越界都会**整表判为无效**；
+  Arduino 2.0.17 的 bootloader 又是 `BOOTLOADER_LOG_LEVEL_NONE`，所以只在 2 MB 模块上表现为
+  `rst:0x3 RTC_SW_SYS_RST` 静默循环，且 app 一行日志都不会出现。
+  4 MB 的 `app1@0x200000` 正好越界——与现场日志完全吻合。
+- 4 MB 版本保持不变（仍带 OTA）。
+
 ## v1.0.4 — 2026-10-19
 
 - 修复 C3 引脚校验：v1.0.0–v1.0.3 把经典 ESP32 的「GPIO6–11 不可用」规则也套在了 C3 上，

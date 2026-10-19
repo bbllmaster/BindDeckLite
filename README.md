@@ -50,9 +50,12 @@ BindDeckLite 是 [BindDeck](https://github.com/bbllmaster/BindDeck) 的精简版
 
 ```bash
 pio run -e esp32dev          # 经典 ESP32
-pio run -e esp32c3           # ESP32-C3
+pio run -e esp32c3           # ESP32-C3（4 MB，带 OTA）
+pio run -e esp32c3_2mb       # ESP32-C3（2 MB，单 app 槽，无 OTA）
 pio run -e esp32dev -t upload
 ```
+
+> **Flash 容量必须匹配**：分区表里任何分区的结束地址超过芯片实际容量，bootloader 会判定整张表无效并静默复位（Arduino 2.0.17 的 bootloader 日志级别为 None）。4 MB 表含 `app1@0x200000`，2 MB 模块请用 `esp32c3_2mb`。
 
 ### 发布包
 

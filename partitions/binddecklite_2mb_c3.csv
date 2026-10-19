@@ -1,0 +1,7 @@
+# Name,     Type, SubType, Offset,   Size,    Flags
+# BindDeckLite — ESP32-C3 modules with 2 MB flash (single app slot, no OTA).
+# Every partition must end below 0x200000: the bootloader rejects the whole
+# table (silently, because Arduino 2.0.17 ships BOOTLOADER_LOG_LEVEL_NONE)
+# when one partition lies beyond the flash chip size.
+nvs,      data, nvs,     0x9000,  0x5000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,

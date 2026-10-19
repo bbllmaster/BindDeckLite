@@ -38,6 +38,16 @@ TARGETS = {
         "bootloader_offset": "0x0",
         "boot_app0_offset": "0xe000",
     },
+    # 2 MB C3 modules: single app slot, no otadata partition.
+    "c3_2mb": {
+        "env": "esp32c3_2mb",
+        "chip": "esp32c3",
+        "name": "c3_2mb",
+        "flash_freq": "80m",
+        "flash_size": "2MB",
+        "bootloader_offset": "0x0",
+        "boot_app0_offset": None,
+    },
 }
 
 
@@ -92,12 +102,13 @@ def main():
             "merge_bin", "-o", merged,
             "--flash_mode", "dio",
             "--flash_freq", t["flash_freq"],
-            "--flash_size", "4MB",
+            "--flash_size", t.get("flash_size", "4MB"),
             t["bootloader_offset"], bootloader,
             "0x8000", partitions,
-            t["boot_app0_offset"], boot_app0,
             "0x10000", app,
         ]
+        if t["boot_app0_offset"]:
+            cmd[-2:-2] = [t["boot_app0_offset"], boot_app0]
         print("==> merging", os.path.basename(merged))
         subprocess.run(cmd, cwd=ROOT, check=True)
 
