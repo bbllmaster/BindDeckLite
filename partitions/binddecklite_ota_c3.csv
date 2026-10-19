@@ -1,4 +1,6 @@
+# Name,     Type, SubType, Offset,   Size,    Flags
 # BindDeckLite — ESP32-C3 (no phy_init: C3 compiles PHY calibration into the app).
+# OTA layout: two 1.9 MB app slots, NVS, otadata.
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
 app0,     app,  ota_0,   0x10000, 0x1F0000,
