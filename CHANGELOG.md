@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.9 — 2026-10-19
+
+- 现场验证 v1.0.8：9 个按键（`BTN:95B4:0..8`）与 EC11（`ENC:95B4:CW/CCW`）全部正常，
+  HID primary 成功建立（PC 接管）。
+- 本版把 bootloader 换回**自研的 80 MHz 版本**（Arduino core 3.x / ESP-IDF 5 构建，
+  与已验证的 Tasmota bootloader 同为 80 MHz DIO），去掉对第三方二进制的依赖。
+- 应用侧仅版本号变化。
+
 ## v1.0.8 — 2026-10-19
 
 - 修复首次启动的 NVS 噪音：`loadConfig()` 改用读写方式打开命名空间，空白设备首启即创建，
