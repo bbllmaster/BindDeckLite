@@ -13,6 +13,7 @@ __pycache__/
 .venv/
 host/config.json
 host/ble_cache.json
+host/build/          # PyInstaller workpath (host/build_exe.py)
 *.log
 
 # Scratch project used to obtain an ESP-IDF 5 bootloader (not shipped)

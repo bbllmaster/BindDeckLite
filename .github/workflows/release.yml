@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# The release is self-contained: it builds the authoritative merged/OTA images
+# (tools/build_release.py does the esptool merge, which the per-env compile in
+# build-firmware.yml does NOT) and the Windows host exe, then publishes them all
+# on the tag. Keeping the build inside one workflow lets the publish job fetch
+# the artifacts with a plain needs()-dependent download - no cross-workflow
+# polling, no race between sibling workflows.
+jobs:
+  firmware:
+    name: release / firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PlatformIO Core
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'bl_idf/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Build release images
+        run: |
+          python tools/build_release.py
+          # Non-silent verification: every expected merged/ota image must exist.
+          for f in dist/merged_binddecklite_esp32_v*.bin \
+                   dist/merged_binddecklite_c3_v*.bin \
+                   dist/merged_binddecklite_c3_2mb_v*.bin \
+                   dist/merged_binddecklite_c3_16mb_v*.bin; do
+            test -f "$f" || { echo "missing release image: $f"; exit 1; }
+          done
+          ls -lh dist/
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-firmware
+          path: |
+            dist/*.bin
+          if-no-files-found: error
+
+  host:
+    name: release / host-exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r host/requirements.txt
+          python -m pip install pyinstaller keyboard
+
+      - name: Build Windows exe
+        run: |
+          python host/build_exe.py --onefile --name BindDeckLite --dist host/dist
+          if (-not (Test-Path host/dist/BindDeckLite.exe)) {
+            throw "BindDeckLite.exe was not produced"
+          }
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-exe
+          path: |
+            host/dist/BindDeckLite.exe
+          if-no-files-found: error
+
+  release:
+    name: release / publish
+    needs: [firmware, host]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge: true
+
+      - name: SHA256 sums
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum *.bin BindDeckLite.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Write release notes
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "# BindDeckLite ${TAG}"
+            echo
+            echo "Automated release of the BindDeckLite firmware (merged + app-only OTA"
+            echo "images) and the Windows host executable."
+            echo
+            echo "## SHA256"
+            echo
+            echo '```'
+            cat artifacts/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo "- Firmware: merged images flash whole-chip from 0x0; ota_ images are"
+            echo "  app-only for the config-mode OTA page."
+            echo "- Host: BindDeckLite.exe - single-file Windows executable (Flask + BLE)."
+            echo
+            echo "Board-specific flashing notes and the full version manifest live in the"
+            echo "[WS-279](https://github.com/bbllmaster/BindDeckLite) release tracker."
+            echo
+            echo "Full checksum list: SHA256SUMS.txt (attached to this release)."
+          } > RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(artifacts/*.bin artifacts/BindDeckLite.exe artifacts/SHA256SUMS.txt)
+          gh release create "${TAG}" \
+            --title "BindDeckLite ${TAG}" \
+            --notes-file RELEASE_NOTES.md \
+            "${FILES[@]}"
