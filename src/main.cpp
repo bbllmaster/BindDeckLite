@@ -46,7 +46,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3

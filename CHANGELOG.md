@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0 — 2026-10-19
+
+- 新增 **16 MB 布局**镜像：bootloader 以 `CONFIG_ESPTOOLPY_FLASHSIZE_16MB` 构建（头部 flash size = 16 MB），
+  分区表用满整片：`nvs 0x9000 / otadata 0xE000 / app0 0x10000(3MB) / app1 0x310000(3MB) /
+  storage 0x610000(9.875MB) / coredump 0xFF0000(64KB)`，全部结束于 `0x1000000`。
+- 应用版本 1.2.0（与 1.1.0 功能相同，仅便于区分 16 MB 布局）。
+- 4 MB 布局的 v1.1.0 继续保留（兼容旧分区/OTA 路径）。
+
 ## v1.1.0 — 2026-10-19
 
 - 用 **ESP-IDF 5.1 + `CONFIG_SPI_FLASH_ROM_IMPL=y`** 自建 bootloader（13.3 KB，与 Tasmota 的
