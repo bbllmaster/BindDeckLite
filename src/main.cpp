@@ -51,7 +51,7 @@ static NoopStream g_nullPrintC3;
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -91,7 +91,12 @@ static const uint8_t DEFAULT_KEYS[NUM_INPUTS] = {
   KEY_F18, KEY_F19, KEY_F20, KEY_F21, KEY_F22
 };
 
-#define CONFIG_HOLD_MS      5000   // hold the encoder push this long -> portal
+// v1.0.1: the old "hold 5 s to open the portal" gesture was the firmware's only
+// automatic ESP.restart() path. A pin that reads LOW (active-high encoder
+// wiring, a stuck switch, or a pin used by something else on the board) turned
+// it into a reboot loop every ~6 s. The portal now needs a deliberate
+// DOUBLE-CLICK, which a permanently-LOW pin can never produce.
+#define DOUBLE_CLICK_MS     1200   // second press within this window -> portal
 #define CONFIG_MODE_MS      300000 // portal auto-closes after 5 min
 #define CONFIG_EXIT_MS      1000   // hold the encoder push this long to leave
 #define DEBOUNCE_MS         25
@@ -118,6 +123,15 @@ static int g_otaProgress = -1;
 
 static bool g_nvsOk = false;
 static unsigned long g_lastActivity = 0;
+
+// v1.0.1 boot-loop guard (see setup()).
+#define BOOT_MAGIC 0xB17D0001u
+RTC_NOINIT_ATTR static uint32_t g_bootMagic;
+RTC_NOINIT_ATTR static uint32_t g_bootCount;
+static bool g_safeMode = false;
+// True once the encoder push has been seen idle (HIGH at least once). Gestures
+// stay disarmed until then so a pin that is permanently LOW cannot fire them.
+static bool g_encSeenIdle = false;
 
 // === Encoder sampling =====================================================
 static const int8_t ENC_STATES[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
@@ -667,8 +681,28 @@ void setup() {
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
   pinMode(ENCODER_SW, INPUT_PULLUP);
+  delay(5);
+  bool swLowAtBoot = (digitalRead(ENCODER_SW) == LOW);
+
+  // Boot-loop guard. RTC memory survives a software reset (but not a power
+  // cycle); the magic invalidates it after a real power-on. Four boots without
+  // ever reaching 30 s of uptime means something restarts the device, so the
+  // next boot skips config mode and the portal gesture and just runs normally.
+  if (g_bootMagic != BOOT_MAGIC) {
+    g_bootMagic = BOOT_MAGIC;
+    g_bootCount = 0;
+  }
+  g_bootCount++;
+  if (g_bootCount >= 4) {
+    g_safeMode = true;
+    g_bootCount = 0;
+  }
+  esp_reset_reason_t rr = esp_reset_reason();
+  log_e("[boot] reset=%d bootCount=%u safe=%d sw=%d", (int)rr, g_bootCount,
+        (int)g_safeMode, (int)swLowAtBoot);
+
   bool heldAtBoot = false;
-  {
+  if (!g_safeMode) {
     int low = 0, high = 0;
     for (int i = 0; i < 60 && !heldAtBoot; i++) {
       if (digitalRead(ENCODER_SW) == LOW) {
@@ -737,6 +771,13 @@ void setup() {
 }
 
 void loop() {
+  // Reaching 30 s of uptime means the boot was healthy; forget the loop count.
+  static bool bootCountCleared = false;
+  if (!bootCountCleared && millis() > 30000) {
+    bootCountCleared = true;
+    g_bootCount = 0;
+  }
+
   // ---- config mode -------------------------------------------------------
   if (g_configMode) {
     cfgServer.handleClient();
@@ -780,32 +821,37 @@ void loop() {
     }
   }
 
-  // ---- encoder push: key + config-mode gesture ---------------------------
+  // ---- encoder push: key + portal gesture --------------------------------
+  // The portal gesture is a DOUBLE-CLICK. It is armed only after the pin has
+  // been seen idle (HIGH) at least once, so a permanently-LOW pin can never
+  // reboot the device in a loop.
   if (!g_configMode) {
     static bool lastRaw = false;
     static bool stable = false;
     static unsigned long rawChangeAt = 0;
-    static unsigned long pressedAt = 0;
+    static unsigned long lastPressAt = 0;
     bool raw = (digitalRead(ENCODER_SW) == LOW);
+    if (!raw) g_encSeenIdle = true;
     if (raw != lastRaw) { lastRaw = raw; rawChangeAt = millis(); }
     if (millis() - rawChangeAt >= DEBOUNCE_MS && stable != raw) {
       stable = raw;
       if (stable) {
-        pressedAt = millis();
-        g_lastActivity = millis();
+        unsigned long now = millis();
+        bool armed = g_encSeenIdle && !g_safeMode;
+        if (armed && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
+          log_e("[cfg] encoder double-click -> reboot into portal");
+          preferences.begin("binddecklite", false);
+          preferences.putBool("forceCfg", true);
+          preferences.end();
+          delay(100);
+          ESP.restart();
+        }
+        lastPressAt = now;
+        g_lastActivity = now;
         log_e("[btn] encoder push");
         sendKeyForInput(NUM_INPUTS - 1);
         sendToHost("BTN:" + g_devId + ":" + String(NUM_INPUTS - 1));
       }
-    }
-    if (stable && millis() - pressedAt >= CONFIG_HOLD_MS) {
-      // Long hold: ask for the WiFi portal on the next boot.
-      log_e("[cfg] encoder held %dms -> reboot into portal", CONFIG_HOLD_MS);
-      preferences.begin("binddecklite", false);
-      preferences.putBool("forceCfg", true);
-      preferences.end();
-      delay(100);
-      ESP.restart();
     }
   }
 
