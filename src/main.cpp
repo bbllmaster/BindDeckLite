@@ -51,7 +51,7 @@ static NoopStream g_nullPrintC3;
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.4"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -163,10 +163,15 @@ static bool isValidButtonPin(int pin) {
 #ifdef TARGET_ESP32C3
   if (pin < 0 || pin > 21) return false;
   if (pin >= 11 && pin <= 17) return false;   // embedded flash
-#endif
+  // Do NOT apply the classic-ESP32 exclusions here: GPIO6..GPIO8 are ordinary
+  // pins on the C3 and buttons 7..9 of this board sit on them. Applying the
+  // classic rule made every pin set invalid on the C3, so CFG:PINS: and the
+  // portal form were always rejected (v1.0.0..v1.0.3).
+#else
   if (pin < 0 || pin > 39) return false;
   if (pin >= 6 && pin <= 11) return false;    // classic ESP32 SPI flash
   if (pin >= 34) return false;                // input-only, no pull-up
+#endif
   if (pin == ENCODER_CLK || pin == ENCODER_DT || pin == ENCODER_SW) return false;
   return true;
 }
