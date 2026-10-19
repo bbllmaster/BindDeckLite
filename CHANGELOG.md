@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-19 — 16 MB 板启动问题定位
+
+- 现场 16 MB C3 板在 bootloader 阶段静默复位（`entry 0x403cc710` 后立刻 `rst:0x3`），
+  应用从未执行；同板 Tasmota 可正常启动。
+- Tasmota 的 bootloader 入口是 `0x403cbf10`（ESP-IDF 5.x），本项目 Arduino 2.0.17 的 bootloader
+  入口是 `0x403cc710`（ESP-IDF 4.4.x）。用 core 3.x 的 bootloader 与现有 app/分区表重新合并出
+  `test_idf5bl_binddecklite_c3_16mb.bin` 用于验证；若可启动，则整体迁移到 Arduino core 3.x。
+- `platformio.ini` 显式固定 `espressif32@7.1.3`，避免机器上同时安装 pioarduino(55.x) 时误用。
+
 ## v1.0.6 — 2026-10-19
 
 - 新增 **ESP32-C3 16 MB Flash** 变体（`esp32c3_16mb`）：16 MB 分区表（3 MB OTA 槽 + storage），
