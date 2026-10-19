@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.0 — 2026-10-19
+
+- 用 **ESP-IDF 5.1 + `CONFIG_SPI_FLASH_ROM_IMPL=y`** 自建 bootloader（13.3 KB，与 Tasmota 的
+  实现方式一致：直接走 ROM 的 Flash 实现建立映射），替换掉临时使用的第三方 bootloader。
+- 应用、分区表（4 MB，含 coredump）不变；版本号 1.1.0 便于确认。
+- 说明：Arduino core 3.x 仍基于 IDF 5.x；IDF 6 目前没有 Arduino 支持，采用 IDF 6 需要把固件
+  改成纯 ESP-IDF 工程（BLE HID / WiFi 门户 / OTA / NVS 全部重写），与本次 Flash 问题无关。
+
 ## v1.0.9 — 2026-10-19
 
 - 现场验证 v1.0.8：9 个按键（`BTN:95B4:0..8`）与 EC11（`ENC:95B4:CW/CCW`）全部正常，

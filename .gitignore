@@ -17,3 +17,5 @@ host/ble_cache.json
 
 # Scratch project used to obtain an ESP-IDF 5 bootloader (not shipped)
 bl_probe/
+
+# ESP-IDF bootloader probe (source only; .pio ignored)
