@@ -51,7 +51,7 @@ static NoopStream g_nullPrintC3;
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.2"
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -837,7 +837,9 @@ void loop() {
       stable = raw;
       if (stable) {
         unsigned long now = millis();
-        bool armed = g_encSeenIdle && !g_safeMode;
+        // Never restart during the first 10 s of a boot: even a wiring fault
+        // must not be able to turn the device into a reset loop.
+        bool armed = g_encSeenIdle && !g_safeMode && millis() > 10000;
         if (armed && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
           log_e("[cfg] encoder double-click -> reboot into portal");
           preferences.begin("binddecklite", false);
