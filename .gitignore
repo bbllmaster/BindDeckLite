@@ -1,0 +1,16 @@
+# ---- PlatformIO ----------------------------------------------------------
+.pio/
+.vscode/
+
+# ---- Build artifacts -----------------------------------------------------
+dist/
+*.bin
+!partitions/*.csv
+
+# ---- Python --------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+host/config.json
+host/ble_cache.json
+*.log

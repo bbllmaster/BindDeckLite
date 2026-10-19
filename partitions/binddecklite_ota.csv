@@ -1,0 +1,7 @@
+# BindDeckLite — classic ESP32 (with phy_init; the ESP32 stores RF calibration here).
+# OTA layout: two 1.9 MB app slots, NVS, otadata.
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+app0,     app,  ota_0,   0x10000, 0x1F0000,
+app1,     app,  ota_1,   0x200000,0x1F0000,
