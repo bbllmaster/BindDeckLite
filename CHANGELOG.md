@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.6 — 2026-10-19
+
+- 新增 **ESP32-C3 16 MB Flash** 变体（`esp32c3_16mb`）：16 MB 分区表（3 MB OTA 槽 + storage），
+  并改用 **40 MHz DIO**。部分 16 MB 模组在 80 MHz 下 bootloader 读完分区表即静默复位
+  （`entry 0x403cc710` 后无任何输出），40 MHz 是保守可用的设置。
+- 16 MB 表的每个分区都结束在 `0x1000000` 以内，`--flash_size 16MB` 写入镜像头。
+- 4 MB / 2 MB 变体保持不变。
+
 ## v1.0.5 — 2026-10-19
 
 - 新增 **ESP32-C3 2 MB Flash** 变体（`esp32c3_2mb`）：单 app 槽、无 OTA。

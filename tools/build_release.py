@@ -38,7 +38,17 @@ TARGETS = {
         "bootloader_offset": "0x0",
         "boot_app0_offset": "0xe000",
     },
-    # 2 MB C3 modules: single app slot, no otadata partition.
+    # 16 MB C3 modules: 3 MB OTA slots, 40 MHz DIO (conservative).
+    "c3_16mb": {
+        "env": "esp32c3_16mb",
+        "chip": "esp32c3",
+        "name": "c3_16mb",
+        "flash_freq": "40m",
+        "flash_size": "16MB",
+        "bootloader_offset": "0x0",
+        "boot_app0_offset": "0xe000",
+    },
+    # 2 MB C3 modules: single app slot, no OTA.
     "c3_2mb": {
         "env": "esp32c3_2mb",
         "chip": "esp32c3",
