@@ -6,7 +6,13 @@ Produces, for each target (classic ESP32 + ESP32-C3):
     app, flashed from 0x0 in one shot (esptool write_flash 0x0 file.bin)
   * ota_<target>_v<ver>.bin     — app-only image for the config-mode OTA page
 
-Usage:  python tools/build_release.py [--skip-build]
+Usage:
+  python tools/build_release.py [--skip-build] [--target <name> ...]
+
+  --target may be given several times to build only the chosen targets
+  (esp32 | c3 | c3_16mb | c3_2mb); default = all. The flag lets CI build a
+  single target without re-running the whole matrix, e.g. after a targeted
+  change to one partition table.
 """
 
 from __future__ import annotations
@@ -116,6 +122,23 @@ def build_idf_bootloader(skip_build: bool) -> str:
     return IDF_BOOTLOADER
 
 
+def _parse_targets(argv):
+    """Return the subset of TARGETS requested on the command line.
+
+    Every --target <name> adds one; with none given, all targets are built.
+    Unknown names abort so a typo never silently builds the wrong image.
+    """
+    wanted = [a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--target"]
+    if not wanted:
+        return dict(TARGETS)
+    unknown = [w for w in wanted if w not in TARGETS]
+    if unknown:
+        raise SystemExit(
+            "unknown --target %s (choose from %s)" % (", ".join(unknown), ", ".join(TARGETS))
+        )
+    return {w: TARGETS[w] for w in wanted}
+
+
 def main():
     skip_build = "--skip-build" in sys.argv
     version = fw_version()
@@ -125,7 +148,7 @@ def main():
     # Built once, used by the 16 MB image only.
     build_idf_bootloader(skip_build)
 
-    for target, t in TARGETS.items():
+    for target, t in _parse_targets(sys.argv).items():
         build_dir = os.path.join(ROOT, ".pio", "build", t["env"])
         if not skip_build:
             print(f"==> building {t['env']}")
