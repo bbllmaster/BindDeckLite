@@ -1,2 +1,5 @@
 flask>=3.0
 bleak>=0.22
+# Macros / media keys on Windows (app.py imports it lazily and degrades
+# gracefully without it, but the packaged exe ships with it enabled).
+keyboard

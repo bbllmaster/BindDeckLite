@@ -26,10 +26,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r host/requirements.txt
-          # Macros and media keys are optional in app.py but need the
-          # keyboard library on Windows; install it so the frozen image
-          # supports them out of the box.
-          python -m pip install pyinstaller keyboard
+          # keyboard is in requirements.txt (macros/media keys on Windows);
+          # PyInstaller is a build tool, not a runtime dependency.
+          python -m pip install pyinstaller
 
       - name: Build Windows exe
         run: |

@@ -57,7 +57,12 @@ def build(onefile: bool, name: str, dist: str, workpath: str, clean: bool) -> st
         "--name", name,
         "--distpath", dist,
         "--workpath", workpath,
-        # app assets: templates + static, relative to host/ (cwd below)
+        # app assets: templates + static, relative to host/ (cwd below). The destination
+# (right of the separator) is the path *inside the bundle*, which is exactly
+# what app.py's RESOURCE_ROOT resolves to when frozen: sys._MEIPASS in one-file
+# mode (or the bundle dir in one-dir mode). Keeping the destination as a plain
+# "templates"/"static" name - not an absolute path - makes both modes align
+# with Flask's template_folder/static_folder without a per-mode branch.
         "--add-data", f"templates{os.pathsep}templates",
         "--add-data", f"static{os.pathsep}static",
         # bleak's Windows backend is imported dynamically at runtime

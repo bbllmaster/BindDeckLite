@@ -39,7 +39,27 @@ PORT = int(os.environ.get("BINDDECKLITE_PORT", "8788"))
 # Same vendor service as the firmware's ble_config.cpp (shared protocol).
 CONTROL_SERVICE = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
 
-app = Flask(__name__, static_folder="static", template_folder="templates")
+
+def _resource_root() -> str:
+    """Directory holding the bundled templates/static assets.
+
+    When packaged with PyInstaller (one-file) the app runs out of a temp
+    directory exposed as ``sys._MEIPASS``; Flask's default ``root_path`` is
+    derived from ``__file__`` and points at the exe's folder instead, so a
+    relative ``templates/`` / ``static/`` resolves to a non-existent path and
+    the frozen app 404s on every page. Return the absolute bundle root so the
+    Flask folders resolve correctly both when run from source and when frozen.
+    """
+    if getattr(sys, "frozen", False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+RESOURCE_ROOT = _resource_root()
+
+app = Flask(__name__,
+            static_folder=os.path.join(RESOURCE_ROOT, "static"),
+            template_folder=os.path.join(RESOURCE_ROOT, "templates"))
 app.config["JSON_AS_ASCII"] = False
 
 _lock = threading.RLock()
