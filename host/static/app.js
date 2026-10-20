@@ -201,8 +201,12 @@ function renderKeys() {
 
     $(".test", card).onclick = async () => {
       try {
-        await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
-        toast("已执行：" + (item.action.type === "none" ? "无上位机动作" : item.action.type));
+        const r = await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
+        if (r.ok) {
+          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type), "ok");
+        } else {
+          toast("动作执行失败：" + (r.error || "未知错误"), "bad");
+        }
       } catch (e) {
         toast(e.message, "bad");
       }
@@ -419,6 +423,11 @@ async function pollLog() {
       row.className = "log-row " + (e.level || "info");
       row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
       list.appendChild(row);
+      // Physical-button action failures arrive through the log stream;
+      // surface them as a toast so the user sees them immediately.
+      if (e.kind === "action" && e.level === "error") {
+        toast(e.text, "bad");
+      }
     });
     while (list.children.length > 300) list.removeChild(list.firstChild);
     list.scrollTop = list.scrollHeight;
