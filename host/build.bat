@@ -27,7 +27,8 @@ if errorlevel 1 goto :fail
 
 echo.
 echo [build] done: %~dp0dist\BindDeckLite.exe
-echo [build] double-click it: the console stays hidden, the tray icon is at the bottom right.
+echo [build] double-click it: a native pywebview window opens (no console, no browser); \
+      close it to exit, or minimize to the tray.
 pause
 exit /b 0
 

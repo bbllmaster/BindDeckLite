@@ -1,6 +1,15 @@
-# Extra dependencies for the desktop shell (tray icon, native dialogs).
+# Extra dependencies for the desktop shell (native window, tray icon, dialogs).
 # Only needed for `python app.py --desktop` and for building the exe;
 # `run.sh` / `run.bat` keep working with just requirements.txt.
+#
+# pywebview turns the frozen exe into a real desktop app: it renders the
+# existing Flask Web UI in a native window (WinForms / Edge Chromium on
+# Windows) instead of popping a browser, and removes the console window.
+# pythonnet is pywebview's Windows backend (WinForms) and is pulled in
+# automatically by pywebview on win32; listed here explicitly so the PyInstaller
+# hidden-imports and the bundled .NET interop assembly are unambiguous.
+pywebview>=6.0
+pythonnet>=3.0; sys_platform == "win32"
 pystray>=0.19.5
 pillow>=10.0
 keyboard>=0.13.5; sys_platform == "win32"
