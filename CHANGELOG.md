@@ -1,5 +1,25 @@
 # Changelog
 
+## 上位机桌面版 — 2026-10-20（pywebview 真桌面化）
+
+- **应用模型改为 pywebview 原生窗口**：`host/desktop.py` 新增 `run_webview()`，
+  Flask 在后台线程运行，pywebview 在主线程创建本机窗口（1280×800）并
+  `webview.start()` 阻塞运行。双击 exe 直接出现应用窗口，**无黑色控制台、
+  无浏览器弹窗**；关闭窗口退出，有托盘时改为最小化到托盘。
+- `host/app.py` 的 `main()` 桌面分支由 `run_desktop()` 改为 `run_webview()`。
+- **兜底**：pywebview 或其 GUI 后端不可用（无头 Linux、Windows 无 pythonnet）
+  时自动退回 `_serve_headless()` 托盘/无头服务，`python app.py --desktop`
+  不会因缺 GUI 而崩溃；`run.sh` / `run.bat` 浏览器方式不受影响。
+- 托盘菜单「显示控制台」改为「显示窗口」（直接唤起 pywebview 窗口）；
+  pywebview 的 `Window.show()/hide()/destroy()` 已在 GUI 线程 marshalling，
+  托盘回调跨线程调用安全。
+- 依赖：`host/requirements-desktop.txt` 新增 `pywebview>=6.0` 与
+  `pythonnet>=3.0; sys_platform == "win32"`（pywebview 的 Windows 后端）。
+- 打包：`host/app.spec` 增加 `webview` / `webview.platforms.{winforms,
+  edgechromium,mshtml}` / `pythonnet` / `clr_loader` hidden-imports，并对
+  `webview`、`pythonnet` 做 `collect_submodules`；两个包各自带的
+  PyInstaller hook（JS bridge 数据文件、pythonnet .NET 互op 程序集）自动生效。
+
 ## 上位机桌面版修复 — 2026-10-20
 
 - 修复托盘不可用时应用无法退出：启动前先探测 pystray / Pillow，探测失败不隐藏控制台；

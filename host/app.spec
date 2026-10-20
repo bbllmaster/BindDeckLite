@@ -6,7 +6,9 @@ Build on Windows from ``host/``:
     pyinstaller --noconfirm --clean app.spec
 
 Output: ``host/dist/BindDeckLite.exe`` (one file, no console window).
-The exe starts in desktop/tray mode; see ``desktop.py``.
+The exe starts as a native pywebview window (``desktop.run_webview``): Flask
+serves in the background while pywebview renders the existing Web UI in a real
+window, with a tray icon for minimize-to-tray.  See ``desktop.py``.
 """
 
 import os
@@ -28,6 +30,16 @@ hiddenimports = [
     "tkinter.filedialog",
     "pystray._win32",
     "PIL.ImageDraw",
+    # pywebview renders the Web UI in a native window.  The platform backend
+    # (winforms / edgechromium / mshtml) is picked lazily at runtime by
+    # guilib.initialize(), so static analysis misses it — list them explicitly.
+    # pythonnet (clr / clr_loader) is pywebview's Windows backend.
+    "webview",
+    "webview.platforms.winforms",
+    "webview.platforms.edgechromium",
+    "webview.platforms.mshtml",
+    "pythonnet",
+    "clr_loader",
     # bleak's WinRT backend is imported lazily.
     "winrt.windows.foundation",
     "winrt.windows.foundation.collections",
@@ -38,7 +50,7 @@ hiddenimports = [
     "winrt.windows.devices.radios",
     "winrt.windows.storage",
 ]
-for package in ("bleak", "pystray"):
+for package in ("bleak", "pystray", "webview", "pythonnet"):
     try:
         hiddenimports += collect_submodules(package)
     except Exception:

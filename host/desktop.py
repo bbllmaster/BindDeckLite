@@ -2,16 +2,26 @@
 
 The console is still a Flask app served on 127.0.0.1, so "minimise to tray"
 means: keep the server alive in the background behind a tray icon instead of
-a taskbar window.  This module owns that shell:
+a taskbar window.  This module owns that shell, plus the *real* desktop window:
 
-* hide the console window of the frozen exe (only when a tray exists),
-* a tray icon (pystray) with 显示控制台 / 退出,
+* ``run_webview`` — the frozen exe is a native pywebview window rendering the
+  existing Web UI (no console, no browser popup).  Flask runs in a background
+  thread; pywebview creates the window on the main thread and
+  ``webview.start()`` blocks until it closes.  With a tray available the window
+  minimises to the tray instead of closing.
+* ``run_desktop`` — the legacy tray-only mode (no window): Flask in the
+  background, a tray icon, and a browser tab opened on demand.  Still available
+  for direct invocation on headless boxes where no GUI is wanted.
+* ``_serve_headless`` — the fallback ``run_webview`` uses when pywebview or its
+  GUI backend is unavailable: keeps the already-running Flask server alive in
+  the tray (or blocks until /api/quit / Ctrl+C when there is no tray).
 * native file dialogs used by the "浏览…" button in the web UI,
 * ``/api/quit`` support so the web UI can stop the app when there is no tray,
 * single-instance behaviour (a second double-click focuses the running app).
 
 Nothing here is imported at module import time except the standard library, so
-``run.sh`` on a headless Linux box keeps working without pystray or Pillow.
+``run.sh`` on a headless Linux box keeps working without pystray, Pillow or
+pywebview.
 """
 
 from __future__ import annotations
@@ -265,24 +275,32 @@ def _icon_image(size: int = 64):
     return img
 
 
-def _build_tray(url: str, on_quit):
+def _build_tray(url: str, on_quit, window=None):
+    """Build the pystray icon.
+
+    ``window`` is the native pywebview window when running in windowed mode;
+    the "显示窗口" item then raises it instead of opening a browser tab.
+    """
     import pystray
 
-    icon = None
-
     def show(_icon=None, _item=None):
+        if window is not None:
+            try:
+                window.show()
+                return
+            except Exception:
+                pass
         open_url(url)
 
     def quit_app(_icon=None, _item=None):
         on_quit()
 
     menu = pystray.Menu(
-        pystray.MenuItem("显示控制台", show, default=True),
+        pystray.MenuItem("显示窗口", show, default=True),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("退出 BindDeckLite", quit_app),
     )
-    icon = pystray.Icon("BindDeckLite", _icon_image(), "BindDeckLite · 控制台", menu)
-    return icon
+    return pystray.Icon("BindDeckLite", _icon_image(), "BindDeckLite · 控制台", menu)
 
 
 def _serve_forever(thread) -> None:
@@ -294,35 +312,32 @@ def _serve_forever(thread) -> None:
 
 
 def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
-                use_tray: bool = True, log_path: str = "") -> int:
-    """Serve the app in the background and live in the tray until 退出."""
+                use_tray: bool = True, log_path: str = "", server=None) -> int:
+    """Serve the app in the background and live in the tray until 退出.
+
+    When ``server`` is supplied it is reused instead of binding a new socket,
+    so a caller that already started Flask can hand the running server over
+    without fighting for the port.
+    """
     STATE["desktop"] = True
     STATE["url"] = url
     if log_path:
         setup_stdio(log_path)
 
-    if port_in_use(port):
+    if server is None and port_in_use(port):
         print(f"[desktop] already running at {url}, opening browser")
         open_url(url)
         return 0
 
-    # Probe the tray before hiding the console: without a tray (and with no
-    # visible console) the user would have no way to stop the app.
-    tray_ok, tray_error = tray_available() if use_tray else (False, "托盘已禁用")
-    if use_tray and not tray_ok:
-        STATE["error"] = "托盘不可用：" + tray_error
-        print("[desktop] pystray/Pillow unavailable, falling back:", tray_error)
-    use_tray = use_tray and tray_ok
-
-    from werkzeug.serving import make_server
-
-    try:
-        server = make_server("127.0.0.1", port, flask_app, threaded=True)
-    except OSError as e:
-        STATE["error"] = str(e)
-        show_console()
-        print("[desktop] cannot bind port:", e)
-        return 1
+    if server is None:
+        from werkzeug.serving import make_server
+        try:
+            server = make_server("127.0.0.1", port, flask_app, threaded=True)
+        except OSError as e:
+            STATE["error"] = str(e)
+            show_console()
+            print("[desktop] cannot bind port:", e)
+            return 1
 
     icon = None
 
@@ -337,6 +352,12 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
     thread = threading.Thread(target=server.serve_forever, name="flask", daemon=True)
     thread.start()
     set_quit_callback(stop_all)
+
+    tray_ok, tray_error = tray_available() if use_tray else (False, "托盘已禁用")
+    if use_tray and not tray_ok:
+        STATE["error"] = "托盘不可用：" + tray_error
+        print("[desktop] pystray/Pillow unavailable, falling back:", tray_error)
+    use_tray = use_tray and tray_ok
 
     if use_tray:
         hide_console()
@@ -386,4 +407,193 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
         server.shutdown()
         STATE["tray_active"] = False
         set_quit_callback(None)
+    return 0
+
+
+def _serve_headless(server, flask_thread, url, use_tray):
+    """Keep the already-running Flask server alive without a native window.
+
+    Fallback for when pywebview or its GUI backend is unavailable (headless
+    Linux, or Windows without pythonnet).  With a tray the app lives in the
+    tray; otherwise it blocks until /api/quit or Ctrl+C.  Reuses the server
+    and quit callback the caller already set up, and owns its own cleanup.
+    """
+    icon = None
+    state = {"stopped": False}
+
+    def stop_all():
+        if state["stopped"]:
+            return
+        state["stopped"] = True
+        try:
+            if icon is not None:
+                icon.stop()
+        except Exception:
+            pass
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    set_quit_callback(stop_all)
+
+    if use_tray:
+        try:
+            icon = _build_tray(url, stop_all)
+        except Exception as e:  # noqa: BLE001
+            STATE["tray_active"] = False
+            STATE["error"] = f"{type(e).__name__}: {e}"
+            print("[webview] tray unavailable:", e)
+            icon = None
+            use_tray = False
+
+    try:
+        if icon is not None:
+            STATE["tray_active"] = True
+            print("[webview] tray icon ready")
+            icon.run()
+        else:
+            print("[webview] running headless; use 退出上位机 in the UI or Ctrl+C")
+            _serve_forever(flask_thread)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:  # noqa: BLE001
+        STATE["error"] = f"{type(e).__name__}: {e}"
+        print("[webview] tray failed:", e)
+        _serve_forever(flask_thread)
+    finally:
+        stop_all()
+        STATE["tray_active"] = False
+        set_quit_callback(None)
+    return 0
+
+
+def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
+                use_tray: bool = True, log_path: str = "") -> int:
+    """Serve Flask behind a native pywebview window — the real desktop app.
+
+    Unlike ``run_desktop`` (tray + browser), this renders the existing Web UI
+    in a real window: Flask runs in a background thread, pywebview creates the
+    window on the main thread and ``webview.start()`` blocks until it closes.
+    Closing the window exits the app; with a tray available the window
+    minimises to the tray instead.
+
+    When pywebview or its GUI backend is unavailable (headless Linux, or
+    Windows without pythonnet) it falls back to ``_serve_headless`` so
+    ``python app.py --desktop`` keeps working without a console crash.
+    """
+    STATE["desktop"] = True
+    STATE["url"] = url
+    if log_path:
+        setup_stdio(log_path)
+
+    if port_in_use(port):
+        # Second double-click: the running instance is already up.  We cannot
+        # raise another process's window, so just open the URL in a browser.
+        print(f"[webview] already running at {url}, opening browser")
+        open_url(url)
+        return 0
+
+    # 1. Start Flask in a background thread so the window can load the page.
+    from werkzeug.serving import make_server
+    try:
+        server = make_server("127.0.0.1", port, flask_app, threaded=True)
+    except OSError as e:
+        STATE["error"] = str(e)
+        print("[webview] cannot bind port:", e)
+        return 1
+
+    flask_thread = threading.Thread(target=server.serve_forever, name="flask", daemon=True)
+    flask_thread.start()
+
+    icon = [None]          # mutable holder for the pystray icon
+    window_ref = [None]    # mutable holder for the pywebview window
+    state = {"force_quit": False, "stopped": False}
+
+    def stop_all():
+        """Stop the tray, close the window and shut the server down."""
+        if state["stopped"]:
+            return
+        state["stopped"] = True
+        state["force_quit"] = True
+        try:
+            if window_ref[0] is not None:
+                window_ref[0].destroy()
+        except Exception:
+            pass
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+    set_quit_callback(stop_all)
+
+    # 2. Probe the tray (minimize-to-tray needs it).
+    tray_ok, _tray_error = tray_available() if use_tray else (False, "托盘已禁用")
+    use_tray = use_tray and tray_ok
+
+    # 3. Create the native window (hidden when the user asked to start minimized).
+    try:
+        import webview
+        window = webview.create_window(
+            "BindDeckLite", url,
+            width=1280, height=800, min_size=(960, 600),
+            hidden=start_minimized,
+        )
+    except Exception as e:  # noqa: BLE001
+        STATE["error"] = f"pywebview 不可用: {type(e).__name__}: {e}"
+        print("[webview] native window unavailable, falling back to tray-only:", e)
+        return _serve_headless(server, flask_thread, url, use_tray)
+
+    window_ref[0] = window
+
+    def _on_closing(win):
+        """Fired when the user hits the window close button.
+
+        Return False to cancel the close (minimize to tray), True to allow it.
+        pywebview's WinForms backend runs this on the GUI thread, so hiding the
+        window here is safe and immediate.
+        """
+        if not state["force_quit"] and use_tray:
+            try:
+                win.hide()
+            except Exception:
+                pass
+            return False
+        return True
+
+    window.events.closing += _on_closing
+
+    # 4. Start the tray icon (if available).  pywebview's
+    #    Window.show()/hide()/destroy() marshal onto the GUI thread, so the
+    #    tray callbacks are safe to call from the pystray thread.
+    if use_tray:
+        try:
+            icon[0] = _build_tray(url, stop_all, window)
+            threading.Thread(target=icon[0].run, name="tray", daemon=True).start()
+            STATE["tray_active"] = True
+            print("[webview] tray icon ready")
+        except Exception as e:  # noqa: BLE001
+            STATE["tray_active"] = False
+            STATE["error"] = f"{type(e).__name__}: {e}"
+            print("[webview] tray unavailable:", e)
+
+    # 5. Block on the native GUI loop until the window closes.  A missing GUI
+    #    backend (headless Linux) falls back to serving headlessly instead of
+    #    crashing; a normal close stops the server and tray below.
+    try:
+        webview.start()
+    except Exception as e:  # noqa: BLE001
+        STATE["error"] = f"pywebview GUI 不可用: {type(e).__name__}: {e}"
+        print("[webview] GUI backend unavailable, serving headless:", e)
+        return _serve_headless(server, flask_thread, url, use_tray)
+
+    stop_all()
+    try:
+        if icon[0] is not None:
+            icon[0].stop()
+    except Exception:
+        pass
+    STATE["tray_active"] = False
+    set_quit_callback(None)
     return 0

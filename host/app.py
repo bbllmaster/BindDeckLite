@@ -13,13 +13,15 @@ Responsibilities
   button is pressed. The deck also sends its HID key itself, so actions are an
   add-on, not a requirement.
 
-Run:  python app.py            (opens http://127.0.0.1:8788)
-      python app.py --desktop  (tray mode: console hidden, 显示 / 退出 menu)
+Run:  python app.py            (opens http://127.0.0.1:8788 in a browser)
+      python app.py --desktop  (native pywebview window + tray; no console/browser)
       python app.py --file-dialog file   (internal: native picker child)
 
-Set ``BINDDECKLITE_DESKTOP=1`` to force desktop/tray mode (same as --desktop).
-The frozen Windows build (``BindDeckLite.exe``) always starts in desktop mode;
-see ``desktop.py`` and ``autostart.py`` for the tray and login-start bits.
+Set ``BINDDECKLITE_DESKTOP=1`` to force desktop mode (same as --desktop).
+The frozen Windows build (``BindDeckLite.exe``) always starts in desktop mode:
+Flask serves in the background while pywebview renders the existing Web UI in
+a real window (see ``desktop.run_webview``).  ``desktop.py`` and ``autostart.py``
+own the tray, native dialogs and login-start bits.
 """
 
 from __future__ import annotations
@@ -747,9 +749,9 @@ def api_keycodes():
 def _parse_args(argv):
     parser = argparse.ArgumentParser(prog="BindDeckLite", description="BindDeckLite 上位机")
     parser.add_argument("--desktop", "--tray", dest="desktop", action="store_true",
-                        help="在系统托盘运行（隐藏控制台窗口）")
+                        help="桌面模式：pywebview 原生窗口 + 托盘（无控制台、无浏览器弹窗）")
     parser.add_argument("--minimized", action="store_true",
-                        help="启动时不打开浏览器（托盘模式）")
+                        help="启动时不显示窗口（最小化到托盘）")
     parser.add_argument("--no-tray", dest="no_tray", action="store_true",
                         help="桌面模式但不创建托盘图标")
     parser.add_argument("--file-dialog", choices=("file", "dir"), help=argparse.SUPPRESS)
@@ -782,7 +784,7 @@ def main(argv=None):
     print(f"[app] BindDeckLite host running at {url}")
 
     if desktop_mode:
-        return desktop.run_desktop(app, PORT, url,
+        return desktop.run_webview(app, PORT, url,
                                    start_minimized=bool(args.minimized),
                                    use_tray=not args.no_tray,
                                    log_path=os.path.join(DATA_DIR, "host.log"))
