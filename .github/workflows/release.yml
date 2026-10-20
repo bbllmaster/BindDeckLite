@@ -177,6 +177,7 @@ jobs:
           } > RELEASE_NOTES.md
 
           gh release create "${TAG}" \
+            --repo bbllmaster/BindDeckLite \
             --title "${TITLE}" \
             --notes-file RELEASE_NOTES.md \
             "${EXTRA[@]}" \
