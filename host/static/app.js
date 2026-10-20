@@ -431,17 +431,20 @@ function renderDesktop() {
   toggle.checked = !!auto.enabled;
   toggle.disabled = !auto.supported;
   $("#minimizedToggle").checked = !!d.start_minimized;
+  $("#btnQuitHost").hidden = !d.desktop_mode;
 
   const bits = [];
   if (d.tray_active) bits.push("托盘图标在任务栏右下角：单击显示控制台，右键可显示 / 退出");
-  else if (d.desktop_mode) bits.push("托盘不可用，程序在后台运行");
+  else if (d.desktop_mode) bits.push("托盘不可用，程序在后台运行，可用下方「退出上位机」关闭");
   else bits.push("当前由 run.sh / python app.py 启动，没有托盘图标；打包版双击即带托盘");
   if (auto.supported) {
     bits.push(`开机自启动${auto.enabled ? "已开启" : "未开启"}（${auto.method}）`);
   } else {
     bits.push("开机自启动不可用");
   }
-  if (auto.error || d.error) bits.push(auto.error || d.error);
+  if (auto.error) bits.push(auto.error);
+  const desktopError = (d.error || "").replace(/^托盘不可用：/, "");
+  if (desktopError && !bits.includes(desktopError)) bits.push(desktopError);
   $("#desktopHint").textContent = bits.join("；") + "。";
   if (auto.detail) $("#desktopHint").title = auto.detail;
 }
@@ -616,13 +619,31 @@ async function init() {
     }
   };
   $("#minimizedToggle").onchange = async (e) => {
-    const want = e.target.checked;
+    const target = e.target;
+    const want = target.checked;
+    target.disabled = true;
     try {
       await updateDesktop({ start_minimized: want });
       toast(want ? "开机启动时收进托盘" : "开机启动时打开控制台");
     } catch (err) {
-      e.target.checked = !want;
+      target.checked = !want;
       toast(err.message, "bad");
+    } finally {
+      target.disabled = false;
+    }
+  };
+  $("#btnQuitHost").onclick = async () => {
+    if (!window.confirm("退出 BindDeckLite 上位机？退出后按键的上位机动作将不再执行。")) return;
+    const target = $("#btnQuitHost");
+    target.disabled = true;
+    try {
+      const res = await fetch("/api/quit", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || "退出失败");
+      toast("已退出，可以关闭此页面", "ok");
+    } catch (err) {
+      toast("退出失败：" + (err.message || err), "bad");
+      target.disabled = false;
     }
   };
   const devAction = async (act, okText) => {

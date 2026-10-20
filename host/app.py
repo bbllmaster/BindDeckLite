@@ -17,6 +17,7 @@ Run:  python app.py            (opens http://127.0.0.1:8788)
       python app.py --desktop  (tray mode: console hidden, 显示 / 退出 menu)
       python app.py --file-dialog file   (internal: native picker child)
 
+Set ``BINDDECKLITE_DESKTOP=1`` to force desktop/tray mode (same as --desktop).
 The frozen Windows build (``BindDeckLite.exe``) always starts in desktop mode;
 see ``desktop.py`` and ``autostart.py`` for the tray and login-start bits.
 """
@@ -568,7 +569,10 @@ def api_desktop():
             save_config()
             # Keep the login entry in sync when autostart is already enabled.
             if autostart.status().get("enabled"):
-                autostart.enable(minimized=value)
+                result = autostart.enable(minimized=value)
+                if not result.get("ok"):
+                    add_event("desktop", "重写自启动条目失败: " + str(result.get("error", "?")),
+                              level="warn")
         if "autostart" in data:
             want = bool(data["autostart"])
             with _lock:
@@ -594,6 +598,14 @@ def api_browse():
         save_config()
         add_event("desktop", "已选择文件: " + path, level="ok")
     return jsonify(result), (200 if result.get("ok") else 503)
+
+
+@app.route("/api/quit", methods=["POST"])
+def api_quit():
+    if desktop.request_quit():
+        add_event("desktop", "收到退出请求")
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "当前不是桌面/托盘模式，无法从页面退出"}), 409
 
 
 @app.route("/api/log")

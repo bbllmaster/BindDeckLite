@@ -1,5 +1,15 @@
 # Changelog
 
+## 上位机桌面版修复 — 2026-10-20
+
+- 修复托盘不可用时应用无法退出：启动前先探测 pystray / Pillow，探测失败不隐藏控制台；
+  托盘创建或运行时失败会恢复控制台，并提供 `POST /api/quit`，UI 新增「退出上位机」按钮。
+- 文件对话框子进程超时 600s → 120s；错误信息补充退出码，便于定位。
+- `POST /api/desktop` 重写自启动条目失败时写入 warn 日志，不再静默。
+- `minimizedToggle` 请求期间禁用，避免快速双击产生并发请求。
+- 打开浏览器前改为轮询 `/api/status` 直到服务就绪（最多 5 秒），不再固定 `sleep(0.4)`。
+- 打包：`disable_windowed_traceback=True`，崩溃时不再弹出含内部路径的 traceback 窗口。
+
 ## 上位机桌面版 — 2026-10-19
 
 - 新增 `host/app.spec` + `host/build_exe.bat`：PyInstaller 打包单文件 `BindDeckLite.exe`
