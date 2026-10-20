@@ -4,9 +4,10 @@ The console is still a Flask app served on 127.0.0.1, so "minimise to tray"
 means: keep the server alive in the background behind a tray icon instead of
 a taskbar window.  This module owns that shell:
 
-* hide the console window of the frozen exe,
+* hide the console window of the frozen exe (only when a tray exists),
 * a tray icon (pystray) with 显示控制台 / 退出,
 * native file dialogs used by the "浏览…" button in the web UI,
+* ``/api/quit`` support so the web UI can stop the app when there is no tray,
 * single-instance behaviour (a second double-click focuses the running app).
 
 Nothing here is imported at module import time except the standard library, so
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 
 STATE = {
@@ -32,6 +34,9 @@ STATE = {
 }
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
+BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
+
+_quit_callback = None
 
 
 def is_frozen() -> bool:
@@ -55,6 +60,29 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def wait_until_ready(url: str, timeout: float = 5.0) -> bool:
+    """Poll the API until Flask answers, instead of sleeping a fixed time."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url + "/api/status", timeout=0.5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.1)
+    return False
+
+
+def tray_available() -> tuple[bool, str]:
+    """Whether a tray icon can be created at all (pystray + Pillow present)."""
+    try:
+        import pystray  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        return False, f"{type(e).__name__}: {e}"
+    return True, ""
+
+
 def hide_console() -> None:
     """Hide the console window of a frozen Windows build (no-op elsewhere)."""
     if not (is_frozen() and sys.platform.startswith("win")):
@@ -67,6 +95,42 @@ def hide_console() -> None:
             ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
     except Exception:
         pass
+
+
+def show_console() -> None:
+    """Bring the console back when the tray failed after we hid it."""
+    if not (is_frozen() and sys.platform.startswith("win")):
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+    except Exception:
+        pass
+
+
+def set_quit_callback(callback) -> None:
+    global _quit_callback
+    _quit_callback = callback
+
+
+def request_quit() -> bool:
+    """Shut the desktop app down from the web UI (used when no tray exists)."""
+    callback = _quit_callback
+    if callback is None:
+        return False
+
+    def _run():
+        time.sleep(0.4)  # let the HTTP response reach the browser first
+        try:
+            callback()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, name="quit", daemon=True).start()
+    return True
 
 
 def setup_stdio(log_path: str) -> None:
@@ -151,11 +215,12 @@ def browse(kind: str = "file") -> dict:
             _dialog_command(kind),
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=BROWSE_TIMEOUT,
             creationflags=CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "path": "", "error": "文件对话框超时"}
+        return {"ok": False, "path": "",
+                "error": f"文件对话框 {BROWSE_TIMEOUT} 秒无操作，已取消"}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "path": "", "error": f"{type(e).__name__}: {e}"}
 
@@ -168,10 +233,14 @@ def browse(kind: str = "file") -> dict:
             continue
     if not isinstance(payload, dict):
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        detail = detail[-1] if detail else f"退出码 {proc.returncode}"
-        return {"ok": False, "path": "", "error": f"文件对话框不可用：{detail}"}
+        detail = detail[-1] if detail else "无输出"
+        return {"ok": False, "path": "",
+                "error": f"文件对话框不可用：{detail}（退出码 {proc.returncode}）"}
     if not payload.get("ok"):
-        return {"ok": False, "path": "", "error": payload.get("error") or "文件对话框不可用"}
+        err = payload.get("error") or "文件对话框不可用"
+        if proc.returncode not in (0, None):
+            err += f"（退出码 {proc.returncode}）"
+        return {"ok": False, "path": "", "error": err}
     return {"ok": True, "path": payload.get("path") or ""}
 
 
@@ -199,17 +268,13 @@ def _icon_image(size: int = 64):
 def _build_tray(url: str, on_quit):
     import pystray
 
-    icon: "pystray.Icon" = None  # type: ignore[assignment]
+    icon = None
 
     def show(_icon=None, _item=None):
         open_url(url)
 
     def quit_app(_icon=None, _item=None):
-        try:
-            on_quit()
-        finally:
-            if icon is not None:
-                icon.stop()
+        on_quit()
 
     menu = pystray.Menu(
         pystray.MenuItem("显示控制台", show, default=True),
@@ -220,6 +285,14 @@ def _build_tray(url: str, on_quit):
     return icon
 
 
+def _serve_forever(thread) -> None:
+    """Block until the server stops (via /api/quit) or Ctrl+C."""
+    try:
+        thread.join()
+    except KeyboardInterrupt:
+        pass
+
+
 def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
                 use_tray: bool = True, log_path: str = "") -> int:
     """Serve the app in the background and live in the tray until 退出."""
@@ -227,12 +300,19 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
     STATE["url"] = url
     if log_path:
         setup_stdio(log_path)
-    hide_console()
 
     if port_in_use(port):
         print(f"[desktop] already running at {url}, opening browser")
         open_url(url)
         return 0
+
+    # Probe the tray before hiding the console: without a tray (and with no
+    # visible console) the user would have no way to stop the app.
+    tray_ok, tray_error = tray_available() if use_tray else (False, "托盘已禁用")
+    if use_tray and not tray_ok:
+        STATE["error"] = "托盘不可用：" + tray_error
+        print("[desktop] pystray/Pillow unavailable, falling back:", tray_error)
+    use_tray = use_tray and tray_ok
 
     from werkzeug.serving import make_server
 
@@ -240,34 +320,50 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
         server = make_server("127.0.0.1", port, flask_app, threaded=True)
     except OSError as e:
         STATE["error"] = str(e)
+        show_console()
         print("[desktop] cannot bind port:", e)
         return 1
 
+    icon = None
+
+    def stop_all():
+        nonlocal icon
+        try:
+            if icon is not None:
+                icon.stop()
+        finally:
+            server.shutdown()
+
     thread = threading.Thread(target=server.serve_forever, name="flask", daemon=True)
     thread.start()
+    set_quit_callback(stop_all)
+
+    if use_tray:
+        hide_console()
+
     if not start_minimized:
-        time.sleep(0.4)
+        wait_until_ready(url)
         open_url(url)
 
     if not use_tray:
-        print("[desktop] tray disabled; press Ctrl+C to quit")
-        try:
-            thread.join()
-        except KeyboardInterrupt:
-            server.shutdown()
+        print("[desktop] running without tray; use 退出上位机 in the UI or Ctrl+C")
+        _serve_forever(thread)
+        server.shutdown()
+        set_quit_callback(None)
         return 0
 
     try:
-        icon = _build_tray(url, server.shutdown)
+        icon = _build_tray(url, stop_all)
     except Exception as e:  # noqa: BLE001
-        # Headless machines / missing pystray: keep serving without a tray.
+        # Backend missing at runtime (headless X, etc.): keep the console
+        # visible and keep serving so /api/quit and Ctrl+C still work.
+        show_console()
         STATE["tray_active"] = False
         STATE["error"] = f"{type(e).__name__}: {e}"
         print("[desktop] tray unavailable:", e)
-        try:
-            thread.join()
-        except KeyboardInterrupt:
-            server.shutdown()
+        _serve_forever(thread)
+        server.shutdown()
+        set_quit_callback(None)
         return 0
 
     STATE["tray_active"] = True
@@ -277,13 +373,11 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
     except KeyboardInterrupt:
         pass
     except Exception as e:  # noqa: BLE001
+        show_console()
         STATE["tray_active"] = False
         STATE["error"] = f"{type(e).__name__}: {e}"
         print("[desktop] tray failed:", e)
-        try:
-            thread.join()
-        except KeyboardInterrupt:
-            pass
+        _serve_forever(thread)
     finally:
         try:
             icon.stop()
@@ -291,4 +385,5 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
             pass
         server.shutdown()
         STATE["tray_active"] = False
+        set_quit_callback(None)
     return 0
