@@ -146,9 +146,29 @@ def find_esptool() -> list[str]:
         return [sys.executable, bundle]
 
     raise SystemExit(
-        "esptool.py not found — install with `pip install esptool` or run "
-        "`pio run` once to populate the PlatformIO package cache"
+        "esptool not found — install with `pip install esptool` or "
+        "`pio pkg install -g -f tool-esptoolpy`, then run `pio run` "
+        "once to populate the PlatformIO package cache"
     )
+
+
+def ensure_framework() -> None:
+    """Ensure the framework-arduinoespressif32 package is installed.
+
+    On a cold cache the package directory may not exist yet; install it
+    explicitly instead of letting find_boot_app0() fail downstream.
+    """
+    fw_dir = os.path.join(PIO_HOME, "packages", "framework-arduinoespressif32")
+    if os.path.isdir(fw_dir):
+        return
+    print("==> framework-arduinoespressif32 not found, installing PlatformIO package")
+    try:
+        subprocess.run(
+            ["pio", "pkg", "install", "-g", "-f", "framework-arduinoespressif32"],
+            cwd=ROOT, check=True, timeout=120,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        print(f"    pio pkg install failed ({e}); will retry during pio run")
 
 
 def find_boot_app0() -> str:
@@ -202,6 +222,7 @@ def main():
     version = fw_version()
     os.makedirs(DIST, exist_ok=True)
     esptool_cmd = find_esptool()
+    ensure_framework()
     boot_app0 = find_boot_app0()
     # Built once, used by the 16 MB image only.
     build_idf_bootloader(skip_build)
