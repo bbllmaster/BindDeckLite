@@ -501,6 +501,21 @@ async function applyConfig() {
   await saveConfig();
   try {
     const r = await api(`/api/apply/${encodeURIComponent(state.selected)}`, { method: "POST" });
+
+    // New contract: per-item readback results.
+    if (r.items && r.items.length) {
+      renderApplyResults(r.items);
+      if (r.ok) {
+        toast("配置已生效", "ok");
+        setDirty(false);
+      } else {
+        toast("部分配置未生效，请查看下方结果", "bad");
+        // Keep dirty — the button stays "应用配置 •" until everything is ok.
+      }
+      return;
+    }
+
+    // Legacy fallback (old backend that only returns {ok, results}).
     if (r.ok) {
       toast(`已下发到设备（${r.results.filter((x) => x.sent).length} 条）`, "ok");
       setDirty(false);
@@ -509,6 +524,105 @@ async function applyConfig() {
     }
   } catch (e) {
     toast(e.message, "bad");
+  }
+}
+
+function clearApplyResults() {
+  const existing = $("#applyResults");
+  if (existing) existing.remove();
+  $$(".field-highlight").forEach((el) => el.classList.remove("field-highlight"));
+}
+
+function renderApplyResults(items) {
+  clearApplyResults();
+
+  const container = document.createElement("div");
+  container.id = "applyResults";
+  container.className = "apply-results";
+
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "apply-result-row " + item.status;
+
+    let statusText;
+    switch (item.status) {
+      case "ok":
+        statusText = "已生效";
+        break;
+      case "rejected":
+        statusText = `未生效：设备拒绝（${item.reason}）`;
+        break;
+      case "unconfirmed":
+        statusText = `未确认：${item.reason}`;
+        break;
+      case "unverified":
+        statusText = "已下发，设备未回报（固件不支持校验）";
+        break;
+      default:
+        statusText = item.status;
+    }
+
+    const actionBtn = (item.status !== "ok")
+      ? `<button class="btn tiny" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
+      : "";
+
+    row.innerHTML = `
+      <span class="result-label">${escapeHtml(item.label)}</span>
+      <span class="result-status">${escapeHtml(statusText)}</span>
+      <span class="result-action">${actionBtn}</span>`;
+    container.appendChild(row);
+  });
+
+  // Insert right below the apply button.
+  const btn = $("#btnApply");
+  btn.parentNode.insertBefore(container, btn.nextSibling);
+
+  // Highlight the form fields whose value was rejected.
+  items.forEach((item) => {
+    if (item.status === "rejected") highlightFormField(item.field);
+  });
+}
+
+function highlightFormField(field) {
+  switch (field) {
+    case "pins":
+      $$(".pin").forEach((el) => el.classList.add("field-highlight"));
+      break;
+    case "keys":
+      $$(".keycard").forEach((el) => el.classList.add("field-highlight"));
+      break;
+    case "enc":
+      $("#encoderModes").classList.add("field-highlight");
+      break;
+    case "sleep":
+      $("#sleepEnabled").classList.add("field-highlight");
+      break;
+    case "tz":
+      // No direct tz control in the UI; the hint text stays as-is.
+      break;
+  }
+}
+
+async function acceptDeviceValue(field) {
+  if (!state.selected) return;
+  try {
+    // Trigger a fresh read from the device so the local form reflects what
+    // the device actually has. The CFG_* lines that come back update the
+    // local config through the normal _on_line path.
+    await api(`/api/device/${encodeURIComponent(state.selected)}/refresh`, { method: "POST" });
+    toast("已请求设备配置，更新中…", "ok");
+    // Give the device a moment to respond, then re-render the affected parts.
+    setTimeout(() => {
+      if (state.cfg) {
+        renderKeys();
+        renderEncoder();
+        renderPins();
+        renderDeviceMeta();
+      }
+      clearApplyResults();
+    }, 600);
+  } catch (e) {
+    toast("刷新失败：" + (e.message || e), "bad");
   }
 }
 

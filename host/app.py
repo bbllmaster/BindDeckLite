@@ -143,6 +143,95 @@ KEY_CODES += [(chr(c), c) for c in range(ord("A"), ord("Z") + 1)]
 KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
 
 
+# --- apply readback -------------------------------------------------------
+# Per-device apply operation state, isolating one apply from another. The BLE
+# line callback runs on a different thread than the Flask route handler that
+# drives the apply, so every cross-thread touch is guarded by a lock and ACK
+# signals use threading.Event so the sender can block with a timeout instead
+# of polling.
+_apply_windows: dict = {}
+_apply_lock = threading.RLock()
+
+# Human-readable labels for the five configurable fields (matches the order
+# the firmware applies them and the order the UI shows them).
+FIELD_LABELS = {
+    "pins": "按键引脚",
+    "keys": "按键码",
+    "enc": "编码器模式",
+    "sleep": "休眠",
+    "tz": "时区",
+}
+
+# Ordered (field, CFG prefix, label) tuples for ACK matching and readback
+# comparison. The prefix is the part after "CFG:" — e.g. "PINS" for "CFG:PINS:".
+_CFG_READBACK_FIELDS = [
+    ("pins", "PINS", "按键引脚"),
+    ("keys", "KEYS", "按键码"),
+    ("enc", "ENC", "编码器模式"),
+    ("sleep", "SLEEP", "休眠"),
+    ("tz", "TZ", "时区"),
+]
+
+
+class ApplyWindow:
+    """Per-device apply operation state.
+
+    Owns the ACK / readback capture for one ``apply_device`` call. The BLE
+    line callback runs on a different thread than the Flask route handler
+    that drives the apply, so every cross-thread touch is guarded by a lock
+    and ACK signals use ``threading.Event`` so the sender can block with a
+    timeout instead of polling.
+    """
+
+    def __init__(self, dev_id: str, snapshot: dict):
+        self.dev_id = dev_id
+        self.snapshot = snapshot  # {field: value_string we tried to send}
+        self._ack_ok = {f: False for f, _, _ in _CFG_READBACK_FIELDS}
+        self._ack_events = {f: threading.Event() for f, _, _ in _CFG_READBACK_FIELDS}
+        self.readback = {}        # {field: value_string from CMD:GET_CFG}
+        self._rb_lock = threading.Lock()
+        self._rb_count = 0
+        self.phase = "sending"    # sending -> readback -> done
+        self._done = threading.Event()
+
+    def on_ack(self, field: str):
+        if field in self._ack_events:
+            self._ack_ok[field] = True
+            self._ack_events[field].set()
+
+    def on_readback(self, field: str, value: str):
+        with self._rb_lock:
+            self.readback[field] = value
+            self._rb_count += 1
+        if self._rb_count >= len(_CFG_READBACK_FIELDS):
+            self._done.set()
+
+    def wait_ack(self, field: str, timeout: float) -> bool:
+        return self._ack_events[field].wait(timeout)
+
+    def wait_readback(self, timeout: float) -> bool:
+        return self._done.wait(timeout)
+
+
+def _rejection_reason(field: str, expected: str, actual: str) -> str:
+    """Human-readable reason why the device rejected a config value.
+
+    The firmware only genuinely rejects ``CFG:PINS`` (invalid / duplicate pins
+    and encoder pins); the other CFG commands always accept (they clamp or
+    ignore malformed input). The reason is derived from what we *tried* to
+    send (``expected``), not what the device currently holds (``actual``).
+    """
+    if field == "pins":
+        try:
+            pins = [int(x) for x in expected.split(",") if x.strip()]
+        except ValueError:
+            return "设备拒绝"
+        if len(pins) != len(set(pins)):
+            return "引脚重复"
+        return "保留脚"
+    return "设备拒绝"
+
+
 # --- persistence ----------------------------------------------------------
 def load_config():
     global _config
@@ -228,6 +317,11 @@ ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
 
 def _on_line(dev_id: str, line: str):
     dev_id = dev_id or ""
+
+    # Check for an active apply window on this device (cross-thread read).
+    with _apply_lock:
+        window = _apply_windows.get(dev_id)
+
     if line.startswith("BTN:"):
         parts = line.split(":")
         idx = 0
@@ -261,6 +355,30 @@ def _on_line(dev_id: str, line: str):
             save_config()
         add_event("device", f"固件 {cfg['fw']['version']} ({chip})", dev_id)
         return
+
+    # Apply window: capture ACK during the sending phase so the caller can
+    # confirm the device received each CFG:* line (1.5 s per item).
+    if line.startswith("ACK:") and window and window.phase == "sending":
+        body = line[4:]  # strip "ACK:"
+        for field, prefix, _ in _CFG_READBACK_FIELDS:
+            if body.startswith(prefix + ":"):
+                window.on_ack(field)
+                break
+        add_event("ack", "设备确认: " + body[:60], dev_id, "ok")
+        return
+
+    # Apply window: capture CFG_* during the readback phase WITHOUT touching
+    # the local config — the user must explicitly accept device values.
+    if window and window.phase == "readback":
+        for field, prefix, _ in _CFG_READBACK_FIELDS:
+            if line.startswith(prefix + ":"):
+                window.on_readback(field, line[len(prefix) + 1:])
+                return
+        # Any other line during the readback window is ignored on purpose:
+        # no silent overwrite of the local config while we compare.
+        return
+
+    # Normal path: no active apply readback — handle as before.
     if line.startswith("CFG_KEYS:"):
         vals = [v for v in line[len("CFG_KEYS:"):].split(",") if v.strip()]
         try:
@@ -373,20 +491,102 @@ def send(dev_id: str, cmd: str) -> dict:
 
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
-    results = []
+
+    # Build the values we are going to send — this snapshot is what the
+    # readback is compared against, so a rejected field shows the user what
+    # they tried to set vs what the device actually kept.
     pins = ",".join(str(int(p)) for p in cfg.get("pins", [])[:9])
     keys = ",".join(str(int(k["code"])) for k in cfg.get("keys", [])[:10])
-    if len(pins.split(",")) == 9:
-        results.append(send(dev_id, "CFG:PINS:" + pins))
-    if len(keys.split(",")) == 10:
-        results.append(send(dev_id, "CFG:KEYS:" + keys))
-    results.append(send(dev_id, f"CFG:ENC:{int(cfg['encoder'].get('mode', 0))}"))
+    enc_val = str(int(cfg["encoder"].get("mode", 0)))
     sleep = cfg.get("sleep", {})
-    results.append(send(dev_id, "CFG:SLEEP:%d,%d" % (
-        1 if sleep.get("enabled", True) else 0, max(1, int(sleep.get("minutes", 5))))))
-    if cfg.get("tz"):
-        results.append(send(dev_id, "CFG:TZ:" + cfg["tz"]))
-    return {"ok": any(r["sent"] for r in results), "results": results}
+    sleep_val = "%d,%d" % (
+        1 if sleep.get("enabled", True) else 0,
+        max(1, int(sleep.get("minutes", 5))),
+    )
+    tz_val = cfg.get("tz", "")
+
+    snapshot = {
+        "pins": pins,
+        "keys": keys,
+        "enc": enc_val,
+        "sleep": sleep_val,
+        "tz": tz_val,
+    }
+
+    # Create the per-device apply window before sending anything.
+    window = ApplyWindow(dev_id, snapshot)
+    with _apply_lock:
+        _apply_windows[dev_id] = window
+
+    try:
+        results = []
+        commands = [
+            ("pins", "CFG:PINS:" + pins),
+            ("keys", "CFG:KEYS:" + keys),
+            ("enc", "CFG:ENC:" + enc_val),
+            ("sleep", "CFG:SLEEP:" + sleep_val),
+        ]
+        if tz_val:
+            commands.append(("tz", "CFG:TZ:" + tz_val))
+
+        any_sent = False
+        for field, cmd in commands:
+            r = send(dev_id, cmd)
+            results.append(r)
+            if r["sent"]:
+                any_sent = True
+                # Wait up to 1.5 s for the device's ACK for this field.
+                window.wait_ack(field, 1.5)
+
+        # Readback: ask the device for its current config and compare against
+        # the snapshot we took before sending. The 2 s window covers the
+        # device's round-trip for all five CFG_* lines.
+        window.phase = "readback"
+        send(dev_id, "CMD:GET_CFG")
+        window.wait_readback(2.0)
+
+        # Build per-item results. Status semantics:
+        #   ok          — ACK received and readback matches what we sent
+        #   rejected    — ACK received but readback differs (device refused)
+        #   unconfirmed — no ACK within the per-item timeout
+        #   unverified  — ACK received but the device did not report this
+        #                  field (old firmware that ignores CMD:GET_CFG)
+        items = []
+        for field, prefix, label in _CFG_READBACK_FIELDS:
+            expected = snapshot.get(field, "")
+            actual = window.readback.get(field, "")
+            ack_ok = window._ack_ok.get(field, False)
+
+            if not ack_ok:
+                status = "unconfirmed"
+                reason = "设备未连接" if not any_sent else "连接中断"
+            elif field not in window.readback:
+                status = "unverified"
+                reason = "固件不支持校验"
+            elif actual == expected:
+                status = "ok"
+                reason = ""
+            else:
+                status = "rejected"
+                reason = _rejection_reason(field, expected, actual)
+
+            items.append({
+                "field": field,
+                "label": label,
+                "status": status,
+                "expected": expected,
+                "actual": actual,
+                "reason": reason,
+            })
+
+        return {
+            "ok": all(i["status"] == "ok" for i in items),
+            "results": results,
+            "items": items,
+        }
+    finally:
+        with _apply_lock:
+            _apply_windows.pop(dev_id, None)
 
 
 # --- host-side actions ----------------------------------------------------

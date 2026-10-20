@@ -327,6 +327,41 @@ input.short { width: 80px; }
 .log-row.warn .log-kind, .log-row.warn .log-text { color: var(--warn); }
 .log-row.error .log-text { color: var(--danger); }
 
+/* ---------- apply results ---------- */
+.apply-results {
+  margin: 14px 0 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  overflow: hidden;
+  animation: fade 0.18s ease;
+}
+.apply-result-row {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.apply-result-row:last-child { border-bottom: none; }
+.apply-result-row .result-label { color: var(--muted); font-size: 12px; }
+.apply-result-row .result-status { font-size: 12px; font-weight: 600; }
+.apply-result-row .result-action { flex: none; }
+
+.apply-result-row.ok .result-status { color: var(--ok); }
+.apply-result-row.rejected .result-status { color: var(--danger); }
+.apply-result-row.unconfirmed .result-status { color: var(--warn); }
+.apply-result-row.unverified .result-status { color: var(--muted); }
+
+/* Highlight the form fields whose value was rejected by the device. */
+.field-highlight {
+  box-shadow: 0 0 0 2px rgba(255, 107, 107, 0.45) inset;
+  border-color: var(--danger) !important;
+  transition: box-shadow 0.2s, border-color 0.2s;
+}
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translate(-50%, 20px);
