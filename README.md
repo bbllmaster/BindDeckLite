@@ -143,11 +143,11 @@ python app.py
 
 ### Windows 桌面版（exe / 托盘 / 开机自启动）
 
-在 Windows 上运行 `host/build_exe.bat`，得到单文件 `host\dist\BindDeckLite.exe`（Python 3.12 x64，目标机器无需安装 Python）：
+在 Windows 上运行 `host/build.bat`，得到单文件 `host\dist\BindDeckLite.exe`（Python 3.12 x64，目标机器无需安装 Python）：
 
 ```bat
 cd host
-build_exe.bat
+build.bat
 ```
 
 - exe 隐藏控制台窗口：双击后直接打开浏览器，并在任务栏右下角放一个托盘图标。
@@ -160,8 +160,8 @@ build_exe.bat
 - 源码模式也能体验托盘：`python app.py --desktop`；`--minimized` 表示不自动打开浏览器。`run.sh` / `run.bat` 行为不变（控制台运行，无托盘）。
 
 > PyInstaller 不支持交叉编译，exe 必须在 Windows 上构建。仓库里的
-> `.github/workflows/build-host-exe.yml` 可手动触发，构建完成后从 Actions 页面下载
-> `BindDeckLite-windows` 产物。
+> `.github/workflows/build-host.yml` 可手动触发（workflow_dispatch）或在 PR
+> 时自动构建，构建完成后从 Actions 页面下载 `BindDeckLite-windows` 产物。
 
 ### 上位机动作
 
@@ -191,8 +191,8 @@ build_exe.bat
 │   ├── app.py             # 上位机后端（--desktop 进入托盘模式）
 │   ├── desktop.py         # 托盘图标、控制台隐藏、原生文件对话框
 │   ├── autostart.py       # 开机自启动（注册表 / XDG / LaunchAgent）
-│   ├── app.spec           # PyInstaller 打包配置
-│   ├── build_exe.bat      # Windows 一键打包 exe
+│   ├── app.spec           # PyInstaller 打包配置（唯一入口）
+│   ├── build.bat          # Windows 一键打包 exe
 │   ├── requirements.txt           # 运行必需（Flask / bleak）
 │   ├── requirements-desktop.txt   # 托盘与文件对话框（pystray / pillow）
 │   ├── requirements-build.txt     # 打包依赖（含 PyInstaller）

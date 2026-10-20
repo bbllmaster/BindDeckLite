@@ -1,5 +1,7 @@
 @echo off
 rem Build the Windows host exe (BindDeckLite.exe). Run this on Windows.
+rem Single packaging path: pyinstaller app.spec (windowed, icon, tray + dialog
+rem hidden imports). CI (.github/workflows/build-host.yml) and release.yml
 setlocal
 cd /d "%~dp0"
 

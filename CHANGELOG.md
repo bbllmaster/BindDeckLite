@@ -12,7 +12,7 @@
 
 ## 上位机桌面版 — 2026-10-19
 
-- 新增 `host/app.spec` + `host/build_exe.bat`：PyInstaller 打包单文件 `BindDeckLite.exe`
+- 新增 `host/app.spec` + `host/build.bat`：PyInstaller 打包单文件 `BindDeckLite.exe`
   （windowed、无控制台、带 `host/assets/app.ico`），`templates/`、`static/`、图标一并内嵌。
 - 新增 `host/desktop.py`：系统托盘（显示控制台 / 退出）、启动时隐藏控制台、重复双击只打开浏览器、
   `--file-dialog` 原生文件对话框子进程。打包版默认进入托盘模式，源码可用 `python app.py --desktop`。

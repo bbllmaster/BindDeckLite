@@ -1,47 +1,60 @@
-name: Build Host EXE
+name: Build Windows host exe
 
+# The single Windows exe packaging path: pyinstaller app.spec (windowed, icon,
+# pystray / PIL / tkinter hidden imports, templates + static + assets bundled).
+#   * workflow_dispatch  - on-demand build for a tag or a manual snapshot
+#   * pull_request       - CI gate: the exe must build and serve before merge
+# Push to main and tag pushes are handled by release.yml (which builds the same
+# app.spec and publishes the release), so this workflow does not duplicate them.
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
+  workflow_dispatch:
   pull_request:
     branches: [main]
 
 jobs:
-  host:
-    name: host / windows-exe
-    # A genuine Windows .exe can only be produced on a Windows runner; the
-    # host app targets Windows users (macros / media keys via the keyboard lib).
+  windows-exe:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
+          architecture: "x64"
 
       - name: Install dependencies
+        working-directory: host
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r host/requirements.txt
-          # keyboard is in requirements.txt (macros/media keys on Windows);
-          # PyInstaller is a build tool, not a runtime dependency.
-          python -m pip install pyinstaller
+          python -m pip install -r requirements-build.txt
 
-      - name: Build Windows exe
+      - name: Build exe
+        working-directory: host
+        run: pyinstaller --noconfirm --clean app.spec
+
+      - name: Smoke test (starts, serves, exits)
+        working-directory: host
+        shell: pwsh
         run: |
-          python host/build_exe.py --onefile --name BindDeckLite --dist host/dist
-          # Non-silent verification: the one-file exe must exist after the build.
-          if (-not (Test-Path host/dist/BindDeckLite.exe)) {
-            throw "BindDeckLite.exe was not produced"
+          $env:BINDDECKLITE_PORT = "8799"
+          $env:BINDDECKLITE_NO_BROWSER = "1"
+          $p = Start-Process -FilePath "dist\BindDeckLite.exe" -ArgumentList "--desktop","--no-tray","--minimized" -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8799/api/desktop -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
           }
+          if (-not $ok) { throw "exe did not serve /api/desktop" }
+          $body = $r.Content | ConvertFrom-Json
+          if (-not $body.frozen) { throw "exe did not report frozen=true" }
+          taskkill /PID $p.Id /T /F
+          Write-Host "smoke test ok"
 
-      - name: Upload exe artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: host-exe
-          path: |
-            host/dist/BindDeckLite.exe
+          name: BindDeckLite-windows
+          path: host/dist/BindDeckLite.exe
           if-no-files-found: error
