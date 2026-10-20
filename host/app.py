@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -353,34 +354,111 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
-def run_action(action: dict):
+def _truncate(s, n=80):
+    """Truncate a string to at most n characters, keeping the prefix."""
+    s = str(s or "")
+    if len(s) <= n:
+        return s
+    return s[: n - 3] + "..."
+
+
+def _record_action_result(dev_id: str, idx: int, result: dict):
+    """Write an action result line to the event log.
+
+    Success -> kind=action, level=ok. Failure -> kind=action, level=error;
+    the frontend pollLog() turns level=error action rows into a toast so the
+    user sees the failure immediately even when triggered by a physical key.
+    """
+    kind = result.get("action_type", "none")
+    target = _truncate(result.get("target", ""))
+    if result.get("ok"):
+        text = f"输入 {idx + 1} · {kind} · {target}"
+        add_event("action", text, dev_id, level="ok")
+    else:
+        err = result.get("error", "") or "未知错误"
+        text = f"输入 {idx + 1} · {kind} · {target} · 失败: {err}"
+        add_event("action", text, dev_id, level="error")
+
+
+def run_action(action: dict) -> dict:
+    """Execute one host-side action and return a structured result object.
+
+    Returns {ok: bool, error: str, action_type: str, target: str(truncated)}.
+    Every branch either succeeds or sets ok=False with a human-readable error;
+    no exception leaks out of this function.
+    """
     kind = (action or {}).get("type", "none")
     value = (action or {}).get("value", "")
+    result = {
+        "ok": True,
+        "error": "",
+        "action_type": kind,
+        "target": _truncate(value),
+    }
+
     if kind == "none":
-        return
+        return result
+
     if kind in ("launch", "url"):
-        _open_target(value)
-    elif kind == "command":
-        subprocess.Popen(value, shell=True)
-    elif kind == "macro":
+        if kind == "url" and not value:
+            result["ok"] = False
+            result["error"] = "地址为空"
+            return result
+        try:
+            _open_target(value)
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        except Exception as e:  # noqa: BLE001 — last-resort guard
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+    if kind == "command":
+        try:
+            subprocess.Popen(value, shell=True)
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        except Exception as e:  # noqa: BLE001
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+    if kind == "macro":
         kb = _load_keyboard()
         if kb is None:
-            add_event("error", "宏需要 keyboard 库: pip install keyboard", level="warn")
-            return
-        for step in action.get("macro", []):
-            st = step.get("type")
-            if st == "key":
-                kb.send(step.get("value", ""))
-            elif st == "text":
-                kb.write(step.get("value", ""))
-            elif st == "delay":
-                time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
-    elif kind == "media":
+            result["ok"] = False
+            result["error"] = "宏需要 keyboard 库: pip install keyboard"
+            return result
+        try:
+            for step in action.get("macro", []):
+                st = step.get("type")
+                if st == "key":
+                    kb.send(step.get("value", ""))
+                elif st == "text":
+                    kb.write(step.get("value", ""))
+                elif st == "delay":
+                    time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+        except Exception as e:  # noqa: BLE001
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+    if kind == "media":
         kb = _load_keyboard()
         if kb is None:
-            add_event("error", "媒体键需要 keyboard 库: pip install keyboard", level="warn")
-            return
-        kb.send(value)
+            result["ok"] = False
+            result["error"] = "媒体键需要 keyboard 库: pip install keyboard"
+            return result
+        try:
+            kb.send(value)
+        except Exception as e:  # noqa: BLE001
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {e}"
+        return result
+
+    return result
 
 
 def _run_action_for(dev_id: str, idx: int):
@@ -395,7 +473,12 @@ def _run_action_for(dev_id: str, idx: int):
     action = keys[idx].get("action") or {}
     if action.get("type", "none") == "none":
         return
-    threading.Thread(target=run_action, args=(action,), daemon=True).start()
+
+    def _do():
+        result = run_action(action)
+        _record_action_result(dev_id, idx, result)
+
+    threading.Thread(target=_do, daemon=True).start()
 
 
 # --- HTTP API -------------------------------------------------------------
@@ -451,12 +534,45 @@ def api_apply(dev_id):
 
 @app.route("/api/action/test/<dev_id>/<int:idx>", methods=["POST"])
 def api_action_test(dev_id, idx):
+    if not _config["settings"].get("actions_enabled", True):
+        return jsonify({"ok": False, "error": "上位机动作已关闭"}), 403
+    dev = next((d for d in ble.devices() if d.get("dev_id") == dev_id), None)
+    if not dev or not dev.get("connected"):
+        return jsonify({"ok": False, "error": "设备未连接"}), 404
+
     cfg = device_cfg(dev_id)
     keys = cfg.get("keys", [])
     if idx < 0 or idx >= len(keys):
         return jsonify({"ok": False, "error": "bad index"}), 400
-    threading.Thread(target=run_action, args=(keys[idx].get("action") or {},), daemon=True).start()
-    return jsonify({"ok": True})
+
+    action = keys[idx].get("action") or {}
+    if action.get("type", "none") == "none":
+        return jsonify({"ok": True, "error": ""})
+
+    result_queue = queue.Queue()
+
+    def _do():
+        try:
+            result = run_action(action)
+            result_queue.put(result)
+        except Exception as e:  # noqa: BLE001 — last-resort guard
+            result_queue.put({
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "action_type": action.get("type", "none"),
+                "target": _truncate(action.get("value", "")),
+            })
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+
+    try:
+        result = result_queue.get(timeout=5)
+    except queue.Empty:
+        return jsonify({"ok": False, "error": "执行超时"}), 408
+
+    _record_action_result(dev_id, idx, result)
+    return jsonify({"ok": result["ok"], "error": result.get("error", "")})
 
 
 @app.route("/api/device/<dev_id>/<action>", methods=["POST"])

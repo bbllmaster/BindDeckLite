@@ -43,6 +43,11 @@ async function api(path, opts = {}) {
 }
 
 function toast(msg, kind = "") {
+  // Dedup: avoid stacking two identical toasts within 500 ms (test-button +
+  // pollLog can both fire for the same action result).
+  const now = Date.now();
+  if (toast._last && toast._last.msg === msg && now - toast._last.t < 500) return;
+  toast._last = { msg, t: now };
   const el = $("#toast");
   el.textContent = msg;
   el.className = "toast show " + kind;
@@ -201,8 +206,12 @@ function renderKeys() {
 
     $(".test", card).onclick = async () => {
       try {
-        await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
-        toast("已执行：" + (item.action.type === "none" ? "无上位机动作" : item.action.type));
+        const r = await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
+        if (r.ok) {
+          toast("成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type), "ok");
+        } else {
+          toast("失败：" + (r.error || "未知错误"), "bad");
+        }
       } catch (e) {
         toast(e.message, "bad");
       }
@@ -419,6 +428,11 @@ async function pollLog() {
       row.className = "log-row " + (e.level || "info");
       row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
       list.appendChild(row);
+      // Surface action failures as a toast so the user sees them even when
+      // the trigger was a physical key press (no API round-trip to echo back).
+      if (e.kind === "action" && e.level === "error") {
+        toast(e.text, "bad");
+      }
     });
     while (list.children.length > 300) list.removeChild(list.firstChild);
     list.scrollTop = list.scrollHeight;
