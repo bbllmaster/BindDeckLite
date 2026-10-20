@@ -22,10 +22,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install PlatformIO Core
+      - name: Install PlatformIO Core and esptool
         run: |
           python -m pip install --upgrade pip
           pip install platformio
+          # Explicit esptool dependency: the PlatformIO bundle's esptool.py
+          # imports rich_click, which is NOT in the runner's base Python.
+          # Installing esptool via pip also provides rich_click and lets
+          # build_release.py use `python -m esptool` (self-contained deps).
+          pip install esptool
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4

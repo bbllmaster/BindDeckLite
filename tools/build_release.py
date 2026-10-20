@@ -83,14 +83,72 @@ def fw_version() -> str:
     return m.group(1) if m else "0.0.0"
 
 
-def find_esptool() -> str:
-    candidates = [
-        os.path.join(PIO_HOME, "packages", "tool-esptoolpy", "esptool.py"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    raise SystemExit("esptool.py not found - run `pio run` once to install it")
+def _has_pip_esptool() -> bool:
+    """Check whether esptool is importable (i.e. pip-installed with deps)."""
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import esptool"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=15,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return False
+
+
+def find_esptool() -> list[str]:
+    """Return the esptool command prefix for ``merge_bin``.
+
+    Prefers the pip-installed ``python -m esptool`` (self-contained
+    dependencies — no ``rich_click`` needed in the caller's environment),
+    falls back to the PlatformIO bundle's ``esptool.py``, and auto-installs
+    the PlatformIO package when neither is available instead of exiting.
+    """
+    bundle = os.path.join(PIO_HOME, "packages", "tool-esptoolpy", "esptool.py")
+
+    # 1. Prefer pip-installed esptool: `python -m esptool` ships its own
+    #    dependencies (rich_click, etc.) and does not depend on the caller's
+    #    Python environment having them.
+    if _has_pip_esptool():
+        return [sys.executable, "-m", "esptool"]
+
+    # 2. Fall back to the PlatformIO bundle's esptool.py.
+    if os.path.isfile(bundle):
+        return [sys.executable, bundle]
+
+    # 3. Neither is available — auto-install the PlatformIO package instead
+    #    of exiting immediately (cache-miss cold start).
+    print("==> esptool not found, installing PlatformIO tool-esptoolpy package")
+    try:
+        subprocess.run(
+            ["pio", "pkg", "install", "-g", "-f", "tool-esptoolpy"],
+            cwd=ROOT, check=True, timeout=120,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        print(f"    pio pkg install failed ({e}); trying pio run to populate cache")
+
+    if os.path.isfile(bundle):
+        return [sys.executable, bundle]
+
+    # 4. Last resort: run one pio run to populate the full package cache.
+    print("==> running pio run to populate PlatformIO package cache")
+    try:
+        subprocess.run(
+            ["pio", "run", "-e", "esp32dev"],
+            cwd=ROOT, check=True, timeout=600,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        print(f"    pio run failed ({e})")
+
+    if os.path.isfile(bundle):
+        return [sys.executable, bundle]
+
+    raise SystemExit(
+        "esptool.py not found — install with `pip install esptool` or run "
+        "`pio run` once to populate the PlatformIO package cache"
+    )
 
 
 def find_boot_app0() -> str:
@@ -143,7 +201,7 @@ def main():
     skip_build = "--skip-build" in sys.argv
     version = fw_version()
     os.makedirs(DIST, exist_ok=True)
-    esptool = find_esptool()
+    esptool_cmd = find_esptool()
     boot_app0 = find_boot_app0()
     # Built once, used by the 16 MB image only.
     build_idf_bootloader(skip_build)
@@ -163,8 +221,7 @@ def main():
         print("    bootloader:", os.path.relpath(bootloader, ROOT))
 
         merged = os.path.join(DIST, f"merged_binddecklite_{t['name']}_v{version}.bin")
-        cmd = [
-            sys.executable, esptool,
+        cmd = esptool_cmd + [
             "--chip", t["chip"],
             "merge_bin", "-o", merged,
             "--flash_mode", "dio",
