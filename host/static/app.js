@@ -352,6 +352,11 @@ function parseMacro(text) {
       if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
       if (kind === "text") return { type: "text", value };
       if (kind === "url") return { type: "url", value };
+      if (kind === "key") {
+        // 只存键名本身；旧版本曾把整行（含 key: 前缀）写进 value，这里把
+        // 累积的前缀去掉，否则重启后会变成 key:key:tab。
+        return { type: "key", value: value.replace(/^(?:key:)+/i, "") };
+      }
       return { type: "key", value: line };
     });
 }
@@ -738,7 +743,7 @@ async function copyText(text) {
 async function copyLogLine(text, btn) {
   const ok = await copyText(text);
   if (!ok) {
-    toast("复制失败，请手动选择日志文本", "bad");
+    toast("复制失败，请手动选中日志文本后按 Ctrl+C", "bad");
     return;
   }
   toast("已复制日志");

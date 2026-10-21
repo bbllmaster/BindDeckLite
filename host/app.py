@@ -197,9 +197,14 @@ def macro_key_name(value: str) -> str:
 
     Combos (``ctrl+alt+t``) are normalised token by token and joined back with
     ``+``; a bare ``+`` stays a ``+``. Anything unknown keeps its original
-    spelling so existing macros are unaffected.
+    spelling so existing macros are unaffected. A leading ``key:`` prefix is
+    stripped first, which keeps macros saved by older host builds working.
     """
     raw = (value or "").strip()
+    # 旧配置里可能残留 "key:" 前缀：早期前端把整行写进了 value，已保存的宏
+    # 不会因为前端修复自动重写，剥掉前缀才能继续用。
+    while raw.lower().startswith("key:"):
+        raw = raw[4:].strip()
     if not raw:
         return raw
     parts = raw.split("+")
