@@ -338,6 +338,9 @@ function formatMacro(steps) {
       if (s.type === "text") {
         // 只有显式写了延迟才输出 text!<ms>:；默认 20ms 由主机端套用，
         // 这样旧宏序列化回来仍是 text:xxx（往返一致）。
+        // 注意 delay: 0 是「关闭延迟」（主机端 _text_delay() 返回 0），
+        // 不是「使用默认值」，因此照原样序列化为 text!0:；默认值只在
+        // delay 字段缺失 / 非法时生效。
         const d = typeof s.delay === "number" && isFinite(s.delay) ? s.delay : null;
         return (d === null ? "text:" : "text!" + d + ":") + (s.value || "");
       }
