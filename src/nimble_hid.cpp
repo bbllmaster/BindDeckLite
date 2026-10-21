@@ -78,6 +78,58 @@ static volatile bool s_connected = false;
 // touches these callbacks, so it can neither claim nor lose this slot.
 static volatile uint16_t s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
 
+// WS-321: host binding. The identity address of the one central we let
+// receive HID input, persisted in NVS so it survives a reboot. A central
+// whose address does not match is rejected at HID subscription time; the
+// CFG service is unaffected (it never subscribes to HID input reports).
+static volatile bool   s_hostBound = false;
+static uint8_t         s_hostAddr[6] = { 0, 0, 0, 0, 0, 0 };
+// Set when the user clears the binding while a host is still connected. The
+// old host keeps working so the user is not left with a dead keyboard, but the
+// next *different* central that subscribes takes the HID primary slot over
+// immediately - that is what makes "clear, then connect the new PC" work
+// without unplugging the old one first.
+static volatile bool   s_allowRebind = false;
+
+// Load the persisted host binding into the statics above. Safe to call
+// before BLE is up (only touches NVS).
+static void loadHostBinding() {
+  Preferences p;
+  if (!p.begin("binddecklite", true)) return;
+  s_hostBound = p.getBool("hostBound", false);
+  if (p.getBytesLength("hostAddr") == 6 && p.getBytes("hostAddr", s_hostAddr, 6) == 6) {
+    // valid
+  } else {
+    memset(s_hostAddr, 0, sizeof(s_hostAddr));
+    s_hostBound = false;
+  }
+  p.end();
+}
+
+// Persist the host binding. Called once when the first HID subscriber binds.
+static void saveHostBinding(const uint8_t addr[6]) {
+  Preferences p;
+  if (!p.begin("binddecklite", false)) return;
+  p.putBytes("hostAddr", addr, 6);
+  p.putBool("hostBound", true);
+  p.end();
+}
+
+// Drop the host binding (CMD:CLEARBOND / 5 s boot gesture). The in-RAM state
+// is always cleared, even when NVS is unavailable, so the device still lets a
+// new host in for this session.
+static void clearHostBinding() {
+  Preferences p;
+  if (p.begin("binddecklite", false)) {
+    p.remove("hostAddr");
+    p.putBool("hostBound", false);
+    p.end();
+  }
+  memset(s_hostAddr, 0, sizeof(s_hostAddr));
+  s_hostBound = false;
+  s_allowRebind = true;
+}
+
 // Send one report to exactly one connection. ble_gatts_notify_custom() consumes
 // (and frees) the mbuf, on success and on failure alike, so we never free it.
 static void notifyOne(uint16_t conn, NimBLECharacteristic* ch, const uint8_t* data, size_t len) {
@@ -120,8 +172,10 @@ static void getOrCreateIrk(uint8_t irk[16]) {
   if (prefsOk) p.end();
 }
 
-// WS-275: HID input-report subscription tracking. Only reports (0x0001) or
-// indications (0x0002) in subValue mean "this central wants HID input".
+// WS-275 + WS-321: HID input-report subscription tracking. Only reports
+// (0x0001) or indications (0x0002) in subValue mean "this central wants
+// HID input". When a host is bound, only the bound central is allowed;
+// every other central is rejected at subscription time.
 class HidReportCB : public NimBLECharacteristicCallbacks {
   // NimBLE 2.x passes a NimBLEConnInfo reference instead of the GAP descriptor.
   void onSubscribe(NimBLECharacteristic* ch, NimBLEConnInfo& connInfo, uint16_t subValue) override {
@@ -136,8 +190,58 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
       return;
     }
 
-    if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
+    // WS-321: host binding check. When bound, only the central whose identity
+    // address matches may receive HID input. The CFG service never subscribes
+    // to HID input reports, so the host app keeps working over the same link.
+    if (s_hostBound) {
+      NimBLEAddress idAddr  = connInfo.getIdAddress();   // peer_id_addr
+      NimBLEAddress otaAddr = connInfo.getAddress();     // peer_ota_addr
+      const uint8_t* peerAddr = !idAddr.isNull() ? idAddr.getVal() : otaAddr.getVal();
+
+      if (peerAddr && memcmp(peerAddr, s_hostAddr, 6) != 0) {
+        ESP_LOGE("BIND", "[ble] reject non-bound host conn=0x%04X addr=%s (bound=%02X%02X%02X%02X%02X%02X)",
+                 conn, connInfo.getAddress().toString().c_str(),
+                 s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
+                 s_hostAddr[3], s_hostAddr[4], s_hostAddr[5]);
+        return;   // reject: never set s_hid_conn for this central
+      }
+
+      // Bound host — allow it to become (or stay) the HID primary.
+      if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
+        s_hid_conn = conn;
+        ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (bound host, char=0x%04X sub=0x%04X)",
+                 conn, connInfo.getAddress().toString().c_str(),
+                 ch ? ch->getHandle() : 0, subValue);
+      } else if (conn != s_hid_conn) {
+        ESP_LOGE("BIND", "[ble] HID extra subscriber conn=0x%04X addr=%s ignored (primary=0x%04X)",
+                 conn, connInfo.getAddress().toString().c_str(), s_hid_conn);
+      }
+      return;
+    }
+
+    // Not bound — the first HID subscriber becomes the host. After an explicit
+    // clear (CMD:CLEARBOND / boot gesture) a *different* central may also take
+    // the slot over from a host that is still connected, so the user can move
+    // the deck to another PC without unplugging the old one first.
+    const bool canClaim = (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) ||
+                          (s_allowRebind && conn != s_hid_conn);
+    if (canClaim) {
+      // Persist the identity address (peer_id_addr), falling back to the
+      // over-the-air address when identity resolution produced nothing.
+      NimBLEAddress idAddr  = connInfo.getIdAddress();
+      NimBLEAddress otaAddr = connInfo.getAddress();
+      const uint8_t* bindAddr = !idAddr.isNull() ? idAddr.getVal() : otaAddr.getVal();
+      if (bindAddr) {
+        saveHostBinding(bindAddr);
+        memcpy(s_hostAddr, bindAddr, 6);
+        s_hostBound = true;
+        ESP_LOGE("BIND", "[ble] host bound to %s addr=%02X%02X%02X%02X%02X%02X",
+                 !idAddr.isNull() ? "id" : "ota",
+                 bindAddr[0], bindAddr[1], bindAddr[2],
+                 bindAddr[3], bindAddr[4], bindAddr[5]);
+      }
       s_hid_conn = conn;
+      s_allowRebind = false;
       ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (char=0x%04X sub=0x%04X)",
                conn, connInfo.getAddress().toString().c_str(),
                ch ? ch->getHandle() : 0, subValue);
@@ -217,6 +321,14 @@ void BleKeyboard::begin() {
   getOrCreateIrk(irk);
   int irkRc = ble_hs_pvcy_set_our_irk(irk);
   ESP_LOGE("BIND", "[ble] IRK fp=%02X%02X set=%d", irk[0], irk[1], irkRc);
+
+  // WS-321: restore the persisted host binding (if any) before the GATT
+  // server starts, so the first HID subscription can be validated against it.
+  loadHostBinding();
+  ESP_LOGE("BIND", "[ble] host binding: %s addr=%02X%02X%02X%02X%02X%02X",
+           s_hostBound ? "bound" : "none",
+           s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
+           s_hostAddr[3], s_hostAddr[4], s_hostAddr[5]);
 
   NimBLEDevice::setMTU(517);                                      // room for long CFG lines
   NimBLEDevice::setPower(9);                                      // +9 dBm, max TX power
@@ -312,6 +424,20 @@ void BleKeyboard::sendKeyboard() {
 
 int BleKeyboard::primaryConn() const {
   return (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) ? -1 : (int)s_hid_conn;
+}
+
+bool BleKeyboard::isHostBound() const {
+  return s_hostBound;
+}
+
+bool BleKeyboard::getHostAddr(uint8_t out[6]) const {
+  if (!s_hostBound) return false;
+  memcpy(out, s_hostAddr, 6);
+  return true;
+}
+
+void BleKeyboard::clearHostBinding() {
+  ::clearHostBinding();   // the file-static helper
 }
 
 size_t BleKeyboard::press(uint8_t k) {

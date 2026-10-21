@@ -660,6 +660,28 @@ static void processCommand(String data) {
     sendToHost("ACK:" + data.substring(0, 96));
     delay(150);
     ESP.restart();
+  } else if (data.startsWith("CMD:CLEARBOND")) {
+    // WS-321: drop the persisted host binding so a new central can become the
+    // HID primary. The CFG channel stays usable on this same connection.
+    bleKeyboard.clearHostBinding();
+    sendToHost("ACK:CMD:CLEARBOND");
+    log_e("[ble] host binding cleared by CMD:CLEARBOND");
+  } else if (data.startsWith("CMD:GET_BOND")) {
+    // WS-321: report the current host binding. The address is masked after the
+    // first two octets so the full BLE address never leaves the device.
+    if (bleKeyboard.isHostBound()) {
+      uint8_t addr[6];
+      if (bleKeyboard.getHostAddr(addr)) {
+        char masked[32];
+        snprintf(masked, sizeof(masked), "%02X%02X:**:**:**:**",
+                 addr[0], addr[1]);
+        sendToHost(String("BOND_STATUS:bound,") + masked);
+      } else {
+        sendToHost("BOND_STATUS:bound,<unavailable>");
+      }
+    } else {
+      sendToHost("BOND_STATUS:unbound");
+    }
   }
 
   if (data.startsWith("CFG:")) sendToHost("ACK:" + data.substring(0, 96));
@@ -707,6 +729,9 @@ void setup() {
 #endif
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
+  // WS-321: a 5 s hold is a *separate* gesture that clears the host binding
+  // without entering the portal. It takes priority over the 200 ms hold so a
+  // user who really wants the portal can release before 5 s.
   pinMode(ENCODER_SW, INPUT_PULLUP);
   delay(5);
   bool swLowAtBoot = (digitalRead(ENCODER_SW) == LOW);
@@ -729,13 +754,29 @@ void setup() {
         (int)g_safeMode, (int)swLowAtBoot);
 
   bool heldAtBoot = false;
+  bool clearBindingAtBoot = false;
   if (!g_safeMode) {
     int low = 0, high = 0;
-    for (int i = 0; i < 60 && !heldAtBoot; i++) {
+    int stableLowMs = 0;
+    // Up to 6 s: 200 ms debounce + up to 5 s of stable hold.
+    for (int i = 0; i < 300; i++) {
       if (digitalRead(ENCODER_SW) == LOW) {
-        if (++low >= 10) heldAtBoot = true;
+        low++;
         high = 0;
+        if (low >= 10) {              // stable low for ~200 ms
+          stableLowMs += 20;
+          if (stableLowMs >= 5000) {  // 5 s hold -> clear binding only
+            clearBindingAtBoot = true;
+            break;
+          }
+        }
       } else {
+        if (low >= 10) {              // was stable low, released before 5 s
+          heldAtBoot = true;          // -> portal
+          break;
+        }
+        low = 0;
+        stableLowMs = 0;
         if (++high >= 30) break;
         if (high >= 3) low = 0;
       }
@@ -744,6 +785,15 @@ void setup() {
   }
 
   ensureNvs();
+
+  // WS-321: 5 s boot hold clears the host binding. Done after NVS is up (the
+  // clear helper only touches NVS) and before BLE begins, so the next HID
+  // subscription sees no binding and any central may become the host.
+  if (clearBindingAtBoot) {
+    log_e("[ble] host binding cleared by boot gesture");
+    bleKeyboard.clearHostBinding();
+  }
+
   applyDeviceIdentity();
   loadConfig();
 
