@@ -930,7 +930,11 @@ function bindHelp() {
     if (e.target === modal) close();
   };
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) close();
+    if (e.key !== "Escape" || modal.hidden) return;
+    close();
+    // 帮助浮层打开时 Esc 只关它自己：阻止 document 上后续的 Esc 监听
+    //（配置结果浮层）在同一事件里继续触发。
+    e.stopImmediatePropagation();
   });
 }
 
@@ -938,8 +942,11 @@ function bindHelp() {
    并按 Esc 关闭（帮助弹层打开时先让弹层处理）。 */
 function bindApplyResults() {
   window.addEventListener("resize", positionApplyResults);
+  // 页面卸载 / 跳转前显式回收浮层与自动消失定时器。
+  window.addEventListener("beforeunload", clearApplyResults);
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape" || !$("#applyResults")) return;
+    // 兜底：即使帮助浮层的监听没有阻止冒泡，也不连带关掉结果浮层。
     const modal = $("#helpModal");
     if (modal && !modal.hidden) return;
     clearApplyResults();

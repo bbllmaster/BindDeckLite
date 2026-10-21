@@ -10,7 +10,9 @@
   顶部栏高度与页面内容位置保持不变。
 - **自动消失**：全部 `status=ok` 时 5 秒后淡出移除，鼠标悬停 / 键盘聚焦期间暂停
   计时、移出后继续剩余时间；存在 rejected / unconfirmed / unverified 时保持显示。
-- **关闭**：右上角「×」或 Esc 关闭，并同时清除 `.field-highlight`；重复应用配置、
+- **关闭**：右上角「×」或 Esc 关闭，并同时清除 `.field-highlight`；帮助浮层打开时
+  Esc 只关帮助浮层（`stopImmediatePropagation()`），不会连带关掉结果浮层；页面卸载 /
+  跳转时 `beforeunload` 回收浮层与自动消失定时器。重复应用配置、
   切换设备、设备断开时自动清除，`clearApplyResults()` 一并停掉自动消失定时器，
   避免操作已移除的节点。
 - **可访问性**：浮层 `role="status"` / `aria-live="polite"`，关闭按钮
