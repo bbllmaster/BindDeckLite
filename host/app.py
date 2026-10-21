@@ -1108,8 +1108,11 @@ def _win_clipboard_set(text: str) -> bool:
         if not user32.EmptyClipboard():
             return False
         # Fixed-size Unicode buffer: GlobalAlloc takes a size in bytes and the
-        # clipboard expects a NUL-terminated UTF-16 block.
-        size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+        # clipboard expects a NUL-terminated UTF-16 block. Take the byte count
+        # from the buffer itself (len() counts UTF-16 code units, NUL included)
+        # so allocation and copy can never disagree on the size.
+        buf = ctypes.create_unicode_buffer(text)
+        size = len(buf) * ctypes.sizeof(ctypes.c_wchar)
         handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
         if not handle:
             return False
@@ -1117,7 +1120,7 @@ def _win_clipboard_set(text: str) -> bool:
         if not ptr:
             return False
         try:
-            ctypes.memmove(ptr, ctypes.create_unicode_buffer(text), size)
+            ctypes.memmove(ptr, buf, size)
         finally:
             kernel32.GlobalUnlock(handle)
         # Ownership of the handle moves to the clipboard on success; only free
@@ -1248,7 +1251,9 @@ def _linux_clipboard():
         # Native Wayland: xclip only sees XWayland's (usually empty) clipboard.
         tools.sort(key=lambda t: t[0][0] != "wl-copy")
     for write_argv, read_argv in tools:
-        if not shutil.which(write_argv[0]):
+        # Both halves must exist: a missing reader would only surface as a
+        # failed runtime call (and a silent lost restore), so skip the backend.
+        if not (shutil.which(write_argv[0]) and shutil.which(read_argv[0])):
             continue
 
         def _read(argv=read_argv):
@@ -1314,16 +1319,20 @@ def _paste_text(kb, text: str, dev_id: str = "") -> bool:
             if not cb.write(text):
                 continue
             time.sleep(MACRO_PASTE_SETTLE)
+            sent = True
             try:
                 kb.send(MACRO_PASTE_HOTKEY)
             except Exception as e:  # noqa: BLE001
+                sent = False
                 add_event("action",
                           f"粘贴快捷键 {MACRO_PASTE_HOTKEY} 发送失败"
                           f"（{type(e).__name__}: {e}），paste 步骤回退逐字符输入",
                           dev_id, "error")
-                return False
+            # Restore on both paths: the clipboard already holds this step's
+            # text, so bailing out on the failure path would lose what the
+            # user had copied.
             _restore_clipboard(cb, previous, text)
-            return True
+            return sent
         finally:
             cb.close()
     add_event("action", "剪贴板不可用，paste 步骤跳过（回退逐字符输入）",
