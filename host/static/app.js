@@ -22,6 +22,10 @@ const ACTION_TYPES = [
 
 const MEDIA_KEYS = ["volume up", "volume down", "volume mute", "play/pause", "next track", "previous track"];
 
+// 测试按钮空闲态的固定提示。执行中临时换成「仍在执行」，结束后恢复成这一句，
+// 而不是把 title 清空（WS-360 评审 nit）。
+const TEST_BTN_IDLE_TITLE = "立即执行这条上位机动作（不会发送 HID 键）";
+
 // 宏输入框 placeholder 里展示的键名列表（映射规则见 host/app.py 的
 // MACRO_KEY_NAMES）。这里只是提示，真正的归一化在主机端完成。
 const MACRO_KEY_HINT =
@@ -42,6 +46,7 @@ const state = {
   desktop: null,
   ota: null,           // {status, sent, total, percent, error, filename}
   otaFile: null,       // File object chosen by the user
+  running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
 };
 
 async function api(path, opts = {}) {
@@ -68,6 +73,7 @@ async function pollStatus() {
     const s = await api("/api/status");
     state.devices = s.devices || [];
     state.actionsEnabled = !!s.actions_enabled;
+    state.running = s.running || {};
     $("#actionsToggle").checked = state.actionsEnabled;
 
     if (!state.selected || !state.devices.some((d) => d.dev_id === state.selected)) {
@@ -112,6 +118,7 @@ async function pollStatus() {
       $("#statusSub").textContent = state.preview ? "显示默认配置（预览）" : "请给设备上电";
     }
     highlightKeys(s.last_press || {});
+    applyRunningState();
   } catch (e) {
     $("#statusDot").className = "dot bad";
     $("#statusText").textContent = "上位机未就绪";
@@ -217,21 +224,86 @@ function renderKeys() {
     renderActionInput(holder, item, card);
 
     $(".test", card).onclick = async () => {
+      if (card.classList.contains("running")) {
+        // 按钮此时本应 disabled，兜底防止键盘触发第二次宏。
+        toast("该按键的动作仍在执行", "warn");
+        return;
+      }
+      const devId = state.selected;
+      const noAction = !item.action || (item.action.type || "none") === "none";
+      // /api/action/test 最多阻塞 5 秒才返回；先本地点亮执行中态，
+      // 否则点击后到下一次轮询之间用户看不到任何反馈。
+      if (devId && !noAction) {
+        markRunning(devId, i);
+        applyRunningState();
+      }
+      let r = null;
       try {
-        const r = await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
+        r = await api(`/api/action/test/${encodeURIComponent(devId)}/${i}`, { method: "POST" });
         if (r.ok) {
           // Show which browser a macro actually used, so a silent fallback to
           // the system default is visible instead of surprising.
           const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
           toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type) + used, "ok");
+        } else if (r.running) {
+          // 仍在执行（重入被拒绝，或宏总时长超过 5 秒）：保持执行中态。
+          if (devId) markRunning(devId, i, r.elapsed || 0);
+          applyRunningState();
+          toast(r.error || "该按键的动作仍在执行", "warn");
         } else {
           toast("动作执行失败：" + (r.error || "未知错误"), "bad");
         }
       } catch (e) {
         toast(e.message, "bad");
+      } finally {
+        if (!(r && r.running)) {
+          if (devId) clearRunning(devId, i);
+          applyRunningState();
+        }
       }
     };
   }
+  applyRunningState();
+}
+
+/* ---------- 执行中态（WS-359） ----------
+ * 服务端 /api/status 的 running 字段是唯一权威来源；这里只在点击测试的
+ * 5 秒等待窗口内先本地标记，随后由轮询结果覆盖。 */
+
+function runningFor(devId) {
+  return (state.running && state.running[devId]) || {};
+}
+
+function markRunning(devId, idx, elapsed = 0) {
+  state.running = state.running || {};
+  const map = state.running[devId] || (state.running[devId] = {});
+  if (map[String(idx)] === undefined) map[String(idx)] = elapsed;
+}
+
+function clearRunning(devId, idx) {
+  const map = runningFor(devId);
+  delete map[String(idx)];
+}
+
+function setCardRunning(card, secs) {
+  const live = secs !== undefined && secs !== null;
+  card.classList.toggle("running", live);
+  const btn = $(".test", card);
+  if (!btn) return;
+  btn.disabled = live;
+  btn.textContent = live ? "执行中…" : "测试动作";
+  btn.title = live
+    ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
+    : TEST_BTN_IDLE_TITLE;
+}
+
+function applyRunningState() {
+  // 预览 / 无选中设备时没有任何运行项；status 缺少该项即按未运行渲染。
+  const running = state.preview || !state.selected ? {} : runningFor(state.selected);
+  $$(".keycard").forEach((card) => {
+    const idx = String(parseInt(card.dataset.idx, 10));
+    setCardRunning(card, running[idx]);
+  });
 }
 
 function renderActionInput(holder, item, card) {
