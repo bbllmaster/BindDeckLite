@@ -64,6 +64,14 @@ public:
   // report subscription receives our input reports), or -1 when none is set.
   int    primaryConn() const;
 
+  // WS-321: host binding — the one central whose identity address we persist
+  // in NVS and whose HID reports we accept. Only the bound host can become
+  // primary again after a reboot or disconnect; every other central is
+  // rejected at the HID subscription level.
+  bool   isHostBound() const;                 // true once a host has been bound
+  bool   getHostAddr(uint8_t out[6]) const;   // fill out[6]; false when unbound
+  void   clearHostBinding();                  // drop hostAddr + hostBound from NVS
+
 private:
   void sendKeyboard();
 

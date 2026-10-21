@@ -115,6 +115,7 @@ _events = deque(maxlen=400)
 _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
 _ping_sent = {}           # dev_id -> monotonic send time
+_bond_queried = set()     # dev_ids whose binding status we already asked for
 _udp_sock = None
 _config = {"devices": {}, "settings": {
     "actions_enabled": True,
@@ -445,6 +446,25 @@ def _on_line(dev_id: str, line: str):
     if line.startswith("ACK:"):
         add_event("ack", "设备确认: " + line[len("ACK:"):][:60], dev_id, "ok")
         return
+    # WS-321: host binding status reported by CMD:GET_BOND. The address is
+    # already masked by the firmware; we just store and display it.
+    if line.startswith("BOND_STATUS:"):
+        payload = line[len("BOND_STATUS:"):]
+        cfg = device_cfg(dev_id)
+        with _lock:
+            if payload == "unbound":
+                cfg["bond"] = {"bound": False, "addr": ""}
+            else:
+                parts = payload.split(",", 1)
+                cfg["bond"] = {
+                    "bound": True,
+                    "addr": parts[1] if len(parts) == 2 else "",
+                }
+            save_config()
+        add_event("device",
+                  "主机绑定: " + ("已绑定" if cfg["bond"]["bound"] else "未绑定"),
+                  dev_id)
+        return
     if line.startswith("PONG"):
         sent = _ping_sent.pop(dev_id, None)
         rtt = int((time.time() - sent) * 1000) if sent else 0
@@ -459,13 +479,22 @@ def device_list():
     out = []
     for dev_id, info in known.items():
         cfg = device_cfg(dev_id, name=info.get("name", ""))
+        connected = bool(info.get("connected"))
+        # WS-321: ask a freshly connected deck for its host binding once, so the
+        # device page shows the real state without the user pressing refresh.
+        if connected and dev_id not in _bond_queried:
+            _bond_queried.add(dev_id)
+            send(dev_id, "CMD:GET_BOND")
+        elif not connected:
+            _bond_queried.discard(dev_id)
         out.append({
             "dev_id": dev_id,
             "name": cfg.get("name") or info.get("name") or dev_id,
             "address": info.get("address", ""),
-            "connected": bool(info.get("connected")),
+            "connected": connected,
             "chip": cfg.get("chip", ""),
             "fw": cfg.get("fw", {}),
+            "bond": cfg.get("bond", {"bound": False, "addr": ""}),
         })
     return out
 
@@ -857,10 +886,15 @@ def api_device_action(dev_id, action):
     if action == "refresh":
         send(dev_id, "CMD:VERSION")
         send(dev_id, "CMD:GET_CFG")
+        send(dev_id, "CMD:GET_BOND")   # WS-321
         return jsonify({"ok": True})
     if action == "ping":
         _ping_sent[dev_id] = time.time()
         return jsonify(send(dev_id, "CMD:PING"))
+    if action == "clearbond":
+        # WS-321: drop the persisted host binding so a new central can become
+        # the HID primary. The device ACKs on the same CFG channel.
+        return jsonify(send(dev_id, "CMD:CLEARBOND"))
     return jsonify({"ok": False, "error": "unknown action"}), 404
 
 
