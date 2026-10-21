@@ -808,6 +808,61 @@ def _truncate(s, n: int = 80) -> str:
     return s if len(s) <= n else s[:n] + "..."
 
 
+# --- macro browser selection ----------------------------------------------
+# A ``browser:<name>`` macro step picks the controller that following ``url:``
+# steps open with. Users write the canonical names; ``webbrowser.get()`` only
+# knows platform-specific spellings (Linux registers ``google-chrome`` /
+# ``chromium-browser``, Windows ``chrome``, and macOS ships just Safari), so
+# each name is tried under several aliases before giving up.
+MACRO_BROWSER_ALIASES = {
+    "chrome": ("chrome", "google-chrome", "chromium", "chromium-browser"),
+    "firefox": ("firefox", "mozilla"),
+    "edge": ("edge", "msedge", "microsoft-edge"),
+    "safari": ("safari",),
+}
+
+
+def resolve_macro_browser(name: str):
+    """Return ``(controller, error)`` for a ``browser:`` step.
+
+    ``default`` / an empty name means "system default browser" and yields
+    ``(None, "")`` — the caller then keeps using ``webbrowser.open()``, i.e. the
+    behaviour macros had before ``browser:`` existed. An unknown or missing
+    browser also yields ``(None, error)`` so the caller falls back to the
+    default instead of aborting the macro.
+    """
+    key = (name or "").strip().lower()
+    if not key or key == "default":
+        return None, ""
+    aliases = MACRO_BROWSER_ALIASES.get(key, (key,))
+    failures = []
+    for alias in aliases:
+        try:
+            return webbrowser.get(alias), ""
+        except webbrowser.Error as e:
+            failures.append(f"{alias}: {e}")
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{alias}: {type(e).__name__}: {e}")
+    return None, f"未找到浏览器 {key}（{'; '.join(failures)}），回退默认浏览器"
+
+
+def _open_url_with(controller, url: str):
+    """Open ``url`` with ``controller``, falling back to the default browser.
+
+    Returns an error string when the fallback was used, empty on success.
+    """
+    if controller is None:
+        webbrowser.open(url)
+        return ""
+    try:
+        controller.open(url)
+        return ""
+    except Exception as e:  # noqa: BLE001
+        print(f"[app] 宏浏览器打开失败 ({type(e).__name__}: {e})，回退默认浏览器")
+        webbrowser.open(url)
+        return f"{type(e).__name__}: {e}"
+
+
 def _open_target(value: str):
     if not value:
         return
@@ -876,6 +931,10 @@ def run_action(action: dict) -> dict:
             return {"ok": False, "error": "宏需要 keyboard 库: pip install keyboard",
                     "action_type": kind, "target": target}
         try:
+            # ``browser:`` steps choose the controller for later ``url:`` steps;
+            # None means "system default browser". Reset on a failed open so a
+            # broken controller does not break every following url.
+            browser_ctl = None
             for step in action.get("macro", []):
                 st = step.get("type")
                 if st == "key":
@@ -886,13 +945,19 @@ def run_action(action: dict) -> dict:
                     kb.write(step.get("value", ""))
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                elif st == "browser":
+                    browser_ctl, browser_err = resolve_macro_browser(
+                        step.get("value", ""))
+                    if browser_err:
+                        print("[app] 宏 browser 步骤:", browser_err)
                 elif st == "url":
                     # Empty url: skip silently (no exception).  Non-empty url:
                     # open the browser; subsequent text:/key: steps can fill in
                     # the page that loads (login flows, etc.).
                     url_val = step.get("value", "")
                     if url_val:
-                        webbrowser.open(url_val)
+                        if _open_url_with(browser_ctl, url_val):
+                            browser_ctl = None
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",

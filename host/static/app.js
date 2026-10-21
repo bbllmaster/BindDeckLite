@@ -256,8 +256,8 @@ function renderActionInput(holder, item, card) {
     // 哪些键名；完整示例与语法说明见右上角「帮助」。
     ta.placeholder =
       "键名：" + MACRO_KEY_HINT + "\n" +
-      "每行一步：url: / wait:（毫秒）/ text: / key:\n" +
-      "例：url:https://example.com/login";
+      "每行一步：browser: / url: / wait:（毫秒）/ text: / key:\n" +
+      "例：browser:chrome → url:https://example.com/login";
     ta.title = "每行一步；完整语法与键名对照见右上角「帮助」";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
@@ -334,6 +334,7 @@ function formatMacro(steps) {
       if (s.type === "delay") return "wait:" + (s.value || 0);
       if (s.type === "text") return "text:" + (s.value || "");
       if (s.type === "url") return "url:" + (s.value || "");
+      if (s.type === "browser") return "browser:" + (s.value || "");
       return "key:" + (s.value || "");
     })
     .join("\n");
@@ -352,6 +353,11 @@ function parseMacro(text) {
       if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
       if (kind === "text") return { type: "text", value };
       if (kind === "url") return { type: "url", value };
+      if (kind === "browser") {
+        // 名字统一小写；主机端按 chrome/firefox/edge/safari/default 解析，
+        // 其余值回退默认浏览器。
+        return { type: "browser", value: value.toLowerCase() };
+      }
       if (kind === "key") {
         // 只存键名本身；旧版本曾把整行（含 key: 前缀）写进 value，这里把
         // 累积的前缀去掉，否则重启后会变成 key:key:tab。
