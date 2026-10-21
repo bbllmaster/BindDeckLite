@@ -245,7 +245,7 @@ function renderActionInput(holder, item, card) {
     const ta = document.createElement("textarea");
     ta.className = "in-val macro";
     ta.rows = 3;
-    ta.placeholder = "url:https://example.com/login\nwait:1500\ntext:username\nkey:tab\ntext:password\nkey:enter";
+    ta.placeholder = "url:https://example.com/login\nwait:1500\ntext:username\nkey:tab\ntext:password\nkey:enter\n\n支持键名: esc tab enter space backspace insert delete\nhome end page up page down left right up down\nctrl right ctrl shift right shift alt right alt\nwin right win f1-f12 字母 数字\n组合键示例: ctrl+alt+t";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
       action.macro = parseMacro(ta.value);
@@ -661,7 +661,11 @@ async function pollLog() {
     r.events.forEach((e) => {
       const row = document.createElement("div");
       row.className = "log-row " + (e.level || "info");
-      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
+      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span><button class="log-copy-btn" title="复制该行日志">复制</button>`;
+      row.querySelector(".log-copy-btn").onclick = async () => {
+        const ok = await copyText(`${e.time} [${e.kind}] ${e.text}`);
+        toast(ok ? "已复制到剪贴板" : "复制失败", ok ? "ok" : "bad");
+      };
       list.appendChild(row);
       // Physical-button action failures arrive through the log stream;
       // surface them as a toast so the user sees them immediately.
@@ -696,6 +700,34 @@ function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// 复制文本到剪贴板：优先用 navigator.clipboard（HTTPS / localhost），
+// 不可用时降级为隐藏 textarea + document.execCommand('copy')。
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {
+    /* fall through to the execCommand fallback */
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  ta.style.pointerEvents = "none";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch (_) {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  return ok;
+}
+
 function bindTabs() {
   $$(".tab").forEach((tab) => {
     tab.onclick = () => {
@@ -708,8 +740,21 @@ function bindTabs() {
   });
 }
 
+function bindHelp() {
+  const overlay = $("#helpOverlay");
+  function open() { overlay.classList.add("open"); }
+  function close() { overlay.classList.remove("open"); }
+  $("#btnHelp").onclick = open;
+  $("#btnHelpClose").onclick = close;
+  overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && overlay.classList.contains("open")) close();
+  });
+}
+
 async function init() {
   bindTabs();
+  bindHelp();
   try {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;

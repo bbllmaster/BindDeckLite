@@ -761,6 +761,40 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
+# --- macro key-name normalization ------------------------------------------
+# 上位机下拉框里显示的是 KEY_CODES 的名称（Tab / LCtrl / PageUp ...），而
+# keyboard 库认识的是另一套名称（tab / ctrl / page up ...）。宏里输入
+# key:Tab 时需先转换，否则库报 "Key 'Tab' is not mapped to any known key"。
+_KEY_NAME_MAP = {
+    "Esc": "esc", "Tab": "tab", "Enter": "enter", "Space": "space",
+    "Backspace": "backspace", "Insert": "insert", "Delete": "delete",
+    "Home": "home", "End": "end", "PageUp": "page up", "PageDown": "page down",
+    "Left": "left", "Right": "right", "Up": "up", "Down": "down",
+    "LCtrl": "ctrl", "RCtrl": "right ctrl",
+    "LShift": "shift", "RShift": "right shift",
+    "LAlt": "alt", "RAlt": "right alt",
+    "LWin": "win", "RWin": "right win",
+}
+for _i in range(1, 13):
+    _KEY_NAME_MAP["F%d" % _i] = "f%d" % _i
+# F13–F24：keyboard 库不支持，保留原名，由库报错（见 _UNSUPPORTED_KEYS）。
+_UNSUPPORTED_KEYS = {"F%d" % i for i in range(13, 25)}
+
+
+def _normalize_key_name(name: str) -> str:
+    """把 KEY_CODES 中的键名转换为 keyboard 库认识的键名。
+
+    单字母 / 数字与未知键名保持原值，由 keyboard 库自身判断是否认识。
+    """
+    if not name:
+        return name
+    if name in _KEY_NAME_MAP:
+        return _KEY_NAME_MAP[name]
+    if len(name) == 1:
+        return name
+    return name
+
+
 def run_action(action: dict) -> dict:
     """Execute one host-side action and return a structured result.
 
@@ -814,11 +848,21 @@ def run_action(action: dict) -> dict:
         if kb is None:
             return {"ok": False, "error": "宏需要 keyboard 库: pip install keyboard",
                     "action_type": kind, "target": target}
+        used_unsupported = False
         try:
             for step in action.get("macro", []):
                 st = step.get("type")
                 if st == "key":
-                    kb.send(step.get("value", ""))
+                    raw = step.get("value", "")
+                    if not raw:
+                        kb.send(raw)
+                    elif "+" in raw:
+                        # 组合键：逐个键名归一化，如 LCtrl+Alt+t -> ctrl+alt+t
+                        kb.send("+".join(_normalize_key_name(p) for p in raw.split("+")))
+                    else:
+                        if raw in _UNSUPPORTED_KEYS:
+                            used_unsupported = True
+                        kb.send(_normalize_key_name(raw))
                 elif st == "text":
                     kb.write(step.get("value", ""))
                 elif st == "delay":
@@ -832,7 +876,10 @@ def run_action(action: dict) -> dict:
                         webbrowser.open(url_val)
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(e).__name__}: {e}",
+            msg = f"{type(e).__name__}: {e}"
+            if used_unsupported:
+                msg += "（F13–F24 需键盘硬件支持，keyboard 库可能不映射；请改用帮助文档中的键名）"
+            return {"ok": False, "error": msg,
                     "action_type": kind, "target": target}
 
     if kind == "media":

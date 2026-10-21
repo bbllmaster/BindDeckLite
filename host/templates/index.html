@@ -30,6 +30,7 @@
       </div>
     </div>
     <button class="btn primary" id="btnApply">应用配置</button>
+    <button class="btn" id="btnHelp" title="宏帮助文档">帮助</button>
   </div>
 </header>
 
@@ -181,6 +182,77 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- 宏帮助文档浮层 -->
+<div class="help-overlay" id="helpOverlay">
+  <div class="help-modal" role="dialog" aria-labelledby="helpTitle" aria-modal="true">
+    <head>
+      <h2 id="helpTitle">宏帮助文档</h2>
+      <button class="close-btn" id="btnHelpClose" aria-label="关闭">×</button>
+    </head>
+    <body>
+      <h3>宏语法</h3>
+      <p>每个按键的「上位机动作」选 <b>宏</b> 后，在多行文本框中一行写一个步骤，支持 4 种步骤：</p>
+      <pre><code>url:https://example.com/login
+wait:1500
+text:username
+key:tab
+text:password
+key:enter</code></pre>
+      <ul class="muted small">
+        <li><code>url:&lt;地址&gt;</code> — 打开浏览器网址（登录页加载后再输账号密码）</li>
+        <li><code>text:&lt;文本&gt;</code> — 输入文本</li>
+        <li><code>key:&lt;键名&gt;</code> — 按键（含组合键，见下方对照表）</li>
+        <li><code>wait:&lt;毫秒&gt;</code> — 延迟</li>
+      </ul>
+
+      <h3>键名对照表</h3>
+      <p class="muted small">下拉框里显示的键名 → keyboard 库实际使用的键名：</p>
+      <table>
+        <thead><tr><th>下拉框键名</th><th>keyboard 库键名</th></tr></thead>
+        <tbody>
+          <tr><td>Esc</td><td>esc</td></tr>
+          <tr><td>Tab</td><td>tab</td></tr>
+          <tr><td>Enter</td><td>enter</td></tr>
+          <tr><td>Space</td><td>space</td></tr>
+          <tr><td>Backspace</td><td>backspace</td></tr>
+          <tr><td>Insert</td><td>insert</td></tr>
+          <tr><td>Delete</td><td>delete</td></tr>
+          <tr><td>Home</td><td>home</td></tr>
+          <tr><td>End</td><td>end</td></tr>
+          <tr><td>PageUp</td><td>page up</td></tr>
+          <tr><td>PageDown</td><td>page down</td></tr>
+          <tr><td>Left / Right / Up / Down</td><td>left / right / up / down</td></tr>
+          <tr><td>LCtrl</td><td>ctrl</td></tr>
+          <tr><td>RCtrl</td><td>right ctrl</td></tr>
+          <tr><td>LShift</td><td>shift</td></tr>
+          <tr><td>RShift</td><td>right shift</td></tr>
+          <tr><td>LAlt</td><td>alt</td></tr>
+          <tr><td>RAlt</td><td>right alt</td></tr>
+          <tr><td>LWin</td><td>win</td></tr>
+          <tr><td>RWin</td><td>right win</td></tr>
+          <tr><td>F1–F12</td><td>f1–f12</td></tr>
+          <tr><td>F13–F24</td><td class="warn">不支持（保留原名，会报错）</td></tr>
+          <tr><td>字母 A–Z / 数字 0–9</td><td>保持不变</td></tr>
+        </tbody>
+      </table>
+      <p class="muted small">组合键用 <code>+</code> 连接，如 <code>key:LCtrl+Alt+t</code> 会自动转换为 <code>ctrl+alt+t</code>。</p>
+
+      <h3>完整示例：打开浏览器并自动登录</h3>
+      <pre><code># 打开浏览器并自动登录
+url:https://example.com/login
+wait:1500
+text:username
+key:tab
+text:password
+key:enter</code></pre>
+
+      <h3>常见错误排查</h3>
+      <p class="warn"><code>key:xxx is not mapped to any known key</code> → 键名拼写或大小写不对，请按上表换成 keyboard 库的名称（如 <code>Tab</code> → <code>tab</code>、<code>LCtrl</code> → <code>ctrl</code>）。</p>
+      <p class="muted small">F13–F24 需键盘硬件支持，keyboard 库可能无法映射，请改用 F1–F12。宏执行失败会在下方日志与右上角 toast 中显示原因。</p>
+    </body>
+  </div>
+</div>
 <script src="/static/app.js"></script>
 </body>
 </html>
