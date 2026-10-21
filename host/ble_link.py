@@ -152,6 +152,14 @@ class BleLink:
         self._dev_key = dev_id or ("@" + address)
         self._stopped = False
         self._last_seen = time.monotonic()
+        # Negotiated ATT MTU, refreshed on every connect. OTA uses it to keep
+        # each write inside one ATT payload (max_payload property below).
+        self._mtu = 23
+
+    @property
+    def max_payload(self) -> int:
+        """Largest single write payload for this link (ATT MTU - 3)."""
+        return max(20, self._mtu - 3)
 
     @property
     def available(self) -> bool:
@@ -202,6 +210,24 @@ class BleLink:
             loop, queue = self._loop, self._queue
         try:
             loop.call_soon_threadsafe(queue.put_nowait, cmd)
+            return True
+        except Exception:
+            return False
+
+    def send_raw(self, data: bytes) -> bool:
+        """Queue raw bytes (firmware chunk) to *this* device.
+
+        Distinct from ``send()`` so the session coroutine can tell text
+        commands from binary payloads — the BLE write path differs (no UTF-8
+        encode, and the device's CFG characteristic switches to binary mode).
+        False when not connected.
+        """
+        with self._lock:
+            if not self._connected or self._loop is None or self._queue is None:
+                return False
+            loop, queue = self._loop, self._queue
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, ("RAW", data))
             return True
         except Exception:
             return False
@@ -549,14 +575,18 @@ class BleLinkManager:
                 link._not_found = 0
                 link._failures = 0
                 link.touch()
-                print(f"[ble {tag}] connected {client.address} mtu={getattr(client, 'mtu_size', '?')}")
+                link._mtu = int(getattr(client, "mtu_size", 0) or 23)
+                print(f"[ble {tag}] connected {client.address} mtu={link._mtu}")
                 while client.is_connected and not link.stopped:
                     try:
                         cmd = await asyncio.wait_for(link._queue.get(), timeout=1.0)
                     except asyncio.TimeoutError:
                         continue
                     try:
-                        await self._write(link, client, cmd)
+                        if isinstance(cmd, tuple) and len(cmd) == 2 and cmd[0] == "RAW":
+                            await self._write_raw(link, client, cmd[1])
+                        else:
+                            await self._write(link, client, cmd)
                     except Exception as e:  # noqa: BLE001
                         print(f"[ble {tag}] write error:", e)
             except asyncio.CancelledError:
@@ -635,6 +665,21 @@ class BleLinkManager:
             await client.pair()
             await client.write_gatt_char(RX, cmd.encode(), response=True)
 
+    async def _write_raw(self, link, client, data: bytes):
+        """Write raw bytes (firmware chunk) to the CFG RX characteristic.
+
+        The firmware switches the same characteristic to binary mode while
+        OTA is active, so no text framing is added — just the payload.
+        """
+        try:
+            await client.write_gatt_char(RX, data, response=True)
+        except _BleakGATTProtocolError as e:
+            if not _is_security_error(e):
+                raise
+            print(f"[ble {link.dev_id or 'deck'}] write needs security - pairing ...")
+            await client.pair()
+            await client.write_gatt_char(RX, data, response=True)
+
     # ---- inbound routing --------------------------------------------------
     def _route(self, dev_id, line):
         if self._on_line:
@@ -646,6 +691,25 @@ class BleLinkManager:
     # ---- outbound ---------------------------------------------------------
     def send(self, dev_id, cmd: str) -> bool:
         """Send a command to the single deck identified by ``dev_id``."""
+        link = self._find_link(dev_id)
+        if link is None:
+            return False
+        return link.send(cmd)
+
+    def send_raw(self, dev_id, data: bytes) -> bool:
+        """Send raw bytes (firmware chunk) to the deck identified by ``dev_id``."""
+        link = self._find_link(dev_id)
+        if link is None:
+            return False
+        return link.send_raw(data)
+
+    def max_payload(self, dev_id, default: int = 20) -> int:
+        """Largest single write payload for ``dev_id``'s link (ATT MTU - 3)."""
+        link = self._find_link(dev_id)
+        return link.max_payload if link is not None else default
+
+    def _find_link(self, dev_id):
+        """Resolve ``dev_id`` to its BleLink (same rules as ``send``)."""
         with self._lock:
             link = self._links_by_dev.get(dev_id)
             if link is None and dev_id:
@@ -653,15 +717,13 @@ class BleLinkManager:
                 link = next((l for l in self._links.values()
                              if l.dev_id == dev_id and not l.stopped), None)
             if link is None and not dev_id:
-                # Legacy "BindDeckLite" decks are keyed by address; with one of them
-                # present, an unaddressed command still has an obvious target.
+                # Legacy "BindDeckLite" decks are keyed by address; with one of
+                # them present, an unaddressed command still has a clear target.
                 legacy = [l for l in self._links.values()
                           if l.dev_id == "" and not l.stopped]
                 if len(legacy) == 1:
                     link = legacy[0]
-        if link is None:
-            return False
-        return link.send(cmd)
+        return link
 
     def send_all(self, cmd: str) -> bool:
         """Send a command to every connected deck. True if at least one got it."""

@@ -5,11 +5,46 @@ BleConfigService bleConfig;
 #include <NimBLEDevice.h>
 #include <esp_log.h>
 
+// Distinguish a CFG:/CMD: text line from raw firmware bytes while OTA is
+// active. Firmware chunks start with 0xE9 (ESP image magic) and are binary,
+// but every chunk after the first is arbitrary data, so the test must not
+// rely on the magic alone: a text command is short, starts with CFG:/CMD: and
+// contains printable ASCII only. The odds of a firmware chunk clearing that
+// bar are negligible, and the size cap keeps a 512-byte block out.
+static bool looksLikeTextCommand(const std::string& v) {
+  if (v.size() < 4 || v.size() > 64) return false;
+  if (v.compare(0, 4, "CMD:") != 0 && v.compare(0, 4, "CFG:") != 0) return false;
+  for (unsigned char ch : v) {
+    if (ch == '\n' || ch == '\r') continue;
+    if (ch < 0x20 || ch > 0x7E) return false;
+  }
+  return true;
+}
+
 // A single write can carry one or more lines; process by line so the PC app can
 // either write one command per write or batch several separated by '\n'.
+//
+// During an active OTA session (CMD:OTA) the same characteristic carries raw
+// firmware bytes instead of text lines — the binary image contains NULs and
+// newlines, so the line-splitting path is skipped and the payload is handed
+// to onOtaData() verbatim. Text commands (CMD:OTA_END / CMD:OTA_CANCEL) must
+// still reach onCommand: they are what finalizes or aborts the session.
 class CfgRxCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*connInfo*/) override {
     std::string v = c->getValue();
+    if (v.empty()) return;
+
+    if (bleConfig.isOtaMode() && bleConfig.onOtaData) {
+      if (looksLikeTextCommand(v)) {
+        String data(v.c_str());
+        data.trim();
+        if (data.length() && bleConfig.onCommand) bleConfig.onCommand(data);
+        return;
+      }
+      bleConfig.onOtaData(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+      return;
+    }
+
     String data(v.c_str());
     data.trim();
     if (data.length() == 0) return;

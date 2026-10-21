@@ -27,6 +27,7 @@ own the tray, native dialogs and login-start bits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -160,6 +161,23 @@ KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
 _apply_windows: dict = {}
 _apply_lock = threading.RLock()
 
+# OTA push state — one OtaWindow per device, mirroring the apply windows.
+# The BLE line callback runs on a different thread than the Flask route
+# handler that drives the push, so every cross-thread touch is guarded by a
+# lock and ACK signals use threading.Event so the sender can block with a
+# timeout instead of polling.
+_ota_windows: dict = {}
+_ota_lock = threading.RLock()
+
+# OTA constants (must match src/main.cpp).
+OTA_CHUNK_MIN = 200          # never go below this even on a small MTU
+OTA_CHUNK_MAX = 512          # CFG RX characteristic capacity (firmware guard)
+OTA_WINDOW_BYTES = 32 * 1024  # bytes allowed in flight before waiting for ACKs
+OTA_CMD_TIMEOUT = 5.0        # s to wait for ACK:CMD:OTA (old firmware)
+OTA_ACK_TIMEOUT = 15.0       # s without ACK progress during the push
+OTA_END_TIMEOUT = 15.0       # s to wait for ACK:OTA:DONE
+OTA_VERIFY_TIMEOUT = 90.0    # s to wait for the new firmware version after reboot
+
 # Human-readable labels for the five configurable fields (matches the order
 # the firmware applies them and the order the UI shows them).
 FIELD_LABELS = {
@@ -219,6 +237,70 @@ class ApplyWindow:
 
     def wait_readback(self, timeout: float) -> bool:
         return self._done.wait(timeout)
+
+
+class OtaWindow:
+    """Per-device OTA push state, owning the ACK capture for one push.
+
+    The push is pipelined: the writer thread keeps ``sent`` ahead of the
+    device's confirmed ``acked`` offset and only blocks when the amount in
+    flight reaches ``OTA_WINDOW_BYTES``. ``acked`` — not ``sent`` — drives the
+    progress the user sees.
+
+    The BLE line callback runs on a different thread than the Flask route
+    handler that drives the push, so every cross-thread touch is guarded by a
+    condition variable.
+    """
+
+    def __init__(self, dev_id: str, filename: str, total: int):
+        self.dev_id = dev_id
+        self.filename = filename
+        self.total = total
+        self.sent = 0              # enqueued to the BLE link
+        self.acked = 0             # confirmed by the device
+        self.status = "starting"   # starting -> uploading -> done -> error
+        self.error = ""
+        self._ack_line = ""
+        self._cond = threading.Condition()
+
+    def on_ack(self, line: str):
+        with self._cond:
+            self._ack_line = line
+            # "ACK:OTA:<n>" advances the confirmed offset. DONE and ERROR both
+            # start with this prefix but fail the int() parse, so they only
+            # update _ack_line.
+            if line.startswith("ACK:OTA:"):
+                try:
+                    n = int(line[len("ACK:OTA:"):])
+                except ValueError:
+                    n = None
+                if n is not None and n > self.acked:
+                    self.acked = n
+            self._cond.notify_all()
+
+    def wait_change(self, timeout: float):
+        """Block until an ACK arrives or *timeout* elapses."""
+        with self._cond:
+            self._cond.wait(timeout)
+
+    @property
+    def ack_line(self) -> str:
+        with self._cond:
+            return self._ack_line
+
+    @property
+    def ack_error(self) -> str:
+        """The ACK:OTA:ERROR:<reason> line, or "" when none arrived."""
+        with self._cond:
+            line = self._ack_line
+        return line if line.startswith("ACK:OTA:ERROR") else ""
+
+    @property
+    def progress(self) -> int:
+        return self.acked
+
+    def percent(self) -> int:
+        return (100 * self.acked // self.total) if self.total else 0
 
 
 def _rejection_reason(field: str, expected: str, actual: str) -> str:
@@ -442,6 +524,15 @@ def _on_line(dev_id: str, line: str):
         with _lock:
             cfg["tz"] = line[len("CFG_TZ:"):]
             save_config()
+        return
+    # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
+    # These arrive during a host-driven firmware push (CMD:OTA); the push
+    # thread blocks on OtaWindow.wait_ack() so it needs the signal.
+    ota = _ota_windows.get(dev_id) if dev_id else None
+    if ota is not None and (line.startswith("ACK:CMD:OTA")
+                            or line.startswith("ACK:OTA")):
+        ota.on_ack(line)
+        add_event("ota", line, dev_id, "ok")
         return
     if line.startswith("ACK:"):
         add_event("ack", "设备确认: " + line[len("ACK:"):][:60], dev_id, "ok")
@@ -903,6 +994,345 @@ def api_device_action(dev_id, action):
         # the HID primary. The device ACKs on the same CFG channel.
         return jsonify(send(dev_id, "CMD:CLEARBOND"))
     return jsonify({"ok": False, "error": "unknown action"}), 404
+
+
+# --- OTA (host-driven firmware push) --------------------------------------
+def _ota_validate(filename: str) -> str:
+    """Return an error string when *filename* is not an app-only OTA image.
+
+    The firmware's Update framework only flashes a single app image; a
+    merged整片包 (bootloader + partitions + otadata + app) is rejected by
+    Update.end() anyway, but the host catches the obvious case up front so
+    the user gets a clear message instead of a silent flash failure.
+    """
+    import re as _re
+    if not filename:
+        return "未选择文件"
+    base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    # Accept the release naming (ota_binddecklite_c3_v1.3.0.bin) — dots are
+    # part of the version, so do not restrict the stem to word characters.
+    if not _re.fullmatch(r"ota_[^/\\]+\.bin", base, _re.IGNORECASE):
+        return ("文件名必须以 ota_ 开头、以 .bin 结尾（app-only 固件），"
+                "不要上传 merged 整片包")
+    return ""
+
+
+def _ota_version_from_name(filename: str) -> str:
+    """Best-effort version from the release filename.
+
+    ``ota_binddecklite_c3_v1.3.0.bin`` → ``1.3.0``. The esp_app_desc_t version
+    field is a build hash under pioarduino (the descriptor comes from the
+    prebuilt Arduino core), so the filename is the reliable source.
+    """
+    import re as _re
+    base = (filename or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    m = _re.search(r"_v([0-9][0-9A-Za-z.\-]*)\.bin$", base, _re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+# Device-side rejection reasons → what the user should do about them.
+_OTA_ERROR_TEXT = {
+    "timeout": "设备接收超时，请重试",
+    "not_app_image": "设备拒绝：不是 app-only 固件，请使用 ota_*.bin",
+    "not_bound": "设备拒绝：当前主机未绑定或无 HID 连接，请先在设备页确认绑定状态",
+    "size": "设备拒绝：固件长度与声明不一致",
+    "hash": "设备拒绝：SHA256 校验失败，固件可能已损坏",
+    "args": "设备拒绝：OTA 参数无效（固件版本过低？请使用配网页面）",
+    "begin_failed": "设备拒绝：固件超出 app 分区容量",
+    "write_failed": "设备写入失败，请重试",
+    "end_failed": "设备校验固件失败，请重试",
+    "busy": "设备正在执行其他 OTA",
+    "config_mode": "设备处于配网模式，请退出后重试",
+    "chunk_too_big": "块大小超出设备接受范围",
+    "not_active": "设备当前没有 OTA 会话",
+}
+
+
+def _ota_error_text(ack: str) -> str:
+    reason = ack[len("ACK:OTA:ERROR:"):] if ack.startswith("ACK:OTA:ERROR:") else ack
+    return _OTA_ERROR_TEXT.get(reason, f"设备拒绝: {reason}")
+
+
+def _wait_until(pred, timeout: float) -> bool:
+    """Poll *pred* every 20 ms until true or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return pred()
+
+
+def _ota_current_fw(dev_id: str) -> dict:
+    with _lock:
+        cfg = _config["devices"].get(dev_id) or {}
+    fw = cfg.get("fw") or {}
+    return {"version": fw.get("version", ""), "build": fw.get("build", "")}
+
+
+def _ota_is_connected(dev_id: str) -> bool:
+    try:
+        for d in ble.devices():
+            if (d.get("dev_id") or "") == dev_id:
+                return bool(d.get("connected"))
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _ota_wait_restart(dev_id: str, old_version: str, old_build: str,
+                      expected_version: str, timeout: float):
+    """Confirm the deck really came back on the new image.
+
+    Returns ``(ok, note)``. Success requires the firmware version or build
+    timestamp reported through ``VERSION:`` to change, or the version to match
+    the release filename — a BLE reconnect alone is not proof. If neither
+    changes but the link dropped and came back, the device did reboot (same
+    build re-flashed) and that is reported as success with a note.
+    """
+    deadline = time.monotonic() + timeout
+    saw_down = False
+    while time.monotonic() < deadline:
+        fw = _ota_current_fw(dev_id)
+        if not _ota_is_connected(dev_id):
+            saw_down = True
+        if expected_version and fw["version"] == expected_version \
+                and (fw["version"] != old_version
+                     or (fw["build"] and fw["build"] != old_build)):
+            return True, ""
+        if fw["version"] and fw["version"] != old_version:
+            return True, ""
+        if old_build and fw["build"] and fw["build"] != old_build:
+            return True, ""
+        # Nudge the device once the link is back; silent while it reboots.
+        ble.send(dev_id, "CMD:VERSION")
+        time.sleep(2.0)
+
+    fw = _ota_current_fw(dev_id)
+    if expected_version and fw["version"] == expected_version and fw["version"] != old_version:
+        return True, ""
+    if saw_down and fw["version"]:
+        return True, "版本号未变化（可能是同一构建重刷），设备已重启"
+    return False, ""
+
+
+def _ota_push(dev_id: str, filename: str, file_data: bytes,
+              sha_hex: str, expected_version: str,
+              old_version: str = "", old_build: str = ""):
+    """Run one OTA push on a background thread.
+
+    Returns the OtaWindow; poll ``/api/ota/<dev_id>/progress`` for status.
+    """
+    window = OtaWindow(dev_id, filename, len(file_data))
+    with _ota_lock:
+        _ota_windows[dev_id] = window
+
+    def _fail(message: str, level: str = "error"):
+        window.status = "error"
+        window.error = message
+        add_event("ota", f"OTA 失败: {filename} · {message}", dev_id, level)
+
+    def _run():
+        total = window.total
+        add_event("ota", f"OTA 开始: {filename} ({total} bytes)", dev_id)
+
+        # 1. CMD:OTA:<size>:<sha256> — arm the device. OTA is BLE-only: the
+        #    CFG characteristic switches to binary mode and the WiFi UDP path
+        #    has no OTA channel, so never fall back to it.
+        if not ble.send(dev_id, f"CMD:OTA:{total}:{sha_hex}"):
+            _fail("设备未连接")
+            return
+        if not _wait_until(lambda: window.ack_line or window.ack_error, OTA_CMD_TIMEOUT):
+            _fail("固件版本过低，不支持 OTA 升级。"
+                  "请使用配网页面（浏览器打开 http://192.168.4.1 → 固件 OTA 升级）")
+            return
+        ack = window.ack_line
+        if ack.startswith("ACK:OTA:ERROR"):
+            _fail(_ota_error_text(ack))
+            return
+
+        # 2. Pipelined push. ``sent`` may run up to OTA_WINDOW_BYTES ahead of
+        #    the device's confirmed ``acked`` offset; only then do we block.
+        #    Chunks follow the negotiated MTU (never below OTA_CHUNK_MIN) so a
+        #    large MTU is not wasted on 200-byte writes.
+        window.status = "uploading"
+        chunk_size = min(OTA_CHUNK_MAX,
+                         max(OTA_CHUNK_MIN, ble.max_payload(dev_id, OTA_CHUNK_MIN)))
+        add_event("ota", f"OTA 块大小 {chunk_size} B（MTU 窗口 32 KB）", dev_id)
+        sent = 0
+        while sent < total:
+            if window.status == "cancelled":
+                return
+            err = window.ack_error
+            if err:
+                _fail(_ota_error_text(err))
+                return
+            if sent - window.acked >= OTA_WINDOW_BYTES:
+                if not _wait_until(
+                        lambda: (sent - window.acked) < OTA_WINDOW_BYTES
+                                or bool(window.ack_error)
+                                or window.status == "cancelled", OTA_ACK_TIMEOUT):
+                    _fail("推送超时，请重试")
+                    return
+                continue
+            chunk = file_data[sent:sent + chunk_size]
+            if not ble.send_raw(dev_id, chunk):
+                _fail("连接中断，请重试")
+                return
+            sent += len(chunk)
+            window.sent = sent
+        if window.status == "cancelled":
+            return
+
+        # Wait for the device to confirm every byte before finalizing.
+        if not _wait_until(lambda: window.acked >= total or bool(window.ack_error)
+                                   or window.status == "cancelled",
+                           OTA_ACK_TIMEOUT):
+            _fail("推送超时，请重试")
+            return
+        if window.status == "cancelled":
+            return
+        err = window.ack_error
+        if err:
+            _fail(_ota_error_text(err))
+            return
+
+        # 3. CMD:OTA_END — device verifies size + SHA256, then Update.end()
+        #    and reboots. The ACK may be lost to the reset, so a timeout here
+        #    is not fatal; step 4 decides.
+        if not ble.send(dev_id, "CMD:OTA_END"):
+            _fail("连接中断，请重试")
+            return
+        _wait_until(lambda: window.ack_line == "ACK:OTA:DONE"
+                            or bool(window.ack_error)
+                            or window.status == "cancelled",
+                    OTA_END_TIMEOUT)
+        if window.status == "cancelled":
+            return
+        err = window.ack_error
+        if err:
+            _fail(_ota_error_text(err))
+            return
+
+        # 4. Prove the deck actually came back on the image we pushed instead
+        #    of trusting a BLE reconnect: compare the version / build stamp
+        #    reported by VERSION: against the values captured before the push.
+        ok, note = _ota_wait_restart(dev_id, old_version, old_build,
+                                     expected_version, OTA_VERIFY_TIMEOUT)
+        if not ok:
+            _fail(f"设备未在 {int(OTA_VERIFY_TIMEOUT)} 秒内确认运行新固件"
+                  f"（期望 {expected_version or '新的构建'}），请检查设备是否正常启动")
+            return
+
+        window.status = "done"
+        got = _ota_current_fw(dev_id).get("version") or expected_version or "?"
+        add_event("ota", f"OTA 完成: {filename} ({total} bytes) → v{got}"
+                         + (f"（{note}）" if note else ""), dev_id, "ok")
+
+    threading.Thread(target=_run, daemon=True, name=f"ota-{dev_id}").start()
+    return window
+
+
+@app.route("/api/ota/<dev_id>", methods=["POST"])
+def api_ota(dev_id):
+    """Start a host-driven OTA push for one deck.
+
+    Accepts a multipart ``file`` field (the app-only ``ota_*.bin``). Returns
+    immediately with a ``task`` id; poll ``/api/ota/<dev_id>/progress``.
+    """
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "未上传固件文件"}), 400
+    upload = request.files["file"]
+    if not upload.filename:
+        return jsonify({"ok": False, "error": "未选择文件"}), 400
+
+    err = _ota_validate(upload.filename)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    file_data = upload.read()
+    if not file_data:
+        return jsonify({"ok": False, "error": "文件为空"}), 400
+
+    # Firmware images built by tools/build_release.py:
+    #   ota_*.bin     — ESP app image: 0xE9 magic at 0 and esp_app_desc_t
+    #                   (0xABCD5432) at offset 0x20
+    #   merged_*.bin  — bootloader + partitions + otadata + app: starts with
+    #                   the bootloader, so offset 0x20 is NOT an app descriptor
+    # The header check is the reliable discriminator; the firmware's
+    # Update.end() CRC check stays the authoritative one.
+    if len(file_data) < 0x30 or file_data[0] != 0xE9:
+        return jsonify({"ok": False, "error": "不是 ESP32 固件镜像"}), 400
+    if file_data[0x20:0x24] != b"\x32\x54\xcd\xab":
+        return jsonify({"ok": False,
+                        "error": "请上传 app-only 固件（ota_*.bin），不要上传 merged 整片包"}), 400
+    if len(file_data) > 4 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "固件过大，超出 app 分区容量"}), 400
+
+    with _ota_lock:
+        existing = _ota_windows.get(dev_id)
+        if existing is not None and existing.status in ("starting", "uploading"):
+            return jsonify({"ok": False, "error": "该设备正在 OTA 中，请勿重复提交"}), 409
+
+    # The device verifies both values before Update.end(), so a truncated or
+    # tampered file can never replace the running firmware.
+    sha_hex = hashlib.sha256(file_data).hexdigest()
+    version = _ota_version_from_name(upload.filename)
+    old = _ota_current_fw(dev_id)
+    window = _ota_push(dev_id, upload.filename, file_data, sha_hex, version,
+                       old_version=old["version"], old_build=old["build"])
+    return jsonify({"ok": True, "task": dev_id, "filename": window.filename,
+                    "total": window.total, "sha256": sha_hex, "version": version})
+
+
+@app.route("/api/ota/<dev_id>/cancel", methods=["POST"])
+def api_ota_cancel(dev_id):
+    """Cancel an in-flight OTA and tell the device to drop the partial image.
+
+    The push thread stops on its next loop check; the device aborts its own
+    session on CMD:OTA_CANCEL (or on the 30 s inter-chunk timeout if the
+    command cannot be delivered).
+    """
+    with _ota_lock:
+        window = _ota_windows.get(dev_id)
+        if window is None:
+            return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
+        if window.status in ("done", "error", "cancelled"):
+            _ota_windows.pop(dev_id, None)
+            return jsonify({"ok": True, "sent": False, "status": window.status})
+        window.status = "cancelled"
+        window.error = "已取消"
+
+    sent = ble.send(dev_id, "CMD:OTA_CANCEL")
+    add_event("ota", "OTA 已取消" + ("" if sent else "（取消指令未送达，设备将在 30 秒后自动中止）"),
+              dev_id, "warn")
+    return jsonify({"ok": True, "sent": bool(sent), "status": "cancelled"})
+
+
+@app.route("/api/ota/<dev_id>/progress")
+def api_ota_progress(dev_id):
+    with _ota_lock:
+        window = _ota_windows.get(dev_id)
+        if window is None:
+            return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
+        # Clean up finished / errored windows after one last read so the poller
+        # can detect completion by the task disappearing.
+        done = window.status in ("done", "error", "cancelled")
+        payload = {
+            "ok": True,
+            "status": window.status,
+            "sent": window.sent,
+            # Progress is what the DEVICE confirmed, not what we queued.
+            "acked": window.acked,
+            "received": window.acked,
+            "total": window.total,
+            "percent": window.percent(),
+            "error": window.error,
+            "filename": window.filename,
+        }
+        if done:
+            _ota_windows.pop(dev_id, None)
+    return jsonify(payload)
 
 
 @app.route("/api/settings", methods=["POST"])

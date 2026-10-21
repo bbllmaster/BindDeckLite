@@ -292,6 +292,11 @@ class HidServerCB : public NimBLEServerCallbacks {
                connInfo.getConnHandle(), connInfo.getAddress().toString().c_str());
       s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
     }
+
+    // WS-328: a link drop during OTA must abort the write immediately. The
+    // handler checks whether a session is active, so ordinary disconnects are
+    // unaffected.
+    if (bleConfig.onDisconnect) bleConfig.onDisconnect();
   }
 };
 

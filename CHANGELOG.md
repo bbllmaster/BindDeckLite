@@ -1,5 +1,35 @@
 # Changelog
 
+## 上位机 OTA — 2026-10-21（WS-328）
+
+- **复审修复**：OTA 期间 CFG RX 特性原先把所有写入都当固件数据，导致
+  `CMD:OTA_END` / `CMD:OTA_CANCEL` 到不了命令解析器（`Update.end(true)`
+  永不执行、设备不重启）。现在按「短 + `CMD:`/`CFG:` 前缀 + 可打印 ASCII」
+  识别文本命令，固件块（`0xE9` 开头）仍走二进制通道；上位机「取消升级」
+  按钮改为真正调用 `POST /api/ota/<dev_id>/cancel`，下发 `CMD:OTA_CANCEL`。
+
+- **固件**：新增 `CMD:OTA:<size>:<sha256>` / `CMD:OTA_END` / `CMD:OTA_CANCEL`。
+  进入时校验发起者是**已绑定主机且持有 HID 主连接**（`isHostBound()` +
+  `primaryConn()`），否则回 `ACK:OTA:ERROR:not_bound`；`Update.begin(size)`
+  后 CFG RX 特性切换为二进制接收（`ble_config` 新增 `onOtaData` /
+  `onDisconnect`）。每累计 4096 字节回一次 `ACK:OTA:<已确认字节数>`（窗口 ACK，
+  不做逐块停等）；`CMD:OTA_END` 先比对总长度与 SHA256，任一不符
+  `Update.abort()` 且旧固件保持可启动，回 `ERROR:size` / `ERROR:hash`；
+  校验通过才 `Update.end(true)` 并重启。超时改为**块间 30 秒无数据**；
+  BLE 断连立即 abort。OTA 期间 `loop()` 暂停按键/编码器处理，CFG 通道保持可用。
+- **上位机**：设备页新增「OTA 升级」按钮与进度卡片；`POST /api/ota/<dev_id>`
+  后台流水线推送（`min(512, max(200, MTU-3))` 块大小、32 KB 在途窗口），
+  `GET /api/ota/<dev_id>/progress` 按**设备已确认字节**报进度。升级后用
+  `CMD:VERSION` 比对升级前后的版本号 / 构建时间戳（或文件名里的 `_vX.Y.Z`），
+  确认设备真的重启并运行新固件才提示成功。`ble_link` 新增 `send_raw()` / `max_payload()`。
+- **校验**：前端 + 后端双重校验 `ota_*.bin` 文件名，后端再校验镜像头与
+  SHA256，拒绝 merged 整片包；设备未连接禁止 OTA；OTA 期间上位机锁定
+  配置下发与设备指令。
+- **兜底**：配网页面 `/update` 保留；旧固件无 `CMD:OTA:<size>:<sha256>` 时
+  上位机提示「固件版本过低，请使用配网页面」。
+- 四个固件 env（`esp32dev` / `esp32c3` / `esp32c3_2mb` / `esp32c3_16mb`）
+  编译通过；`docs/protocol.md` 同步。
+
 ## 主机绑定 — 2026-10-21（WS-321）
 
 - **固件**：`src/nimble_hid.cpp` 新增 NVS `hostAddr`（6B）+ `hostBound`（bool），
