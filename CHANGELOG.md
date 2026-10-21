@@ -1,5 +1,23 @@
 # Changelog
 
+## 配置结果浮层 UI 修复 — 2026-10-21（WS-349）
+
+- **根因**：`#applyResults` 被插到 `.topbar-right` 里、紧跟「应用配置」按钮，作为
+  顶部栏的 flex 子项参与布局，结果面板一出现就把顶部栏撑高、整页内容下移。
+- **修复**：改成 `position: fixed` 浮层并挂到 `body` 上，`top` 由 JS 按 `.topbar`
+  实际底边 `+8` 计算（窗口 resize 时重算），`right: 16px`、宽 `360px`、
+  `max-width: calc(100vw - 32px)`、`max-height: 50vh` 内部滚动，不再参与文档流，
+  顶部栏高度与页面内容位置保持不变。
+- **自动消失**：全部 `status=ok` 时 5 秒后淡出移除，鼠标悬停 / 键盘聚焦期间暂停
+  计时、移出后继续剩余时间；存在 rejected / unconfirmed / unverified 时保持显示。
+- **关闭**：右上角「×」或 Esc 关闭，并同时清除 `.field-highlight`；重复应用配置、
+  切换设备、设备断开时自动清除，`clearApplyResults()` 一并停掉自动消失定时器，
+  避免操作已移除的节点。
+- **可访问性**：浮层 `role="status"` / `aria-live="polite"`，关闭按钮
+  `aria-label="关闭配置结果"`。
+- 不改 `/api/apply` 返回结构、后端判定逻辑、`CFG:` / `CMD:` 协议与固件；
+  「全部 ok 才清除 dirty」的逻辑保持不变。
+
 ## 宏指定浏览器（`browser:` 步骤）— 2026-10-21（WS-340）
 
 - **新增 `browser:<name>` 宏步骤**：可选 `chrome` / `firefox` / `edge` /

@@ -408,20 +408,65 @@ input.short { width: 80px; }
 body.modal-open { overflow: hidden; }
 
 /* ---------- apply results ---------- */
+/* 配置结果浮层：固定定位，脱离文档流，因此不会撑高 .topbar 或推动页面内容。
+   top 由 app.js 按 .topbar 的实际底边计算（见 positionApplyResults）。 */
 .apply-results {
-  margin: 14px 0 18px;
+  position: fixed;
+  right: 16px;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  max-height: 50vh;
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--card);
-  overflow: hidden;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  z-index: 30;
   animation: fade 0.18s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease;
 }
+.apply-results.leaving { opacity: 0; transform: translateY(-6px); }
+
+.apply-results-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px 9px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.apply-results-close {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.apply-results-close:hover { color: var(--text); border-color: var(--line); background: var(--card-2); }
+.apply-results-close:focus-visible { outline: 2px solid var(--accent-dim); outline-offset: 1px; }
+
 .apply-result-row {
   display: grid;
-  grid-template-columns: 120px 1fr auto;
+  grid-template-columns: 104px 1fr auto;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
+  gap: 10px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--line);
   font-size: 13px;
 }
