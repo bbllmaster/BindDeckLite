@@ -220,7 +220,10 @@ function renderKeys() {
       try {
         const r = await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
         if (r.ok) {
-          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type), "ok");
+          // Show which browser a macro actually used, so a silent fallback to
+          // the system default is visible instead of surprising.
+          const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
+          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type) + used, "ok");
         } else {
           toast("动作执行失败：" + (r.error || "未知错误"), "bad");
         }
@@ -263,8 +266,8 @@ function renderActionInput(holder, item, card) {
     // 哪些键名；完整示例与语法说明见右上角「帮助」。
     ta.placeholder =
       "键名：" + MACRO_KEY_HINT + "\n" +
-      "每行一步：browser: / url: / wait:（毫秒）/ text: / key:\n" +
-      "例：browser:chrome → url:https://example.com/login";
+      "每行一步：browser: / url: / wait:（毫秒）/ text: / text!80: / paste: / key:\n" +
+      "例：browser:chrome → url:https://example.com/login → paste:密码";
     ta.title = "每行一步；完整语法与键名对照见右上角「帮助」";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
@@ -339,7 +342,13 @@ function formatMacro(steps) {
   return steps
     .map((s) => {
       if (s.type === "delay") return "wait:" + (s.value || 0);
-      if (s.type === "text") return "text:" + (s.value || "");
+      if (s.type === "text") {
+        // 只有显式写了延迟才输出 text!<ms>:；默认 20ms 由主机端套用，
+        // 这样旧宏序列化回来仍是 text:xxx（往返一致）。
+        const d = typeof s.delay === "number" && isFinite(s.delay) ? s.delay : null;
+        return (d === null ? "text:" : "text!" + d + ":") + (s.value || "");
+      }
+      if (s.type === "paste") return "paste:" + (s.value || "");
       if (s.type === "url") return "url:" + (s.value || "");
       if (s.type === "browser") return "browser:" + (s.value || "");
       return "key:" + (s.value || "");
@@ -355,10 +364,23 @@ function parseMacro(text) {
     .map((line) => {
       const i = line.indexOf(":");
       if (i < 0) return { type: "key", value: line };
-      const kind = line.slice(0, i).trim().toLowerCase();
+      let kind = line.slice(0, i).trim().toLowerCase();
       const value = line.slice(i + 1).trim();
+      // text!<延迟毫秒>:<文本> 覆盖默认的 20ms 逐字符延迟，如 text!80:pass
+      let textDelay = null;
+      const m = /^text!(\d+)$/.exec(kind);
+      if (m) {
+        textDelay = parseInt(m[1], 10);
+        kind = "text";
+      }
       if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
-      if (kind === "text") return { type: "text", value };
+      if (kind === "text") {
+        // 没写延迟就不带 delay 字段，主机端用默认 20ms，旧宏行为不变。
+        return textDelay === null
+          ? { type: "text", value }
+          : { type: "text", value, delay: textDelay };
+      }
+      if (kind === "paste") return { type: "paste", value };
       if (kind === "url") return { type: "url", value };
       if (kind === "browser") {
         // 名字统一小写；主机端按 chrome/firefox/edge/safari/default 解析，

@@ -19,6 +19,48 @@
   `aria-label="关闭配置结果"`。
 - 不改 `/api/apply` 返回结构、后端判定逻辑、`CFG:` / `CMD:` 协议与固件；
   「全部 ok 才清除 dirty」的逻辑保持不变。
+## 宏输入可靠性（逐字符延迟 / `paste:` / `url:` 前台）— 2026-10-21（WS-353）
+
+- **`text:` 逐字符延迟**：`text:` 步骤改为 `kb.write(value, delay=0.02)`（默认每
+  字符 20 ms），解决 Electron 应用、远程桌面、慢客户端丢字符的问题；新增
+  `text!<延迟毫秒>:<文本>`（如 `text!80:pass`）按步骤覆盖，`text!0:` 等于关闭
+  延迟；未写延迟时行为与旧版一致，`delay` 上限 5 秒防止误写。
+- **新增 `paste:<文本>` 步骤**：写系统剪贴板后发送 `Ctrl+V`（macOS `Cmd+V`），
+  让目标程序以一次文本粘贴接收内容，规避键盘布局 / 输入法导致的非 ASCII 与
+  符号错位。后端：Windows 用 `ctypes` 调 `OpenClipboard` / `SetClipboardData`
+  （不新增依赖），macOS `pbcopy` / `pbpaste`，Linux `xclip` / `xsel` / `wl-copy`，
+  最后回退 tkinter（X11 下 Tk 需在粘贴期间持有 selection，因此根窗口延后销毁）。
+  剪贴板不可用时写 `level=error` 事件「剪贴板不可用，paste 步骤跳过」并回退
+  `keyboard.write()`，宏不中断；粘贴后约 0.4 秒恢复原剪贴板文本，且仅当剪贴板
+  仍为本步内容（避免覆盖用户期间新复制的内容）。
+- **`url:` 后前台保障**：Windows 下 `url:` 打开后最多等 3 秒让浏览器窗口进入
+  前台（已是前台立即返回），超时后对最上层浏览器窗口调 `SetForegroundWindow`；
+  macOS / Linux 不做处理，`wait:` 语义不变。
+- **前端**：`parseMacro()` / `formatMacro()` 支持 `paste:` 与 `text!<ms>:` 往返
+  （未写延迟的 `text:` 仍序列化为 `text:xxx`），宏输入框 placeholder 更新；
+  帮助浮层新增「密码框输入无效怎么办」章节（原因表 / 推荐写法 / 管理员权限 /
+  无法绕过的场景 / 剪贴板说明），README 宏语法表同步。
+- 不引入 Playwright / Selenium，不改 `CFG:` / `CMD:` 协议与固件，`key:` /
+  `wait:` / `browser:` / `url:` 语义不变。
+
+## 宏指定浏览器在 Windows 生效（`browser:` 修复）— 2026-10-21（WS-345）
+
+- **根因**：`resolve_macro_browser()` 用 `webbrowser.get(alias)` 找浏览器，Windows 上
+  Chrome（尤其 `%LOCALAPPDATA%` 的 per-user 安装）常常不在 `webbrowser` 的注册表列表
+  里，抛错后静默 `webbrowser.open()` 回退，于是 `browser:chrome` 打开了 Edge；失败
+  信息只 `print()` 到 stdout，desktop 模式（无控制台）下完全不可见。
+- **修复（Windows）**：新增 `_windows_browser_exe()`，先查注册表 `App Paths`
+  （HKLM → HKCU，读默认值），再查标准安装路径（Chrome / Edge / Firefox 的
+  `%PROGRAMFILES%`、`%PROGRAMFILES(X86)%`、`%LOCALAPPDATA%`），命中后用
+  `subprocess.Popen([exe, url])` 直接启动，不经过 shell，也不再走 `webbrowser.get()`。
+- **修复（Linux / macOS）**：先 `shutil.which()` 找可执行文件并直接 `Popen`，找不到再
+  退回原有 `webbrowser.get(alias)`，`run.sh` 用法不变。
+- **失败可见**：解析失败写 `level=error` 事件「未找到浏览器 chrome，已回退默认浏览器」；
+  打开失败写 `level=error` 事件并带原因；成功写 `level=ok` 事件「已用 Chrome 打开 …」。
+  `run_action()` 结果新增 `browser_used`，`/api/action/test` 返回并在前端 toast 里显示
+  实际使用的浏览器。
+- `browser:safari` 在 Windows 明确报「Windows 不支持 Safari」，不再静默落到 Edge。
+- 不改宏语法、不改 `CFG:` / `CMD:` 协议、不动固件；无 `browser:` 步骤的宏行为不变。
 
 ## 宏指定浏览器（`browser:` 步骤）— 2026-10-21（WS-340）
 
