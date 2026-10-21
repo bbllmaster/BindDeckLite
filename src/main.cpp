@@ -124,6 +124,22 @@ static unsigned long g_configModeStart = 0;
 static String g_cfgApName;
 static int g_otaProgress = -1;
 
+// === OTA (host-driven firmware upgrade, CMD:OTA) ==========================
+// While g_otaMode is set the CFG characteristic carries raw firmware bytes and
+// the button / encoder / serial paths are skipped. BLE HID is closed the moment
+// CMD:OTA is accepted so the user's keystrokes do not disturb the flash write.
+#define OTA_TIMEOUT_MS   30000   // 30 s of silence → cancel, reply ERROR:timeout
+#define OTA_CHUNK_MAX    200     // host must not write more than this per TX
+static bool g_otaMode = false;
+static unsigned long g_otaStart = 0;
+static unsigned long g_otaReceived = 0;
+
+// First bytes of the image, collected across one or more BLE writes so the
+// app-image header can be validated regardless of the negotiated MTU.
+static uint8_t g_otaHdr[0x24];
+static size_t g_otaHdrLen = 0;
+static bool g_otaHdrOk = false;
+
 static bool g_nvsOk = false;
 static unsigned long g_lastActivity = 0;
 
@@ -682,6 +698,56 @@ static void processCommand(String data) {
     } else {
       sendToHost("BOND_STATUS:unbound");
     }
+  } else if (data.startsWith("CMD:OTA_END")) {
+    // All firmware bytes have been pushed. Update.end(true) verifies the
+    // image CRC and reboots into it on success; on failure the device leaves
+    // OTA mode so the host can retry instead of bricking itself.
+    // NOTE: matched before CMD:OTA — "CMD:OTA_END".startsWith("CMD:OTA").
+    if (!g_otaMode) return;
+    if (Update.end(true)) {
+      log_e("[ota] image verified, rebooting");
+      sendToHost("ACK:OTA:DONE");
+      delay(300);
+      bleConfig.setOtaMode(false);
+      ESP.restart();
+    } else {
+      log_e("[ota] Update.end failed (bad image / CRC)");
+      sendToHost("ACK:OTA:ERROR:end_failed");
+      g_otaMode = false;
+      bleConfig.setOtaMode(false);
+    }
+  } else if (data == "CMD:OTA") {
+    // Host-driven OTA entry point. The firmware pauses BLE HID, arms the
+    // Update framework and switches the CFG characteristic to binary mode.
+    // Only accepted in normal (non-config) mode — the WiFi portal already
+    // has its own /update page and OTA here would fight the softAP radio.
+    if (g_configMode) {
+      sendToHost("ACK:OTA:ERROR:config_mode");
+      return;
+    }
+    if (g_otaMode) {
+      sendToHost("ACK:OTA:ERROR:busy");
+      return;
+    }
+    g_otaMode = true;
+    g_otaStart = millis();
+    g_otaReceived = 0;
+    g_otaHdrLen = 0;
+    g_otaHdrOk = false;
+    bleConfig.setOtaMode(true);
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      log_e("[ota] Update.begin failed");
+      sendToHost("ACK:OTA:ERROR:begin_failed");
+      g_otaMode = false;
+      bleConfig.setOtaMode(false);
+      return;
+    }
+    // loop() skips button / encoder processing while g_otaMode is set, so no
+    // HID keystrokes are forwarded during the flash. The CFG service stays up
+    // (the NimBLE connection is untouched) so the host can still write
+    // firmware bytes and read ACKs.
+    log_e("[ota] OTA mode armed, BLE HID paused");
+    sendToHost("ACK:CMD:OTA");
   }
 
   if (data.startsWith("CFG:")) sendToHost("ACK:" + data.substring(0, 96));
@@ -841,6 +907,69 @@ void setup() {
     log_e("[cfg ble] rx: %s", cmd.c_str());
     processCommand(cmd);
   };
+  // OTA binary data: the PC writes raw firmware bytes during CMD:OTA.
+  bleConfig.onOtaData = [](const uint8_t* data, size_t len) {
+    if (!g_otaMode) return;
+    if (len == 0) return;
+
+    // Timeout guard: 30 s of silence cancels the session and tells the host.
+    if (millis() - g_otaStart > OTA_TIMEOUT_MS) {
+      Update.abort();
+      log_e("[ota] timeout after %lums", millis() - g_otaStart);
+      sendToHost("ACK:OTA:ERROR:timeout");
+      g_otaMode = false;
+      bleConfig.setOtaMode(false);
+      return;
+    }
+
+    // App-image header check. A BLE write can be smaller than the 0x24 bytes
+    // we need (small MTU), so collect the first bytes first and validate as
+    // soon as they are complete. Nothing has been committed to the boot
+    // partition yet, so a rejection here is safe: Update.abort() discards the
+    // partial image.
+    //   offset 0x00: 0xE9 ESP image magic
+    //   offset 0x20: 0xABCD5432 esp_app_desc_t magic (app images only; a
+    //                bootloader / merged image has no app descriptor there)
+    if (!g_otaHdrOk) {
+      size_t need = sizeof(g_otaHdr) - g_otaHdrLen;
+      size_t take = (len < need) ? len : need;
+      memcpy(g_otaHdr + g_otaHdrLen, data, take);
+      g_otaHdrLen += take;
+      if (g_otaHdrLen == sizeof(g_otaHdr)) {
+        if (g_otaHdr[0] != 0xE9 ||
+            g_otaHdr[0x20] != 0x32 || g_otaHdr[0x21] != 0x54 ||
+            g_otaHdr[0x22] != 0xCD || g_otaHdr[0x23] != 0xAB) {
+          log_e("[ota] not an app image (bad header)");
+          Update.abort();
+          sendToHost("ACK:OTA:ERROR:not_app_image");
+          g_otaMode = false;
+          bleConfig.setOtaMode(false);
+          return;
+        }
+        g_otaHdrOk = true;
+      }
+    }
+
+    // Refuse oversized writes — the host contract is ≤ OTA_CHUNK_MAX bytes.
+    if (len > OTA_CHUNK_MAX) {
+      log_e("[ota] chunk too big: %u bytes", (unsigned)len);
+      sendToHost("ACK:OTA:ERROR:chunk_too_big");
+      return;
+    }
+
+    // UpdateClass::write() takes a non-const buffer but only reads from it,
+    // so the const_cast is safe here.
+    size_t written = Update.write(const_cast<uint8_t*>(data), len);
+    if (written != len) {
+      log_e("[ota] Update.write short: %u/%u", (unsigned)written, (unsigned)len);
+      sendToHost("ACK:OTA:ERROR:write_failed");
+      g_otaMode = false;
+      bleConfig.setOtaMode(false);
+      return;
+    }
+    g_otaReceived += len;
+    sendToHost("ACK:OTA:" + String(g_otaReceived));
+  };
   if (g_nvsOk && !g_configMode) {
     bleKeyboard.begin();
     g_bleStarted = true;
@@ -853,6 +982,23 @@ void loop() {
   if (!bootCountCleared && millis() > 30000) {
     bootCountCleared = true;
     g_bootCount = 0;
+  }
+
+  // ---- OTA mode ----------------------------------------------------------
+  // While the host is flashing firmware the CFG characteristic carries binary
+  // data (handled by onOtaData on the NimBLE task), so this loop has nothing
+  // to do except watch the 30 s timeout and stay out of the way of the
+  // buttons / encoder / serial paths.
+  if (g_otaMode) {
+    if (millis() - g_otaStart > OTA_TIMEOUT_MS) {
+      Update.abort();
+      log_e("[ota] loop timeout after %lums", millis() - g_otaStart);
+      sendToHost("ACK:OTA:ERROR:timeout");
+      g_otaMode = false;
+      bleConfig.setOtaMode(false);
+    }
+    delay(20);
+    return;
   }
 
   // ---- config mode -------------------------------------------------------

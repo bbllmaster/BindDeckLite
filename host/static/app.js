@@ -32,6 +32,8 @@ const state = {
   saveTimer: null,
   preview: false,
   desktop: null,
+  ota: null,           // {status, sent, total, percent, error, filename}
+  otaFile: null,       // File object chosen by the user
 };
 
 async function api(path, opts = {}) {
@@ -837,6 +839,9 @@ async function init() {
       btn.disabled = false;
     }
   };
+  $("#btnOta").onclick = openOtaPicker;
+  $("#btnOtaStart").onclick = startOta;
+  $("#btnOtaCancel").onclick = cancelOta;
 
   const initialTab = new URLSearchParams(location.search).get("tab");
   if (initialTab) {
@@ -848,6 +853,194 @@ async function init() {
   await pollStatus();
   setInterval(pollStatus, 1200);
   setInterval(pollLog, 800);
+  setInterval(pollOta, 500);
+}
+
+/* ---------------- OTA ---------------- */
+
+function renderOta() {
+  const card = $("#otaCard");
+  const ota = state.ota;
+  if (!ota) {
+    card.hidden = true;
+    state.otaFile = null;
+    $("#btnOtaStart").hidden = true;
+    return;
+  }
+  card.hidden = false;
+
+  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  const connected = !!(sel && sel.connected);
+
+  if (ota.status === "done") {
+    $("#otaStatusText").textContent = "升级成功";
+    $("#otaFileLine").innerHTML = `<span class="ok">${escapeHtml(ota.filename || "")} · ${ota.total} bytes</span> · 设备即将重启`;
+    $("#otaProgressBar").style.width = "100%";
+    $("#btnOtaStart").hidden = true;
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "关闭";
+    $("#otaHint").textContent = "升级成功，设备即将重启。重启后将自动重新连接。";
+  } else if (ota.status === "error") {
+    $("#otaStatusText").textContent = "失败";
+    $("#otaFileLine").textContent = "";
+    $("#otaProgressBar").style.width = "0%";
+    $("#btnOtaStart").hidden = true;
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "关闭";
+    $("#otaHint").textContent = ota.error || "未知错误";
+  } else if (ota.status === "uploading") {
+    $("#otaStatusText").textContent = "上传中";
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaProgressBar").style.width = ota.percent + "%";
+    $("#btnOtaStart").hidden = true;
+    // No cancel mid-push: aborting halfway leaves the device in OTA mode.
+    $("#btnOtaCancel").hidden = true;
+    $("#otaHint").textContent = `${ota.sent} / ${ota.total} bytes (${ota.percent}%) · 升级中请勿断电`;
+  } else if (ota.status === "starting") {
+    $("#otaStatusText").textContent = "启动中";
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaProgressBar").style.width = "0%";
+    $("#btnOtaStart").hidden = true;
+    $("#btnOtaCancel").hidden = true;
+    $("#otaHint").textContent = "正在进入 OTA 模式…";
+  } else {
+    // idle: file selected, waiting for user to click "开始升级"
+    $("#otaStatusText").textContent = "就绪";
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaProgressBar").style.width = "0%";
+    $("#btnOtaStart").hidden = false;
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "取消";
+    $("#otaHint").textContent = connected
+      ? "点击「开始升级」推送固件（分块传输，约需 1-3 分钟）"
+      : "设备未连接，无法 OTA";
+    $("#btnOtaStart").disabled = !connected;
+  }
+}
+
+async function pollOta() {
+  if (!state.selected) return;
+  // Terminal (done / error) and idle states do not need polling: the server
+  // pops a finished task on its first read, so polling again would 404 and
+  // wipe the result card the user needs to see.
+  if (!state.ota || ["idle", "done", "error"].includes(state.ota.status)) return;
+  try {
+    const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/progress`);
+    if (!r.ok) {
+      // The server no longer has the task (app restarted or device gone).
+      toast("连接中断，请重试", "bad");
+      state.ota.status = "error";
+      state.ota.error = "连接中断，请重试";
+      renderOta();
+      return;
+    }
+    state.ota = {
+      status: r.status,
+      sent: r.sent,
+      total: r.total,
+      percent: r.percent,
+      error: r.error,
+      filename: r.filename,
+    };
+    if (r.status === "done") {
+      toast("升级成功，设备即将重启", "ok");
+    } else if (r.status === "error") {
+      toast(r.error || "升级失败", "bad");
+    }
+    renderOta();
+  } catch (_) {
+    /* ignore network blips */
+  }
+}
+
+function openOtaPicker() {
+  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  if (!sel || !sel.connected) {
+    toast("设备未连接，无法 OTA", "bad");
+    return;
+  }
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".bin";
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    // Front-end half of the app-only check; the server repeats it before the
+    // push and the firmware validates the image header again.
+    if (!name.endsWith(".bin") || !name.startsWith("ota_")) {
+      toast("请选择 app-only 固件（ota_*.bin），不要用 merged 整片包", "bad");
+      return;
+    }
+    state.otaFile = file;
+    state.ota = {
+      status: "idle",
+      sent: 0,
+      total: file.size,
+      percent: 0,
+      error: "",
+      filename: file.name,
+    };
+    renderOta();
+  };
+  input.click();
+}
+
+async function startOta() {
+  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  if (!sel || !sel.connected) {
+    toast("设备未连接，无法 OTA", "bad");
+    return;
+  }
+  if (!state.otaFile) {
+    toast("请选择固件文件", "bad");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", state.otaFile);
+  try {
+    const res = await fetch(`/api/ota/${encodeURIComponent(state.selected)}`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      toast(data.error || "OTA 启动失败", "bad");
+      state.ota = null;
+      state.otaFile = null;
+      renderOta();
+      return;
+    }
+    state.ota = {
+      status: "starting",
+      sent: 0,
+      total: data.total,
+      percent: 0,
+      error: "",
+      filename: data.filename,
+    };
+    renderOta();
+  } catch (e) {
+    toast("OTA 启动失败: " + (e.message || e), "bad");
+    state.ota = null;
+    state.otaFile = null;
+    renderOta();
+  }
+}
+
+function cancelOta() {
+  if (state.ota && (state.ota.status === "done" || state.ota.status === "error")) {
+    state.ota = null;
+    state.otaFile = null;
+    renderOta();
+    return;
+  }
+  // In-progress cancel: the server side keeps running until the window
+  // closes; just hide the card and let the background thread finish or
+  // time out on its own.
+  state.ota = null;
+  state.otaFile = null;
+  renderOta();
 }
 
 init();

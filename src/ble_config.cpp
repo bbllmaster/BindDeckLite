@@ -7,9 +7,21 @@ BleConfigService bleConfig;
 
 // A single write can carry one or more lines; process by line so the PC app can
 // either write one command per write or batch several separated by '\n'.
+//
+// During an active OTA session (CMD:OTA) the same characteristic carries raw
+// firmware bytes instead of text lines — the binary image contains NULs and
+// newlines, so the line-splitting path is skipped and the payload is handed
+// to onOtaData() verbatim.
 class CfgRxCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*connInfo*/) override {
     std::string v = c->getValue();
+    if (v.empty()) return;
+
+    if (bleConfig.isOtaMode() && bleConfig.onOtaData) {
+      bleConfig.onOtaData(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+      return;
+    }
+
     String data(v.c_str());
     data.trim();
     if (data.length() == 0) return;

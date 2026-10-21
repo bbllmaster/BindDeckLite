@@ -362,6 +362,24 @@ input.short { width: 80px; }
   transition: box-shadow 0.2s, border-color 0.2s;
 }
 
+/* ---------- OTA progress ---------- */
+.progress {
+  height: 8px;
+  margin: 10px 0;
+  border-radius: 999px;
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  transition: width 0.25s ease;
+}
+.ok { color: var(--ok); }
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translate(-50%, 20px);

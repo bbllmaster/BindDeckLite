@@ -37,8 +37,28 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CMD:BOOT_CFG` | | 重启并进入配网 / OTA 模式 |
 | `CMD:CLEARBOND` | | 清除已绑定的 HID 主机（WS-321） |
 | `CMD:GET_BOND` | | 查询当前主机绑定状态（WS-321） |
+| `CMD:OTA` | | 进入上位机推送 OTA 模式（关闭 BLE HID，CFG 特性切换为二进制接收） |
+| `CMD:OTA_END` | | 固件全部接收完毕，校验并重启 |
 
 任何 `CFG:` 命令都会收到 `ACK:<原命令前 96 字节>`。
+
+### 上位机推送 OTA（CMD:OTA）
+
+与配网页面 `/update` 的 OTA 互补：用户无需手动连接设备热点，直接在上位机
+里完成固件刷新。只接受 **app-only** 固件（`ota_*.bin`），**拒绝 merged 整片包**。
+
+1. 上位机发送 `CMD:OTA` → 设备关闭 BLE HID，`Update.begin(UPDATE_SIZE_UNKNOWN)`，
+   CFG 特性切换为二进制模式，回复 `ACK:CMD:OTA`
+2. 上位机以 **≤ 200 字节** 的原始块通过 RX 特性写入固件（非文本行，可含 NUL /
+   换行）→ 设备 `Update.write()` 后回复 `ACK:OTA:<已接收字节数>`
+3. 全部写入后上位机发送 `CMD:OTA_END` → 设备 `Update.end(true)` 校验并通过后
+   自动重启，回复 `ACK:OTA:DONE`（重启后该 ACK 不会到达）
+4. 接收超时（30 秒无数据）→ 设备取消 OTA，回复 `ACK:OTA:ERROR:timeout`
+5. 旧固件（不支持 `CMD:OTA`）→ 上位机等待 5 秒无回应，提示「固件版本过低，
+   请使用配网页面 OTA」
+
+错误回复格式：`ACK:OTA:ERROR:<原因>`，原因包括 `timeout` / `begin_failed` /
+`write_failed` / `end_failed` / `config_mode` / `busy`。
 
 ### 编码器模式
 

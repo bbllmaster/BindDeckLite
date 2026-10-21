@@ -148,8 +148,21 @@
           <button class="btn" id="btnRefresh">读取设备配置</button>
           <button class="btn" id="btnPortal">进入配网模式</button>
           <button class="btn danger" id="btnReboot">重启设备</button>
+          <button class="btn primary" id="btnOta">OTA 升级</button>
         </div>
         <p class="muted small">配网模式会开热点 <code>BindDeckLite-XXXX</code>，浏览器打开 <code>http://192.168.4.1</code> 可配 WiFi / OTA。长按编码器 1 秒退出。</p>
+      </div>
+
+      <!-- OTA progress card (hidden until an OTA starts) -->
+      <div class="card" id="otaCard" hidden>
+        <h3>OTA 升级 <span class="muted small" id="otaStatusText">就绪</span></h3>
+        <div id="otaFileLine" class="muted small"></div>
+        <div class="progress"><div class="progress-bar" id="otaProgressBar" style="width:0%"></div></div>
+        <div class="btn-row">
+          <button class="btn primary" id="btnOtaStart" hidden>开始升级</button>
+          <button class="btn" id="btnOtaCancel">取消</button>
+        </div>
+        <p class="muted small" id="otaHint"></p>
       </div>
     </section>
 
