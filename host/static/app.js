@@ -22,6 +22,13 @@ const ACTION_TYPES = [
 
 const MEDIA_KEYS = ["volume up", "volume down", "volume mute", "play/pause", "next track", "previous track"];
 
+// 宏输入框 placeholder 里展示的键名列表（映射规则见 host/app.py 的
+// MACRO_KEY_NAMES）。这里只是提示，真正的归一化在主机端完成。
+const MACRO_KEY_HINT =
+  "Tab Enter Esc Space Backspace Insert Delete Home End PageUp PageDown " +
+  "Left Right Up Down LCtrl RCtrl LShift RShift LAlt RAlt LWin RWin " +
+  "F1-F12、单个字母/数字；组合键用 + 连接（ctrl+alt+t）";
+
 const state = {
   devices: [],
   selected: null,
@@ -245,7 +252,13 @@ function renderActionInput(holder, item, card) {
     const ta = document.createElement("textarea");
     ta.className = "in-val macro";
     ta.rows = 3;
-    ta.placeholder = "url:https://example.com/login\nwait:1500\ntext:username\nkey:tab\ntext:password\nkey:enter";
+    // 键名列表放在第一行：卡片里的输入框只有 3 行高，用户一眼能看到支持
+    // 哪些键名；完整示例与语法说明见右上角「帮助」。
+    ta.placeholder =
+      "键名：" + MACRO_KEY_HINT + "\n" +
+      "每行一步：url: / wait:（毫秒）/ text: / key:\n" +
+      "例：url:https://example.com/login";
+    ta.title = "每行一步；完整语法与键名对照见右上角「帮助」";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
       action.macro = parseMacro(ta.value);
@@ -339,6 +352,11 @@ function parseMacro(text) {
       if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
       if (kind === "text") return { type: "text", value };
       if (kind === "url") return { type: "url", value };
+      if (kind === "key") {
+        // 只存键名本身；旧版本曾把整行（含 key: 前缀）写进 value，这里把
+        // 累积的前缀去掉，否则重启后会变成 key:key:tab。
+        return { type: "key", value: value.replace(/^(?:key:)+/i, "") };
+      }
       return { type: "key", value: line };
     });
 }
@@ -662,6 +680,17 @@ async function pollLog() {
       const row = document.createElement("div");
       row.className = "log-row " + (e.level || "info");
       row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
+
+      // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
+      // 放进剪贴板，方便贴到 issue / 聊天里。
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "log-copy";
+      copyBtn.textContent = "复制";
+      copyBtn.title = "复制这一行日志";
+      copyBtn.onclick = () => copyLogLine(`${e.time} [${e.kind}] ${e.text}`, copyBtn);
+      row.appendChild(copyBtn);
+
       list.appendChild(row);
       // Physical-button action failures arrive through the log stream;
       // surface them as a toast so the user sees them immediately.
@@ -674,6 +703,58 @@ async function pollLog() {
   } catch (_) {
     /* ignore */
   }
+}
+
+/* ---------------- clipboard ---------------- */
+
+/* 复制文本：优先 Clipboard API（需要安全上下文，127.0.0.1 满足），
+   失败时降级到隐藏 textarea + document.execCommand('copy')，兼容
+   pywebview / 老浏览器 / 无权限场景。返回是否成功。 */
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      /* 权限被拒或窗口失焦：走下面的降级路径 */
+    }
+  }
+  let ta = null;
+  try {
+    ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.left = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    return document.execCommand("copy");
+  } catch (_) {
+    return false;
+  } finally {
+    // copy 抛错时也要把临时节点收掉，避免残留在 DOM 里。
+    if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
+  }
+}
+
+async function copyLogLine(text, btn) {
+  const ok = await copyText(text);
+  if (!ok) {
+    toast("复制失败，请手动选中日志文本后按 Ctrl+C", "bad");
+    return;
+  }
+  toast("已复制日志");
+  if (!btn) return;
+  const label = btn.textContent;
+  btn.textContent = "已复制";
+  btn.classList.add("copied");
+  setTimeout(() => {
+    btn.textContent = label;
+    btn.classList.remove("copied");
+  }, 1200);
 }
 
 /* ---------------- misc ---------------- */
@@ -708,8 +789,41 @@ function bindTabs() {
   });
 }
 
+/* ---------------- help ---------------- */
+
+/* 帮助浮层：说明宏语法、键名对照、登录示例与常见错误。纯前端开关，
+   不请求后端，关掉后页面状态完全不变。 */
+function bindHelp() {
+  const modal = $("#helpModal");
+  const openBtn = $("#btnHelp");
+  const closeBtn = $("#btnHelpClose");
+  if (!modal || !openBtn || !closeBtn) return;
+
+  const open = () => {
+    modal.hidden = false;
+    document.body.classList.add("modal-open");
+    closeBtn.focus();
+  };
+  const close = () => {
+    modal.hidden = true;
+    document.body.classList.remove("modal-open");
+    openBtn.focus();
+  };
+
+  openBtn.onclick = open;
+  closeBtn.onclick = close;
+  // 点击遮罩关闭，点击卡片内部不关闭。
+  modal.onclick = (e) => {
+    if (e.target === modal) close();
+  };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.hidden) close();
+  });
+}
+
 async function init() {
   bindTabs();
+  bindHelp();
   try {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;

@@ -29,6 +29,7 @@
         <div class="status-sub" id="statusSub">BLE</div>
       </div>
     </div>
+    <button class="btn" id="btnHelp" title="宏语法、键名对照与常见错误">帮助</button>
     <button class="btn primary" id="btnApply">应用配置</button>
   </div>
 </header>
@@ -178,6 +179,71 @@
       <div class="log" id="logList"></div>
     </section>
   </main>
+</div>
+
+<!-- ================= HELP ================= -->
+<div class="modal" id="helpModal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <div class="modal-head">
+      <h2 id="helpTitle">宏与动作帮助</h2>
+      <button class="icon-btn" id="btnHelpClose" title="关闭（Esc）">✕</button>
+    </div>
+    <div class="modal-body">
+      <h3>宏怎么用</h3>
+      <p>按键的「上位机动作」选 <code>宏</code>，文本框里一行写一步，按顺序执行；改完点右上角「应用配置」下发。宏只在主机侧执行，设备本身仍会照常发送上面的 HID 键。</p>
+      <table class="help-table">
+        <thead><tr><th>写法</th><th>作用</th></tr></thead>
+        <tbody>
+          <tr><td><code>key:Tab</code></td><td>发送一个按键或组合键；修饰键用 <code>+</code> 连接，如 <code>key:ctrl+alt+t</code></td></tr>
+          <tr><td><code>text:hello</code></td><td>逐字符输入文本</td></tr>
+          <tr><td><code>wait:500</code></td><td>等待 500 毫秒（单位毫秒）</td></tr>
+          <tr><td><code>url:https://example.com</code></td><td>用默认浏览器打开网址</td></tr>
+          <tr><td>无前缀行</td><td>按 <code>key:</code> 处理，例如单独一行 <code>enter</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3>键名对照表</h3>
+      <p>键名不区分大小写，写界面上显示的名字即可（<code>PageUp</code> 与 <code>pageup</code> 等价）。</p>
+      <table class="help-table">
+        <thead><tr><th>宏里写</th><th>实际按键</th></tr></thead>
+        <tbody>
+          <tr><td><code>Tab</code> <code>Enter</code> <code>Esc</code> <code>Space</code></td><td>Tab、回车、Esc、空格</td></tr>
+          <tr><td><code>Backspace</code> <code>Insert</code> <code>Delete</code></td><td>退格、插入、删除</td></tr>
+          <tr><td><code>Home</code> <code>End</code> <code>PageUp</code> <code>PageDown</code></td><td>行首、行尾、上翻页、下翻页</td></tr>
+          <tr><td><code>Left</code> <code>Right</code> <code>Up</code> <code>Down</code></td><td>方向键</td></tr>
+          <tr><td><code>LCtrl</code> / <code>RCtrl</code></td><td>左 / 右 Ctrl（<code>ctrl</code> 等同左 Ctrl）</td></tr>
+          <tr><td><code>LShift</code> / <code>RShift</code></td><td>左 / 右 Shift</td></tr>
+          <tr><td><code>LAlt</code> / <code>RAlt</code></td><td>左 / 右 Alt</td></tr>
+          <tr><td><code>LWin</code> / <code>RWin</code></td><td>左 / 右 Win</td></tr>
+          <tr><td><code>F1</code>–<code>F12</code></td><td>功能键</td></tr>
+          <tr><td><code>F13</code>–<code>F24</code></td><td>原样传给 keyboard 库（设备默认键码即 F13–F22）</td></tr>
+          <tr><td><code>A</code>–<code>Z</code> / <code>0</code>–<code>9</code></td><td>单个字母 / 数字</td></tr>
+        </tbody>
+      </table>
+
+      <h3>完整示例：打开页面并登录</h3>
+      <pre class="help-code">url:https://example.com/login
+wait:1500
+key:tab
+text:my-user
+key:tab
+text:my-password
+key:enter</pre>
+      <p>先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
+
+      <h3>常见错误排查</h3>
+      <ul>
+        <li><b>报错 <code>key:xxx is not mapped to any known key</code></b>：键名不在上面的对照表里。核对拼写（对照表已不区分大小写），组合键用 <code>+</code> 连接。</li>
+        <li><b>宏完全没反应</b>：宏需要 <code>keyboard</code> 库（<code>pip install keyboard</code>，Windows 打包版已内置）；确认右上角「上位机动作」已开启，动作类型选的是「宏」且点过「应用配置」。</li>
+        <li><b>组合键不生效</b>：用 <code>+</code> 连接，<code>key:ctrl+shift+t</code>；不要写成 <code>key:ctrl shift t</code> 或 <code>key:ctrl+alt t</code>。</li>
+        <li><b>输入跑到了别的位置</b>：页面还没加载完，把 <code>wait:</code> 调大（如 <code>wait:2000</code>）。</li>
+        <li><b>目标程序收不到按键</b>：目标程序以管理员身份运行时，上位机也要以管理员身份运行。</li>
+        <li><b>Linux / macOS 下按键无效</b>：<code>keyboard</code> 需要 root 权限（<code>sudo python app.py</code>）；不便提权时改用「执行命令」。</li>
+        <li><b>网址没打开</b>：<code>url:</code> 后面必须带 <code>http://</code> 或 <code>https://</code>。</li>
+        <li><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法。</li>
+      </ul>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
