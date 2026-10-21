@@ -1,5 +1,32 @@
 # Changelog
 
+## 上位机动作执行中可见并拒绝重入 — 2026-10-21（WS-359）
+
+- **运行表**：`host/app.py` 新增 `_action_running`（`(dev_id, idx)` → 单调时钟开始
+  时间），读写都走现有 `_lock`。`_run_action_for()` 起线程前 `_begin_action()` 抢占用，
+  已占用则不再起第二条线程，改写一条 `kind=action` / `level=warn` 的日志
+  「动作跳过: 按键 N · 上一次动作仍在执行（已运行 x.x 秒）」；线程 `finally` 里
+  `_end_action()` 注销（动作抛异常也释放），`Thread.start()` 失败同样回收。
+- **挂死保护**：运行超过 `ACTION_STUCK_SECONDS`（120 秒）视为挂死，在下次访问运行表时
+  强制释放并写一条 warn 日志，卡片不会永久呼吸。每次 `/api/status` 轮询顺带清理，
+  不新增定时线程。
+- **`/api/status` 新增 `running`**：`{dev_id: {"<idx>": 已运行秒数}}`，纯增量字段，
+  旧前端忽略即回到现状，复用现有 1.2 秒轮询，不加推送通道。设备断开后不再上报该项
+  （残留项同时被清掉），切换设备时前端按 `dev_id` 取用，互不影响。
+- **前端第三态**：`renderKeys()` 卡片新增 `.running`——右上角 `.kc-live` 以
+  `kc-breathe` 2 秒一周期呼吸（只动 `opacity` / `box-shadow`，无布局位移，窄屏可见，
+  `prefers-reduced-motion` 下放慢），边框改 accent 色，底部按钮变「执行中…」并
+  `disabled`，`title` 显示已运行秒数；结束后 1.2 秒内恢复。
+- **测试动作共用同一把锁**：`/api/action/test` 先 `_begin_action()`，执行中再点返回
+  `{ok:false, error:"该按键的动作仍在执行", running:true, elapsed:x.x}`（前端 warn
+  toast，不起新宏）；宏总时长超过 5 秒返回「仍在执行」而不是误导性的「执行超时」，
+  后台线程继续跑、卡片保持执行中，结束后由 worker 释放。测试按钮点击后先本地点亮
+  执行中态，避免 5 秒等待窗口内没有任何反馈。
+- **帮助浮层**：「常见错误排查」新增「按了没反应，但卡片在呼吸」，说明重复按下会被
+  忽略、2 分钟自动释放、上位机不会中断已发出的按键。
+- 不做取消 / 中断、不做全局动作队列、不同按键仍可并行；不改宏语法、`config.json`
+  结构、`CFG:` / `CMD:` 协议与固件，不新增依赖。
+
 ## 配置结果浮层 UI 修复 — 2026-10-21（WS-349）
 
 - **根因**：`#applyResults` 被插到 `.topbar-right` 里、紧跟「应用配置」按钮，作为

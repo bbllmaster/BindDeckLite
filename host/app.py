@@ -117,6 +117,7 @@ _lock = threading.RLock()
 _events = deque(maxlen=400)
 _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
+_action_running = {}      # (dev_id, idx) -> monotonic start; see _run_action_for
 _ping_sent = {}           # dev_id -> monotonic send time
 _bond_queried = set()     # dev_ids whose binding status we already asked for
 _udp_sock = None
@@ -127,6 +128,10 @@ _config = {"devices": {}, "settings": {
     "close_button_behavior": "minimize",
     "recent_paths": [],
 }}
+
+# WS-359: a stuck action thread never reaches its ``finally``, so an entry kept
+# past this many seconds is force-released instead of breathing forever.
+ACTION_STUCK_SECONDS = 120.0
 
 # --- defaults -------------------------------------------------------------
 DEFAULT_PINS = {
@@ -1598,6 +1603,72 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict):
                   dev_id, "error")
 
 
+def _prune_stuck_actions(now: float | None = None):
+    """Force-release actions that have been running past ``ACTION_STUCK_SECONDS``.
+
+    A macro stuck inside ``keyboard`` never returns, so its thread never reaches
+    the ``finally`` that unregisters it. Called whenever the run table is
+    touched, which keeps the check free of any extra timer thread.
+    """
+    if now is None:
+        now = time.monotonic()
+    with _lock:
+        stuck = [(key, now - started)
+                 for key, started in _action_running.items()
+                 if now - started >= ACTION_STUCK_SECONDS]
+        for key, _ in stuck:
+            _action_running.pop(key, None)
+    for (dev_id, idx), elapsed in stuck:
+        add_event("action",
+                  f"动作超时释放: {_action_label(idx)} · 已运行 {elapsed:.1f} 秒，"
+                  f"强制解除执行中状态",
+                  dev_id, "warn")
+
+
+def _begin_action(dev_id: str, idx: int):
+    """Claim ``(dev_id, idx)`` for one action.
+
+    Returns ``None`` when the claim succeeded (the caller must call
+    ``_end_action`` when the action finishes), or the number of seconds the
+    previous action of this input has been running when it is still busy.
+    """
+    now = time.monotonic()
+    _prune_stuck_actions(now)
+    with _lock:
+        started = _action_running.get((dev_id, idx))
+        if started is not None:
+            return now - started
+        _action_running[(dev_id, idx)] = now
+        return None
+
+
+def _end_action(dev_id: str, idx: int):
+    """Release the claim taken by ``_begin_action`` (idempotent)."""
+    with _lock:
+        _action_running.pop((dev_id, idx), None)
+
+
+def _running_snapshot() -> dict:
+    """``{dev_id: {"<idx>": 已运行秒数}}`` for actions currently executing.
+
+    Entries whose deck is no longer connected are dropped: the action belongs to
+    a device the user cannot press anymore, and a card must not keep breathing
+    after the device is gone (WS-359).
+    """
+    _prune_stuck_actions()
+    connected = {d.get("dev_id", "") for d in ble.devices() if d.get("connected")}
+    now = time.monotonic()
+    out: dict = {}
+    with _lock:
+        for key in list(_action_running):
+            if key[0] not in connected:
+                _action_running.pop(key, None)
+                continue
+            dev_id, idx = key
+            out.setdefault(dev_id, {})[str(idx)] = round(now - _action_running[key], 1)
+    return out
+
+
 def _run_action_for(dev_id: str, idx: int):
     if not _config["settings"].get("actions_enabled", True):
         return
@@ -1611,11 +1682,30 @@ def _run_action_for(dev_id: str, idx: int):
     if action.get("type", "none") == "none":
         return
 
-    def _do():
-        result = run_action(action, dev_id)
-        _record_action_result(dev_id, idx, action, result)
+    busy_for = _begin_action(dev_id, idx)
+    if busy_for is not None:
+        # Re-entry: the previous macro is still typing into the focused window,
+        # so a second one would interleave characters. Drop it silently.
+        add_event("action",
+                  f"动作跳过: {_action_label(idx)} · 上一次动作仍在执行"
+                  f"（已运行 {busy_for:.1f} 秒）",
+                  dev_id, "warn")
+        return
 
-    threading.Thread(target=_do, daemon=True).start()
+    def _do():
+        try:
+            result = run_action(action, dev_id)
+            _record_action_result(dev_id, idx, action, result)
+        finally:
+            # Release even when run_action raised; otherwise the card would
+            # breathe until the 120 s stuck guard fires.
+            _end_action(dev_id, idx)
+
+    try:
+        threading.Thread(target=_do, daemon=True).start()
+    except Exception:  # noqa: BLE001 — Thread.start() failed, keep the table clean
+        _end_action(dev_id, idx)
+        raise
 
 
 # --- HTTP API -------------------------------------------------------------
@@ -1635,6 +1725,8 @@ def api_status():
         "actions_enabled": _config["settings"].get("actions_enabled", True),
         "last_press": {k: {"index": v[0], "age": round(time.time() - v[1], 2)}
                        for k, v in last.items()},
+        # WS-359: additive field — old front-ends simply ignore it.
+        "running": _running_snapshot(),
         "event_seq": _event_seq,
     })
 
@@ -1679,6 +1771,13 @@ def api_action_test(dev_id, idx):
     if action.get("type", "none") == "none":
         return jsonify({"ok": True, "error": ""})
 
+    # WS-359: the test button shares the physical key's claim, so a test can
+    # never start a second macro next to a running one.
+    busy_for = _begin_action(dev_id, idx)
+    if busy_for is not None:
+        return jsonify({"ok": False, "error": "该按键的动作仍在执行",
+                        "running": True, "elapsed": round(busy_for, 1)}), 200
+
     # Execute synchronously (5 s cap) so the caller gets the real result.
     result_queue: "queue.Queue" = queue.Queue()
 
@@ -1689,14 +1788,20 @@ def api_action_test(dev_id, idx):
             result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "action_type": action.get("type", ""),
                               "target": _truncate(action.get("value", ""))})
+        finally:
+            # A macro longer than the 5 s wait keeps running in the background;
+            # the worker owns the claim then, so the card stays in "执行中".
+            _end_action(dev_id, idx)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
     try:
         result = result_queue.get(timeout=5.0)
     except queue.Empty:
-        return jsonify({"ok": False, "error": "执行超时"}), 200
+        # Still running: report it as such instead of a misleading timeout.
+        return jsonify({"ok": False, "error": "仍在执行", "running": True}), 200
 
+    _end_action(dev_id, idx)
     _record_action_result(dev_id, idx, action, result)
     return jsonify({"ok": result["ok"], "error": result["error"],
                     "browser_used": result.get("browser_used", "")})
