@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -809,11 +810,18 @@ def _truncate(s, n: int = 80) -> str:
 
 
 # --- macro browser selection ----------------------------------------------
-# A ``browser:<name>`` macro step picks the controller that following ``url:``
-# steps open with. Users write the canonical names; ``webbrowser.get()`` only
-# knows platform-specific spellings (Linux registers ``google-chrome`` /
-# ``chromium-browser``, Windows ``chrome``, and macOS ships just Safari), so
-# each name is tried under several aliases before giving up.
+# A ``browser:<name>`` macro step picks the browser that following ``url:``
+# steps open with. Users write the canonical names; the aliases cover the
+# different spellings ``webbrowser`` registers per platform (Linux has
+# ``google-chrome`` / ``chromium-browser``, macOS ships just Safari).
+#
+# Windows needs a different route entirely: ``webbrowser.get("chrome")`` only
+# works when Chrome is registered in the registry and otherwise either raises
+# or resolves to the default handler (Edge), which is why ``browser:chrome``
+# used to open Edge.  There we locate the real executable (registry ``App
+# Paths`` first, then the standard install directories, including per-user
+# installs under ``%LOCALAPPDATA%``) and start it directly with
+# ``subprocess.Popen([exe, url])``.
 MACRO_BROWSER_ALIASES = {
     "chrome": ("chrome", "google-chrome", "chromium", "chromium-browser"),
     "firefox": ("firefox", "mozilla"),
@@ -821,41 +829,136 @@ MACRO_BROWSER_ALIASES = {
     "safari": ("safari",),
 }
 
+MACRO_BROWSER_LABELS = {
+    "chrome": "Chrome",
+    "firefox": "Firefox",
+    "edge": "Edge",
+    "safari": "Safari",
+}
+
+# Windows executable names looked up under ``App Paths`` in the registry.
+WINDOWS_BROWSER_EXES = {
+    "chrome": ("chrome.exe",),
+    "edge": ("msedge.exe",),
+    "firefox": ("firefox.exe",),
+}
+
+# Standard install locations, in the order they are probed.  Chrome's per-user
+# install under %LOCALAPPDATA% is the common case that ``webbrowser`` misses.
+WINDOWS_BROWSER_PATHS = {
+    "chrome": (
+        ("PROGRAMFILES", "Google/Chrome/Application/chrome.exe"),
+        ("PROGRAMFILES(X86)", "Google/Chrome/Application/chrome.exe"),
+        ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+    ),
+    "edge": (
+        ("PROGRAMFILES(X86)", "Microsoft/Edge/Application/msedge.exe"),
+        ("PROGRAMFILES", "Microsoft/Edge/Application/msedge.exe"),
+        ("LOCALAPPDATA", "Microsoft/Edge/Application/msedge.exe"),
+    ),
+    "firefox": (
+        ("PROGRAMFILES", "Mozilla Firefox/firefox.exe"),
+        ("PROGRAMFILES(X86)", "Mozilla Firefox/firefox.exe"),
+        ("LOCALAPPDATA", "Mozilla Firefox/firefox.exe"),
+    ),
+}
+
+
+def _windows_browser_exe(name: str) -> str:
+    """Return the absolute exe path for ``name`` on Windows, or "" if missing.
+
+    Checks the registry ``App Paths`` keys (HKLM first, then HKCU so per-user
+    installs are found) and then the standard install directories.
+    """
+    if not sys.platform.startswith("win"):
+        return ""
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - winreg exists on every Windows build
+        winreg = None
+
+    if winreg is not None:
+        for exe in WINDOWS_BROWSER_EXES.get(name, ()):
+            subkey = (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+                      "\\" + exe)
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        path, _ = winreg.QueryValueEx(key, "")
+                except OSError:
+                    continue
+                path = (path or "").strip().strip('"')
+                if path and os.path.isfile(path):
+                    return path
+
+    for env, rel in WINDOWS_BROWSER_PATHS.get(name, ()):
+        base = os.environ.get(env, "")
+        if not base:
+            continue
+        path = os.path.join(base, rel)
+        if os.path.isfile(path):
+            return path
+    return ""
+
 
 def resolve_macro_browser(name: str):
-    """Return ``(controller, error)`` for a ``browser:`` step.
+    """Resolve a ``browser:`` step into ``(target, used, error)``.
 
-    ``default`` / an empty name means "system default browser" and yields
-    ``(None, "")`` — the caller then keeps using ``webbrowser.open()``, i.e. the
-    behaviour macros had before ``browser:`` existed. An unknown or missing
-    browser also yields ``(None, error)`` so the caller falls back to the
-    default instead of aborting the macro.
+    ``target`` is an executable path, a ``webbrowser`` controller, or ``None``
+    for "system default browser"; ``used`` is the display name of the browser
+    that will actually be used (``default`` when falling back); ``error`` is a
+    human-readable reason when the requested browser is unavailable.  A failed
+    resolution keeps ``target`` at ``None`` so the caller falls back to the
+    default browser instead of aborting the macro.
     """
     key = (name or "").strip().lower()
     if not key or key == "default":
-        return None, ""
+        return None, "default", ""
+    label = MACRO_BROWSER_LABELS.get(key, (name or "").strip() or key)
     aliases = MACRO_BROWSER_ALIASES.get(key, (key,))
+
+    if sys.platform.startswith("win"):
+        if key == "safari":
+            return None, "default", "Windows 不支持 Safari"
+        exe = _windows_browser_exe(key)
+        if exe:
+            return exe, label, ""
+        # Never fall through to webbrowser.get() here: that is the call that
+        # silently resolves to the default handler (Edge).
+        return None, "default", f"未找到浏览器 {key}"
+
+    for alias in aliases:
+        exe = shutil.which(alias)
+        if exe:
+            return exe, label, ""
+
     failures = []
     for alias in aliases:
         try:
-            return webbrowser.get(alias), ""
+            return webbrowser.get(alias), label, ""
         except webbrowser.Error as e:
             failures.append(f"{alias}: {e}")
         except Exception as e:  # noqa: BLE001
             failures.append(f"{alias}: {type(e).__name__}: {e}")
-    return None, f"未找到浏览器 {key}（{'; '.join(failures)}），回退默认浏览器"
+    return None, "default", f"未找到浏览器 {key}（{'; '.join(failures)}）"
 
 
-def _open_url_with(controller, url: str):
-    """Open ``url`` with ``controller``, falling back to the default browser.
+def _open_url_with(target, url: str) -> str:
+    """Open ``url`` with ``target``, falling back to the default browser.
 
-    Returns an error string when the fallback was used, empty on success.
+    ``target`` is an executable path, a ``webbrowser`` controller, or ``None``
+    for the system default.  Returns an error string when the fallback was
+    used, empty on success.  Executables are started directly (no shell), so
+    the URL is passed as a plain argument and cannot be shell-interpreted.
     """
-    if controller is None:
+    if target is None:
         webbrowser.open(url)
         return ""
     try:
-        controller.open(url)
+        if isinstance(target, str):
+            subprocess.Popen([target, url])
+        else:
+            target.open(url)
         return ""
     except Exception as e:  # noqa: BLE001
         print(f"[app] 宏浏览器打开失败 ({type(e).__name__}: {e})，回退默认浏览器")
@@ -931,10 +1034,11 @@ def run_action(action: dict) -> dict:
             return {"ok": False, "error": "宏需要 keyboard 库: pip install keyboard",
                     "action_type": kind, "target": target}
         try:
-            # ``browser:`` steps choose the controller for later ``url:`` steps;
+            # ``browser:`` steps choose the target for later ``url:`` steps;
             # None means "system default browser". Reset on a failed open so a
-            # broken controller does not break every following url.
-            browser_ctl = None
+            # broken target does not break every following url.
+            browser_target = None
+            browser_used = "default"
             for step in action.get("macro", []):
                 st = step.get("type")
                 if st == "key":
@@ -946,19 +1050,36 @@ def run_action(action: dict) -> dict:
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
                 elif st == "browser":
-                    browser_ctl, browser_err = resolve_macro_browser(
-                        step.get("value", ""))
+                    browser_target, browser_used, browser_err = (
+                        resolve_macro_browser(step.get("value", "")))
                     if browser_err:
                         print("[app] 宏 browser 步骤:", browser_err)
+                        add_event("error", browser_err + "，已回退默认浏览器",
+                                  level="error")
                 elif st == "url":
                     # Empty url: skip silently (no exception).  Non-empty url:
                     # open the browser; subsequent text:/key: steps can fill in
                     # the page that loads (login flows, etc.).
                     url_val = step.get("value", "")
                     if url_val:
-                        if _open_url_with(browser_ctl, url_val):
-                            browser_ctl = None
-            return {"ok": True, "error": "", "action_type": kind, "target": target}
+                        open_err = _open_url_with(browser_target, url_val)
+                        if open_err:
+                            add_event(
+                                "error",
+                                f"未能用 {browser_used} 打开 {url_val}"
+                                f"（{open_err}），已回退默认浏览器",
+                                level="error")
+                            browser_target = None
+                            browser_used = "default"
+                        elif browser_used == "default":
+                            add_event("action", f"已用默认浏览器打开 {url_val}",
+                                      level="ok")
+                        else:
+                            add_event("action",
+                                      f"已用 {browser_used} 打开 {url_val}",
+                                      level="ok")
+            return {"ok": True, "error": "", "action_type": kind,
+                    "target": target, "browser_used": browser_used}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
                     "action_type": kind, "target": target}
@@ -1100,7 +1221,8 @@ def api_action_test(dev_id, idx):
         return jsonify({"ok": False, "error": "执行超时"}), 200
 
     _record_action_result(dev_id, idx, action, result)
-    return jsonify({"ok": result["ok"], "error": result["error"]})
+    return jsonify({"ok": result["ok"], "error": result["error"],
+                    "browser_used": result.get("browser_used", "")})
 
 
 @app.route("/api/device/<dev_id>/<action>", methods=["POST"])
