@@ -703,6 +703,13 @@ def run_action(action: dict) -> dict:
                     kb.write(step.get("value", ""))
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                elif st == "url":
+                    # Empty url: skip silently (no exception).  Non-empty url:
+                    # open the browser; subsequent text:/key: steps can fill in
+                    # the page that loads (login flows, etc.).
+                    url_val = step.get("value", "")
+                    if url_val:
+                        webbrowser.open(url_val)
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
