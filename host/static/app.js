@@ -902,8 +902,9 @@ function renderOta() {
     $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
     $("#otaProgressBar").style.width = ota.percent + "%";
     $("#btnOtaStart").hidden = true;
-    // No cancel mid-push: aborting halfway leaves the device in OTA mode.
-    $("#btnOtaCancel").hidden = true;
+    // Cancel sends CMD:OTA_CANCEL so the device aborts and keeps the old image.
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "取消升级";
     const acked = ota.acked != null ? ota.acked : ota.sent;
     $("#otaHint").textContent =
       `${acked} / ${ota.total} bytes (${ota.percent}%) · 已确认字节 · 升级中请勿断电`;
@@ -912,8 +913,16 @@ function renderOta() {
     $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
     $("#otaProgressBar").style.width = "0%";
     $("#btnOtaStart").hidden = true;
-    $("#btnOtaCancel").hidden = true;
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "取消升级";
     $("#otaHint").textContent = "正在进入 OTA 模式…";
+  } else if (ota.status === "cancelled") {
+    $("#otaStatusText").textContent = "已取消";
+    $("#otaProgressBar").style.width = "0%";
+    $("#btnOtaStart").hidden = true;
+    $("#btnOtaCancel").hidden = false;
+    $("#btnOtaCancel").textContent = "关闭";
+    $("#otaHint").textContent = "升级已取消，设备保持原固件。";
   } else {
     // idle: file selected, waiting for user to click "开始升级"
     $("#otaStatusText").textContent = "就绪";
@@ -951,7 +960,7 @@ async function pollOta() {
   // Terminal (done / error) and idle states do not need polling: the server
   // pops a finished task on its first read, so polling again would 404 and
   // wipe the result card the user needs to see.
-  if (!state.ota || ["idle", "done", "error"].includes(state.ota.status)) return;
+  if (!state.ota || ["idle", "done", "error", "cancelled"].includes(state.ota.status)) return;
   try {
     const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/progress`);
     if (!r.ok) {
@@ -1061,16 +1070,28 @@ async function startOta() {
   }
 }
 
-function cancelOta() {
-  if (state.ota && (state.ota.status === "done" || state.ota.status === "error")) {
+async function cancelOta() {
+  if (state.ota && ["done", "error", "cancelled"].includes(state.ota.status)) {
     state.ota = null;
     state.otaFile = null;
     renderOta();
     return;
   }
-  // In-progress cancel: the server side keeps running until the window
-  // closes; just hide the card and let the background thread finish or
-  // time out on its own.
+  // In-progress cancel: ask the server to stop the push and tell the device
+  // to abort (CMD:OTA_CANCEL), so the device leaves OTA mode immediately
+  // instead of waiting for its 30 s inter-chunk timeout.
+  if (state.ota && state.selected && otaBusy()) {
+    try {
+      const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/cancel`, { method: "POST" });
+      if (r.sent === false) {
+        toast("已取消；取消指令未送达，设备将在 30 秒后自动中止", "bad");
+      } else {
+        toast("已取消升级，设备保持原固件", "ok");
+      }
+    } catch (e) {
+      toast("取消失败：" + (e.message || e), "bad");
+    }
+  }
   state.ota = null;
   state.otaFile = null;
   renderOta();

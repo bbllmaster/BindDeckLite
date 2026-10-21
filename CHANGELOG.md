@@ -2,6 +2,12 @@
 
 ## 上位机 OTA — 2026-10-21（WS-328）
 
+- **复审修复**：OTA 期间 CFG RX 特性原先把所有写入都当固件数据，导致
+  `CMD:OTA_END` / `CMD:OTA_CANCEL` 到不了命令解析器（`Update.end(true)`
+  永不执行、设备不重启）。现在按「短 + `CMD:`/`CFG:` 前缀 + 可打印 ASCII」
+  识别文本命令，固件块（`0xE9` 开头）仍走二进制通道；上位机「取消升级」
+  按钮改为真正调用 `POST /api/ota/<dev_id>/cancel`，下发 `CMD:OTA_CANCEL`。
+
 - **固件**：新增 `CMD:OTA:<size>:<sha256>` / `CMD:OTA_END` / `CMD:OTA_CANCEL`。
   进入时校验发起者是**已绑定主机且持有 HID 主连接**（`isHostBound()` +
   `primaryConn()`），否则回 `ACK:OTA:ERROR:not_bound`；`Update.begin(size)`

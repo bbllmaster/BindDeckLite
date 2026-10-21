@@ -1161,6 +1161,8 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         add_event("ota", f"OTA 块大小 {chunk_size} B（MTU 窗口 32 KB）", dev_id)
         sent = 0
         while sent < total:
+            if window.status == "cancelled":
+                return
             err = window.ack_error
             if err:
                 _fail(_ota_error_text(err))
@@ -1168,7 +1170,8 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
             if sent - window.acked >= OTA_WINDOW_BYTES:
                 if not _wait_until(
                         lambda: (sent - window.acked) < OTA_WINDOW_BYTES
-                                or bool(window.ack_error), OTA_ACK_TIMEOUT):
+                                or bool(window.ack_error)
+                                or window.status == "cancelled", OTA_ACK_TIMEOUT):
                     _fail("推送超时，请重试")
                     return
                 continue
@@ -1178,11 +1181,16 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
                 return
             sent += len(chunk)
             window.sent = sent
+        if window.status == "cancelled":
+            return
 
         # Wait for the device to confirm every byte before finalizing.
-        if not _wait_until(lambda: window.acked >= total or bool(window.ack_error),
+        if not _wait_until(lambda: window.acked >= total or bool(window.ack_error)
+                                   or window.status == "cancelled",
                            OTA_ACK_TIMEOUT):
             _fail("推送超时，请重试")
+            return
+        if window.status == "cancelled":
             return
         err = window.ack_error
         if err:
@@ -1195,8 +1203,12 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         if not ble.send(dev_id, "CMD:OTA_END"):
             _fail("连接中断，请重试")
             return
-        _wait_until(lambda: window.ack_line == "ACK:OTA:DONE" or bool(window.ack_error),
+        _wait_until(lambda: window.ack_line == "ACK:OTA:DONE"
+                            or bool(window.ack_error)
+                            or window.status == "cancelled",
                     OTA_END_TIMEOUT)
+        if window.status == "cancelled":
+            return
         err = window.ack_error
         if err:
             _fail(_ota_error_text(err))
@@ -1273,6 +1285,30 @@ def api_ota(dev_id):
                     "total": window.total, "sha256": sha_hex, "version": version})
 
 
+@app.route("/api/ota/<dev_id>/cancel", methods=["POST"])
+def api_ota_cancel(dev_id):
+    """Cancel an in-flight OTA and tell the device to drop the partial image.
+
+    The push thread stops on its next loop check; the device aborts its own
+    session on CMD:OTA_CANCEL (or on the 30 s inter-chunk timeout if the
+    command cannot be delivered).
+    """
+    with _ota_lock:
+        window = _ota_windows.get(dev_id)
+        if window is None:
+            return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
+        if window.status in ("done", "error", "cancelled"):
+            _ota_windows.pop(dev_id, None)
+            return jsonify({"ok": True, "sent": False, "status": window.status})
+        window.status = "cancelled"
+        window.error = "已取消"
+
+    sent = ble.send(dev_id, "CMD:OTA_CANCEL")
+    add_event("ota", "OTA 已取消" + ("" if sent else "（取消指令未送达，设备将在 30 秒后自动中止）"),
+              dev_id, "warn")
+    return jsonify({"ok": True, "sent": bool(sent), "status": "cancelled"})
+
+
 @app.route("/api/ota/<dev_id>/progress")
 def api_ota_progress(dev_id):
     with _ota_lock:
@@ -1281,7 +1317,7 @@ def api_ota_progress(dev_id):
             return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
         # Clean up finished / errored windows after one last read so the poller
         # can detect completion by the task disappearing.
-        done = window.status in ("done", "error")
+        done = window.status in ("done", "error", "cancelled")
         payload = {
             "ok": True,
             "status": window.status,
