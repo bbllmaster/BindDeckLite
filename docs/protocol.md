@@ -37,8 +37,9 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CMD:BOOT_CFG` | | 重启并进入配网 / OTA 模式 |
 | `CMD:CLEARBOND` | | 清除已绑定的 HID 主机（WS-321） |
 | `CMD:GET_BOND` | | 查询当前主机绑定状态（WS-321） |
-| `CMD:OTA` | | 进入上位机推送 OTA 模式（关闭 BLE HID，CFG 特性切换为二进制接收） |
-| `CMD:OTA_END` | | 固件全部接收完毕，校验并重启 |
+| `CMD:OTA:<size>:<sha256>` | `CMD:OTA:1234567:9f86d0…` | 进入上位机推送 OTA 模式（仅绑定主机 / HID 主连接） |
+| `CMD:OTA_END` | | 固件接收完毕，校验长度与 SHA256 后重启 |
+| `CMD:OTA_CANCEL` | | 取消进行中的 OTA，丢弃已写入数据 |
 
 任何 `CFG:` 命令都会收到 `ACK:<原命令前 96 字节>`。
 
@@ -47,18 +48,40 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 与配网页面 `/update` 的 OTA 互补：用户无需手动连接设备热点，直接在上位机
 里完成固件刷新。只接受 **app-only** 固件（`ota_*.bin`），**拒绝 merged 整片包**。
 
-1. 上位机发送 `CMD:OTA` → 设备关闭 BLE HID，`Update.begin(UPDATE_SIZE_UNKNOWN)`，
-   CFG 特性切换为二进制模式，回复 `ACK:CMD:OTA`
-2. 上位机以 **≤ 200 字节** 的原始块通过 RX 特性写入固件（非文本行，可含 NUL /
-   换行）→ 设备 `Update.write()` 后回复 `ACK:OTA:<已接收字节数>`
-3. 全部写入后上位机发送 `CMD:OTA_END` → 设备 `Update.end(true)` 校验并通过后
-   自动重启，回复 `ACK:OTA:DONE`（重启后该 ACK 不会到达）
-4. 接收超时（30 秒无数据）→ 设备取消 OTA，回复 `ACK:OTA:ERROR:timeout`
-5. 旧固件（不支持 `CMD:OTA`）→ 上位机等待 5 秒无回应，提示「固件版本过低，
-   请使用配网页面 OTA」
+1. 上位机发送 `CMD:OTA:<size>:<sha256_hex>`（十进制字节数 + 64 位十六进制
+   SHA256）。设备依次校验：非配网模式、无进行中的会话、**发起者必须是已绑定
+   主机且持有 HID 主连接**（`isHostBound()` + `primaryConn()`），然后
+   `Update.begin(size)` 并切换 CFG 特性为二进制接收，回复 `ACK:CMD:OTA`。
+2. 上位机通过 RX 特性连续写入固件原始字节（非文本行，可含 NUL / 换行）。
+   块大小按协商 MTU 取 `MTU-3`，不小于 200 B、不大于 512 B；上位机保持
+   约 32 KB 的流水线窗口，不等单块 ACK。
+3. 设备每累计接收 **4096 字节**（以及最后一个字节）回复一次
+   `ACK:OTA:<已确认字节数>`，上位机以该值计算进度。
+4. 全部写入后上位机发送 `CMD:OTA_END`：设备先比对已收字节数与 `size`，
+   再比对 SHA256，**任一不符立即 `Update.abort()`，旧固件保持可启动**，
+   分别回复 `ACK:OTA:ERROR:size` / `ACK:OTA:ERROR:hash`。校验通过才
+   `Update.end(true)` 并重启，回复 `ACK:OTA:DONE`（重启时该 ACK 可能丢失）。
+5. 上位机在重启后通过 `CMD:VERSION` 确认设备确实运行新版本，才提示升级成功。
+6. 超时定义为**块间 30 秒无数据**（不是全程 30 秒）；超时或 BLE 断连都会
+   立即 `Update.abort()`，设备不重启、不切换分区。
+7. 旧固件（不支持 `CMD:OTA:<size>:<sha256>`）→ 上位机 5 秒无回应，提示
+   「固件版本过低，请使用配网页面 OTA」。
 
-错误回复格式：`ACK:OTA:ERROR:<原因>`，原因包括 `timeout` / `begin_failed` /
-`write_failed` / `end_failed` / `config_mode` / `busy`。
+错误回复格式：`ACK:OTA:ERROR:<原因>`，原因包括：
+
+| 原因 | 说明 |
+|------|------|
+| `not_bound` | 发起者不是已绑定主机，或没有 HID 主连接 |
+| `args` | 参数缺失 / 长度或 SHA256 格式非法 / 超出分区容量 |
+| `config_mode` | 设备处于配网模式，请退出后重试 |
+| `busy` | 已有 OTA 会话在进行 |
+| `not_active` | `CMD:OTA_END` / `CMD:OTA_CANCEL` 时没有会话 |
+| `not_app_image` | 镜像头不是 ESP app 镜像（merged 整片包会命中） |
+| `chunk_too_big` | 单次写入超过 512 字节 |
+| `size` | 已收字节数不等于声明长度（或流超出声明长度） |
+| `hash` | SHA256 不匹配 |
+| `begin_failed` / `write_failed` / `end_failed` | Update 框架失败 |
+| `timeout` | 块间 30 秒无数据 |
 
 ### 编码器模式
 

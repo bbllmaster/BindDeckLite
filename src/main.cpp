@@ -26,6 +26,7 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <mbedtls/sha256.h>   // OTA payload integrity (CMD:OTA:<size>:<sha256>)
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_log.h>
@@ -124,15 +125,25 @@ static unsigned long g_configModeStart = 0;
 static String g_cfgApName;
 static int g_otaProgress = -1;
 
-// === OTA (host-driven firmware upgrade, CMD:OTA) ==========================
+// === OTA (host-driven firmware upgrade, CMD:OTA:<size>:<sha256>) ==========
 // While g_otaMode is set the CFG characteristic carries raw firmware bytes and
-// the button / encoder / serial paths are skipped. BLE HID is closed the moment
-// CMD:OTA is accepted so the user's keystrokes do not disturb the flash write.
-#define OTA_TIMEOUT_MS   30000   // 30 s of silence → cancel, reply ERROR:timeout
-#define OTA_CHUNK_MAX    200     // host must not write more than this per TX
+// the button / encoder / serial paths are skipped. The host sends a continuous
+// stream (no per-chunk stop-and-wait): the device acknowledges every
+// OTA_ACK_WINDOW bytes so the host can keep a window in flight.
+#define OTA_TIMEOUT_MS   30000   // INTER-CHUNK silence → cancel, ERROR:timeout
+#define OTA_CHUNK_MAX    512     // hard ceiling = CFG RX characteristic size
+#define OTA_ACK_WINDOW   4096    // cumulative bytes between ACKs
+#define OTA_SHA_LEN      32
+
 static bool g_otaMode = false;
-static unsigned long g_otaStart = 0;
-static unsigned long g_otaReceived = 0;
+static unsigned long g_otaStart = 0;      // accepted-at, logging only
+static unsigned long g_otaLastData = 0;   // last chunk arrival (inter-chunk timeout)
+static uint32_t g_otaTotal = 0;           // expected image size
+static uint32_t g_otaReceived = 0;
+static uint32_t g_otaAcked = 0;           // last value reported to the host
+static uint8_t  g_otaShaExp[OTA_SHA_LEN];
+static mbedtls_sha256_context g_otaSha;
+static bool g_otaShaActive = false;
 
 // First bytes of the image, collected across one or more BLE writes so the
 // app-image header can be validated regardless of the negotiated MTU.
@@ -562,6 +573,54 @@ static void loopWiFi() {
   }
 }
 
+// === OTA helpers ==========================================================
+// Clear every OTA flag without touching the Update partition. Safe to call
+// when no session is active.
+static void otaResetState() {
+  g_otaMode = false;
+  g_otaTotal = 0;
+  g_otaReceived = 0;
+  g_otaAcked = 0;
+  g_otaHdrLen = 0;
+  g_otaHdrOk = false;
+  if (g_otaShaActive) {
+    mbedtls_sha256_free(&g_otaSha);
+    g_otaShaActive = false;
+  }
+  bleConfig.setOtaMode(false);
+}
+
+// Abort the running session: drop the partial image so the boot partition is
+// untouched and the old firmware still boots. Replies ACK:OTA:ERROR:<reason>
+// when a reason is given ("" = silent, e.g. the link just disappeared).
+static void otaAbort(const char* reason) {
+  if (!g_otaMode) return;
+  Update.abort();
+  log_e("[ota] aborted: %s (%lu/%lu bytes)", reason ? reason : "link lost",
+        (unsigned long)g_otaReceived, (unsigned long)g_otaTotal);
+  if (reason && *reason) sendToHost(String("ACK:OTA:ERROR:") + reason);
+  otaResetState();
+}
+
+static int otaHexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Parse a 64-char SHA256 hex string into 32 bytes.
+static bool otaParseSha256Hex(const String& hex, uint8_t out[OTA_SHA_LEN]) {
+  if (hex.length() != OTA_SHA_LEN * 2) return false;
+  for (int i = 0; i < OTA_SHA_LEN; i++) {
+    int hi = otaHexNibble(hex[i * 2]);
+    int lo = otaHexNibble(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
 // === Command parser =======================================================
 static void processCommand(String data) {
   if (data.startsWith("CFG:PINS:")) {
@@ -699,28 +758,57 @@ static void processCommand(String data) {
       sendToHost("BOND_STATUS:unbound");
     }
   } else if (data.startsWith("CMD:OTA_END")) {
-    // All firmware bytes have been pushed. Update.end(true) verifies the
-    // image CRC and reboots into it on success; on failure the device leaves
-    // OTA mode so the host can retry instead of bricking itself.
+    // The host has pushed every byte. Verify the declared size and SHA256
+    // before letting Update commit the image: a truncated or tampered stream
+    // must never replace the running firmware.
     // NOTE: matched before CMD:OTA — "CMD:OTA_END".startsWith("CMD:OTA").
-    if (!g_otaMode) return;
+    if (!g_otaMode) {
+      sendToHost("ACK:OTA:ERROR:not_active");
+      return;
+    }
+    if (g_otaReceived != g_otaTotal) {
+      log_e("[ota] size mismatch: %lu/%lu", (unsigned long)g_otaReceived,
+            (unsigned long)g_otaTotal);
+      otaAbort("size");
+      return;
+    }
+    uint8_t digest[OTA_SHA_LEN];
+    mbedtls_sha256_finish(&g_otaSha, digest);
+    mbedtls_sha256_free(&g_otaSha);
+    g_otaShaActive = false;
+    if (memcmp(digest, g_otaShaExp, OTA_SHA_LEN) != 0) {
+      log_e("[ota] SHA256 mismatch");
+      otaAbort("hash");
+      return;
+    }
+    // Report the final confirmed offset before the DONE marker.
+    sendToHost("ACK:OTA:" + String(g_otaReceived));
     if (Update.end(true)) {
-      log_e("[ota] image verified, rebooting");
+      log_e("[ota] image verified, rebooting (%lu bytes in %lums)",
+            (unsigned long)g_otaReceived, millis() - g_otaStart);
       sendToHost("ACK:OTA:DONE");
-      delay(300);
-      bleConfig.setOtaMode(false);
+      delay(200);
+      otaResetState();
       ESP.restart();
     } else {
-      log_e("[ota] Update.end failed (bad image / CRC)");
-      sendToHost("ACK:OTA:ERROR:end_failed");
-      g_otaMode = false;
-      bleConfig.setOtaMode(false);
+      log_e("[ota] Update.end failed");
+      otaAbort("end_failed");
     }
+  } else if (data.startsWith("CMD:OTA_CANCEL")) {
+    if (!g_otaMode) {
+      sendToHost("ACK:OTA:ERROR:not_active");
+      return;
+    }
+    otaAbort(nullptr);
+    sendToHost("ACK:OTA:CANCEL");
   } else if (data == "CMD:OTA") {
-    // Host-driven OTA entry point. The firmware pauses BLE HID, arms the
-    // Update framework and switches the CFG characteristic to binary mode.
-    // Only accepted in normal (non-config) mode — the WiFi portal already
-    // has its own /update page and OTA here would fight the softAP radio.
+    // Old (argument-less) form: the host must send size + SHA256 so the image
+    // can be verified before it replaces the running firmware.
+    sendToHost("ACK:OTA:ERROR:args");
+  } else if (data.startsWith("CMD:OTA:")) {
+    // Host-driven OTA entry point: CMD:OTA:<total_size>:<sha256_hex>.
+    // Only accepted in normal (non-config) mode — the WiFi portal already has
+    // its own /update page and OTA here would fight the softAP radio.
     if (g_configMode) {
       sendToHost("ACK:OTA:ERROR:config_mode");
       return;
@@ -729,24 +817,53 @@ static void processCommand(String data) {
       sendToHost("ACK:OTA:ERROR:busy");
       return;
     }
-    g_otaMode = true;
-    g_otaStart = millis();
-    g_otaReceived = 0;
-    g_otaHdrLen = 0;
-    g_otaHdrOk = false;
-    bleConfig.setOtaMode(true);
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-      log_e("[ota] Update.begin failed");
-      sendToHost("ACK:OTA:ERROR:begin_failed");
-      g_otaMode = false;
-      bleConfig.setOtaMode(false);
+    // Authorization: only the bound host that currently owns the HID link may
+    // replace the firmware. An unbound deck (no WS-319 binding yet) still
+    // requires a live HID primary connection.
+    if (!bleKeyboard.isHostBound() || bleKeyboard.primaryConn() < 0) {
+      log_e("[ota] rejected: not the bound/primary host (bound=%d primary=%d)",
+            (int)bleKeyboard.isHostBound(), bleKeyboard.primaryConn());
+      sendToHost("ACK:OTA:ERROR:not_bound");
       return;
     }
-    // loop() skips button / encoder processing while g_otaMode is set, so no
-    // HID keystrokes are forwarded during the flash. The CFG service stays up
-    // (the NimBLE connection is untouched) so the host can still write
-    // firmware bytes and read ACKs.
-    log_e("[ota] OTA mode armed, BLE HID paused");
+
+    String args = data.substring(8);        // after "CMD:OTA:"
+    int colon = args.indexOf(':');
+    if (colon <= 0) {
+      sendToHost("ACK:OTA:ERROR:args");
+      return;
+    }
+    long total = args.substring(0, colon).toInt();
+    String shaHex = args.substring(colon + 1);
+    shaHex.trim();
+    uint8_t sha[OTA_SHA_LEN];
+    if (total <= 0 || total > 4L * 1024 * 1024 || !otaParseSha256Hex(shaHex, sha)) {
+      log_e("[ota] bad args (size=%ld sha_len=%u)", total, (unsigned)shaHex.length());
+      sendToHost("ACK:OTA:ERROR:args");
+      return;
+    }
+
+    g_otaMode = true;
+    g_otaStart = millis();
+    g_otaLastData = g_otaStart;
+    g_otaTotal = (uint32_t)total;
+    g_otaReceived = 0;
+    g_otaAcked = 0;
+    g_otaHdrLen = 0;
+    g_otaHdrOk = false;
+    memcpy(g_otaShaExp, sha, OTA_SHA_LEN);
+    mbedtls_sha256_init(&g_otaSha);
+    mbedtls_sha256_starts(&g_otaSha, 0);
+    g_otaShaActive = true;
+    bleConfig.setOtaMode(true);
+
+    // Exact size: Update checks it against the target partition up front.
+    if (!Update.begin(g_otaTotal)) {
+      log_e("[ota] Update.begin(%lu) failed", (unsigned long)g_otaTotal);
+      otaAbort("begin_failed");
+      return;
+    }
+    log_e("[ota] armed: %lu bytes, sha256=%s", (unsigned long)g_otaTotal, shaHex.c_str());
     sendToHost("ACK:CMD:OTA");
   }
 
@@ -909,24 +1026,30 @@ void setup() {
   };
   // OTA binary data: the PC writes raw firmware bytes during CMD:OTA.
   bleConfig.onOtaData = [](const uint8_t* data, size_t len) {
-    if (!g_otaMode) return;
-    if (len == 0) return;
+    if (!g_otaMode || len == 0) return;
 
-    // Timeout guard: 30 s of silence cancels the session and tells the host.
-    if (millis() - g_otaStart > OTA_TIMEOUT_MS) {
-      Update.abort();
-      log_e("[ota] timeout after %lums", millis() - g_otaStart);
-      sendToHost("ACK:OTA:ERROR:timeout");
-      g_otaMode = false;
-      bleConfig.setOtaMode(false);
+    // Inter-chunk timeout: 30 s without a byte cancels the session.
+    if (millis() - g_otaLastData > OTA_TIMEOUT_MS) {
+      otaAbort("timeout");
+      return;
+    }
+    g_otaLastData = millis();
+
+    if (len > OTA_CHUNK_MAX) {
+      log_e("[ota] chunk too big: %u bytes", (unsigned)len);
+      sendToHost("ACK:OTA:ERROR:chunk_too_big");
+      return;
+    }
+    if (g_otaReceived + len > g_otaTotal) {
+      log_e("[ota] stream exceeds declared size");
+      otaAbort("size");
       return;
     }
 
     // App-image header check. A BLE write can be smaller than the 0x24 bytes
-    // we need (small MTU), so collect the first bytes first and validate as
-    // soon as they are complete. Nothing has been committed to the boot
-    // partition yet, so a rejection here is safe: Update.abort() discards the
-    // partial image.
+    // we need (small MTU), so collect the first bytes across writes and
+    // validate as soon as they are complete. A rejection aborts the update,
+    // leaving the running firmware in place.
     //   offset 0x00: 0xE9 ESP image magic
     //   offset 0x20: 0xABCD5432 esp_app_desc_t magic (app images only; a
     //                bootloader / merged image has no app descriptor there)
@@ -940,21 +1063,11 @@ void setup() {
             g_otaHdr[0x20] != 0x32 || g_otaHdr[0x21] != 0x54 ||
             g_otaHdr[0x22] != 0xCD || g_otaHdr[0x23] != 0xAB) {
           log_e("[ota] not an app image (bad header)");
-          Update.abort();
-          sendToHost("ACK:OTA:ERROR:not_app_image");
-          g_otaMode = false;
-          bleConfig.setOtaMode(false);
+          otaAbort("not_app_image");
           return;
         }
         g_otaHdrOk = true;
       }
-    }
-
-    // Refuse oversized writes — the host contract is ≤ OTA_CHUNK_MAX bytes.
-    if (len > OTA_CHUNK_MAX) {
-      log_e("[ota] chunk too big: %u bytes", (unsigned)len);
-      sendToHost("ACK:OTA:ERROR:chunk_too_big");
-      return;
     }
 
     // UpdateClass::write() takes a non-const buffer but only reads from it,
@@ -962,13 +1075,28 @@ void setup() {
     size_t written = Update.write(const_cast<uint8_t*>(data), len);
     if (written != len) {
       log_e("[ota] Update.write short: %u/%u", (unsigned)written, (unsigned)len);
-      sendToHost("ACK:OTA:ERROR:write_failed");
-      g_otaMode = false;
-      bleConfig.setOtaMode(false);
+      otaAbort("write_failed");
       return;
     }
+    mbedtls_sha256_update(&g_otaSha, data, len);
     g_otaReceived += len;
-    sendToHost("ACK:OTA:" + String(g_otaReceived));
+
+    // Windowed ACK: one notification per OTA_ACK_WINDOW bytes (plus the final
+    // byte) instead of one per chunk — the host pipelines and only stalls
+    // when this counter stops advancing.
+    if (g_otaReceived - g_otaAcked >= OTA_ACK_WINDOW || g_otaReceived == g_otaTotal) {
+      g_otaAcked = g_otaReceived;
+      sendToHost("ACK:OTA:" + String(g_otaReceived));
+    }
+  };
+
+  // A drop mid-OTA must abort immediately instead of waiting for the 30 s
+  // timeout: the host is gone, so nothing will flush the remaining bytes.
+  bleConfig.onDisconnect = []() {
+    if (g_otaMode) {
+      log_e("[ota] link lost mid-update");
+      otaAbort(nullptr);
+    }
   };
   if (g_nvsOk && !g_configMode) {
     bleKeyboard.begin();
@@ -990,14 +1118,12 @@ void loop() {
   // to do except watch the 30 s timeout and stay out of the way of the
   // buttons / encoder / serial paths.
   if (g_otaMode) {
-    if (millis() - g_otaStart > OTA_TIMEOUT_MS) {
-      Update.abort();
-      log_e("[ota] loop timeout after %lums", millis() - g_otaStart);
-      sendToHost("ACK:OTA:ERROR:timeout");
-      g_otaMode = false;
-      bleConfig.setOtaMode(false);
+    // Inter-chunk timeout: the clock restarts on every received write, so a
+    // long transfer is fine and only a stalled one is cancelled.
+    if (millis() - g_otaLastData > OTA_TIMEOUT_MS) {
+      otaAbort("timeout");
     }
-    delay(20);
+    delay(10);
     return;
   }
 

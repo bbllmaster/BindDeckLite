@@ -2,21 +2,25 @@
 
 ## 上位机 OTA — 2026-10-21（WS-328）
 
-- **固件**：新增 `CMD:OTA` / `CMD:OTA_END`。收到 `CMD:OTA` 后
-  `Update.begin(UPDATE_SIZE_UNKNOWN)`，CFG RX 特性切换为二进制接收模式
-  （`ble_config` 新增 `onOtaData`），每块 ≤200 字节写入后回
-  `ACK:OTA:<已接收字节数>`，`CMD:OTA_END` 触发 `Update.end(true)` 校验并重启。
-  30 秒无数据 → `ACK:OTA:ERROR:timeout`；首块校验 ESP app 镜像头
-  （`0xE9` + `0x20` 处 `0xABCD5432`），merged 整片包回
-  `ACK:OTA:ERROR:not_app_image`。OTA 期间 `loop()` 暂停按键/编码器处理，
-  BLE CFG 通道保持可用。
+- **固件**：新增 `CMD:OTA:<size>:<sha256>` / `CMD:OTA_END` / `CMD:OTA_CANCEL`。
+  进入时校验发起者是**已绑定主机且持有 HID 主连接**（`isHostBound()` +
+  `primaryConn()`），否则回 `ACK:OTA:ERROR:not_bound`；`Update.begin(size)`
+  后 CFG RX 特性切换为二进制接收（`ble_config` 新增 `onOtaData` /
+  `onDisconnect`）。每累计 4096 字节回一次 `ACK:OTA:<已确认字节数>`（窗口 ACK，
+  不做逐块停等）；`CMD:OTA_END` 先比对总长度与 SHA256，任一不符
+  `Update.abort()` 且旧固件保持可启动，回 `ERROR:size` / `ERROR:hash`；
+  校验通过才 `Update.end(true)` 并重启。超时改为**块间 30 秒无数据**；
+  BLE 断连立即 abort。OTA 期间 `loop()` 暂停按键/编码器处理，CFG 通道保持可用。
 - **上位机**：设备页新增「OTA 升级」按钮与进度卡片；`POST /api/ota/<dev_id>`
-  分块推送（后台线程，逐块等 ACK），`GET /api/ota/<dev_id>/progress` 供
-  进度轮询。`ble_link` 新增 `send_raw()` 走原始字节写入。
-- **校验**：前端 + 后端双重校验 `ota_*.bin` 文件名，后端再校验镜像头，
-  拒绝 merged 整片包；设备未连接禁止 OTA。
-- **兜底**：配网页面 `/update` 保留；旧固件无 `CMD:OTA` 时上位机提示
-  「固件版本过低，请使用配网页面」。
+  后台流水线推送（`min(512, max(200, MTU-3))` 块大小、32 KB 在途窗口），
+  `GET /api/ota/<dev_id>/progress` 按**设备已确认字节**报进度。升级后用
+  `CMD:VERSION` 比对升级前后的版本号 / 构建时间戳（或文件名里的 `_vX.Y.Z`），
+  确认设备真的重启并运行新固件才提示成功。`ble_link` 新增 `send_raw()` / `max_payload()`。
+- **校验**：前端 + 后端双重校验 `ota_*.bin` 文件名，后端再校验镜像头与
+  SHA256，拒绝 merged 整片包；设备未连接禁止 OTA；OTA 期间上位机锁定
+  配置下发与设备指令。
+- **兜底**：配网页面 `/update` 保留；旧固件无 `CMD:OTA:<size>:<sha256>` 时
+  上位机提示「固件版本过低，请使用配网页面」。
 - 四个固件 env（`esp32dev` / `esp32c3` / `esp32c3_2mb` / `esp32c3_16mb`）
   编译通过；`docs/protocol.md` 同步。
 

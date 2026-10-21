@@ -29,6 +29,9 @@ public:
   // active OTA session (see CMD:OTA). The payload is the raw characteristic
   // value — NOT a text line — so it may contain NULs and newlines.
   std::function<void(const uint8_t*, size_t)> onOtaData;
+  // Any central disconnected. Used to abort an in-flight OTA immediately
+  // instead of waiting for the inter-chunk timeout.
+  std::function<void()> onDisconnect;
 
   bool begin(NimBLEServer* server);   // true if the service was created
   void notify(const String& data);    // device -> PC (no-op if not subscribed)

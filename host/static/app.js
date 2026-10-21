@@ -514,6 +514,10 @@ async function saveConfig() {
 }
 
 async function applyConfig() {
+  if (otaBusy()) {
+    toast("OTA 进行中，配置下发已锁定", "bad");
+    return;
+  }
   if (!state.selected) {
     toast("未连接设备，当前只是默认配置预览", "bad");
     return;
@@ -805,6 +809,10 @@ async function init() {
   };
   const devAction = async (act, okText) => {
     if (!state.selected) return;
+    if (otaBusy()) {
+      toast("OTA 进行中，设备指令已锁定", "bad");
+      return;
+    }
     try {
       const r = await api(`/api/device/${encodeURIComponent(state.selected)}/${act}`, { method: "POST" });
       toast(r.sent === false ? "指令未送出：设备未连接" : okText, r.sent === false ? "bad" : "ok");
@@ -865,6 +873,7 @@ function renderOta() {
     card.hidden = true;
     state.otaFile = null;
     $("#btnOtaStart").hidden = true;
+    applyOtaLock();
     return;
   }
   card.hidden = false;
@@ -895,7 +904,9 @@ function renderOta() {
     $("#btnOtaStart").hidden = true;
     // No cancel mid-push: aborting halfway leaves the device in OTA mode.
     $("#btnOtaCancel").hidden = true;
-    $("#otaHint").textContent = `${ota.sent} / ${ota.total} bytes (${ota.percent}%) · 升级中请勿断电`;
+    const acked = ota.acked != null ? ota.acked : ota.sent;
+    $("#otaHint").textContent =
+      `${acked} / ${ota.total} bytes (${ota.percent}%) · 已确认字节 · 升级中请勿断电`;
   } else if (ota.status === "starting") {
     $("#otaStatusText").textContent = "启动中";
     $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
@@ -916,6 +927,23 @@ function renderOta() {
       : "设备未连接，无法 OTA";
     $("#btnOtaStart").disabled = !connected;
   }
+  applyOtaLock();
+}
+
+/* OTA lock: while firmware is being written the deck's configuration and
+   device commands are frozen — a concurrent CFG:/CMD: write would interleave
+   with the binary stream and corrupt the image. */
+function otaBusy() {
+  return !!(state.ota && (state.ota.status === "starting" || state.ota.status === "uploading"));
+}
+
+function applyOtaLock() {
+  const busy = otaBusy();
+  ["btnApply", "btnOta", "btnPing", "btnRefresh", "btnPortal", "btnReboot", "btnClearBond"]
+    .forEach((id) => {
+      const el = $("#" + id);
+      if (el) el.disabled = busy;
+    });
 }
 
 async function pollOta() {
@@ -937,6 +965,7 @@ async function pollOta() {
     state.ota = {
       status: r.status,
       sent: r.sent,
+      acked: r.acked != null ? r.acked : r.sent,
       total: r.total,
       percent: r.percent,
       error: r.error,
@@ -954,6 +983,10 @@ async function pollOta() {
 }
 
 function openOtaPicker() {
+  if (otaBusy()) {
+    toast("OTA 进行中", "bad");
+    return;
+  }
   const sel = state.devices.find((d) => d.dev_id === state.selected);
   if (!sel || !sel.connected) {
     toast("设备未连接，无法 OTA", "bad");
