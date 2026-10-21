@@ -27,10 +27,12 @@ own the tray, native dialogs and login-start bits.
 from __future__ import annotations
 
 import argparse
+import ctypes  # only used by the Windows clipboard / window helpers below
 import hashlib
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -877,11 +879,464 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
-def run_action(action: dict) -> dict:
+# --- macro input reliability ---------------------------------------------
+# ``text:`` used to call ``kb.write(value)`` with no inter-key delay. Electron
+# apps, remote desktops and slow clients drop characters at that speed, and
+# every character is rebuilt through the active keyboard layout, so non-ASCII
+# text (Chinese, symbols) comes out wrong. A per-character delay fixes the
+# first problem; ``paste:`` (clipboard + Ctrl/Cmd+V) fixes both, because the
+# target receives one text block instead of synthetic keystrokes.
+MACRO_TEXT_DEFAULT_DELAY = 0.02      # seconds between characters (20 ms)
+MACRO_TEXT_MAX_DELAY = 5.0           # clamp a typo such as text!999999:
+MACRO_PASTE_HOTKEY = "command+v" if sys.platform == "darwin" else "ctrl+v"
+MACRO_PASTE_SETTLE = 0.05            # let the OS publish the clipboard first
+MACRO_PASTE_RESTORE_DELAY = 0.4      # give the target time to read it back
+MACRO_URL_FOCUS_TIMEOUT = 3.0        # wait for the browser window (Windows)
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+SW_RESTORE = 9
+# Chromium's Chrome/Edge/Brave/Opera share one window class; Firefox has its own.
+_BROWSER_WINDOW_CLASSES = ("Chrome_WidgetWin_1", "MozillaWindowClass")
+
+_win32 = None  # cached (user32, kernel32); False once known to be unavailable
+
+
+def _win32_api():
+    """Return cached ``(user32, kernel32)`` ctypes bindings, or ``None``.
+
+    Only loaded on Windows. Explicit ``argtypes`` / ``restype`` matter on
+    64-bit: the default ``c_int`` return type truncates HANDLEs and makes
+    ``GlobalLock`` / ``GetClipboardData`` fail with garbage pointers.
+    """
+    global _win32
+    if _win32 is not None:
+        return _win32 or None
+    if not sys.platform.startswith("win"):
+        _win32 = False
+        return None
+    try:
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.EnumWindows.argtypes = None  # function pointer, passed as-is
+        user32.EnumWindows.restype = wintypes.BOOL
+
+        _win32 = (user32, kernel32)
+    except Exception as e:  # noqa: BLE001
+        print(f"[app] Win32 clipboard API 不可用 ({type(e).__name__}: {e})")
+        _win32 = False
+    return _win32 or None
+
+
+def _win_clipboard_open(retries: int = 8) -> bool:
+    """OpenClipboard with short retries — another process may hold it briefly."""
+    api = _win32_api()
+    if api is None:
+        return False
+    user32 = api[0]
+    for i in range(retries):
+        if user32.OpenClipboard(None):
+            return True
+        time.sleep(0.01 * (i + 1))
+    return False
+
+
+def _win_clipboard_get() -> str | None:
+    api = _win32_api()
+    if api is None or not _win_clipboard_open():
+        return None
+    user32, kernel32 = api
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def _win_clipboard_set(text: str) -> bool:
+    api = _win32_api()
+    if api is None or not _win_clipboard_open():
+        return False
+    user32, kernel32 = api
+    handle = None
+    try:
+        if not user32.EmptyClipboard():
+            return False
+        # Fixed-size Unicode buffer: GlobalAlloc takes a size in bytes and the
+        # clipboard expects a NUL-terminated UTF-16 block.
+        size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        if not handle:
+            return False
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return False
+        try:
+            ctypes.memmove(ptr, ctypes.create_unicode_buffer(text), size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+        # Ownership of the handle moves to the clipboard on success; only free
+        # it ourselves when SetClipboardData failed.
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            return False
+        handle = None
+        return True
+    finally:
+        if handle:
+            kernel32.GlobalFree(handle)
+        user32.CloseClipboard()
+
+
+def _run_quiet(argv, data: bytes | None = None, timeout: float = 2.0):
+    """Run a clipboard helper; return stdout, or ``None`` when unusable."""
+    try:
+        proc = subprocess.run(argv, input=data, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+# (write argv, read argv) per tool, most preferred first.
+_LINUX_CLIPBOARD_TOOLS = (
+    (("xclip", "-selection", "clipboard"), ("xclip", "-selection", "clipboard", "-o")),
+    (("xsel", "--clipboard", "--input"), ("xsel", "--clipboard", "--output")),
+    (("wl-copy",), ("wl-paste", "--no-newline")),
+)
+
+
+class _NativeClipboard:
+    """Clipboard through a platform tool (Win32 API / pbcopy / xclip / wl-copy)."""
+
+    def __init__(self, reader, writer):
+        self._read = reader
+        self._write = writer
+
+    def read(self):
+        try:
+            return self._read()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def write(self, text: str) -> bool:
+        try:
+            return bool(self._write(text))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self):
+        pass
+
+
+class _TkClipboard:
+    """tkinter fallback, used when no native clipboard tool is installed.
+
+    On X11 the clipboard is owned by the process that set it, so the Tk root
+    must stay alive until the target has read the text — ``close()`` is only
+    called after the paste (and the optional restore) finished. A fresh root
+    per paste because macros run on worker threads and Tk is thread-affine.
+    """
+
+    def __init__(self, root):
+        self._root = root
+
+    @classmethod
+    def open(cls):
+        try:
+            import tkinter
+
+            root = tkinter.Tk()
+        except Exception:  # noqa: BLE001 — no DISPLAY / Tcl missing
+            return None
+        try:
+            root.withdraw()
+        except Exception:  # noqa: BLE001
+            pass
+        return cls(root)
+
+    def read(self):
+        for kwargs in ({"type": "UTF8_STRING"}, {"type": "STRING"}, {}):
+            try:
+                return self._root.clipboard_get(**kwargs)
+            except Exception:  # noqa: BLE001 — no text on the clipboard
+                continue
+        return None
+
+    def write(self, text: str) -> bool:
+        try:
+            self._root.clipboard_clear()
+            self._root.clipboard_append(text)
+            self._root.update()  # flush the selection to the display server
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self):
+        try:
+            self._root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _windows_clipboard():
+    return _NativeClipboard(_win_clipboard_get, _win_clipboard_set) \
+        if _win32_api() else None
+
+
+def _macos_clipboard():
+    if not (shutil.which("pbcopy") and shutil.which("pbpaste")):
+        return None
+
+    def _read():
+        out = _run_quiet(["pbpaste"])
+        return out.decode("utf-8", "replace") if out is not None else None
+
+    def _write(text):
+        return _run_quiet(["pbcopy"], text.encode("utf-8")) is not None
+
+    return _NativeClipboard(_read, _write)
+
+
+def _linux_clipboard():
+    tools = list(_LINUX_CLIPBOARD_TOOLS)
+    if os.environ.get("WAYLAND_DISPLAY"):
+        # Native Wayland: xclip only sees XWayland's (usually empty) clipboard.
+        tools.sort(key=lambda t: t[0][0] != "wl-copy")
+    for write_argv, read_argv in tools:
+        if not shutil.which(write_argv[0]):
+            continue
+
+        def _read(argv=read_argv):
+            out = _run_quiet(list(argv))
+            return out.decode("utf-8", "replace") if out is not None else None
+
+        def _write(text, argv=write_argv):
+            return _run_quiet(list(argv), text.encode("utf-8")) is not None
+
+        return _NativeClipboard(_read, _write)
+    return None
+
+
+def _clipboard_candidates():
+    """Backend factories in platform preference order.
+
+    macOS deliberately skips the tkinter fallback: Tk must run on the main
+    thread there, while macros run on worker threads, and ``pbcopy`` always
+    ships with the OS anyway. A ``None`` result means "try the next one".
+    """
+    if sys.platform.startswith("win"):
+        return (_windows_clipboard, _TkClipboard.open)
+    if sys.platform == "darwin":
+        return (_macos_clipboard,)
+    return (_linux_clipboard, _TkClipboard.open)
+
+
+def _restore_clipboard(cb, previous: str | None, text: str):
+    """Put the user's previous clipboard text back after a paste.
+
+    Best effort and never fatal: only restores plain text, only when the
+    clipboard still holds exactly what we put there (so we never clobber
+    something the user copied in the meantime), and only after a short delay
+    so a slow target (remote desktop, VM) had time to read it.
+    """
+    if not previous or previous == text:
+        return
+    time.sleep(MACRO_PASTE_RESTORE_DELAY)
+    try:
+        if cb.read() == text:
+            cb.write(previous)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _paste_text(kb, text: str, dev_id: str = "") -> bool:
+    """Paste ``text`` through the clipboard + Ctrl/Cmd+V.
+
+    Returns ``True`` when a backend pasted it. ``False`` means no clipboard
+    was usable (or the hotkey failed) — the caller then falls back to
+    per-character typing so the macro still completes.
+    """
+    if not text:
+        return True
+    for factory in _clipboard_candidates():
+        cb = factory()
+        if cb is None:
+            continue
+        try:
+            # Read the old value first: pastes must not cost the user whatever
+            # they had copied (passwords especially — see _restore_clipboard).
+            previous = cb.read()
+            if not cb.write(text):
+                continue
+            time.sleep(MACRO_PASTE_SETTLE)
+            try:
+                kb.send(MACRO_PASTE_HOTKEY)
+            except Exception as e:  # noqa: BLE001
+                add_event("action",
+                          f"粘贴快捷键 {MACRO_PASTE_HOTKEY} 发送失败"
+                          f"（{type(e).__name__}: {e}），paste 步骤回退逐字符输入",
+                          dev_id, "error")
+                return False
+            _restore_clipboard(cb, previous, text)
+            return True
+        finally:
+            cb.close()
+    add_event("action", "剪贴板不可用，paste 步骤跳过（回退逐字符输入）",
+              dev_id, "error")
+    return False
+
+
+def _text_delay(step: dict) -> float:
+    """Per-character delay for a ``text:`` step, in seconds.
+
+    ``text!80:pass`` stores ``delay=80`` (ms) via ``parseMacro()``; anything
+    missing, unparsable or negative falls back to the 20 ms default.
+    """
+    raw = step.get("delay")
+    if raw is None or raw == "":
+        return MACRO_TEXT_DEFAULT_DELAY
+    try:
+        ms = float(raw)
+    except (TypeError, ValueError):
+        return MACRO_TEXT_DEFAULT_DELAY
+    if ms < 0:
+        return MACRO_TEXT_DEFAULT_DELAY
+    return min(ms / 1000.0, MACRO_TEXT_MAX_DELAY)
+
+
+def _win_foreground_class() -> str:
+    api = _win32_api()
+    if api is None:
+        return ""
+    hwnd = api[0].GetForegroundWindow()
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(256)
+    if not api[0].GetClassNameW(hwnd, buf, 256):
+        return ""
+    return buf.value
+
+
+def _win_topmost_browser_window():
+    """First visible browser window in z-order (EnumWindows is top-down)."""
+    api = _win32_api()
+    if api is None:
+        return 0
+    user32 = api[0]
+    found = []
+    # Keep the callback object alive for the duration of the call.
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        if not user32.GetClassNameW(hwnd, buf, 256):
+            return True
+        if buf.value in _BROWSER_WINDOW_CLASSES:
+            found.append(hwnd)
+            return False  # stop at the first (topmost) match
+        return True
+
+    callback = enum_proc(_cb)
+    user32.EnumWindows(callback, 0)
+    return found[0] if found else 0
+
+
+def _force_foreground(hwnd) -> bool:
+    """Show + focus ``hwnd``; ``False`` when Windows refuses (foreground lock)."""
+    api = _win32_api()
+    if api is None or not hwnd:
+        return False
+    user32 = api[0]
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        return bool(user32.SetForegroundWindow(hwnd))
+    except Exception:  # noqa: BLE001 — foreground lock, UIPI, ...
+        return False
+
+
+def _wait_url_foreground(timeout: float | None = None) -> bool:
+    """Bring the window that just handled ``url:`` to the foreground (Windows).
+
+    Synthetic keys go to whatever window has focus: a browser that opened
+    behind the current app silently swallows the following ``text:`` /
+    ``paste:`` steps. Polls for up to ``timeout`` seconds (default
+    ``MACRO_URL_FOCUS_TIMEOUT``) while a cold browser starts, and forces the
+    topmost browser window forward as soon as one is on screen. Returns
+    ``True`` when a browser window ends up focused. A no-op off Windows, where
+    window managers already focus new windows.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    if timeout is None:
+        timeout = MACRO_URL_FOCUS_TIMEOUT
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if _win_foreground_class() in _BROWSER_WINDOW_CLASSES:
+            return True
+        hwnd = _win_topmost_browser_window()
+        if hwnd:
+            # A browser window is already on screen but not focused (opened
+            # behind us, or reused as a background tab): bring it forward now
+            # instead of burning the rest of the timeout.
+            return _force_foreground(hwnd)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def run_action(action: dict, dev_id: str = "") -> dict:
     """Execute one host-side action and return a structured result.
 
     Returns ``{ok: bool, error: str, action_type: str, target: str}`` where
     ``error`` is a human-readable failure reason (empty when ``ok`` is True).
+    ``dev_id`` only tags inner log rows (clipboard/paste warnings) with the
+    device they came from.
     Never raises: every code path produces a result object.
     """
     action = action or {}
@@ -942,7 +1397,17 @@ def run_action(action: dict) -> dict:
                     # 这里统一换成 keyboard 库认识的写法。
                     kb.send(macro_key_name(step.get("value", "")))
                 elif st == "text":
-                    kb.write(step.get("value", ""))
+                    # Per-character delay: 0 ms drops characters in Electron
+                    # apps / remote desktops, and non-ASCII text needs the
+                    # layout round-trip to settle. ``text!<ms>:`` overrides it.
+                    kb.write(step.get("value", ""), delay=_text_delay(step))
+                elif st == "paste":
+                    # Clipboard + Ctrl/Cmd+V: the only reliable way to type
+                    # Chinese / symbols / passwords into apps that mangle
+                    # synthetic keystrokes. Falls back to typing on failure.
+                    if not _paste_text(kb, step.get("value", ""), dev_id):
+                        kb.write(step.get("value", ""),
+                                 delay=MACRO_TEXT_DEFAULT_DELAY)
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
                 elif st == "browser":
@@ -958,6 +1423,10 @@ def run_action(action: dict) -> dict:
                     if url_val:
                         if _open_url_with(browser_ctl, url_val):
                             browser_ctl = None
+                        # Keep the freshly opened window in front, otherwise
+                        # the next text:/paste: steps land in the old window.
+                        # Windows only; bounded by MACRO_URL_FOCUS_TIMEOUT.
+                        _wait_url_foreground()
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
@@ -1014,7 +1483,7 @@ def _run_action_for(dev_id: str, idx: int):
         return
 
     def _do():
-        result = run_action(action)
+        result = run_action(action, dev_id)
         _record_action_result(dev_id, idx, action, result)
 
     threading.Thread(target=_do, daemon=True).start()
@@ -1086,7 +1555,7 @@ def api_action_test(dev_id, idx):
 
     def _worker():
         try:
-            result_queue.put(run_action(action))
+            result_queue.put(run_action(action, dev_id))
         except Exception as e:  # noqa: BLE001
             result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "action_type": action.get("type", ""),

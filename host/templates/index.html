@@ -195,10 +195,12 @@
         <thead><tr><th>写法</th><th>作用</th></tr></thead>
         <tbody>
           <tr><td><code>key:Tab</code></td><td>发送一个按键或组合键；修饰键用 <code>+</code> 连接，如 <code>key:ctrl+alt+t</code></td></tr>
-          <tr><td><code>text:hello</code></td><td>逐字符输入文本</td></tr>
+          <tr><td><code>text:hello</code></td><td>逐字符模拟输入文本，默认每个字符间隔 20 毫秒</td></tr>
+          <tr><td><code>text!80:pass123</code></td><td>同上，但把逐字符间隔改为 80 毫秒（<code>text!</code> 后接毫秒数）；字符丢失时调大</td></tr>
+          <tr><td><code>paste:mypassword</code></td><td>把文本放进剪贴板并发送 <code>Ctrl+V</code>（macOS 为 <code>Cmd+V</code>）：中文、特殊符号、密码框等 <code>text:</code> 输不进去的场景优先用它</td></tr>
           <tr><td><code>wait:500</code></td><td>等待 500 毫秒（单位毫秒）</td></tr>
           <tr><td><code>browser:chrome</code></td><td>指定后续 <code>url:</code> 用哪个浏览器打开：<code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>（不区分大小写）；浏览器未安装时自动回退默认浏览器</td></tr>
-          <tr><td><code>url:https://example.com</code></td><td>打开网址：上面有 <code>browser:</code> 用指定浏览器，否则用默认浏览器</td></tr>
+          <tr><td><code>url:https://example.com</code></td><td>打开网址：上面有 <code>browser:</code> 用指定浏览器，否则用默认浏览器；打开后会等待浏览器窗口到前台（最多 3 秒）再执行下一步</td></tr>
           <tr><td>无前缀行</td><td>按 <code>key:</code> 处理，例如单独一行 <code>enter</code></td></tr>
         </tbody>
       </table>
@@ -227,11 +229,69 @@
 url:https://example.com/login
 wait:1500
 key:tab
-text:my-user
+paste:my-user
 key:tab
-text:my-password
+paste:my-password
 key:enter</pre>
       <p><code>browser:</code> 只影响它后面的 <code>url:</code> 步骤，可以写在宏的任意位置；不写就用系统默认浏览器。先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
+
+      <h3>密码框输入无效怎么办</h3>
+      <p>密码框（以及登录页的邮箱框）是最容易「发得出按键、打不进字」的地方。宏本身不会失败，所以先判断属于下面哪一种情况，再换写法。</p>
+      <table class="help-table">
+        <thead><tr><th>原因</th><th>典型表现</th><th>处理办法</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>逐字符速度太快</td>
+            <td>只进去几个字符、顺序错乱，日志显示动作成功</td>
+            <td>改用 <code>text!80:密码</code> 放慢速度，或直接用 <code>paste:密码</code></td>
+          </tr>
+          <tr>
+            <td>焦点不在输入框</td>
+            <td>字打进了地址栏、搜索框或别的窗口</td>
+            <td>先 <code>wait:1500</code> 等页面加载，再用 <code>key:tab</code> 逐个聚焦；<code>url:</code> 后会自动等浏览器窗口到前台（最多 3 秒）</td>
+          </tr>
+          <tr>
+            <td>输入法 / 键盘布局</td>
+            <td>中文、emoji、<code>@ # ¥</code> 之类的符号变成别的字符或丢失</td>
+            <td>改用 <code>paste:</code>（剪贴板不经过键盘布局）。<code>text:</code> 前先切到英文输入法</td>
+          </tr>
+          <tr>
+            <td>目标程序以管理员权限运行</td>
+            <td>整个宏对别的程序有效，只对这个程序完全没反应</td>
+            <td>Windows UIPI 会丢弃低权限进程的合成输入，代码层面绕不过：<b>以管理员身份运行上位机</b>（右键 <code>BindDeckLite.exe</code> → 以管理员身份运行）</td>
+          </tr>
+          <tr>
+            <td>程序主动拦截合成按键</td>
+            <td>按键、<code>text:</code> 都没反应，但手工输入正常</td>
+            <td>程序在检测 <code>LLKHF_INJECTED</code> 标记。先试 <code>paste:</code>（它只发一次 Ctrl+V，很多程序放行）；仍不行就是硬限制</td>
+          </tr>
+          <tr>
+            <td>macOS 安全键盘输入</td>
+            <td>只在密码框里无效，普通输入框正常</td>
+            <td>「安全键盘输入」会屏蔽合成按键。用 <code>paste:</code>，或临时在输入法菜单里关闭安全键盘输入</td>
+          </tr>
+          <tr>
+            <td>浏览器密码框未渲染完</td>
+            <td>前几次按键丢失，之后才正常</td>
+            <td>把 <code>wait:</code> 调到 2000 以上；必要时重复 <code>key:tab</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p><b>推荐写法</b>：先 <code>wait:</code>，再 <code>key:tab</code> 聚焦，账号和密码都用 <code>paste:</code>。</p>
+      <pre class="help-code">browser:chrome
+url:https://example.com/login
+wait:2000
+key:tab
+paste:my-user
+key:tab
+paste:my-password
+key:enter</pre>
+      <ul>
+        <li><b>管理员程序</b>：只要目标程序是「以管理员身份运行」的（任务管理器、部分网银/游戏客户端），上位机也必须以管理员身份运行，否则任何按键方案都无效。</li>
+        <li><b>无法绕过的场景</b>：银行安全控件、远程桌面/虚拟机里对合成输入的过滤、带反作弊或主动防御的客户端、UAC 提权弹窗本身。这些场景请改用设备直接发 HID 键，或手动输入。</li>
+        <li><b>剪贴板</b>：<code>paste:</code> 会先把原剪贴板里的<b>文本</b>保存下来，粘贴后约 0.4 秒再恢复（只恢复文本，图片等其它内容无法恢复）。这段时间内密码会短暂留在剪贴板里；<code>paste:</code> 不可用时日志会写「剪贴板不可用」，并自动回退成逐字符输入，宏不会中断。</li>
+        <li><b>Linux / macOS</b>：macOS 用系统自带的 <code>pbcopy</code>；Linux 优先 <code>xclip</code> / <code>xsel</code>（X11）或 <code>wl-copy</code>（Wayland），都没装时回退 tkinter，此时需要图形界面（<code>DISPLAY</code>）。</li>
+      </ul>
 
       <h3>常见错误排查</h3>
       <ul>
@@ -243,7 +303,8 @@ key:enter</pre>
         <li><b>Linux / macOS 下按键无效</b>：<code>keyboard</code> 需要 root 权限（<code>sudo python app.py</code>）；不便提权时改用「执行命令」。</li>
         <li><b>网址没打开</b>：<code>url:</code> 后面必须带 <code>http://</code> 或 <code>https://</code>。</li>
         <li><b>指定的浏览器没生效</b>：<code>browser:</code> 只认 <code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>；未安装或名字不认识时日志里会记录原因，并按默认浏览器打开，宏继续执行。</li>
-        <li><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法。</li>
+        <li><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法；中文或符号改用 <code>paste:</code>。</li>
+        <li><b><code>paste:</code> 没反应或只粘贴了旧内容</b>：看日志有没有「剪贴板不可用，paste 步骤跳过」；Linux 需安装 <code>xclip</code>（X11）或 <code>wl-copy</code>（Wayland），或用图形界面下的 tkinter 回退。密码框里仍无效时按上面「密码框输入无效怎么办」逐条排查。</li>
       </ul>
     </div>
   </div>

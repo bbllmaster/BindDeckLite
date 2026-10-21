@@ -1,5 +1,29 @@
 # Changelog
 
+## 宏输入可靠性（逐字符延迟 / `paste:` / `url:` 前台）— 2026-10-21（WS-353）
+
+- **`text:` 逐字符延迟**：`text:` 步骤改为 `kb.write(value, delay=0.02)`（默认每
+  字符 20 ms），解决 Electron 应用、远程桌面、慢客户端丢字符的问题；新增
+  `text!<延迟毫秒>:<文本>`（如 `text!80:pass`）按步骤覆盖，`text!0:` 等于关闭
+  延迟；未写延迟时行为与旧版一致，`delay` 上限 5 秒防止误写。
+- **新增 `paste:<文本>` 步骤**：写系统剪贴板后发送 `Ctrl+V`（macOS `Cmd+V`），
+  让目标程序以一次文本粘贴接收内容，规避键盘布局 / 输入法导致的非 ASCII 与
+  符号错位。后端：Windows 用 `ctypes` 调 `OpenClipboard` / `SetClipboardData`
+  （不新增依赖），macOS `pbcopy` / `pbpaste`，Linux `xclip` / `xsel` / `wl-copy`，
+  最后回退 tkinter（X11 下 Tk 需在粘贴期间持有 selection，因此根窗口延后销毁）。
+  剪贴板不可用时写 `level=error` 事件「剪贴板不可用，paste 步骤跳过」并回退
+  `keyboard.write()`，宏不中断；粘贴后约 0.4 秒恢复原剪贴板文本，且仅当剪贴板
+  仍为本步内容（避免覆盖用户期间新复制的内容）。
+- **`url:` 后前台保障**：Windows 下 `url:` 打开后最多等 3 秒让浏览器窗口进入
+  前台（已是前台立即返回），超时后对最上层浏览器窗口调 `SetForegroundWindow`；
+  macOS / Linux 不做处理，`wait:` 语义不变。
+- **前端**：`parseMacro()` / `formatMacro()` 支持 `paste:` 与 `text!<ms>:` 往返
+  （未写延迟的 `text:` 仍序列化为 `text:xxx`），宏输入框 placeholder 更新；
+  帮助浮层新增「密码框输入无效怎么办」章节（原因表 / 推荐写法 / 管理员权限 /
+  无法绕过的场景 / 剪贴板说明），README 宏语法表同步。
+- 不引入 Playwright / Selenium，不改 `CFG:` / `CMD:` 协议与固件，`key:` /
+  `wait:` / `browser:` / `url:` 语义不变。
+
 ## 宏指定浏览器（`browser:` 步骤）— 2026-10-21（WS-340）
 
 - **新增 `browser:<name>` 宏步骤**：可选 `chrome` / `firefox` / `edge` /

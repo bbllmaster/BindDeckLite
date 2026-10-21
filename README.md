@@ -188,9 +188,11 @@ build.bat
 | 打开网址 | 默认浏览器 |
 | 执行命令 | `shell=True`，请只填可信命令 |
 | 媒体键 | 音量 / 播放 / 上下曲（需 `keyboard`） |
-| 宏 | 每行一步：`key:ctrl+alt+t`、`text:hello`、`wait:200`、`url:https://…`、`browser:chrome`（指定后续 `url:` 用 Chrome / Firefox / Edge / Safari，未安装时回退默认浏览器）；键名可用 `Tab` / `PageUp` / `LCtrl` 等界面名称（对照表见上位机右上角「帮助」） |
+| 宏 | 每行一步：`key:ctrl+alt+t`、`text:hello`（逐字符，默认 20ms 间隔）、`text!80:hello`（自定义逐字符延迟毫秒）、`paste:文本`（走剪贴板 + Ctrl/Cmd+V，中文/符号/密码框用这个）、`wait:200`、`url:https://…`、`browser:chrome`（指定后续 `url:` 用 Chrome / Firefox / Edge / Safari，未安装时回退默认浏览器）；键名可用 `Tab` / `PageUp` / `LCtrl` 等界面名称（对照表见上位机右上角「帮助」） |
 
 > 上位机动作默认开启，可在右上角关闭；关闭后设备仍然正常发 HID 键。
+
+> `paste:` 的剪贴板后端：Windows 用 ctypes 直接调 Win32 剪贴板 API（无新增依赖），macOS 用 `pbcopy` / `pbpaste`，Linux 依次尝试 `xclip` / `xsel` / `wl-copy`，都没有时回退 tkinter（需图形界面）；仍不可用时日志写「剪贴板不可用，paste 步骤跳过」并回退成逐字符输入，宏不会中断。粘贴后约 0.4 秒恢复原剪贴板里的文本内容（图片等非文本内容无法恢复）。
 
 ## 目录结构
 
