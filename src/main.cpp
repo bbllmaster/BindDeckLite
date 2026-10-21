@@ -47,7 +47,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.1"   // WS-336: CMD:GET_CFG replies were coalesced on BLE
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -706,6 +706,13 @@ static void processCommand(String data) {
     for (int i = 0; i < NUM_INPUTS; i++) { if (i) keys += ","; keys += String(buttonKeys[i]); }
     String pins;
     for (int i = 0; i < NUM_BUTTONS; i++) { if (i) pins += ","; pins += String(buttonPins[i]); }
+    // WS-336: one compact console line with the five values that go out, so a
+    // "设备未回报该字段" report can be checked against what the deck actually
+    // held without a BLE sniffer. Logging happens before the notifications so
+    // the line is on the CDC console even if a notify fails.
+    log_e("[cfg] GET_CFG -> keys=%s pins=%s enc=%d sleep=%d,%lu tz=%s",
+          keys.c_str(), pins.c_str(), encMode, (int)sleepEnabled,
+          (unsigned long)(sleepTimeoutMs / 60000UL), tzString);
     sendToHost("CFG_KEYS:" + keys);
     sendToHost("CFG_PINS:" + pins);
     sendToHost("CFG_ENC:" + String(encMode));

@@ -1,5 +1,18 @@
 # Changelog
 
+## CMD:GET_CFG 回读修复 — 2026-10-21（WS-336）
+
+- **根因**：`BleConfigService::notify()` 用的是 `setValue()` + 无参 `notify()`，走 NimBLE
+  的 `ble_gatts_chr_updated()`：每条连接对这个特性只有一个「值已变更」标志，真正发送
+  时才去读特性的**当前**值。`CMD:GET_CFG` 在同一个 BLE 写入回调里连发 5 条 `CFG_*`，
+  全部在主机任务处理「待发通知」事件之前压在同一个标志上，结果只发出最后一条
+  （`CFG_TZ`），上位机把其余 4 个字段判为「设备未回报该字段」。与芯片/分区表无关，
+  四个 env 都受影响，只是 16 MB merged 包最先被这样测到。
+- **修复**：改走带 payload 的 `NimBLECharacteristic::notify(value, len, conn)`，逐连接
+  直接下发 ATT 通知，一条一个包，不再合并；发送失败写一行 CDC 日志。
+- **诊断**：`CMD:GET_CFG` 处理中增加一行串口日志，打印实际回读的 5 个字段。
+- 版本 1.3.1；四个固件 env 编译通过；16 MB merged / OTA 包重新构建。
+
 ## 上位机 OTA — 2026-10-21（WS-328）
 
 - **复审修复**：OTA 期间 CFG RX 特性原先把所有写入都当固件数据，导致

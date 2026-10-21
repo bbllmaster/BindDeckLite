@@ -4,6 +4,7 @@ BleConfigService bleConfig;
 
 #include <NimBLEDevice.h>
 #include <esp_log.h>
+#include <vector>   // NimBLEServer::getPeerDevices() (WS-336)
 
 // Distinguish a CFG:/CMD: text line from raw firmware bytes while OTA is
 // active. Firmware chunks start with 0xE9 (ESP image magic) and are binary,
@@ -101,8 +102,35 @@ bool BleConfigService::begin(NimBLEServer* server) {
 void BleConfigService::notify(const String& data) {
   NimBLECharacteristic* tx = (NimBLECharacteristic*)_tx;
   if (!tx || data.length() == 0) return;
+
+  // The value is cached first so a GATT read of the TX characteristic still
+  // returns the last line that was sent.
   tx->setValue((const uint8_t*)data.c_str(), data.length());
-  tx->notify();
+
+  NimBLEServer* server = NimBLEDevice::getServer();
+  if (!server) return;
+  std::vector<uint16_t> peers = server->getPeerDevices();
+  if (peers.empty()) return;
+
+  // WS-336: do NOT use tx->notify() (the no-argument form). That path calls
+  // ble_gatts_chr_updated(), which only sets ONE "value changed" flag per
+  // (connection, characteristic) and reads the characteristic's current value
+  // when the NimBLE host task finally runs the pending-notification event.
+  // Several sendToHost() calls made inside one write callback therefore
+  // collapse into a single notification carrying the LAST value — exactly what
+  // broke CMD:GET_CFG, whose five CFG_* lines are emitted back to back (the
+  // host only ever saw the final CFG_TZ line and reported the other four
+  // fields as "设备未回报该字段").
+  //
+  // Passing the payload explicitly takes the ble_gatts_notify_custom() path:
+  // one ATT notification per call, queued in order, no coalescing.
+  const uint8_t* payload = (const uint8_t*)data.c_str();
+  const size_t   len     = data.length();
+  for (uint16_t conn : peers) {
+    if (!tx->notify(payload, len, conn)) {
+      ESP_LOGE("BIND", "[cfg] notify failed conn=0x%04X len=%u", conn, (unsigned)len);
+    }
+  }
 }
 
 bool BleConfigService::subscribed() {
