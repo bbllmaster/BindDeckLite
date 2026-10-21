@@ -24,6 +24,25 @@
 - 不引入 Playwright / Selenium，不改 `CFG:` / `CMD:` 协议与固件，`key:` /
   `wait:` / `browser:` / `url:` 语义不变。
 
+## 宏指定浏览器在 Windows 生效（`browser:` 修复）— 2026-10-21（WS-345）
+
+- **根因**：`resolve_macro_browser()` 用 `webbrowser.get(alias)` 找浏览器，Windows 上
+  Chrome（尤其 `%LOCALAPPDATA%` 的 per-user 安装）常常不在 `webbrowser` 的注册表列表
+  里，抛错后静默 `webbrowser.open()` 回退，于是 `browser:chrome` 打开了 Edge；失败
+  信息只 `print()` 到 stdout，desktop 模式（无控制台）下完全不可见。
+- **修复（Windows）**：新增 `_windows_browser_exe()`，先查注册表 `App Paths`
+  （HKLM → HKCU，读默认值），再查标准安装路径（Chrome / Edge / Firefox 的
+  `%PROGRAMFILES%`、`%PROGRAMFILES(X86)%`、`%LOCALAPPDATA%`），命中后用
+  `subprocess.Popen([exe, url])` 直接启动，不经过 shell，也不再走 `webbrowser.get()`。
+- **修复（Linux / macOS）**：先 `shutil.which()` 找可执行文件并直接 `Popen`，找不到再
+  退回原有 `webbrowser.get(alias)`，`run.sh` 用法不变。
+- **失败可见**：解析失败写 `level=error` 事件「未找到浏览器 chrome，已回退默认浏览器」；
+  打开失败写 `level=error` 事件并带原因；成功写 `level=ok` 事件「已用 Chrome 打开 …」。
+  `run_action()` 结果新增 `browser_used`，`/api/action/test` 返回并在前端 toast 里显示
+  实际使用的浏览器。
+- `browser:safari` 在 Windows 明确报「Windows 不支持 Safari」，不再静默落到 Edge。
+- 不改宏语法、不改 `CFG:` / `CMD:` 协议、不动固件；无 `browser:` 步骤的宏行为不变。
+
 ## 宏指定浏览器（`browser:` 步骤）— 2026-10-21（WS-340）
 
 - **新增 `browser:<name>` 宏步骤**：可选 `chrome` / `firefox` / `edge` /
