@@ -32,6 +32,7 @@ const MACRO_KEY_HINT =
 const state = {
   devices: [],
   selected: null,
+  selectedConnected: false,
   cfg: null,
   keycodes: [],
   logSeq: 0,
@@ -95,6 +96,10 @@ async function pollStatus() {
     }
 
     const sel = state.devices.find((d) => d.dev_id === state.selected);
+    // 设备断开后，上一次的配置结果已经无法再操作，直接收起浮层。
+    const nowConnected = !!(sel && sel.connected);
+    if (state.selectedConnected && !nowConnected) clearApplyResults();
+    state.selectedConnected = nowConnected;
     const connected = state.devices.filter((d) => d.connected).length;
     if (sel) {
       $("#statusDot").className = "dot " + (sel.connected ? "ok" : "warn");
@@ -139,6 +144,8 @@ function renderDevices() {
 }
 
 async function selectDevice(devId) {
+  // 切换设备：上一台设备的结果浮层不再适用。
+  clearApplyResults();
   state.selected = devId;
   state.preview = false;
   localStorage.setItem("binddecklite.device", devId);
@@ -582,7 +589,7 @@ async function applyConfig() {
         toast("配置已生效", "ok");
         setDirty(false);
       } else {
-        toast("部分配置未生效，请查看下方结果", "bad");
+        toast("部分配置未生效，请查看右上角结果", "bad");
         // Keep dirty — the button stays "应用配置 •" until everything is ok.
       }
       return;
@@ -600,18 +607,107 @@ async function applyConfig() {
   }
 }
 
-function clearApplyResults() {
-  const existing = $("#applyResults");
-  if (existing) existing.remove();
+/* ---------------- apply results overlay ---------------- */
+
+// 全部生效时浮层自动消失的时长；鼠标悬停或键盘聚焦时暂停计时。
+const APPLY_AUTOCLOSE_MS = 5000;
+// 与 style.css 中 .apply-results 的过渡时长保持一致。
+const APPLY_FADE_MS = 200;
+
+// 自动消失计时状态：deadline 为绝对时间戳，remaining 是暂停时刻的剩余毫秒。
+let applyTimer = null;
+let applyDeadline = 0;
+let applyRemaining = 0;
+
+function stopApplyTimer() {
+  if (applyTimer !== null) {
+    clearTimeout(applyTimer);
+    applyTimer = null;
+  }
+}
+
+function startApplyTimer(ms) {
+  stopApplyTimer();
+  if (ms <= 0) return;
+  applyDeadline = Date.now() + ms;
+  applyTimer = setTimeout(dismissApplyResults, ms);
+}
+
+function pauseApplyTimer() {
+  if (applyTimer === null) return;
+  applyRemaining = Math.max(0, applyDeadline - Date.now());
+  stopApplyTimer();
+}
+
+function resumeApplyTimer() {
+  if (applyTimer === null && applyRemaining > 0) startApplyTimer(applyRemaining);
+}
+
+function clearFieldHighlights() {
   $$(".field-highlight").forEach((el) => el.classList.remove("field-highlight"));
 }
 
+function clearApplyResults() {
+  stopApplyTimer();
+  applyRemaining = 0;
+  const existing = $("#applyResults");
+  if (existing) existing.remove();
+  clearFieldHighlights();
+}
+
+// 自动消失：先淡出，再移除节点。若期间被新的结果替换或手动关闭，
+// 节点已不在文档中，这里直接放弃，避免清掉新浮层的字段高亮。
+function dismissApplyResults() {
+  stopApplyTimer();
+  applyRemaining = 0;
+  const el = $("#applyResults");
+  if (!el) {
+    clearFieldHighlights();
+    return;
+  }
+  el.classList.add("leaving");
+  setTimeout(() => {
+    if (!el.isConnected) return;
+    el.remove();
+    clearFieldHighlights();
+  }, APPLY_FADE_MS);
+}
+
+// 浮层固定定位，top 跟随顶部栏的实际底边：窄窗口下顶部栏会换行变高，
+// 所以每次尺寸变化都重新测量，而不是写死一个数值。
+function positionApplyResults() {
+  const el = $("#applyResults");
+  if (!el) return;
+  const bar = $(".topbar");
+  el.style.top = bar ? Math.round(bar.getBoundingClientRect().bottom + 8) + "px" : "16px";
+}
+
 function renderApplyResults(items) {
+  // 重复应用配置时先清掉上一份，避免浮层叠加。
   clearApplyResults();
+
+  const allOk = items.every((item) => item.status === "ok");
 
   const container = document.createElement("div");
   container.id = "applyResults";
   container.className = "apply-results";
+  container.setAttribute("role", "status");
+  container.setAttribute("aria-live", "polite");
+
+  const head = document.createElement("div");
+  head.className = "apply-results-head";
+  const title = document.createElement("span");
+  title.textContent = allOk ? "配置结果 · 全部已生效" : "配置结果 · 有项目未生效";
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "apply-results-close";
+  closeBtn.textContent = "×";
+  closeBtn.title = "关闭（Esc）";
+  closeBtn.setAttribute("aria-label", "关闭配置结果");
+  closeBtn.onclick = clearApplyResults;
+  head.appendChild(title);
+  head.appendChild(closeBtn);
+  container.appendChild(head);
 
   items.forEach((item) => {
     const row = document.createElement("div");
@@ -646,14 +742,25 @@ function renderApplyResults(items) {
     container.appendChild(row);
   });
 
-  // Insert right below the apply button.
-  const btn = $("#btnApply");
-  btn.parentNode.insertBefore(container, btn.nextSibling);
+  // 浮层挂在 body 上并脱离文档流，不占用顶部栏的布局空间。
+  document.body.appendChild(container);
+  positionApplyResults();
 
   // Highlight the form fields whose value was rejected.
   items.forEach((item) => {
     if (item.status === "rejected") highlightFormField(item.field);
   });
+
+  // 全部生效 → 5 秒后自动淡出，悬停 / 聚焦期间暂停；有未生效项 → 常驻，
+  // 由用户点 × 或按 Esc 关闭。
+  if (allOk) {
+    applyRemaining = APPLY_AUTOCLOSE_MS;
+    startApplyTimer(APPLY_AUTOCLOSE_MS);
+    container.addEventListener("mouseenter", pauseApplyTimer);
+    container.addEventListener("mouseleave", resumeApplyTimer);
+    container.addEventListener("focusin", pauseApplyTimer);
+    container.addEventListener("focusout", resumeApplyTimer);
+  }
 }
 
 function highlightFormField(field) {
@@ -848,13 +955,33 @@ function bindHelp() {
     if (e.target === modal) close();
   };
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) close();
+    if (e.key !== "Escape" || modal.hidden) return;
+    close();
+    // 帮助浮层打开时 Esc 只关它自己：阻止 document 上后续的 Esc 监听
+    //（配置结果浮层）在同一事件里继续触发。
+    e.stopImmediatePropagation();
+  });
+}
+
+/* 配置结果浮层：窗口尺寸变化时重新定位（顶部栏在窄窗口会换行变高），
+   并按 Esc 关闭（帮助弹层打开时先让弹层处理）。 */
+function bindApplyResults() {
+  window.addEventListener("resize", positionApplyResults);
+  // 页面卸载 / 跳转前显式回收浮层与自动消失定时器。
+  window.addEventListener("beforeunload", clearApplyResults);
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !$("#applyResults")) return;
+    // 兜底：即使帮助浮层的监听没有阻止冒泡，也不连带关掉结果浮层。
+    const modal = $("#helpModal");
+    if (modal && !modal.hidden) return;
+    clearApplyResults();
   });
 }
 
 async function init() {
   bindTabs();
   bindHelp();
+  bindApplyResults();
   try {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;
