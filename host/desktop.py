@@ -469,7 +469,8 @@ def _serve_headless(server, flask_thread, url, use_tray):
 
 
 def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
-                use_tray: bool = True, log_path: str = "") -> int:
+                use_tray: bool = True, log_path: str = "",
+                close_ref: dict | None = None) -> int:
     """Serve Flask behind a native pywebview window — the real desktop app.
 
     Unlike ``run_desktop`` (tray + browser), this renders the existing Web UI
@@ -477,6 +478,12 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     window on the main thread and ``webview.start()`` blocks until it closes.
     Closing the window exits the app; with a tray available the window
     minimises to the tray instead.
+
+    ``close_ref`` is a mutable ``{"behavior": "minimize" | "exit"}`` dict that
+    the caller (``app.py``) owns and updates through the settings API.  The
+    ``_on_closing`` closure reads it at close time so a setting change takes
+    effect immediately without restarting the app.  When omitted it defaults
+    to a local ``{"behavior": "minimize"}`` dict (static minimize-to-tray).
 
     When pywebview or its GUI backend is unavailable (headless Linux, or
     Windows without pythonnet) it falls back to ``_serve_headless`` so
@@ -547,13 +554,21 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
 
     window_ref[0] = window
 
+    if close_ref is None:
+        close_ref = {"behavior": "minimize"}
+
     def _on_closing(win):
         """Fired when the user hits the window close button.
 
         Return False to cancel the close (minimize to tray), True to allow it.
         pywebview's WinForms backend runs this on the GUI thread, so hiding the
         window here is safe and immediate.
+
+        ``close_ref`` is read at close time so the user can switch the behavior
+        at runtime through the settings page without restarting the app.
         """
+        if close_ref["behavior"] == "exit":
+            return True
         if not state["force_quit"] and use_tray:
             try:
                 win.hide()

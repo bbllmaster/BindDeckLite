@@ -99,6 +99,12 @@ PORT = int(os.environ.get("BINDDECKLITE_PORT", "8788"))
 # Same vendor service as the firmware's ble_config.cpp (shared protocol).
 CONTROL_SERVICE = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
 
+# Mutable reference for the running webview's close-button behavior.  The
+# ``_on_closing`` closure in ``desktop.run_webview`` reads this dict instead of
+# capturing a plain string, so a setting change through the settings page takes
+# effect immediately without restarting the app.
+_close_behavior_ref = {"behavior": "minimize"}
+
 app = Flask(__name__,
             static_folder=os.path.join(RESOURCE_ROOT, "static"),
             template_folder=os.path.join(RESOURCE_ROOT, "templates"))
@@ -114,6 +120,7 @@ _config = {"devices": {}, "settings": {
     "actions_enabled": True,
     "udp_fallback": True,
     "start_minimized": True,
+    "close_button_behavior": "minimize",
     "recent_paths": [],
 }}
 
@@ -873,6 +880,7 @@ def desktop_payload() -> dict:
     with _lock:
         recent = list(_config["settings"].get("recent_paths") or [])
         start_minimized = bool(_config["settings"].get("start_minimized", True))
+        close_behavior = _config["settings"].get("close_button_behavior", "minimize")
     return {
         "platform": sys.platform,
         "frozen": desktop.is_frozen(),
@@ -882,6 +890,7 @@ def desktop_payload() -> dict:
         "error": desktop.STATE.get("error") or "",
         "autostart": autostart.status(),
         "start_minimized": start_minimized,
+        "close_button_behavior": close_behavior,
         "recent_paths": recent,
     }
 
@@ -901,6 +910,17 @@ def api_desktop():
                 if not result.get("ok"):
                     add_event("desktop", "重写自启动条目失败: " + str(result.get("error", "?")),
                               level="warn")
+        if "close_button_behavior" in data:
+            value = str(data["close_button_behavior"])
+            if value not in ("minimize", "exit"):
+                value = "minimize"
+            with _lock:
+                _config["settings"]["close_button_behavior"] = value
+            _close_behavior_ref["behavior"] = value
+            save_config()
+            add_event("desktop",
+                      "关闭按钮行为已设为 " + ("最小化到托盘" if value == "minimize" else "直接退出"),
+                      level="ok")
         if "autostart" in data:
             want = bool(data["autostart"])
             with _lock:
@@ -992,9 +1012,11 @@ def main(argv=None):
     print(f"[app] BindDeckLite host running at {url}")
 
     if desktop_mode:
+        _close_behavior_ref["behavior"] = _config["settings"].get("close_button_behavior", "minimize")
         return desktop.run_webview(app, PORT, url,
                                    start_minimized=bool(args.minimized),
                                    use_tray=not args.no_tray,
+                                   close_ref=_close_behavior_ref,
                                    log_path=os.path.join(DATA_DIR, "host.log"))
 
     if os.environ.get("BINDDECKLITE_NO_BROWSER") != "1":
