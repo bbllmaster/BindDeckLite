@@ -1,5 +1,20 @@
 # Changelog
 
+## 宏指定浏览器（`browser:` 步骤）— 2026-10-21（WS-340）
+
+- **新增 `browser:<name>` 宏步骤**：可选 `chrome` / `firefox` / `edge` /
+  `safari` / `default`（不区分大小写），只影响其后的 `url:` 步骤；不写或写
+  `default` 时沿用 `webbrowser.open()`，现有宏行为不变。
+- **跨平台别名**：`browser:chrome` 依次尝试 `chrome` / `google-chrome` /
+  `chromium` / `chromium-browser`，Firefox 兼容 `mozilla`，Edge 兼容
+  `msedge` / `microsoft-edge`，以覆盖 Python `webbrowser` 在 Linux / Windows /
+  macOS 上不同的注册名。
+- **失败回退**：浏览器未安装、名字不认识或控制器打开失败时记录 `[app]` 日志
+  并回退默认浏览器，后续 `text:` / `key:` / `wait:` 步骤继续执行，宏不中断。
+- **前端**：`parseMacro()` / `formatMacro()` 支持 `browser:` 序列化与反序列化，
+  宏输入框 placeholder、帮助浮层语法表、登录示例与 README 同步更新。无新增
+  依赖，不改固件与 `CFG:` / `CMD:` 协议。
+
 ## CMD:GET_CFG 回读修复 — 2026-10-21（WS-336）
 
 - **根因**：`BleConfigService::notify()` 用的是 `setValue()` + 无参 `notify()`，走 NimBLE

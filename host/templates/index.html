@@ -197,7 +197,8 @@
           <tr><td><code>key:Tab</code></td><td>发送一个按键或组合键；修饰键用 <code>+</code> 连接，如 <code>key:ctrl+alt+t</code></td></tr>
           <tr><td><code>text:hello</code></td><td>逐字符输入文本</td></tr>
           <tr><td><code>wait:500</code></td><td>等待 500 毫秒（单位毫秒）</td></tr>
-          <tr><td><code>url:https://example.com</code></td><td>用默认浏览器打开网址</td></tr>
+          <tr><td><code>browser:chrome</code></td><td>指定后续 <code>url:</code> 用哪个浏览器打开：<code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>（不区分大小写）；浏览器未安装时自动回退默认浏览器</td></tr>
+          <tr><td><code>url:https://example.com</code></td><td>打开网址：上面有 <code>browser:</code> 用指定浏览器，否则用默认浏览器</td></tr>
           <tr><td>无前缀行</td><td>按 <code>key:</code> 处理，例如单独一行 <code>enter</code></td></tr>
         </tbody>
       </table>
@@ -221,15 +222,16 @@
         </tbody>
       </table>
 
-      <h3>完整示例：打开页面并登录</h3>
-      <pre class="help-code">url:https://example.com/login
+      <h3>完整示例：用 Chrome 打开页面并登录</h3>
+      <pre class="help-code">browser:chrome
+url:https://example.com/login
 wait:1500
 key:tab
 text:my-user
 key:tab
 text:my-password
 key:enter</pre>
-      <p>先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
+      <p><code>browser:</code> 只影响它后面的 <code>url:</code> 步骤，可以写在宏的任意位置；不写就用系统默认浏览器。先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
 
       <h3>常见错误排查</h3>
       <ul>
@@ -240,6 +242,7 @@ key:enter</pre>
         <li><b>目标程序收不到按键</b>：目标程序以管理员身份运行时，上位机也要以管理员身份运行。</li>
         <li><b>Linux / macOS 下按键无效</b>：<code>keyboard</code> 需要 root 权限（<code>sudo python app.py</code>）；不便提权时改用「执行命令」。</li>
         <li><b>网址没打开</b>：<code>url:</code> 后面必须带 <code>http://</code> 或 <code>https://</code>。</li>
+        <li><b>指定的浏览器没生效</b>：<code>browser:</code> 只认 <code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>；未安装或名字不认识时日志里会记录原因，并按默认浏览器打开，宏继续执行。</li>
         <li><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法。</li>
       </ul>
     </div>
