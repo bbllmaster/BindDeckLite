@@ -703,6 +703,11 @@ def run_action(action: dict) -> dict:
                     kb.write(step.get("value", ""))
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                elif st == "url":
+                    url = step.get("value", "")
+                    if not url:
+                        continue
+                    webbrowser.open(url)
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",

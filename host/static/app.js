@@ -243,7 +243,7 @@ function renderActionInput(holder, item, card) {
     const ta = document.createElement("textarea");
     ta.className = "in-val macro";
     ta.rows = 3;
-    ta.placeholder = "key:ctrl+alt+t\nwait:200\ntext:Hello";
+    ta.placeholder = "url:https://example.com/login\nwait:1500\ntext:username\nkey:tab\ntext:password\nkey:enter";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
       action.macro = parseMacro(ta.value);
@@ -318,6 +318,7 @@ function formatMacro(steps) {
     .map((s) => {
       if (s.type === "delay") return "wait:" + (s.value || 0);
       if (s.type === "text") return "text:" + (s.value || "");
+      if (s.type === "url") return "url:" + (s.value || "");
       return "key:" + (s.value || "");
     })
     .join("\n");
@@ -335,6 +336,7 @@ function parseMacro(text) {
       const value = line.slice(i + 1).trim();
       if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
       if (kind === "text") return { type: "text", value };
+      if (kind === "url") return { type: "url", value };
       return { type: "key", value: line };
     });
 }
