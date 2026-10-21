@@ -213,7 +213,10 @@ function renderKeys() {
       try {
         const r = await api(`/api/action/test/${encodeURIComponent(state.selected)}/${i}`, { method: "POST" });
         if (r.ok) {
-          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type), "ok");
+          // Show which browser a macro actually used, so a silent fallback to
+          // the system default is visible instead of surprising.
+          const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
+          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type) + used, "ok");
         } else {
           toast("动作执行失败：" + (r.error || "未知错误"), "bad");
         }
