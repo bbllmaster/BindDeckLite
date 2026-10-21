@@ -151,6 +151,62 @@ KEY_CODES = [
 KEY_CODES += [(chr(c), c) for c in range(ord("A"), ord("Z") + 1)]
 KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
 
+# --- macro key names ------------------------------------------------------
+# ``key:`` macro steps are written with the names the UI shows in the HID key
+# list, but the ``keyboard`` library spells several of them differently
+# ("page up", "right ctrl", ...). Normalise before sending so ``key:PageUp``
+# and ``key:RCtrl`` behave like the lowercase names users already write.
+# Keys are lowercase looked-up names; values are ``keyboard`` names.
+MACRO_KEY_NAMES = {
+    "tab": "tab",
+    "enter": "enter", "return": "enter",
+    "esc": "esc", "escape": "esc",
+    "space": "space",
+    "backspace": "backspace",
+    "insert": "insert", "ins": "insert",
+    "delete": "delete", "del": "delete",
+    "home": "home", "end": "end",
+    "pageup": "page up", "pgup": "page up",
+    "pagedown": "page down", "pgdn": "page down",
+    "left": "left", "right": "right", "up": "up", "down": "down",
+    "lctrl": "ctrl", "ctrl": "ctrl", "control": "ctrl",
+    "rctrl": "right ctrl",
+    "lshift": "shift", "shift": "shift",
+    "rshift": "right shift",
+    "lalt": "alt", "alt": "alt",
+    "ralt": "right alt", "altgr": "right alt",
+    "lwin": "win", "win": "win",
+    "rwin": "right win",
+}
+# F1–F12 use the same lowercase name in the ``keyboard`` library. F13–F24 are
+# deliberately absent: they are outside KEY_CODES and go through unchanged, as
+# do single letters, digits and any name this table does not know.
+MACRO_KEY_NAMES.update({f"f{i}": f"f{i}" for i in range(1, 13)})
+
+
+def _macro_key_token(token: str) -> str:
+    """Map one key name (no ``+`` separator) to its ``keyboard`` spelling."""
+    key = token.strip()
+    if not key:
+        return key
+    return MACRO_KEY_NAMES.get(key.lower(), key)
+
+
+def macro_key_name(value: str) -> str:
+    """Normalise a ``key:`` step before handing it to ``keyboard.send()``.
+
+    Combos (``ctrl+alt+t``) are normalised token by token and joined back with
+    ``+``; a bare ``+`` stays a ``+``. Anything unknown keeps its original
+    spelling so existing macros are unaffected.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+    parts = raw.split("+")
+    if len(parts) == 1:
+        return _macro_key_token(raw)
+    return "+".join(_macro_key_token(p) for p in parts)
+
 
 # --- apply readback -------------------------------------------------------
 # Per-device apply operation state, isolating one apply from another. The BLE
@@ -818,7 +874,9 @@ def run_action(action: dict) -> dict:
             for step in action.get("macro", []):
                 st = step.get("type")
                 if st == "key":
-                    kb.send(step.get("value", ""))
+                    # 宏里可以写界面上的键名（PageUp / RCtrl / Tab ...），
+                    # 这里统一换成 keyboard 库认识的写法。
+                    kb.send(macro_key_name(step.get("value", "")))
                 elif st == "text":
                     kb.write(step.get("value", ""))
                 elif st == "delay":

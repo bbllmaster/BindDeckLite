@@ -1,5 +1,21 @@
 # Changelog
 
+## 上位机体验修复（日志复制 / 宏键名 / 帮助）— 2026-10-21（WS-332）
+
+- **日志复制**：日志页每行右侧新增「复制」按钮，点击把「时间 [类型] 内容」
+  完整写入剪贴板；优先 `navigator.clipboard.writeText()`，不可用时降级为
+  隐藏 textarea + `document.execCommand('copy')`。日志轮询、清空与 300 行上限不变。
+- **宏键名映射**：`run_action()` 的 `key:` 步骤先经 `macro_key_name()` 归一化
+  （`Tab`→`tab`、`PageUp`→`page up`、`RCtrl`→`right ctrl`、`F1`–`F12`→`f1`–`f12`
+  等），组合键逐段处理（`key:LCtrl+Tab` → `ctrl+tab`）；单个字母/数字、
+  F13–F24 以及未知键名保持原样，旧宏行为不变，未知键名仍由 `keyboard` 库
+  报错并经动作日志 / toast 提示。宏输入框 placeholder 补充支持的键名列表。
+- **宏帮助**：右上角新增「帮助」入口，浮层包含 `key:` / `text:` / `wait:` /
+  `url:` 语法说明、键名对照表、完整登录示例与常见错误排查；Esc、遮罩点击或
+  右上角关闭，打开时锁定页面滚动，不请求后端、不影响现有布局与轮询。
+- 涉及 `host/app.py` / `host/static/app.js` / `host/static/style.css` /
+  `host/templates/index.html`，无新增依赖；Linux / macOS 的 `run.sh` 用法不变。
+
 ## 上位机 OTA — 2026-10-21（WS-328）
 
 - **复审修复**：OTA 期间 CFG RX 特性原先把所有写入都当固件数据，导致
