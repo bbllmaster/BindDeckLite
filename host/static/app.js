@@ -435,6 +435,8 @@ function renderDesktop() {
   toggle.checked = !!auto.enabled;
   toggle.disabled = !auto.supported;
   $("#minimizedToggle").checked = !!d.start_minimized;
+  // close_button_behavior: "minimize" (default) → checked, "exit" → unchecked
+  $("#closeMinimizeToggle").checked = (d.close_button_behavior || "minimize") === "minimize";
   $("#btnQuitHost").hidden = !d.desktop_mode;
 
   const bits = [];
@@ -750,6 +752,20 @@ async function init() {
       toast(want ? "开机启动时收进托盘" : "开机启动时打开控制台");
     } catch (err) {
       target.checked = !want;
+      toast(err.message, "bad");
+    } finally {
+      target.disabled = false;
+    }
+  };
+  $("#closeMinimizeToggle").onchange = async (e) => {
+    const target = e.target;
+    const minimize = target.checked;
+    target.disabled = true;
+    try {
+      await updateDesktop({ close_button_behavior: minimize ? "minimize" : "exit" });
+      toast(minimize ? "关闭窗口将最小化到托盘" : "关闭窗口将直接退出应用");
+    } catch (err) {
+      target.checked = !minimize;
       toast(err.message, "bad");
     } finally {
       target.disabled = false;
