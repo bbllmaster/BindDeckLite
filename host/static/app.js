@@ -22,6 +22,10 @@ const ACTION_TYPES = [
 
 const MEDIA_KEYS = ["volume up", "volume down", "volume mute", "play/pause", "next track", "previous track"];
 
+// 测试按钮空闲态的固定提示。执行中临时换成「仍在执行」，结束后恢复成这一句，
+// 而不是把 title 清空（WS-360 评审 nit）。
+const TEST_BTN_IDLE_TITLE = "立即执行这条上位机动作（不会发送 HID 键）";
+
 // 宏输入框 placeholder 里展示的键名列表（映射规则见 host/app.py 的
 // MACRO_KEY_NAMES）。这里只是提示，真正的归一化在主机端完成。
 const MACRO_KEY_HINT =
@@ -288,7 +292,9 @@ function setCardRunning(card, secs) {
   if (!btn) return;
   btn.disabled = live;
   btn.textContent = live ? "执行中…" : "测试动作";
-  btn.title = live ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略` : "";
+  btn.title = live
+    ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
+    : TEST_BTN_IDLE_TITLE;
 }
 
 function applyRunningState() {
