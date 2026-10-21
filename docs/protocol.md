@@ -35,6 +35,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CMD:PING` | | 链路探测 |
 | `CMD:REBOOT` | | 重启 |
 | `CMD:BOOT_CFG` | | 重启并进入配网 / OTA 模式 |
+| `CMD:CLEARBOND` | | 清除已绑定的 HID 主机（WS-321） |
+| `CMD:GET_BOND` | | 查询当前主机绑定状态（WS-321） |
 
 任何 `CFG:` 命令都会收到 `ACK:<原命令前 96 字节>`。
 
@@ -64,6 +66,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG_TZ:` | `CFG_TZ:CST-8` | `CMD:GET_CFG` 应答 |
 | `TZ_INFO:` | `TZ_INFO:CST-8` | `CMD:GET_TZ` 应答 |
 | `WIFI_INFO:` | `WIFI_INFO:home,192.168.1.42` | `CMD:GET_WIFI` 应答；未连接为 `DISCONNECTED,0.0.0.0` |
+| `BOND_STATUS:` | `BOND_STATUS:bound,A1:B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |
+| `BOND_STATUS:` | `BOND_STATUS:unbound` | `CMD:GET_BOND` 应答；未绑定任何主机 |
 
 ## HID 键码
 

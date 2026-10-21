@@ -111,6 +111,20 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 
 退出：长按编码器约 1 秒，或 5 分钟自动关闭 WiFi。BLE 在配网模式期间关闭（与热点共用 2.4G 射频），退出后自动恢复。
 
+### 主机绑定（WS-321）
+
+首个连接并订阅 HID 输入报告的主机会被**绑定**到设备：固件在 NVS 记录其 identity address（`peer_id_addr`，无效时用 `peer_ota_addr` 归一化），重启后仍然有效。绑定后只有该主机能发送 HID 按键；其他 central（手机等）的 HID 订阅会被拒绝，但同一连接上的 CFG 配置通道不受影响。
+
+三种清除方式：
+
+1. **上位机**：设备页「清除主机绑定」按钮，通过 `CMD:CLEARBOND` 下发；
+2. **上电长按**：按住编码器按压键 **5 秒**（与 0.2 秒配网、1.2 秒双击配网区分），只清除绑定、不进入配网；
+3. 设备恢复出厂（NVS 擦除）后自动解除。
+
+查询绑定状态用 `CMD:GET_BOND`，设备返回 `BOND_STATUS:bound,<脱敏地址>` 或 `BOND_STATUS:unbound`。地址只保留前两字节，完整 BLE 地址不会离开设备。
+
+清除是立即生效的：旧的已连接主机不会被强行断开（避免操作过程中键盘失效），但下一台发来 HID 订阅的主机会直接接管并成为新的绑定主机，不需要给设备重新上电。
+
 ### 串口协议
 
 经典 ESP32 的 USB 串口（115200）与 BLE CFG 服务、WiFi UDP 使用同一套行协议，详见 [docs/protocol.md](docs/protocol.md)。
@@ -138,7 +152,7 @@ python app.py
 浏览器自动打开 <http://127.0.0.1:8788>。
 
 - Windows 宏动作需要 `pip install keyboard`；未安装时宏与媒体键不可用，其他功能不受影响。
-- 设备同时只能被一个 BLE central 作为 HID 主机，配置通道是同一连接上的第二个 GATT 服务，不需要断开。
+- 设备同时只能被一个 BLE central 作为 HID 主机（首个订阅者被绑定，详见「主机绑定」一节）；配置通道是同一连接上的第二个 GATT 服务，不需要断开。
 - 上位机配置保存在 `host/config.json`（运行时生成，不入库）。
 
 ### Windows 桌面版（exe / 托盘 / 开机自启动）

@@ -384,6 +384,20 @@ function renderDeviceMeta() {
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
 
+  // WS-321: host binding status
+  const bond = state.cfg.bond || { bound: false, addr: "" };
+  const bondEl = $("#bondStatus");
+  const clearBtn = $("#btnClearBond");
+  if (bond.bound) {
+    bondEl.innerHTML = `<span class="dot ok"></span>已绑定 <b>${escapeHtml(bond.addr || "—")}</b>`;
+    clearBtn.hidden = false;
+    $("#bondHint").textContent = "只有已绑定的主机能发送 HID 按键；清除后任何主机均可接入。";
+  } else {
+    bondEl.innerHTML = `<span class="dot warn"></span>未绑定`;
+    clearBtn.hidden = true;
+    $("#bondHint").textContent = "首次 HID 订阅的主机会被绑定；按住编码器 5 秒也可清除。";
+  }
+
   const hint = chip === "C3" || chip === "ESP32C3"
     ? "C3 预设：按键 GPIO0-8、编码器按压 GPIO10、编码器 A/B=GPIO20/21；避开 11-17（Flash）与 18/19（USB）。"
     : "经典 ESP32：避开 6-11（Flash）与 34-39（仅输入）。编码器固定 18/19/5。";
@@ -798,6 +812,29 @@ async function init() {
   $("#btnRefresh").onclick = () => devAction("refresh", "已请求设备配置");
   $("#btnPortal").onclick = () => devAction("portal", "设备将重启进入配网模式");
   $("#btnReboot").onclick = () => devAction("reboot", "设备重启中");
+  // WS-321: clear the persisted host binding so a new central can take over.
+  $("#btnClearBond").onclick = async () => {
+    if (!state.selected) return;
+    if (!window.confirm("清除主机绑定后，任何主机都能控制键盘。确定要清除吗？")) return;
+    const btn = $("#btnClearBond");
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/device/${encodeURIComponent(state.selected)}/clearbond`, { method: "POST" });
+      if (r.sent === false) {
+        toast("指令未送出：设备未连接", "bad");
+        return;
+      }
+      toast("已发送清除绑定指令", "ok");
+      // The device ACKs on the same CFG channel; give it a moment then refresh.
+      setTimeout(() => {
+        if (state.selected) api(`/api/device/${encodeURIComponent(state.selected)}/refresh`, { method: "POST" });
+      }, 500);
+    } catch (e) {
+      toast("清除失败：" + (e.message || e), "bad");
+    } finally {
+      btn.disabled = false;
+    }
+  };
 
   const initialTab = new URLSearchParams(location.search).get("tab");
   if (initialTab) {

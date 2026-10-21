@@ -1,5 +1,18 @@
 # Changelog
 
+## 主机绑定 — 2026-10-21（WS-321）
+
+- **固件**：`src/nimble_hid.cpp` 新增 NVS `hostAddr`（6B）+ `hostBound`（bool），
+  首个 HID 订阅时记录 identity address（`peer_id_addr`，无效用 `peer_ota_addr`
+  归一化）；已绑定且地址不同的 central 拒绝 HID 订阅，日志打印
+  `[ble] reject non-bound host ...`；同一地址的 CFG 连接不受影响。
+- **上位机**：设备页新增「清除主机绑定」按钮 + 绑定状态显示（地址脱敏）；
+  新增 `CMD:CLEARBOND` / `CMD:GET_BOND` 命令，与现有 `CMD:*` 命名一致。
+- **上电长按**：按住编码器 5 秒 clear binding（与 0.2 秒配网、1.2 秒双击配网
+  区分），CDC 日志 `[ble] host binding cleared by boot gesture`。
+- 四个固件 env（`esp32dev` / `esp32c3` / `esp32c3_2mb` / `esp32c3_16mb`）
+  编译通过；`docs/protocol.md` 与 README 同步。
+
 ## 上位机桌面版 — 2026-10-20（pywebview 真桌面化）
 
 - **应用模型改为 pywebview 原生窗口**：`host/desktop.py` 新增 `run_webview()`，
