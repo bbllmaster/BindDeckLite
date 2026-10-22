@@ -163,6 +163,14 @@ static bool g_safeMode = false;
 // stay disarmed until then so a pin that is permanently LOW cannot fire them.
 static bool g_encSeenIdle = false;
 
+// WS-366: deferred-boot request. processCommand() (NimBLE host task) and the
+// encoder double-click handler (esp_timer task) must not write NVS or call
+// ESP.restart() directly — they only arm this flag. loop() (the only Arduino
+// task) performs the NVS write + ACK + restart, serializing with every other
+// preferences access and keeping BLE/notify out of unsafe contexts.
+enum BootReq : uint8_t { BOOT_NONE = 0, BOOT_CFG = 1, BOOT_REBOOT = 2 };
+static BootReq g_bootReq = BOOT_NONE;
+
 // === Encoder sampling =====================================================
 static const int8_t ENC_STATES[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 static volatile int encoderSteps = 0;
@@ -731,17 +739,14 @@ static void processCommand(String data) {
   } else if (data.startsWith("CMD:PING")) {
     sendToHost("PONG:" + String(millis()));
   } else if (data.startsWith("CMD:BOOT_CFG")) {
-    // Reboot into the WiFi portal (used by the host app: no menu key on Lite).
-    preferences.begin("binddecklite", false);
-    preferences.putBool("forceCfg", true);
-    preferences.end();
-    sendToHost("ACK:" + data.substring(0, 96));
-    delay(150);
-    ESP.restart();
+    // WS-366: defer the NVS write + restart to loop(). This callback runs on the
+    // NimBLE host task, where sendToHost()/preferences/ESP.restart() are unsafe
+    // and a stale forceCfg write would be lost, leaving the device in normal
+    // mode after reboot (no portal). loop() consumes g_bootReq and does the work.
+    g_bootReq = BOOT_CFG;
   } else if (data.startsWith("CMD:REBOOT")) {
-    sendToHost("ACK:" + data.substring(0, 96));
-    delay(150);
-    ESP.restart();
+    // WS-366: same deferral as BOOT_CFG — never restart from the NimBLE task.
+    g_bootReq = BOOT_REBOOT;
   } else if (data.startsWith("CMD:CLEARBOND")) {
     // WS-321: drop the persisted host binding so a new central can become the
     // HID primary. The CFG channel stays usable on this same connection.
@@ -1119,6 +1124,26 @@ void loop() {
     g_bootCount = 0;
   }
 
+  // ---- deferred boot (WS-366) -------------------------------------------
+  // Armed by CMD:BOOT_CFG / CMD:REBOOT (NimBLE task) or the encoder
+  // double-click (esp_timer task). Only loop() touches NVS + BLE notify +
+  // ESP.restart, so the forceCfg write is serialized with every other
+  // preferences access and cannot be lost before reset.
+  if (g_bootReq != BOOT_NONE) {
+    BootReq r = g_bootReq;
+    g_bootReq = BOOT_NONE;
+    if (r == BOOT_CFG) {
+      preferences.begin("binddecklite", false);
+      preferences.putBool("forceCfg", true);
+      preferences.end();
+      sendToHost("ACK:CMD:BOOT_CFG");
+    } else {
+      sendToHost("ACK:CMD:REBOOT");
+    }
+    delay(250);   // let the loop-task ACK/notify flush before reset
+    ESP.restart();
+  }
+
   // ---- OTA mode ----------------------------------------------------------
   // While the host is flashing firmware the CFG characteristic carries binary
   // data (handled by onOtaData on the NimBLE task), so this loop has nothing
@@ -1198,11 +1223,9 @@ void loop() {
         bool armed = g_encSeenIdle && !g_safeMode && millis() > 10000;
         if (armed && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
           log_e("[cfg] encoder double-click -> reboot into portal");
-          preferences.begin("binddecklite", false);
-          preferences.putBool("forceCfg", true);
-          preferences.end();
-          delay(100);
-          ESP.restart();
+          // WS-366: this runs on the esp_timer task. Only arm the deferred boot;
+          // loop() writes forceCfg and restarts from the safe Arduino task.
+          g_bootReq = BOOT_CFG;
         }
         lastPressAt = now;
         g_lastActivity = now;
