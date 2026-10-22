@@ -2362,6 +2362,8 @@ def desktop_payload() -> dict:
         "frozen": desktop.is_frozen(),
         "desktop_mode": bool(desktop.STATE.get("desktop")),
         "tray_active": bool(desktop.STATE.get("tray_active")),
+        "tray_available": bool(desktop.STATE.get("tray_available")),
+        "tray_available_error": desktop.STATE.get("tray_available_error") or "",
         "window_hidden": bool(desktop.STATE.get("window_hidden")),
         "url": desktop.STATE.get("url") or f"http://127.0.0.1:{PORT}",
         "error": desktop.STATE.get("error") or "",
