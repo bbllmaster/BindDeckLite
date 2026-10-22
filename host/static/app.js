@@ -1225,6 +1225,8 @@ function renderOta() {
   const sel = state.devices.find((d) => d.dev_id === state.selected);
   const connected = !!(sel && sel.connected);
 
+  const shaLine = (ota.sha256 && ota.status !== "error")
+    ? ` · SHA256 ${ota.sha256}` : "";
   if (ota.status === "done") {
     $("#otaStatusText").textContent = "升级成功";
     $("#otaFileLine").innerHTML = `<span class="ok">${escapeHtml(ota.filename || "")} · ${ota.total} bytes</span> · 设备即将重启`;
@@ -1235,15 +1237,16 @@ function renderOta() {
     $("#otaHint").textContent = "升级成功，设备即将重启。重启后将自动重新连接。";
   } else if (ota.status === "error") {
     $("#otaStatusText").textContent = "失败";
-    $("#otaFileLine").textContent = "";
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
     $("#otaProgressBar").style.width = "0%";
     $("#btnOtaStart").hidden = true;
     $("#btnOtaCancel").hidden = false;
     $("#btnOtaCancel").textContent = "关闭";
-    $("#otaHint").textContent = ota.error || "未知错误";
+    $("#otaHint").textContent = (ota.error || "未知错误")
+      + (ota.sha256 ? `（所选文件 SHA256 ${ota.sha256}，请与发布页 WS-279 核对）` : "");
   } else if (ota.status === "uploading") {
     $("#otaStatusText").textContent = "上传中";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
     $("#otaProgressBar").style.width = ota.percent + "%";
     $("#btnOtaStart").hidden = true;
     // Cancel sends CMD:OTA_CANCEL so the device aborts and keeps the old image.
@@ -1254,7 +1257,7 @@ function renderOta() {
       `${acked} / ${ota.total} bytes (${ota.percent}%) · 已确认字节 · 升级中请勿断电`;
   } else if (ota.status === "starting") {
     $("#otaStatusText").textContent = "启动中";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
     $("#otaProgressBar").style.width = "0%";
     $("#btnOtaStart").hidden = true;
     $("#btnOtaCancel").hidden = false;
@@ -1270,13 +1273,15 @@ function renderOta() {
   } else {
     // idle: file selected, waiting for user to click "开始升级"
     $("#otaStatusText").textContent = "就绪";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes`;
+    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
     $("#otaProgressBar").style.width = "0%";
     $("#btnOtaStart").hidden = false;
     $("#btnOtaCancel").hidden = false;
     $("#btnOtaCancel").textContent = "取消";
     $("#otaHint").textContent = connected
-      ? "点击「开始升级」推送固件（分块传输，约需 1-3 分钟）"
+      ? (ota.sha256
+          ? `SHA256 ${ota.sha256}（请与发布页 WS-279 核对），点击「开始升级」推送`
+          : "点击「开始升级」推送固件（分块传输，约需 1-3 分钟）")
       : "设备未连接，无法 OTA";
     $("#btnOtaStart").disabled = !connected;
   }
@@ -1359,15 +1364,30 @@ function openOtaPicker() {
       return;
     }
     state.otaFile = file;
-    state.ota = {
+    const otaObj = {
       status: "idle",
       sent: 0,
       total: file.size,
       percent: 0,
       error: "",
       filename: file.name,
+      sha256: "",
     };
+    state.ota = otaObj;
     renderOta();
+    // Compute the local SHA256 so the user can compare it against the release
+    // page (WS-279) before pushing — a mismatch here is exactly the "device
+    // verify failed" root cause we now guard against.
+    if (file.arrayBuffer && crypto && crypto.subtle) {
+      file.arrayBuffer().then((buf) => crypto.subtle.digest("SHA-256", buf))
+        .then((h) => {
+          const hex = [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
+          otaObj.sha256 = hex;
+          if (state.ota === otaObj) state.ota.sha256 = hex;
+          renderOta();
+        })
+        .catch(() => {});
+    }
   };
   input.click();
 }
@@ -1404,6 +1424,7 @@ async function startOta() {
       percent: 0,
       error: "",
       filename: data.filename,
+      sha256: data.sha256 || (state.ota && state.ota.sha256) || "",
     };
     renderOta();
   } catch (e) {

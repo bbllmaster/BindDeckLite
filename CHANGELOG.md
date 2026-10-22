@@ -1,5 +1,68 @@
 # Changelog
 
+## OTA 校验与诊断：设备错误详情 + 上位机发送前镜像预校验 — 2026-10-22（WS-363）
+
+- **设备端 `end_failed` 详情**（`src/main.cpp`）：`Update.end(true)` 失败时回复
+  `ACK:OTA:ERROR:end_failed:<detail>(<code>)`，`<detail>` 为 `otaUpdateErrorText()`
+  映射的 `Update.getError()` 短原因。映射改用 `Update.h` 的 `UPDATE_ERROR_*` 宏做
+  `switch`（编译期校验，不随版本漂移）：`write_error`(1) / `erase_error`(2) /
+  `read_error`(3) / `no_space`(4) / `bad_size`(5) / `stream`(6) / `md5`(7) /
+  `magic_byte`(8) / `activate`(9) / `no_partition`(10) / `bad_argument`(11) /
+  `abort`(12) / `decrypt`(13)。本设备 `Update::end()` 只走 `_enablePartition`/
+  `_partitionIsBootable`（失败=3 READ）与 `esp_ota_set_boot_partition`（内部
+  `esp_image_verify`，失败=9 ACTIVATE），实际只会看到 3 或 9。旧上位机仍按
+  `end_failed` 前缀匹配，向后兼容。
+- **`VERSION:` 增加第 5 字段 flash(KB)**：`VERSION:<fw>,<model>,<chip>,<build>,<flash_kb>`，
+  上位机据此精确推算 OTA 槽容量（16 MB 表 3 MB、4 MB 表约 1.94 MB），旧固件缺省为 0（未知，按 3 MB 兜底）。
+- **上位机发送前镜像预校验**（`host/app.py` `_ota_validate_image`）：首字节 `0xE9`；
+  `0x20` 处必须是 app 描述符 magic `0xABCD5432`（拒绝 merged 整片包）；按段数与长度累加
+  核对声明长度；尾部 SHA256 校验：`hash_appended=1`（第 23 字节）时必须尾部 32 字节
+  哈希存在且匹配（否则判损坏，不再走宽松的段表兜底，修复 `d[:-32]`/`d[:-33]`/`d[:-43]`
+  被误放行）；`hash_appended=0` 时退回段表 walk（容忍 ≤16 字节对齐填充）；文件大小
+  不得超过目标 OTA 槽。任一不符在发送前即拒绝并给出可执行提示。
+- **OTA 槽容量按 flash 精确化**（`_ota_slot_cap` / `_ota_current_fw`）：`_ota_current_fw()`
+  返回 `flash` 字段（旧版缺失导致槽容量恒为 3 MB）；16 MB→3 MB、4 MB→0x1F0000、
+  2 MB（2048）→0（该表无 app1，不支持上位机 OTA，直接提示改用 USB merged 或
+  配网页面），未知（0）→3 MB 兜底。
+- **失败引导**：`end_failed` 时事件日志追加一行排查建议（核对发布页 SHA256 / 配网页面
+  `/update` / USB 刷 merged 整片包）；OTA 对话框展示所选文件 SHA256 便于与发布页比对。
+- **两条 OTA 通道诊断一致**：BLE `CMD:OTA_END` 与配网页面 `/update` 的
+  `Update.end(true)` 失败时均记录 `end_failed:<detail>(<code)`（前者还通过
+  `ACK:OTA:ERROR` 上报主机）。
+- `docs/protocol.md`：错误原因表补充 `end_failed:<detail>(<code>)` 并同步为
+  `UPDATE_ERROR_*` 宏取值表，`VERSION:` 注明第 5 字段。
+
+### v1.3.1 16MB C3 `end_failed` 根因分析（未实测 + 复现步骤）
+
+发布资产 `ota_binddecklite_c3_16mb_v1.3.1.bin`（SHA256 `bbd4060f15c9f2f48ebabcb0035572b4786f31297e9f8f4b8a8914e0560792c7`，
+以发布页 `SHA256SUMS.txt` 为准）经独立复核**结构完全合法**：首字节 `0xE9`、`0x20` 处
+app 描述符 magic `0xABCD5432`、7 段段表可完整解析、尾部 32 字节 SHA256 与其前全部字节
+一致、文件 1.28 MB 远小于 3 MB OTA 槽。因此**故障不在资产侧，也不在传输侧**（主机
+与设备 SHA256 一致才走到 `Update.end`），更不是预校验能拦截的问题。
+
+**结论：未拿到硬件串口日志，根因未实测。** 本仓库的修复已让两条 OTA 通道（BLE
+`CMD:OTA_END` 与配网页面 `/update`）在 `Update.end(true)` 失败时都输出
+`end_failed:<detail>(<code)`，其中 `<code>` 只可能是 3（`read_error`，
+`_partitionIsBootable` 失败）或 9（`activate`，`esp_ota_set_boot_partition` 内部
+`esp_image_verify` 失败）。**定位方法：** 用 USB 线连接 16MB C3 板（C3 走 CDC，
+`Serial.printf` 即 USB Serial/JTAG），在 OTA 失败后查看 CDC 日志最后一行
+`[ota] Update.end failed (end_failed:<detail>(<code))`，按 `<code>` 定方向：
+
+| `<code>` | 含义 | 可能的下一步 |
+|---------|------|-------------|
+| 3 `read_error` | `_partitionIsBootable` 失败：app1 分区不可引导 | 检查 16MB 分区表（`partitions/`）app1 偏移/大小是否与实际 flash 匹配；尝试在 `Update.begin` 前显式擦除 app1；确认不是 2MB 表误刷 |
+| 9 `activate` | `esp_image_verify` 失败：镜像本身校验不过 | 与本表矛盾（资产已验证合法），此时应怀疑 OTA 槽有残留旧数据，或 flash 写入中途失败导致镜像不完整 |
+
+**复现步骤（需要硬件）：**
+1. 准备一台跑 `merged_binddecklite_c3_16mb_v1.3.0.bin` 的 16MB C3 设备（USB 线连 CDC，
+   `ARDUINO_USB_CDC_ON_BOOT=1`，`Serial` 即日志口）。
+2. 上位机选择 `ota_binddecklite_c3_16mb_v1.3.1.bin`，点「开始升级」。
+3. 失败后在 CDC 日志找 `end_failed:<detail>(<code)` 行，按上表定位。
+4. 若为 code 3：核对 16MB 分区表 app1 槽（`0x310000` 起 3MB）与实际 flash 容量；
+   可尝试配网页面 `/update`（同一条 `Update.end` 路径，日志格式一致）交叉验证。
+5. 若为 code 9：用 esptool 从 `0x310000` 读回 app1 槽与官方 OTA 包逐字节比对，
+   确认写入完整性。
+
 ## 上位机动作执行中可见并拒绝重入 — 2026-10-21（WS-359）
 
 - **运行表**：`host/app.py` 新增 `_action_running`（`(dev_id, idx)` → `{started, token,

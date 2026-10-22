@@ -48,6 +48,13 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 与配网页面 `/update` 的 OTA 互补：用户无需手动连接设备热点，直接在上位机
 里完成固件刷新。只接受 **app-only** 固件（`ota_*.bin`），**拒绝 merged 整片包**。
 
+> 上位机在发送前会本地预校验镜像：首字节必须为 `0xE9`；`0x20` 处必须是 app
+> 描述符 magic `0xABCD5432`（否则判定为 merged 整片包）；按 `esp_image_header_t`
+> 的段数与长度累加得到声明长度，与实际文件大小比对（容忍末尾 ≤16 字节对齐填充）；
+> 若镜像内嵌 SHA256，则校验其等于前面全部字节的 SHA256；文件大小不得超过目标
+> OTA 槽（由 `VERSION:` 第 5 字段 flash KB 推算：16 MB 表 3 MB、4 MB 表约 1.94 MB）。
+> 任一不符即拒绝并给出可执行提示，避免白传一遍。设备侧 `Update.end()` 仍做最终校验。
+
 1. 上位机发送 `CMD:OTA:<size>:<sha256_hex>`（十进制字节数 + 64 位十六进制
    SHA256）。设备依次校验：非配网模式、无进行中的会话、**发起者必须是已绑定
    主机且持有 HID 主连接**（`isHostBound()` + `primaryConn()`），然后
@@ -83,7 +90,9 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `chunk_too_big` | 单次写入超过 512 字节 |
 | `size` | 已收字节数不等于声明长度（或流超出声明长度） |
 | `hash` | SHA256 不匹配 |
-| `begin_failed` / `write_failed` / `end_failed` | Update 框架失败 |
+| `begin_failed` / `write_failed` | `Update.begin` / `Update.write` 失败（如超出 app 分区） |
+| `end_failed` | `Update.end(true)` 失败：镜像校验（`esp_image_verify`）或 flash 写入失败 |
+| `end_failed:<detail>(<code>)` | 同 `end_failed`，附 `Update.getError()` 的短原因与数值码；旧上位机仍按 `end_failed` 前缀匹配。`<detail>` 取值（与 `Update.h` 的 `UPDATE_ERROR_*` 宏一一对应，编译期校验）：`write_error`(1) / `erase_error`(2) / `read_error`(3) / `no_space`(4) / `bad_size`(5) / `stream`(6) / `md5`(7) / `magic_byte`(8) / `activate`(9) / `no_partition`(10) / `bad_argument`(11) / `abort`(12) / `decrypt`(13)。本设备 `Update::end()` 只走 `_enablePartition`/`_partitionIsBootable`（失败=3 READ）与 `esp_ota_set_boot_partition`（内部 `esp_image_verify`，失败=9 ACTIVATE），实际只会看到 3 或 9 |
 | `timeout` | 块间 30 秒无数据 |
 
 ### 编码器模式
@@ -100,7 +109,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 
 | 消息 | 示例 | 说明 |
 |------|------|------|
-| `VERSION:` | `VERSION:1.0.0,Lite,ESP32,Oct 19 2026 03:20:00` | 版本, 型号, 芯片, 编译时间 |
+| `VERSION:` | `VERSION:1.0.0,Lite,ESP32,Oct 19 2026 03:20:00,16384` | 版本, 型号, 芯片, 编译时间, 闪存容量(KB) |
 | `BTN:` | `BTN:A1B2:3` | 按键事件；`devId` + 输入编号（0–8 按键，9 编码器按压） |
 | `ENC:` | `ENC:A1B2:CW` | 编码器旋转，`CW` / `CCW` |
 | `ACK:` | `ACK:CFG:ENC:0` | 配置确认 |
