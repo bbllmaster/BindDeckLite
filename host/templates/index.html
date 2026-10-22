@@ -202,6 +202,7 @@
           <tr><td><code>wait:500</code></td><td>等待 500 毫秒（单位毫秒）</td></tr>
           <tr><td><code>browser:chrome</code></td><td>指定后续 <code>url:</code> 用哪个浏览器打开：<code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>（不区分大小写）；浏览器未安装时自动回退默认浏览器</td></tr>
           <tr><td><code>url:https://example.com</code></td><td>打开网址：上面有 <code>browser:</code> 用指定浏览器，否则用默认浏览器；打开后会等待浏览器窗口到前台（最多 3 秒）再执行下一步</td></tr>
+          <tr><td><code>app:C:\path\app.exe --arg</code></td><td>启动桌面应用程序（可执行文件路径，可带参数；含空格的路径用引号包裹）；启动后会等待应用窗口到前台（最多 3 秒）再执行下一步，后续 <code>text:</code> / <code>key:</code> / <code>paste:</code> 直接打进去</td></tr>
           <tr><td>无前缀行</td><td>按 <code>key:</code> 处理，例如单独一行 <code>enter</code></td></tr>
         </tbody>
       </table>
@@ -235,6 +236,12 @@ key:tab
 paste:my-password
 key:enter</pre>
       <p><code>browser:</code> 只影响它后面的 <code>url:</code> 步骤，可以写在宏的任意位置；不写就用系统默认浏览器。先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
+
+      <h3>完整示例：启动桌面应用并自动输入</h3>
+      <pre class="help-code">app:"C:\Program Files\MyApp\myapp.exe" --new-session
+text:hello world
+key:enter</pre>
+      <p><code>app:</code> 启动桌面应用后会自动等待窗口获得焦点（最多 3 秒），再执行后面的 <code>text:</code> / <code>key:</code> / <code>paste:</code>。应用启动较慢时，可用 <code>wait:</code> 手动兜底；可执行文件不存在时，日志会写「app: 未找到可执行文件」并跳过本步，宏继续执行后续步骤。</p>
 
       <h3>密码框输入无效怎么办</h3>
       <p>密码框（以及登录页的邮箱框）是最容易「发得出按键、打不进字」的地方。宏本身不会失败，所以先判断属于下面哪一种情况，再换写法。</p>
@@ -307,6 +314,8 @@ key:enter</pre>
         <li><b>指定的浏览器没生效</b>：<code>browser:</code> 只认 <code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>；未安装或名字不认识时日志里会记录原因，并按默认浏览器打开，宏继续执行。</li>
         <li><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法；中文或符号改用 <code>paste:</code>。</li>
         <li><b><code>paste:</code> 没反应或只粘贴了旧内容</b>：看日志有没有「剪贴板不可用，paste 步骤跳过」；Linux 需安装 <code>xclip</code>（X11）或 <code>wl-copy</code>（Wayland），或用图形界面下的 tkinter 回退。密码框里仍无效时按上面「密码框输入无效怎么办」逐条排查。</li>
+        <li><b><code>app:</code> 启动后字打到了别的窗口</b>：桌面应用启动比浏览器慢，<code>app:</code> 后的 3 秒内可能还没抢到焦点。把后面的 <code>text:</code> / <code>key:</code> 前面加一行 <code>wait:1000</code> 手动兜底；仍无效则目标程序可能在后台打开或被 UAC 拦截。</li>
+        <li><b><code>app:</code> 报「未找到可执行文件」</b>：路径写错了，或 exe 不在指定位置。含空格的路径用引号包裹，如 <code>app:"C:\Program Files\App\app.exe"</code>；只写程序名（如 <code>app:notepad</code>）时确保它在系统 PATH 里。</li>
       </ul>
     </div>
   </div>

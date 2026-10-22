@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import socket
 import subprocess
@@ -990,6 +991,72 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
+def _open_app(value: str):
+    """Launch a desktop application, splitting the exe path from its args.
+
+    ``value`` is the full command line the user writes after ``app:``, e.g.
+    ``C:\\Program Files\\App\\app.exe --flag --port 8080``.  ``shlex.split``
+    with ``posix=False`` keeps Windows backslashes literal while still
+    honouring quoted paths that contain spaces.  The first token is the
+    executable; the rest are passed verbatim.  On Windows ``subprocess.Popen``
+    is used directly (``os.startfile`` cannot pass extra args); on macOS the
+    ``open`` command carries the args; on Linux the exe is started directly
+    (the user is expected to give a PATH-resolvable name or full path).
+    """
+    if not value:
+        return
+    parts = shlex.split(value, posix=False)
+    if not parts:
+        return
+    # posix=False keeps Windows backslashes literal but leaves surrounding
+    # quotes on every token; strip them so os.path.exists / Popen see real
+    # paths and args (a quoted "arg with spaces" stays one argument).
+    parts = [p.strip('"') for p in parts]
+    exe = parts[0]
+    args = parts[1:]
+    if sys.platform.startswith("win"):
+        subprocess.Popen([exe] + args)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", exe] + args)
+    else:
+        subprocess.Popen([exe] + args)
+
+
+def _win_foreground_hwnd() -> int:
+    """Return the foreground window handle on Windows (0 when unavailable)."""
+    api = _win32_api()
+    if api is None:
+        return 0
+    return int(api[0].GetForegroundWindow() or 0)
+
+
+def _wait_app_foreground(prev_hwnd: int, timeout: float | None = None) -> bool:
+    """Wait for the just-launched desktop app to take the foreground (Windows).
+
+    Desktop apps start slower than browsers and may open behind the current
+    window, which is why the following ``text:`` / ``key:`` steps would land
+    in the wrong window.  Polls for up to ``timeout`` seconds (default
+    ``MACRO_APP_FOCUS_TIMEOUT``) for the foreground window to change to
+    something other than ``prev_hwnd`` — the handle captured before the
+    launch.  Returns ``True`` when a new window is focused, ``False`` on
+    timeout.  A no-op off Windows, where window managers already focus new
+    windows.  ``delay:`` remains the manual fallback when the app refuses
+    focus (foreground lock, UAC, ...).
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    if timeout is None:
+        timeout = MACRO_APP_FOCUS_TIMEOUT
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        hwnd = _win_foreground_hwnd()
+        if hwnd and hwnd != prev_hwnd:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 # --- macro input reliability ---------------------------------------------
 # ``text:`` used to call ``kb.write(value)`` with no inter-key delay. Electron
 # apps, remote desktops and slow clients drop characters at that speed, and
@@ -1003,6 +1070,7 @@ MACRO_PASTE_HOTKEY = "command+v" if sys.platform == "darwin" else "ctrl+v"
 MACRO_PASTE_SETTLE = 0.05            # let the OS publish the clipboard first
 MACRO_PASTE_RESTORE_DELAY = 0.4      # give the target time to read it back
 MACRO_URL_FOCUS_TIMEOUT = 3.0        # wait for the browser window (Windows)
+MACRO_APP_FOCUS_TIMEOUT = 3.0        # wait for the launched app window (Windows)
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -1531,6 +1599,37 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                                  delay=MACRO_TEXT_DEFAULT_DELAY)
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                elif st == "app":
+                    # Launch a desktop application, then wait for its window to
+                    # take the foreground so the following text:/key:/paste:
+                    # steps land in the right window.  A missing exe is reported
+                    # and skipped — the rest of the macro keeps running.
+                    app_val = step.get("value", "")
+                    if app_val:
+                        app_parts = shlex.split(app_val, posix=False)
+                        app_exe = app_parts[0].strip('"') if app_parts else ""
+                        if app_exe and not os.path.exists(app_exe):
+                            add_event("error",
+                                      f"app: 未找到可执行文件 {app_exe}，"
+                                      "本步跳过，继续执行后续步骤",
+                                      dev_id, "error")
+                        else:
+                            add_event("action",
+                                      f"正在启动 {app_val}", dev_id, "ok")
+                            prev_hwnd = _win_foreground_hwnd()
+                            try:
+                                _open_app(app_val)
+                            except (FileNotFoundError, PermissionError,
+                                    OSError) as e:
+                                add_event("error",
+                                          f"app: 启动失败 "
+                                          f"{type(e).__name__}: {e}",
+                                          dev_id, "error")
+                            else:
+                                # Desktop apps start slower than browsers;
+                                # without this the following text:/key:
+                                # steps land in the previous window.
+                                _wait_app_foreground(prev_hwnd)
                 elif st == "browser":
                     browser_target, browser_used, browser_err = (
                         resolve_macro_browser(step.get("value", "")))
