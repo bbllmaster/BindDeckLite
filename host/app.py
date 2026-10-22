@@ -510,7 +510,10 @@ def _on_line(dev_id: str, line: str):
             cfg["fw"] = {"version": fields[0] if fields else "",
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
-                         "build": fields[3] if len(fields) > 3 else ""}
+                         "build": fields[3] if len(fields) > 3 else "",
+                         # 5th field is flash size in KB (added in v1.3.1); older
+                         # firmware omits it and we fall back to 0 (unknown).
+                         "flash": int(fields[4]) if len(fields) > 4 and fields[4].strip().isdigit() else 0}
             save_config()
         add_event("device", f"固件 {cfg['fw']['version']} ({chip})", dev_id)
         return
@@ -1886,6 +1889,91 @@ def _ota_validate(filename: str) -> str:
     return ""
 
 
+# OTA slot capacity (bytes) by flash size, matching partitions/*.csv:
+#   16 MB → 3 MB app slot, 4 MB → ~1.94 MB slot, 2 MB → no real OTA slot.
+# Unknown flash size (older firmware) defaults to the 3 MB cap so a genuine
+# 16 MB image is never wrongly rejected; a 4 MB board that exceeds its own
+# slot is still caught by the device's Update.begin().
+def _ota_slot_cap(fw: dict) -> int:
+    flash_kb = int((fw or {}).get("flash") or 0)
+    if flash_kb >= 16000:
+        return 3 * 1024 * 1024          # 16 MB table: app1 @ 0x310000, 0x300000
+    if flash_kb >= 4000:
+        return 0x1F0000                 # 4 MB table: app1 @ 0x200000, 0x1F0000
+    return 3 * 1024 * 1024              # conservative default
+
+
+# ESP-IDF app image layout (esp_image_header_t, 24-byte header):
+#   [0]   magic (0xE9)
+#   [1]   segment count
+#   then per segment: 4-byte load addr + 4-byte length + <length> bytes
+#   then 1-byte XOR checksum
+#   then (optionally) a 32-byte SHA256 over everything before it
+# The SHA256 is always the final 32 bytes of a correctly built app image and
+# covers all preceding bytes; we verify it directly rather than trusting the
+# image's own hash_appended flag (which is 0 on some toolchain outputs even
+# though the hash is present). A merged whole-flash image starts with the
+# bootloader, so offset 0x20 is NOT the app descriptor (0xABCD5432); that is
+# the reliable app-only test.
+def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
+    """Return "" if *file_data* is a valid app-only OTA image that fits the
+    target slot, otherwise a user-facing, actionable error string."""
+    n = len(file_data)
+    if n < 0x30:
+        return "文件过小，不是完整的 ESP32 固件镜像"
+    if file_data[0] != 0xE9:
+        return "不是 ESP32 固件镜像（缺少 0xE9 文件头），请选择 ota_*.bin"
+    # app descriptor magic at 0x20 — only an app image has it there.
+    if file_data[0x20:0x24] != b"\x32\x54\xcd\xab":
+        return ("这是整片 merged 包，OTA 只能刷 app-only 固件（ota_*.bin）。\n"
+                "请到发布页下载 ota_binddecklite_*_vX.Y.Z.bin，"
+                "或用配网页面 http://192.168.4.1 → 固件 OTA 升级。")
+    # Walk the segments to (a) reject a corrupt/truncated segment table and
+    # (b) compute the declared image length (header + segments + checksum).
+    try:
+        seg_count = file_data[1]
+        pos = 24  # ESP_IMAGE_HEADER_LEN
+        for _ in range(min(seg_count, 128)):
+            if pos + 8 > n:
+                return "固件镜像段表损坏或被截断"
+            seg_len = int.from_bytes(file_data[pos + 4:pos + 8], "little")
+            if seg_len > n or pos + 8 + seg_len > n:
+                return "固件镜像已损坏或被截断（段长度越界）"
+            pos += 8 + seg_len
+        core_len = pos + 1  # + trailing checksum byte
+    except Exception:
+        return "固件镜像结构无法解析"
+
+    # The trailing 32 bytes should be the SHA256 of everything before them.
+    # If so, the image is definitively intact (the hash covers every byte of
+    # the real payload, regardless of any 16-byte alignment padding after it).
+    if n >= 32 and file_data[n - 32:n] == hashlib.sha256(file_data[:n - 32]).digest():
+        # valid image with appended hash; accept (padding after the hash is
+        # ignored because the hash sits at the very end).
+        pass
+    else:
+        # No valid trailing hash: rely on the segment walk. The file must be at
+        # least core_len, with at most 16 bytes of alignment padding; anything
+        # else is corrupt/truncated.
+        if n < core_len:
+            return ("固件镜像不完整（已损坏或被截断）：文件 %d 字节，预期至少 %d 字节。"
+                    "请重新下载并核对发布页的 SHA256。" % (n, core_len))
+        if n > core_len + 16:
+            return ("固件镜像可能损坏或不完整（长度异常，预期约 %d 字节）。"
+                    "请重新下载并核对发布页的 SHA256。" % core_len)
+
+    if n > slot_cap:
+        if slot_cap >= 1024 * 1024:
+            cap_txt = "约 %d MB" % (slot_cap // (1024 * 1024))
+        else:
+            cap_txt = "%d KB" % (slot_cap // 1024)
+        return ("固件 %d 字节，超出本设备 OTA 槽容量（%s）。\n"
+                "请确认选择了对应设备型号的固件；若确为此设备，"
+                "请用配网页面 /update 或 USB 刷 merged 整片包。"
+                % (n, cap_txt))
+    return ""
+
+
 def _ota_version_from_name(filename: str) -> str:
     """Best-effort version from the release filename.
 
@@ -1918,7 +2006,17 @@ _OTA_ERROR_TEXT = {
 
 
 def _ota_error_text(ack: str) -> str:
-    reason = ack[len("ACK:OTA:ERROR:"):] if ack.startswith("ACK:OTA:ERROR:") else ack
+    if not ack.startswith("ACK:OTA:ERROR:"):
+        return ack
+    reason = ack[len("ACK:OTA:ERROR:"):]
+    # end_failed:<detail>(code) — the device now attaches the concrete
+    # Update error so we can tell a corrupt image from a flash failure. Keep the
+    # bare "end_failed" form working for old firmware.
+    if reason == "end_failed" or reason.startswith("end_failed:"):
+        detail = reason[len("end_failed:"):] if reason.startswith("end_failed:") else ""
+        if detail:
+            return f"设备校验固件失败（end_failed: {detail}）"
+        return "设备校验固件失败，请重试"
     return _OTA_ERROR_TEXT.get(reason, f"设备拒绝: {reason}")
 
 
@@ -2080,6 +2178,15 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
             return
         err = window.ack_error
         if err:
+            # Device-side flash failure (end_failed): append concrete next steps
+            # so the user is not left with a bare "verify failed" message.
+            if err.startswith("ACK:OTA:ERROR:end_failed"):
+                add_event("ota",
+                          "排查建议：1) 核对所选文件 SHA256 与发布页（WS-279）一致，"
+                          "截断/损坏文件即使大小正确也会在此失败；2) 改用配网页面 "
+                          "http://192.168.4.1 → 固件 OTA 升级；3) 或 USB 刷 merged "
+                          "整片包从 0x0 烧录。",
+                          dev_id, "warn")
             _fail(_ota_error_text(err))
             return
 
@@ -2123,20 +2230,14 @@ def api_ota(dev_id):
     if not file_data:
         return jsonify({"ok": False, "error": "文件为空"}), 400
 
-    # Firmware images built by tools/build_release.py:
-    #   ota_*.bin     — ESP app image: 0xE9 magic at 0 and esp_app_desc_t
-    #                   (0xABCD5432) at offset 0x20
-    #   merged_*.bin  — bootloader + partitions + otadata + app: starts with
-    #                   the bootloader, so offset 0x20 is NOT an app descriptor
-    # The header check is the reliable discriminator; the firmware's
-    # Update.end() CRC check stays the authoritative one.
-    if len(file_data) < 0x30 or file_data[0] != 0xE9:
-        return jsonify({"ok": False, "error": "不是 ESP32 固件镜像"}), 400
-    if file_data[0x20:0x24] != b"\x32\x54\xcd\xab":
-        return jsonify({"ok": False,
-                        "error": "请上传 app-only 固件（ota_*.bin），不要上传 merged 整片包"}), 400
-    if len(file_data) > 4 * 1024 * 1024:
-        return jsonify({"ok": False, "error": "固件过大，超出 app 分区容量"}), 400
+    # Pre-flight the image locally so a corrupt / truncated / wrong-kind file is
+    # rejected before we spend 1-3 minutes pushing it over BLE. The firmware's
+    # Update.end() still verifies the image itself — this is a fast gate.
+    fw = _ota_current_fw(dev_id)
+    slot_cap = _ota_slot_cap(fw)
+    img_err = _ota_validate_image(file_data, slot_cap)
+    if img_err:
+        return jsonify({"ok": False, "error": img_err}), 400
 
     with _ota_lock:
         existing = _ota_windows.get(dev_id)

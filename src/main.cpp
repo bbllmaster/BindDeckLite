@@ -602,6 +602,27 @@ static void otaAbort(const char* reason) {
   otaResetState();
 }
 
+// Map Update.getError() codes to a short, stable reason token. The host shows
+// this verbatim after the `end_failed:` prefix so the user can tell a
+// truncated/corrupt image from a flash write failure.
+static const char* otaUpdateErrorText(int code) {
+  switch (code) {
+    case 1:  return "write_error";     // Update.write short
+    case 2:  return "erase_error";     // partition erase failed
+    case 3:  return "read_error";      // read-back mismatch
+    case 4:  return "no_space";        // image larger than the OTA slot
+    case 5:  return "bad_size";        // declared size wrong
+    case 6:  return "md5_mismatch";    // (legacy) MD5 check
+    case 7:  return "bad_magic";       // not an ESP image
+    case 8:  return "activate_failed"; // could not mark slot bootable
+    case 9:  return "no_partition";    // no OTA partition on this board
+    case 10: return "bad_argument";    // Update.begin argument invalid
+    case 11: return "aborted";         // OTA aborted/cancelled
+    case 12: return "hash_mismatch";   // appended SHA256 mismatch
+    default: return "unknown";
+  }
+}
+
 static int otaHexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -700,7 +721,12 @@ static void processCommand(String data) {
       applyTimezone();
     }
   } else if (data.startsWith("CMD:VERSION")) {
-    sendToHost(String("VERSION:") + FW_VERSION + "," + FW_MODEL + "," + FW_CHIP + "," + FW_BUILD);
+    // VERSION:<fw>,<model>,<chip>,<build>,<flash_kb>
+    // The 5th field (flash size in KB) lets the host size the OTA slot cap
+    // precisely (16 MB table → 3 MB slot, 4 MB table → ~1.94 MB slot) without
+    // guessing from the chip name. Old hosts ignore the extra field.
+    sendToHost(String("VERSION:") + FW_VERSION + "," + FW_MODEL + "," + FW_CHIP
+               + "," + FW_BUILD + "," + String(ESP.getFlashChipSize() / 1024));
   } else if (data.startsWith("CMD:GET_CFG")) {
     String keys;
     for (int i = 0; i < NUM_INPUTS; i++) { if (i) keys += ","; keys += String(buttonKeys[i]); }
@@ -798,8 +824,16 @@ static void processCommand(String data) {
       otaResetState();
       ESP.restart();
     } else {
-      log_e("[ota] Update.end failed");
-      otaAbort("end_failed");
+      // Update.end(true) failed: the image failed ESP-IDF verification
+      // (esp_image_verify) or the flash write did. Surface the concrete reason
+      // as end_failed:<detail>(code) so the host can tell a corrupt/truncated
+      // image apart from a flash error, and old hosts still match the
+      // end_failed prefix.
+      int code = Update.getError();
+      const char* detail = otaUpdateErrorText(code);
+      log_e("[ota] Update.end failed (code %d: %s)", code, detail);
+      String reason = String("end_failed:") + detail + "(" + String(code) + ")";
+      otaAbort(reason.c_str());
     }
   } else if (data.startsWith("CMD:OTA_CANCEL")) {
     if (!g_otaMode) {

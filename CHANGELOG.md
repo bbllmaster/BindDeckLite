@@ -1,5 +1,21 @@
 # Changelog
 
+## OTA 校验与诊断：设备错误详情 + 上位机发送前镜像预校验 — 2026-10-22（WS-363）
+
+- **设备端 `end_failed` 详情**（`src/main.cpp`）：`Update.end(true)` 失败时回复
+  `ACK:OTA:ERROR:end_failed:<detail>(<code>)`，`<detail>` 为 `otaUpdateErrorText()`
+  映射的 `Update.getError()` 短原因（`no_space` / `hash_mismatch` / `write_error` 等）。
+  旧上位机仍按 `end_failed` 前缀匹配，向后兼容。
+- **`VERSION:` 增加第 5 字段 flash(KB)**：`VERSION:<fw>,<model>,<chip>,<build>,<flash_kb>`，
+  上位机据此精确推算 OTA 槽容量（16 MB 表 3 MB、4 MB 表约 1.94 MB），旧固件缺省为 0（未知，按 3 MB 兜底）。
+- **上位机发送前镜像预校验**（`host/app.py` `_ota_validate_image`）：首字节 `0xE9`；
+  `0x20` 处必须是 app 描述符 magic `0xABCD5432`（拒绝 merged 整片包）；按段数与长度累加
+  核对声明长度；校验末尾 32 字节 SHA256（覆盖其前全部字节，容忍 ≤16 字节对齐填充）；
+  文件大小不得超过目标 OTA 槽。任一不符在发送前即拒绝并给出可执行提示。
+- **失败引导**：`end_failed` 时事件日志追加一行排查建议（核对发布页 SHA256 / 配网页面
+  `/update` / USB 刷 merged 整片包）；OTA 对话框展示所选文件 SHA256 便于与发布页比对。
+- `docs/protocol.md`：错误原因表补充 `end_failed:<detail>(<code>)`，`VERSION:` 注明第 5 字段。
+
 ## 上位机动作执行中可见并拒绝重入 — 2026-10-21（WS-359）
 
 - **运行表**：`host/app.py` 新增 `_action_running`（`(dev_id, idx)` → `{started, token,
