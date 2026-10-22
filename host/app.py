@@ -2362,6 +2362,9 @@ def desktop_payload() -> dict:
         "frozen": desktop.is_frozen(),
         "desktop_mode": bool(desktop.STATE.get("desktop")),
         "tray_active": bool(desktop.STATE.get("tray_active")),
+        "tray_available": bool(desktop.STATE.get("tray_available")),
+        "tray_available_error": desktop.STATE.get("tray_available_error") or "",
+        "window_hidden": bool(desktop.STATE.get("window_hidden")),
         "url": desktop.STATE.get("url") or f"http://127.0.0.1:{PORT}",
         "error": desktop.STATE.get("error") or "",
         "autostart": autostart.status(),
@@ -2430,6 +2433,23 @@ def api_quit():
         add_event("desktop", "收到退出请求")
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "当前不是桌面/托盘模式，无法从页面退出"}), 409
+
+
+@app.route("/api/show-window", methods=["POST"])
+def api_show_window():
+    """Restore the native window (recovery path when tray is unavailable).
+
+    The window may have been hidden by ``_on_closing`` when the user clicked X
+    with "minimize to tray" checked but no tray icon was available.  The web UI
+    at the served URL is then the only way to interact with the app, and this
+    endpoint is how the user brings the window back.
+    """
+    if not desktop.STATE.get("desktop"):
+        return jsonify({"ok": False, "error": "当前不是桌面模式"}), 409
+    if desktop.show_window():
+        add_event("desktop", "已恢复窗口显示")
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "没有可恢复的原生窗口（源码运行或 pywebview 不可用）"}), 409
 
 
 @app.route("/api/log")

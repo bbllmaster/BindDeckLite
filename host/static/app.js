@@ -584,10 +584,16 @@ function renderDesktop() {
   // close_button_behavior: "minimize" (default) → checked, "exit" → unchecked
   $("#closeMinimizeToggle").checked = (d.close_button_behavior || "minimize") === "minimize";
   $("#btnQuitHost").hidden = !d.desktop_mode;
+  // Show "显示窗口" only when the native window exists but is hidden
+  // (minimize-to-tray with no tray available — recovery path).
+  $("#btnShowWindow").hidden = !(d.desktop_mode && d.window_hidden);
 
   const bits = [];
   if (d.tray_active) bits.push("托盘图标在任务栏右下角：单击显示控制台，右键可显示 / 退出");
-  else if (d.desktop_mode) bits.push("托盘不可用，程序在后台运行，可用下方「退出上位机」关闭");
+  else if (d.desktop_mode) {
+    if (d.window_hidden) bits.push("托盘不可用，窗口已隐藏：可用下方「显示窗口」恢复，或「退出上位机」关闭");
+    else bits.push("托盘不可用，程序在后台运行，可用下方「退出上位机」关闭");
+  }
   else bits.push("当前由 run.sh / python app.py 启动，没有托盘图标；打包版双击即带托盘");
   if (auto.supported) {
     bits.push(`开机自启动${auto.enabled ? "已开启" : "未开启"}（${auto.method}）`);
@@ -1148,6 +1154,20 @@ async function init() {
       toast("已退出，可以关闭此页面", "ok");
     } catch (err) {
       toast("退出失败：" + (err.message || err), "bad");
+      target.disabled = false;
+    }
+  };
+  $("#btnShowWindow").onclick = async () => {
+    const target = $("#btnShowWindow");
+    target.disabled = true;
+    try {
+      const res = await fetch("/api/show-window", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || "恢复窗口失败");
+      toast("已显示窗口", "ok");
+      await refreshDesktop();
+    } catch (err) {
+      toast("恢复窗口失败：" + (err.message || err), "bad");
       target.disabled = false;
     }
   };

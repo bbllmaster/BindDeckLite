@@ -50,8 +50,20 @@ jobs:
           if (-not $ok) { throw "exe did not serve /api/desktop" }
           $body = $r.Content | ConvertFrom-Json
           if (-not $body.frozen) { throw "exe did not report frozen=true" }
+          # tray_available() must return True in the packaged exe: pystray +
+          # Pillow must be importable, otherwise minimize-to-tray silently
+          # degrades to exit (WS-374 review #2).  Probed unconditionally
+          # (independent of --no-tray) so this check is meaningful.
+          if (-not $body.tray_available) {
+            throw "exe reported tray_available=false: $($body.tray_available_error)"
+          }
           taskkill /PID $p.Id /T /F
           Write-Host "smoke test ok"
+
+      - name: Unit tests (close_decision branches)
+        working-directory: host
+        run: |
+          python -m pytest test_close_decision.py -v
 
       - uses: actions/upload-artifact@v4
         with:

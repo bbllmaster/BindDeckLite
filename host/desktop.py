@@ -39,14 +39,22 @@ import webbrowser
 STATE = {
     "desktop": False,
     "tray_active": False,
+    "tray_available": False,
+    "tray_available_error": "",
     "url": "",
     "error": "",
+    "window_hidden": False,  # True while the native window is hidden (minimized w/o tray)
 }
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
 
 _quit_callback = None
+
+# Mutable holder for the native pywebview window, so the web UI can restore
+# it (``/api/show-window``) when the tray is unavailable and the user clicked X
+# with "minimize to tray" checked.  Cleared on shutdown.
+_window_ref = [None]
 
 
 def is_frozen() -> bool:
@@ -156,6 +164,50 @@ def setup_stdio(log_path: str) -> None:
             sys.stderr = stream
     except Exception:
         pass
+
+
+def show_window() -> bool:
+    """Restore the native window from the web UI (recovery path).
+
+    Used when the tray is unavailable and the user clicked X with "minimize to
+    tray" checked: the window was hidden instead of closed, the process keeps
+    serving, and this is how the user brings the window back.
+    """
+    win = _window_ref[0]
+    if win is None:
+        return False
+    try:
+        win.show()
+        STATE["window_hidden"] = False
+        return True
+    except Exception:
+        return False
+
+
+def close_decision(force_quit: bool, behavior: str, use_tray: bool) -> tuple[bool, bool]:
+    """Pure decision helper for ``_on_closing`` — what to do on window close.
+
+    Extracted so the four branches (exit / tray-minimize / no-tray-minimize /
+    force-quit) are unit-testable without a real pywebview window.
+
+    Returns ``(allow_close, hide_window)``:
+
+    * ``force_quit`` — ``stop_all()`` already marked the app for shutdown and
+      called ``window.destroy()``; letting the close proceed is what lets
+      ``webview.start()`` return and the process exit.  Must be checked FIRST
+      to avoid the WinForms ``Form.Close → FormClosing → cancel → FormClosed``
+      deadlock (see WS-374 review #1).
+    * ``behavior == "exit"`` — user explicitly wants to quit.
+    * ``use_tray`` — minimize-to-tray with a tray icon available.
+    * ``behavior == "minimize"`` without a tray — keep the process alive and
+      let the web UI be the recovery path.
+    * anything else — fall through to exit (defensive).
+    """
+    if force_quit or behavior == "exit":
+        return True, False
+    if use_tray or behavior == "minimize":
+        return False, True
+    return True, False
 
 
 # --- native file dialog ---------------------------------------------------
@@ -287,6 +339,7 @@ def _build_tray(url: str, on_quit, window=None):
         if window is not None:
             try:
                 window.show()
+                STATE["window_hidden"] = False
                 return
             except Exception:
                 pass
@@ -353,7 +406,9 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
     thread.start()
     set_quit_callback(stop_all)
 
-    tray_ok, tray_error = tray_available() if use_tray else (False, "托盘已禁用")
+    tray_ok, tray_error = tray_available()
+    STATE["tray_available"] = tray_ok
+    STATE["tray_available_error"] = tray_error
     if use_tray and not tray_ok:
         STATE["error"] = "托盘不可用：" + tray_error
         print("[desktop] pystray/Pillow unavailable, falling back:", tray_error)
@@ -535,8 +590,12 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
 
     set_quit_callback(stop_all)
 
-    # 2. Probe the tray (minimize-to-tray needs it).
-    tray_ok, _tray_error = tray_available() if use_tray else (False, "托盘已禁用")
+    # 2. Probe the tray (minimize-to-tray needs it).  Always record the result so
+    # the web UI and CI can read whether the tray *can* be created in this exe,
+    # independent of whether it is currently enabled (--no-tray).
+    tray_ok, tray_error = tray_available()
+    STATE["tray_available"] = tray_ok
+    STATE["tray_available_error"] = tray_error
     use_tray = use_tray and tray_ok
 
     # 3. Create the native window (hidden when the user asked to start minimized).
@@ -553,6 +612,13 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         return _serve_headless(server, flask_thread, url, use_tray)
 
     window_ref[0] = window
+    _window_ref[0] = window
+
+    # Window starts hidden (start_minimized) without a tray icon: mark it so the
+    # web UI offers "显示窗口" immediately instead of assuming the window is
+    # still visible (WS-374 review #3).
+    if start_minimized and not use_tray:
+        STATE["window_hidden"] = True
 
     if close_ref is None:
         close_ref = {"behavior": "minimize"}
@@ -566,14 +632,28 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
 
         ``close_ref`` is read at close time so the user can switch the behavior
         at runtime through the settings page without restarting the app.
+
+        When the user asks to minimize but no tray is available (old exe,
+        missing pystray/Pillow, headless backend) the app must not silently
+        degrade that into an exit: hide the window, keep serving, and let the
+        web UI be the recovery path (``/api/show-window`` / ``/api/quit``).
         """
-        if close_ref["behavior"] == "exit":
-            return True
-        if not state["force_quit"] and use_tray:
+        allow_close, hide_window = close_decision(
+            state["force_quit"], close_ref["behavior"], use_tray
+        )
+        if not allow_close and hide_window:
             try:
                 win.hide()
             except Exception:
-                pass
+                # Hide failed: the window stays on screen and clicks on X do
+                # nothing.  Let the close proceed instead of trapping the
+                # user in an unresponsive window (WS-374 review #4).
+                return True
+            STATE["window_hidden"] = True
+            # No tray icon to click later — open the web UI in a browser so the
+            # user actually sees the recovery path (显示窗口 / 退出上位机).
+            if not STATE.get("tray_active"):
+                open_url(url)
             return False
         return True
 
@@ -601,6 +681,10 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     except Exception as e:  # noqa: BLE001
         STATE["error"] = f"pywebview GUI 不可用: {type(e).__name__}: {e}"
         print("[webview] GUI backend unavailable, serving headless:", e)
+        # The window is gone; drop the reference so show_window() no-ops
+        # cleanly instead of touching a dead GUI object (WS-374 review #5).
+        _window_ref[0] = None
+        STATE["window_hidden"] = False
         return _serve_headless(server, flask_thread, url, use_tray)
 
     stop_all()
@@ -610,5 +694,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     except Exception:
         pass
     STATE["tray_active"] = False
+    STATE["window_hidden"] = False
+    _window_ref[0] = None
     set_quit_callback(None)
     return 0
