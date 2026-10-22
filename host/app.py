@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import socket
 import subprocess
@@ -990,6 +991,144 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
+def _resolve_exe(value: str) -> str:
+    """Resolve an executable path from a user-supplied string.
+
+    Tries in order: ``%VAR%`` / ``~`` expansion → absolute path check →
+    relative path check → ``shutil.which`` (PATH lookup).  Returns the
+    resolved path, or ``""`` when nothing matches.  This lets users write
+    ``app:notepad`` (PATH name) as well as ``app:"C:\\Program Files\\App\\app.exe"``
+    and ``app:%LOCALAPPDATA%\\App\\app.exe``.
+    """
+    if not value:
+        return ""
+    # 支持 %LOCALAPPDATA% / ~ 环境变量写法
+    v = os.path.expandvars(os.path.expanduser(value))
+    if os.path.isabs(v) and os.path.exists(v):
+        return v
+    if os.path.exists(v):
+        return v
+    # 只写程序名时走 PATH 解析（shutil.which 返回完整路径或 ""）
+    return shutil.which(v) or ""
+
+
+def _open_app(value: str):
+    """Launch a desktop application, splitting the exe path from its args.
+
+    ``value`` is the full command line the user writes after ``app:``, e.g.
+    ``C:\\Program Files\\App\\app.exe --flag --port 8080``.  ``shlex.split``
+    with ``posix=False`` keeps Windows backslashes literal while still
+    honouring quoted paths that contain spaces.  The first token is the
+    executable; the rest are passed verbatim.  On Windows ``subprocess.Popen``
+    is used directly (``os.startfile`` cannot pass extra args); on macOS the
+    ``open`` command carries the args behind ``--args`` (otherwise ``open``
+    treats ``-``-prefixed args as its own options); on Linux the exe is
+    started directly (the user is expected to give a PATH-resolvable name
+    or full path).
+    """
+    if not value:
+        return
+    parts = shlex.split(value, posix=False)
+    if not parts:
+        return
+    # posix=False keeps Windows backslashes literal but leaves surrounding
+    # quotes on every token; strip them so os.path.exists / Popen see real
+    # paths and args (a quoted "arg with spaces" stays one argument).
+    parts = [p.strip('"') for p in parts]
+    exe = parts[0]
+    args = parts[1:]
+    if sys.platform.startswith("win"):
+        subprocess.Popen([exe] + args)
+    elif sys.platform == "darwin":
+        # open 会把 - 开头的参数当成自己的选项，必须加 --args 分隔
+        subprocess.Popen(["open", "--args", exe] + args)
+    else:
+        subprocess.Popen([exe] + args)
+
+
+def _win_foreground_hwnd() -> int:
+    """Return the foreground window handle on Windows (0 when unavailable)."""
+    api = _win32_api()
+    if api is None:
+        return 0
+    return int(api[0].GetForegroundWindow() or 0)
+
+
+def _win_find_app_window(exe_name: str) -> int:
+    """Return the topmost visible window whose title contain ``exe_name``.
+
+    Used as a fallback when the launched app opens behind the current
+    window: enumerate every visible window and pick the first one whose
+    title mentions the exe name (case-insensitive).  Returns 0 when no
+    match is found or we are off Windows.
+    """
+    api = _win32_api()
+    if api is None or not exe_name:
+        return 0
+    user32 = api[0]
+    found = []
+    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        if not user32.GetWindowTextW(hwnd, buf, 256):
+            return True
+        if exe_name.lower() in buf.value.lower():
+            found.append(hwnd)
+            return False  # stop at the first (topmost) match
+        return True
+
+    callback = enum_proc(_cb)
+    user32.EnumWindows(callback, 0)
+    return found[0] if found else 0
+
+
+def _wait_app_foreground(prev_hwnd: int, exe_name: str = "",
+                         timeout: float | None = None) -> bool:
+    """Wait for the just-launched desktop app to take the foreground (Windows).
+
+    Desktop apps start slower than browsers and may open behind the current
+    window, which is why the following ``text:`` / ``key:`` steps would land
+    in the wrong window.
+
+    Two phases:
+    1. Passive — poll for up to ``timeout`` seconds (default
+       ``MACRO_APP_FOCUS_TIMEOUT``) for the foreground window to change to
+       something other than ``prev_hwnd`` (the handle captured before the
+       launch).  Returns ``True`` as soon as a new window is focused.
+    2. Force — if phase 1 times out, enumerate visible windows looking for
+       one whose title mentions ``exe_name`` and call ``_force_foreground``
+       on it (the same fallback ``_wait_url_foreground`` uses for browsers).
+       This catches apps that open in the background or were reused.
+
+    Returns ``True`` when a window ends up focused, ``False`` on timeout.
+    A no-op off Windows, where window managers already focus new windows.
+    ``delay:`` remains the manual fallback when the app refuses focus
+    (foreground lock, UAC, ...).
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    if timeout is None:
+        timeout = MACRO_APP_FOCUS_TIMEOUT
+    deadline = time.monotonic() + max(0.0, timeout)
+    # Phase 1: passive wait for the foreground to change.
+    while True:
+        hwnd = _win_foreground_hwnd()
+        if hwnd and hwnd != prev_hwnd:
+            return True
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    # Phase 2: try to find and force the app window forward.
+    if exe_name:
+        hwnd = _win_find_app_window(exe_name)
+        if hwnd:
+            return _force_foreground(hwnd)
+    return False
+
+
 # --- macro input reliability ---------------------------------------------
 # ``text:`` used to call ``kb.write(value)`` with no inter-key delay. Electron
 # apps, remote desktops and slow clients drop characters at that speed, and
@@ -1003,6 +1142,7 @@ MACRO_PASTE_HOTKEY = "command+v" if sys.platform == "darwin" else "ctrl+v"
 MACRO_PASTE_SETTLE = 0.05            # let the OS publish the clipboard first
 MACRO_PASTE_RESTORE_DELAY = 0.4      # give the target time to read it back
 MACRO_URL_FOCUS_TIMEOUT = 3.0        # wait for the browser window (Windows)
+MACRO_APP_FOCUS_TIMEOUT = 3.0        # wait for the launched app window (Windows)
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -1056,6 +1196,8 @@ def _win32_api():
         user32.GetForegroundWindow.restype = wintypes.HWND
         user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
         user32.IsIconic.argtypes = [wintypes.HWND]
@@ -1531,6 +1673,52 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                                  delay=MACRO_TEXT_DEFAULT_DELAY)
                 elif st == "delay":
                     time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                elif st == "app":
+                    # Launch a desktop application, then wait for its window to
+                    # take the foreground so the following text:/key:/paste:
+                    # steps land in the right window.  A missing exe is reported
+                    # and skipped — the rest of the macro keeps running.
+                    app_val = step.get("value", "")
+                    if app_val:
+                        app_parts = shlex.split(app_val, posix=False)
+                        app_exe_raw = app_parts[0].strip('"') if app_parts else ""
+                        # 用 _resolve_exe 同时支持完整路径、~/%VAR% 展开与
+                        # PATH 程序名（shutil.which），避免只写 notepad 时
+                        # os.path.exists 直接判死。
+                        app_exe = _resolve_exe(app_val)
+                        app_name = os.path.basename(app_exe) if app_exe else ""
+                        if not app_exe:
+                            add_event("error",
+                                      f"app: 未找到可执行文件 "
+                                      f"{app_exe_raw}（已尝试路径展开与 PATH "
+                                      "解析），本步跳过，继续执行后续步骤",
+                                      dev_id, "error")
+                        else:
+                            add_event("action",
+                                      f"正在启动 {app_val}", dev_id, "ok")
+                            prev_hwnd = _win_foreground_hwnd()
+                            try:
+                                _open_app(app_val)
+                            except (FileNotFoundError, PermissionError,
+                                    OSError) as e:
+                                add_event("error",
+                                          f"app: 启动失败 "
+                                          f"{type(e).__name__}: {e}",
+                                          dev_id, "error")
+                            else:
+                                # Desktop apps start slower than browsers;
+                                # without this the following text:/key:
+                                # steps land in the previous window.
+                                focused = _wait_app_foreground(
+                                    prev_hwnd, app_name)
+                                if not focused:
+                                    add_event("warning",
+                                              f"app: 等待 {app_name} 窗口到"
+                                              "前台超时（"
+                                              f"{MACRO_APP_FOCUS_TIMEOUT} "
+                                              "秒），后续 text:/key:/paste:"
+                                              "可能打到别的窗口",
+                                              dev_id, "warning")
                 elif st == "browser":
                     browser_target, browser_used, browser_err = (
                         resolve_macro_browser(step.get("value", "")))

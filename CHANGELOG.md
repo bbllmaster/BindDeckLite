@@ -1,5 +1,25 @@
 # Changelog
 
+## 宏新增 `app:` 步骤：启动桌面应用程序后再输入文字 — 2026-10-22（WS-387）
+
+- **新增宏步骤 `app:<exe> [args]`**（`host/app.py` `_open_app` / `_resolve_exe` /
+  `_wait_app_foreground` + `run_action` macro 分支）：一个按键完成「打开桌面
+  应用 → 自动输入文字」。复用 `subprocess.Popen`，不新增动作类型，保持
+  「一个按键 = 一个宏」模型。
+- **PATH 程序名解析**（`_resolve_exe`）：支持 `%VAR%` / `~` 展开 +
+  `os.path.exists` + `shutil.which`，`app:notepad` 不再被预检判死。
+- **焦点等待两阶段策略**（`_wait_app_foreground`）：Windows 先被动等前台
+  句柄变化，超时后枚举可见窗口按标题匹配 exe 名并 `_force_foreground` 兜底，
+  参考 `_wait_url_foreground`；超时时输出 warning 日志而非静默继续。
+- **macOS 参数修复**：`open` 命令加 `--args` 分隔，避免 `-` 开头参数被
+  `open` 自己吞掉。
+- **文档**：`README.md` 宏表新增 `app:`；`index.html` 帮助新增语法行、
+  完整示例与两条排查条目，并注明等待仅 Windows 有效。
+- **测试**：`host/test_macro_parse.py` 覆盖 `app:` / `url:` / `browser:`
+  / `key:` / `text!80:` / `paste:` / `wait:` 七类输入的往返序列化。
+- 未触碰 `url:` / `browser:` / `key:` / `paste:` / `delay:` 与 `launch` /
+  `command` / `media` 分支，无回归面。
+
 ## OTA 校验与诊断：设备错误详情 + 上位机发送前镜像预校验 — 2026-10-22（WS-363）
 
 - **设备端 `end_failed` 详情**（`src/main.cpp`）：`Update.end(true)` 失败时回复
