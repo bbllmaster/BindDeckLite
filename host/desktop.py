@@ -41,12 +41,18 @@ STATE = {
     "tray_active": False,
     "url": "",
     "error": "",
+    "window_hidden": False,  # True while the native window is hidden (minimized w/o tray)
 }
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
 
 _quit_callback = None
+
+# Mutable holder for the native pywebview window, so the web UI can restore
+# it (``/api/show-window``) when the tray is unavailable and the user clicked X
+# with "minimize to tray" checked.  Cleared on shutdown.
+_window_ref = [None]
 
 
 def is_frozen() -> bool:
@@ -156,6 +162,24 @@ def setup_stdio(log_path: str) -> None:
             sys.stderr = stream
     except Exception:
         pass
+
+
+def show_window() -> bool:
+    """Restore the native window from the web UI (recovery path).
+
+    Used when the tray is unavailable and the user clicked X with "minimize to
+    tray" checked: the window was hidden instead of closed, the process keeps
+    serving, and this is how the user brings the window back.
+    """
+    win = _window_ref[0]
+    if win is None:
+        return False
+    try:
+        win.show()
+        STATE["window_hidden"] = False
+        return True
+    except Exception:
+        return False
 
 
 # --- native file dialog ---------------------------------------------------
@@ -287,6 +311,7 @@ def _build_tray(url: str, on_quit, window=None):
         if window is not None:
             try:
                 window.show()
+                STATE["window_hidden"] = False
                 return
             except Exception:
                 pass
@@ -553,6 +578,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         return _serve_headless(server, flask_thread, url, use_tray)
 
     window_ref[0] = window
+    _window_ref[0] = window
 
     if close_ref is None:
         close_ref = {"behavior": "minimize"}
@@ -566,6 +592,11 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
 
         ``close_ref`` is read at close time so the user can switch the behavior
         at runtime through the settings page without restarting the app.
+
+        When the user asks to minimize but no tray is available (old exe,
+        missing pystray/Pillow, headless backend) the app must not silently
+        degrade that into an exit: hide the window, keep serving, and let the
+        web UI be the recovery path (``/api/show-window`` / ``/api/quit``).
         """
         if close_ref["behavior"] == "exit":
             return True
@@ -574,6 +605,18 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
                 win.hide()
             except Exception:
                 pass
+            STATE["window_hidden"] = True
+            return False
+        # Tray unavailable but user chose minimize-to-tray: keep the process
+        # alive instead of silently exiting.  The web UI at the served URL
+        # remains the recovery path — "显示窗口" restores the window,
+        # "退出上位机" stops the app.
+        if close_ref["behavior"] == "minimize":
+            try:
+                win.hide()
+            except Exception:
+                pass
+            STATE["window_hidden"] = True
             return False
         return True
 
@@ -610,5 +653,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     except Exception:
         pass
     STATE["tray_active"] = False
+    STATE["window_hidden"] = False
+    _window_ref[0] = None
     set_quit_callback(None)
     return 0

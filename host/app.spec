@@ -50,7 +50,7 @@ hiddenimports = [
     "winrt.windows.devices.radios",
     "winrt.windows.storage",
 ]
-for package in ("bleak", "pystray", "webview", "pythonnet"):
+for package in ("bleak", "pystray", "PIL", "webview", "pythonnet"):
     try:
         hiddenimports += collect_submodules(package)
     except Exception:
