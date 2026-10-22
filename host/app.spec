@@ -29,6 +29,8 @@ hiddenimports = [
     "tkinter",
     "tkinter.filedialog",
     "pystray._win32",
+    "pystray",
+    "PIL.Image",
     "PIL.ImageDraw",
     # pywebview renders the Web UI in a native window.  The platform backend
     # (winforms / edgechromium / mshtml) is picked lazily at runtime by
@@ -50,7 +52,7 @@ hiddenimports = [
     "winrt.windows.devices.radios",
     "winrt.windows.storage",
 ]
-for package in ("bleak", "pystray", "webview", "pythonnet"):
+for package in ("bleak", "pystray", "webview", "pythonnet", "PIL"):
     try:
         hiddenimports += collect_submodules(package)
     except Exception:

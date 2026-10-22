@@ -575,6 +575,17 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
             except Exception:
                 pass
             return False
+        if not state["force_quit"]:
+            # Minimize requested but no tray available: keep the process alive
+            # by hiding the window instead of silently exiting.  The user can
+            # recover by double-clicking the exe — the running instance is
+            # detected via the bound port and the URL is served in a browser,
+            # and 退出上位机 in the UI still stops the app.
+            try:
+                win.hide()
+            except Exception:
+                pass
+            return False
         return True
 
     window.events.closing += _on_closing
