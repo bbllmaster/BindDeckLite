@@ -451,6 +451,7 @@ static String cfgPage() {
 
 static const char* otaUpdateErrorText(int code);  // defined below, used by the
                                                     // config-portal /update handler
+static void otaDiagReadback(int code);             // WS-378: defined below, used by both OTA paths
 
 static void setupProvisioning() {
   WiFi.mode(WIFI_AP_STA);
@@ -559,6 +560,7 @@ static void setupProvisioning() {
           // config-portal channel is diagnosable from CDC logs too.
           int code = Update.getError();
           const char* detail = otaUpdateErrorText(code);
+          otaDiagReadback(code);   // WS-378: distinguish write failure vs readback mismatch
           log_e("[ota] Update.end failed (end_failed:%s(%d))", detail, code);
         }
       }
@@ -649,6 +651,36 @@ static const char* otaUpdateErrorText(int code) {
     case UPDATE_ERROR_ABORT:        return "abort";
     case UPDATE_ERROR_DECRYPT:      return "decrypt";
     default: return "unknown";
+  }
+}
+
+// WS-378: after Update.end() fails with UPDATE_ERROR_READ, read back the first
+// byte of every OTA partition to distinguish the two causes that the library
+// folds into the same code:
+//   case A — _enablePartition() write to offset 0 failed  → byte != 0xE9
+//   case B — _enablePartition() wrote ok but _partitionIsBootable() read back
+//            a different value (cache / address-map inconsistency near the
+//            4 MB boundary on 16 MB C3) → byte == 0xE9, verify still failed
+// Only logs; does not change the error code or the end_failed:<detail>(code)
+// protocol format. Uses only public APIs — the internal _verifyEnd() path is
+// not accessible from main.cpp.
+static void otaDiagReadback(int code) {
+  if (code != UPDATE_ERROR_READ) return;
+  const esp_partition_t* otas[16] = {};
+  int n = 0;
+  for (int i = 0; i < 16; i++) {
+    const esp_partition_t* p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_OTA(i), NULL);
+    if (p) otas[n++] = p;
+  }
+  for (int i = 0; i < n; i++) {
+    uint32_t m = 0;
+    if (ESP.partitionRead(otas[i], 0, &m, 1)) {
+      log_e("[ota][diag] %s offset0 readback=0x%02X (expect 0xE9)%s",
+            otas[i]->label, (unsigned)m, (m & 0xFF) == 0xE9 ? " [write ok, read mismatch?]" : " [write failed?]");
+    } else {
+      log_e("[ota][diag] %s offset0 partitionRead FAILED", otas[i]->label);
+    }
   }
 }
 
@@ -857,6 +889,7 @@ static void processCommand(String data) {
       // end_failed prefix.
       int code = Update.getError();
       const char* detail = otaUpdateErrorText(code);
+      otaDiagReadback(code);   // WS-378: distinguish write failure vs readback mismatch
       log_e("[ota] Update.end failed (code %d: %s)", code, detail);
       String reason = String("end_failed:") + detail + "(" + String(code) + ")";
       otaAbort(reason.c_str());
