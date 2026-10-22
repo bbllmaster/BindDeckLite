@@ -1890,17 +1890,21 @@ def _ota_validate(filename: str) -> str:
 
 
 # OTA slot capacity (bytes) by flash size, matching partitions/*.csv:
-#   16 MB → 3 MB app slot, 4 MB → ~1.94 MB slot, 2 MB → no real OTA slot.
-# Unknown flash size (older firmware) defaults to the 3 MB cap so a genuine
-# 16 MB image is never wrongly rejected; a 4 MB board that exceeds its own
-# slot is still caught by the device's Update.begin().
+#   16 MB → 3 MB app slot, 4 MB → ~1.94 MB slot, 2 MB → no app1 slot at all.
+# Unknown flash size (older firmware that does not report the 5th VERSION
+# field) defaults to the 3 MB cap so a genuine 16 MB image is never wrongly
+# rejected; a 4 MB board that exceeds its own slot is still caught by the
+# device's Update.begin(). A known 2 MB board (2048) returns 0: its table has
+# no app1, so host OTA is simply not possible — the caller must surface that.
 def _ota_slot_cap(fw: dict) -> int:
     flash_kb = int((fw or {}).get("flash") or 0)
+    if flash_kb == 0:
+        return 3 * 1024 * 1024          # unknown (old firmware): conservative 3 MB
     if flash_kb >= 16000:
         return 3 * 1024 * 1024          # 16 MB table: app1 @ 0x310000, 0x300000
     if flash_kb >= 4000:
         return 0x1F0000                 # 4 MB table: app1 @ 0x200000, 0x1F0000
-    return 3 * 1024 * 1024              # conservative default
+    return 0                             # 2 MB table: no app1, no host OTA
 
 
 # ESP-IDF app image layout (esp_image_header_t, 24-byte header):
@@ -1930,10 +1934,12 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
                 "或用配网页面 http://192.168.4.1 → 固件 OTA 升级。")
     # Walk the segments to (a) reject a corrupt/truncated segment table and
     # (b) compute the declared image length (header + segments + checksum).
+    # seg_count is one byte (0-255), so the loop is bounded; a corrupt count
+    # is caught by the pos+8 > n check below rather than silently truncated.
     try:
         seg_count = file_data[1]
         pos = 24  # ESP_IMAGE_HEADER_LEN
-        for _ in range(min(seg_count, 128)):
+        for _ in range(seg_count):
             if pos + 8 > n:
                 return "固件镜像段表损坏或被截断"
             seg_len = int.from_bytes(file_data[pos + 4:pos + 8], "little")
@@ -1944,15 +1950,23 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
     except Exception:
         return "固件镜像结构无法解析"
 
-    # The trailing 32 bytes should be the SHA256 of everything before them.
-    # If so, the image is definitively intact (the hash covers every byte of
-    # the real payload, regardless of any 16-byte alignment padding after it).
-    if n >= 32 and file_data[n - 32:n] == hashlib.sha256(file_data[:n - 32]).digest():
-        # valid image with appended hash; accept (padding after the hash is
-        # ignored because the hash sits at the very end).
-        pass
+    # The image may carry an appended 32-byte SHA256 (the ESP-IDF toolchain rule,
+    # flagged by bit 0 of byte 23). When the flag is set the hash MUST be the
+    # final 32 bytes and MUST match everything before it — a truncated image
+    # that drops those bytes would otherwise slip through the lenient
+    # segment-walk fallback below (d[:-32] / d[:-33] / d[:-43] all passed).
+    # When the flag is clear some toolchains omit the hash entirely, and we
+    # fall back to the segment walk with its 16-byte alignment tolerance.
+    hash_appended = (n > 23) and (file_data[23] & 1)
+    if hash_appended:
+        if n < core_len + 32 or \
+                file_data[n - 32:n] != hashlib.sha256(file_data[:n - 32]).digest():
+            return ("固件镜像不完整或尾部 SHA256 不匹配（已损坏/被截断）。"
+                    "请重新下载并核对发布页的 SHA256。")
+        # valid image with appended hash; alignment padding before the hash is
+        # covered by the hash itself, so nothing more to check here.
     else:
-        # No valid trailing hash: rely on the segment walk. The file must be at
+        # No appended hash: rely on the segment walk. The file must be at
         # least core_len, with at most 16 bytes of alignment padding; anything
         # else is corrupt/truncated.
         if n < core_len:
@@ -1997,7 +2011,7 @@ _OTA_ERROR_TEXT = {
     "args": "设备拒绝：OTA 参数无效（固件版本过低？请使用配网页面）",
     "begin_failed": "设备拒绝：固件超出 app 分区容量",
     "write_failed": "设备写入失败，请重试",
-    "end_failed": "设备校验固件失败，请重试",
+    "end_failed": "设备写入/激活失败（end_failed），固件已留在 OTA 槽未生效，旧固件仍可启动",
     "busy": "设备正在执行其他 OTA",
     "config_mode": "设备处于配网模式，请退出后重试",
     "chunk_too_big": "块大小超出设备接受范围",
@@ -2010,13 +2024,23 @@ def _ota_error_text(ack: str) -> str:
         return ack
     reason = ack[len("ACK:OTA:ERROR:"):]
     # end_failed:<detail>(code) — the device now attaches the concrete
-    # Update error so we can tell a corrupt image from a flash failure. Keep the
-    # bare "end_failed" form working for old firmware.
+    # Update error. On this device Update::end() only fails at _partitionIsBootable
+    # (read_error=3) or esp_ota_set_boot_partition (activate=9), i.e. a device-side
+    # flash/activation problem, NOT a corrupt image (the host already proved the
+    # bytes match by passing the size+SHA256 gate). Keep the bare "end_failed"
+    # form working for old firmware.
     if reason == "end_failed" or reason.startswith("end_failed:"):
         detail = reason[len("end_failed:"):] if reason.startswith("end_failed:") else ""
         if detail:
-            return f"设备校验固件失败（end_failed: {detail}）"
-        return "设备校验固件失败，请重试"
+            guidance = ""
+            if "read_error" in detail:
+                guidance = "（OTA 分区不可引导：检查 16MB 分区表 app1 槽与实际 flash，" \
+                           "或改用配网页面 /update 交叉验证）"
+            elif "activate" in detail:
+                guidance = "（镜像激活失败：请用 esptool 从 OTA 槽读回比对，" \
+                           "或改用配网页面 /update 交叉验证）"
+            return f"设备写入/激活失败（end_failed: {detail}）{guidance}"
+        return _OTA_ERROR_TEXT.get("end_failed", "设备写入/激活失败，请重试")
     return _OTA_ERROR_TEXT.get(reason, f"设备拒绝: {reason}")
 
 
@@ -2034,7 +2058,8 @@ def _ota_current_fw(dev_id: str) -> dict:
     with _lock:
         cfg = _config["devices"].get(dev_id) or {}
     fw = cfg.get("fw") or {}
-    return {"version": fw.get("version", ""), "build": fw.get("build", "")}
+    return {"version": fw.get("version", ""), "build": fw.get("build", ""),
+            "flash": fw.get("flash", 0)}
 
 
 def _ota_is_connected(dev_id: str) -> bool:
@@ -2181,11 +2206,16 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
             # Device-side flash failure (end_failed): append concrete next steps
             # so the user is not left with a bare "verify failed" message.
             if err.startswith("ACK:OTA:ERROR:end_failed"):
+                detail = err[len("ACK:OTA:ERROR:end_failed:"):]
                 add_event("ota",
-                          "排查建议：1) 核对所选文件 SHA256 与发布页（WS-279）一致，"
-                          "截断/损坏文件即使大小正确也会在此失败；2) 改用配网页面 "
-                          "http://192.168.4.1 → 固件 OTA 升级；3) 或 USB 刷 merged "
-                          "整片包从 0x0 烧录。",
+                          "排查建议：end_failed 是设备侧写入/激活失败（主机已通过"
+                          "长度+SHA256 门禁，文件本身不是主因）。1) 查看日志里的 "
+                          "end_failed:<detail>(<code>)：read_error(3) 说明 OTA 分区"
+                          "不可引导（检查 16MB 分区表 app1 槽与实际 flash 容量），"
+                          "activate(9) 说明 esp_image_verify 失败（用 esptool 从 "
+                          "OTA 槽读回比对官方包）；2) 改用配网页面 "
+                          "http://192.168.4.1 → 固件 OTA 升级交叉验证（同一套 "
+                          "Update.end 路径）；3) 或 USB 刷 merged 整片包从 0x0 烧录。",
                           dev_id, "warn")
             _fail(_ota_error_text(err))
             return
@@ -2235,6 +2265,11 @@ def api_ota(dev_id):
     # Update.end() still verifies the image itself — this is a fast gate.
     fw = _ota_current_fw(dev_id)
     slot_cap = _ota_slot_cap(fw)
+    if slot_cap <= 0:
+        return jsonify({"ok": False,
+                        "error": "本机型不支持上位机 OTA（2 MB 模块无 app1 分区）。"
+                                  "请用 USB 刷 merged 整片包从 0x0 烧录，"
+                                  "或使用配网页面 http://192.168.4.1 → 固件 OTA 升级。"}), 400
     img_err = _ota_validate_image(file_data, slot_cap)
     if img_err:
         return jsonify({"ok": False, "error": img_err}), 400

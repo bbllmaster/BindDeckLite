@@ -92,7 +92,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `hash` | SHA256 不匹配 |
 | `begin_failed` / `write_failed` | `Update.begin` / `Update.write` 失败（如超出 app 分区） |
 | `end_failed` | `Update.end(true)` 失败：镜像校验（`esp_image_verify`）或 flash 写入失败 |
-| `end_failed:<detail>(<code>)` | 同 `end_failed`，附 `Update.getError()` 的短原因与数值码；旧上位机仍按 `end_failed` 前缀匹配。`<detail>` 取值：`no_space` / `bad_size` / `bad_magic` / `hash_mismatch` / `write_error` / `erase_error` / `activate_failed` / `no_partition` 等 |
+| `end_failed:<detail>(<code>)` | 同 `end_failed`，附 `Update.getError()` 的短原因与数值码；旧上位机仍按 `end_failed` 前缀匹配。`<detail>` 取值（与 `Update.h` 的 `UPDATE_ERROR_*` 宏一一对应，编译期校验）：`write_error`(1) / `erase_error`(2) / `read_error`(3) / `no_space`(4) / `bad_size`(5) / `stream`(6) / `md5`(7) / `magic_byte`(8) / `activate`(9) / `no_partition`(10) / `bad_argument`(11) / `abort`(12) / `decrypt`(13)。本设备 `Update::end()` 只走 `_enablePartition`/`_partitionIsBootable`（失败=3 READ）与 `esp_ota_set_boot_partition`（内部 `esp_image_verify`，失败=9 ACTIVATE），实际只会看到 3 或 9 |
 | `timeout` | 块间 30 秒无数据 |
 
 ### 编码器模式

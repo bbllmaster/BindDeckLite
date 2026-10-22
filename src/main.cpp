@@ -441,6 +441,9 @@ static String cfgPage() {
   return h;
 }
 
+static const char* otaUpdateErrorText(int code);  // defined below, used by the
+                                                    // config-portal /update handler
+
 static void setupProvisioning() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
@@ -541,8 +544,15 @@ static void setupProvisioning() {
         if (Update.write(up.buf, up.currentSize) != up.currentSize) log_e("[ota] write failed");
       } else if (up.status == UPLOAD_FILE_END) {
         g_otaProgress = 100;
-        if (Update.end(true)) log_e("[ota] done, %u bytes", up.totalSize);
-        else                  log_e("[ota] Update.end failed");
+        if (Update.end(true)) {
+          log_e("[ota] done, %u bytes", up.totalSize);
+        } else {
+          // Same end_failed:<detail>(code) detail as the BLE path so the
+          // config-portal channel is diagnosable from CDC logs too.
+          int code = Update.getError();
+          const char* detail = otaUpdateErrorText(code);
+          log_e("[ota] Update.end failed (end_failed:%s(%d))", detail, code);
+        }
       }
     });
   cfgServer.onNotFound([]() {
@@ -605,20 +615,31 @@ static void otaAbort(const char* reason) {
 // Map Update.getError() codes to a short, stable reason token. The host shows
 // this verbatim after the `end_failed:` prefix so the user can tell a
 // truncated/corrupt image from a flash write failure.
+//
+// The numeric codes are the UPDATE_ERROR_* macros from <Update.h> (Arduino
+// core 3.3.x / ESP-IDF 5.5.5). Switching on the macros instead of bare literals
+// keeps the mapping from drifting when the library renumbers its errors:
+//   6=STREAM 7=MD5 8=MAGIC_BYTE 9=ACTIVATE 10=NO_PARTITION 11=BAD_ARGUMENT
+//   12=ABORT 13=DECRYPT (+14 SIGN / 15 SHA256 / 16 SHA512 on newer cores).
+// On this device Update::end() only exercises _enablePartition /
+// _partitionIsBootable (READ=3) and esp_ota_set_boot_partition, whose internal
+// esp_image_verify fails with ACTIVATE=9, so the only codes a user can actually
+// see here are 3 (read-back mismatch) and 9 (image verification / activation).
 static const char* otaUpdateErrorText(int code) {
   switch (code) {
-    case 1:  return "write_error";     // Update.write short
-    case 2:  return "erase_error";     // partition erase failed
-    case 3:  return "read_error";      // read-back mismatch
-    case 4:  return "no_space";        // image larger than the OTA slot
-    case 5:  return "bad_size";        // declared size wrong
-    case 6:  return "md5_mismatch";    // (legacy) MD5 check
-    case 7:  return "bad_magic";       // not an ESP image
-    case 8:  return "activate_failed"; // could not mark slot bootable
-    case 9:  return "no_partition";    // no OTA partition on this board
-    case 10: return "bad_argument";    // Update.begin argument invalid
-    case 11: return "aborted";         // OTA aborted/cancelled
-    case 12: return "hash_mismatch";   // appended SHA256 mismatch
+    case UPDATE_ERROR_WRITE:        return "write_error";
+    case UPDATE_ERROR_ERASE:        return "erase_error";
+    case UPDATE_ERROR_READ:         return "read_error";
+    case UPDATE_ERROR_SPACE:        return "no_space";
+    case UPDATE_ERROR_SIZE:         return "bad_size";
+    case UPDATE_ERROR_STREAM:       return "stream";
+    case UPDATE_ERROR_MD5:          return "md5";
+    case UPDATE_ERROR_MAGIC_BYTE:   return "magic_byte";
+    case UPDATE_ERROR_ACTIVATE:     return "activate";
+    case UPDATE_ERROR_NO_PARTITION: return "no_partition";
+    case UPDATE_ERROR_BAD_ARGUMENT: return "bad_argument";
+    case UPDATE_ERROR_ABORT:        return "abort";
+    case UPDATE_ERROR_DECRYPT:      return "decrypt";
     default: return "unknown";
   }
 }
