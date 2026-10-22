@@ -623,7 +623,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     if close_ref is None:
         close_ref = {"behavior": "minimize"}
 
-    def _on_closing(win):
+    def _on_closing():
         """Fired when the user hits the window close button.
 
         Return False to cancel the close (minimize to tray), True to allow it.
@@ -637,13 +637,21 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         missing pystray/Pillow, headless backend) the app must not silently
         degrade that into an exit: hide the window, keep serving, and let the
         web UI be the recovery path (``/api/show-window`` / ``/api/quit``).
+
+        .. note::
+           The handler takes no parameters.  pywebview calls ``Event.set()``
+           with no arguments, so a handler that requires a positional argument
+           raises ``TypeError`` inside ``Event.set()``; the exception is caught
+           and the return value is discarded, making ``set()`` report "no
+           cancel" and the window closes anyway (WS-381).  ``window_ref[0]``
+           is the same ``Window`` object the handler would have received.
         """
         allow_close, hide_window = close_decision(
             state["force_quit"], close_ref["behavior"], use_tray
         )
         if not allow_close and hide_window:
             try:
-                win.hide()
+                window_ref[0].hide()
             except Exception:
                 # Hide failed: the window stays on screen and clicks on X do
                 # nothing.  Let the close proceed instead of trapping the
