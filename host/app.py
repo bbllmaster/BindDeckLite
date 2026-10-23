@@ -119,6 +119,13 @@ _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
 _action_running = {}      # (dev_id, idx) -> {"started", "token", "thread"}; WS-359/360
 _action_token_seq = 0     # bumped under _lock, one token per claim
+# WS-389: encoder rotation actions share the same preemption model as keys, but
+# are keyed by (dev_id, "CW"|"CCW") because each direction has its own action.
+_encoder_action_running = {}   # (dev_id, dir) -> {"started", "token", "thread"}
+_encoder_action_token_seq = 0  # bumped under _lock, one token per claim
+_encoder_last_trigger = {}     # (dev_id, dir) -> monotonic; one-shot 800 ms cooldown
+_ENCODER_COOLDOWN_S = 0.8      # launch / url / command: at most one trigger per dir
+_ENCODER_ONE_SHOT = {"launch", "url", "command"}
 _ping_sent = {}           # dev_id -> monotonic send time
 _bond_queried = set()     # dev_ids whose binding status we already asked for
 _udp_sock = None
@@ -429,7 +436,12 @@ def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
              "action": {"type": "none", "value": "", "macro": []}}
             for i in range(10)
         ],
-        "encoder": {"mode": 0},
+        # WS-389: rotation actions are host-side (never sent to the device), so they
+# live next to the device-side encoder mode. Default = 未配置 (仅 HID).
+# Keys are the raw ENC: direction ("CW"|"CCW"), not lowercase.
+"encoder": {"mode": 0, "actions": {
+    "CW": {"type": "none", "value": "", "macro": []},
+    "CCW": {"type": "none", "value": "", "macro": []}}},
         "sleep": {"enabled": True, "minutes": 5},
         "tz": "CET-1CEST,M3.5.0,M10.5.0/3",
     }
@@ -498,6 +510,10 @@ def _on_line(dev_id: str, line: str):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
         add_event("enc", "编码器 " + ("顺时针" if direction == "CW" else "逆时针"), dev_id)
+        # WS-389: mode 4 ("上位机动作") may bind a host-side action to each
+        # rotation direction. The device still sends F23/F24 regardless; the
+        # host action is opt-in and only runs when configured.
+        _run_encoder_action(dev_id, direction)
         return
     if line.startswith("VERSION:"):
         payload = line[len("VERSION:"):]
@@ -1590,13 +1606,18 @@ def _action_label(idx: int) -> str:
     return f"按键 {idx + 1}" if 0 <= idx < 9 else "编码器按压"
 
 
-def _record_action_result(dev_id: str, idx: int, action: dict, result: dict):
+def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
+                          label: str = ""):
     """Append a ``kind=action`` result row to the event log.
 
     Success rows use ``level=ok``; failure rows use ``level=error`` and also
     trigger a toast so the user sees the failure immediately.
+
+    ``label`` overrides the default input label (used by WS-389 for encoder
+    directions, which are not one of the 10 button indices).
     """
-    label = _action_label(idx)
+    if not label:
+        label = _action_label(idx)
     atype = result.get("action_type", (action or {}).get("type", "unknown"))
     target = result.get("target", "")
     if result["ok"]:
@@ -1743,6 +1764,151 @@ def _run_action_for(dev_id: str, idx: int):
         raise
 
 
+# --- encoder rotation actions (WS-389) -------------------------------------
+def _encoder_action_label(direction: str) -> str:
+    """Human-readable label for one rotation direction."""
+    return "编码器顺时针" if direction == "CW" else "编码器逆时针"
+
+
+def _prune_stuck_encoder_actions(now: float | None = None):
+    """Force-release encoder claims whose owner thread is gone.
+
+    Mirrors ``_prune_stuck_actions`` for the ``(dev_id, direction)`` table.
+    """
+    if now is None:
+        now = time.monotonic()
+    with _lock:
+        stuck = []
+        for key, entry in list(_encoder_action_running.items()):
+            if now - entry["started"] < ACTION_STUCK_SECONDS:
+                continue
+            thread = entry.get("thread")
+            if thread is not None and thread.is_alive():
+                continue
+            _encoder_action_running.pop(key, None)
+            stuck.append((key, now - entry["started"]))
+    for (dev_id, direction), elapsed in stuck:
+        add_event("action",
+                  f"动作超时释放: {_encoder_action_label(direction)} · 已运行 "
+                  f"{elapsed:.1f} 秒，强制解除执行中状态",
+                  dev_id, "warn")
+
+
+def _begin_encoder_action(dev_id: str, direction: str, action: dict):
+    """Claim ``(dev_id, direction)`` for one encoder action.
+
+    Returns ``(token, None)`` on success — the caller must pass that token
+    back to ``_end_encoder_action`` — or ``(None, busy_for)`` when a previous
+    action of this direction is still running (caller logs "动作跳过"), or
+    ``(None, None)`` when the one-shot cooldown has not elapsed yet (caller
+    drops silently). The cooldown check and the claim are atomic under
+    ``_lock`` so two near-simultaneous detents cannot both trigger.
+    """
+    global _encoder_action_token_seq
+    now = time.monotonic()
+    _prune_stuck_encoder_actions(now)
+    with _lock:
+        entry = _encoder_action_running.get((dev_id, direction))
+        if entry is not None:
+            return None, now - entry["started"]
+        if (action or {}).get("type", "none") in _ENCODER_ONE_SHOT:
+            last = _encoder_last_trigger.get((dev_id, direction))
+            if last is not None and now - last < _ENCODER_COOLDOWN_S:
+                return None, None
+        _encoder_action_token_seq += 1
+        token = _encoder_action_token_seq
+        _encoder_action_running[(dev_id, direction)] = {
+            "started": now, "token": token, "thread": None}
+        if (action or {}).get("type", "none") in _ENCODER_ONE_SHOT:
+            _encoder_last_trigger[(dev_id, direction)] = now
+        return token, None
+
+
+def _bind_encoder_action_thread(dev_id, direction, token, thread):
+    """Attach the owning thread to a claim so the stuck guard can inspect it."""
+    with _lock:
+        entry = _encoder_action_running.get((dev_id, direction))
+        if entry is not None and entry["token"] == token:
+            entry["thread"] = thread
+
+
+def _end_encoder_action(dev_id, direction, token):
+    """Release the claim taken by ``_begin_encoder_action`` (idempotent)."""
+    with _lock:
+        entry = _encoder_action_running.get((dev_id, direction))
+        if entry is not None and entry["token"] == token:
+            _encoder_action_running.pop((dev_id, direction), None)
+
+
+def _encoder_running_snapshot() -> dict:
+    """``{dev_id: {"CW"|"CCW": 已运行秒数}}`` for encoder actions executing.
+
+    Same connected-only rule as ``_running_snapshot``: a deck that went away
+    mid-action is not reported, but the claim is kept so a quick reconnect
+    cannot hand the same detent to a second action (WS-360).
+    """
+    _prune_stuck_encoder_actions()
+    connected = {d.get("dev_id", "") for d in ble.devices() if d.get("connected")}
+    now = time.monotonic()
+    out: dict = {}
+    with _lock:
+        for (dev_id, direction), entry in _encoder_action_running.items():
+            if dev_id not in connected:
+                continue
+            out.setdefault(dev_id, {})[direction] = round(now - entry["started"], 1)
+    return out
+
+
+def _run_encoder_action(dev_id: str, direction: str):
+    """Execute the host-side action bound to one rotation direction.
+
+    Gate: only mode 4 ("上位机动作") runs host actions; every other mode
+    leaves rotation to the device (which still sends F23/F24). A direction
+    whose action is "仅 HID" (type none) does nothing here — the device's
+    F23/F24 is the only effect, matching the default (未配置) behaviour.
+    """
+    if not _config["settings"].get("actions_enabled", True):
+        return
+    if direction not in ("CW", "CCW"):
+        return
+    cfg = device_cfg(dev_id)
+    if cfg.get("encoder", {}).get("mode") != 4:
+        return
+    actions = cfg.get("encoder", {}).get("actions", {}) or {}
+    action = actions.get(direction) or {}
+    if not action or action.get("type", "none") == "none":
+        return
+
+    label = _encoder_action_label(direction)
+    token, busy_for = _begin_encoder_action(dev_id, direction, action)
+    if token is None and busy_for is None:
+        # One-shot cooldown elapsed: silently ignore this detent.
+        return
+    if token is None:
+        # A previous action of this direction is still running — dropping a
+        # second one would interleave characters with the first (WS-360).
+        add_event("action",
+                  f"动作跳过: {label} · 上一次动作仍在执行"
+                  f"（已运行 {busy_for:.1f} 秒）",
+                  dev_id, "warn")
+        return
+
+    def _do():
+        try:
+            result = run_action(action, dev_id)
+            _record_action_result(dev_id, -1, action, result, label=label)
+        finally:
+            _end_encoder_action(dev_id, direction, token)
+
+    thread = threading.Thread(target=_do, daemon=True)
+    _bind_encoder_action_thread(dev_id, direction, token, thread)
+    try:
+        thread.start()
+    except Exception:  # noqa: BLE001 — Thread.start() failed, keep the table clean
+        _end_encoder_action(dev_id, direction, token)
+        raise
+
+
 # --- HTTP API -------------------------------------------------------------
 @app.route("/")
 def index():
@@ -1762,6 +1928,8 @@ def api_status():
                        for k, v in last.items()},
         # WS-359: additive field — old front-ends simply ignore it.
         "running": _running_snapshot(),
+        # WS-389: additive — encoder rotation actions executing, per direction.
+        "encoder_running": _encoder_running_snapshot(),
         "event_seq": _event_seq,
     })
 
@@ -1843,6 +2011,67 @@ def api_action_test(dev_id, idx):
 
     _end_action(dev_id, idx, token)
     _record_action_result(dev_id, idx, action, result)
+    return jsonify({"ok": result["ok"], "error": result["error"],
+                    "browser_used": result.get("browser_used", "")})
+
+
+@app.route("/api/encoder/action/test/<dev_id>/<direction>", methods=["POST"])
+def api_encoder_action_test(dev_id, direction):
+    """Synchronously test the action bound to one encoder direction.
+
+    Mirrors ``api_action_test``: the 5 s HTTP cap keeps the response alive
+    while a longer macro keeps running in the background, the worker owning
+    the claim so the card stays "执行中" until the action really finishes.
+    """
+    if direction not in ("CW", "CCW"):
+        return jsonify({"ok": False, "error": "bad direction"}), 400
+    cfg = device_cfg(dev_id)
+    if cfg.get("encoder", {}).get("mode") != 4:
+        # Not in 上位机动作 mode: the card is greyed out in the UI, so this is
+        # only reached if the user somehow clicks. Nothing to run.
+        return jsonify({"ok": True, "error": ""})
+    actions = cfg.get("encoder", {}).get("actions", {}) or {}
+    action = actions.get(direction) or {}
+    if not action or action.get("type", "none") == "none":
+        return jsonify({"ok": True, "error": ""})
+
+    token, busy_for = _begin_encoder_action(dev_id, direction, action)
+    if token is None and busy_for is None:
+        # One-shot cooldown: nothing to do, report success silently.
+        return jsonify({"ok": True, "error": ""})
+    if token is None:
+        return jsonify({"ok": False, "error": "该方向的动作仍在执行",
+                        "running": True, "elapsed": round(busy_for, 1)}), 200
+
+    result_queue: "queue.Queue" = queue.Queue()
+
+    def _worker():
+        try:
+            result_queue.put(run_action(action, dev_id))
+        except Exception as e:  # noqa: BLE001
+            result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
+                              "action_type": action.get("type", ""),
+                              "target": _truncate(action.get("value", ""))})
+        finally:
+            _end_encoder_action(dev_id, direction, token)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    _bind_encoder_action_thread(dev_id, direction, token, t)
+    try:
+        t.start()
+    except Exception:  # noqa: BLE001
+        _end_encoder_action(dev_id, direction, token)
+        raise
+    try:
+        result = result_queue.get(timeout=5.0)
+    except queue.Empty:
+        # Still running: the worker owns the claim, so the card stays
+        # "执行中" until the action finishes. Do NOT release here.
+        return jsonify({"ok": False, "error": "仍在执行", "running": True}), 200
+
+    _end_encoder_action(dev_id, direction, token)
+    _record_action_result(dev_id, -1, action, result,
+                          label=_encoder_action_label(direction))
     return jsonify({"ok": result["ok"], "error": result["error"],
                     "browser_used": result.get("browser_used", "")})
 

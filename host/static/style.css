@@ -304,6 +304,62 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   line-height: 1.7;
 }
 
+/* ---------- encoder rotation actions (WS-389) ---------- */
+.enc-action-card {
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* 其他 4 个模式下整卡置灰，仅可查看。 */
+.enc-action-card.disabled {
+  opacity: 0.5;
+}
+.enc-action-status {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 10px;
+  line-height: 1.6;
+}
+.enc-action-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+.enc-action-row:first-child { border-top: none; }
+.enc-dir-label {
+  flex: none;
+  width: 56px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.enc-action-row .sel-enc-act {
+  flex: none;
+  width: 124px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.enc-act-input {
+  flex: 1;
+  min-width: 0;
+}
+.enc-action-row .test { flex: none; }
+/* 执行中：行轻微高亮，按钮文本与禁用态由 JS 切换。 */
+.enc-action-row.running {
+  background: rgba(53, 224, 194, 0.06);
+  border-radius: 8px;
+}
+@media (max-width: 860px) {
+  .enc-dir-label { width: 48px; }
+  .enc-action-row .sel-enc-act { width: 104px; }
+}
+
 /* ---------- device ---------- */
 .chip-badge {
   border: 1px solid var(--line); background: var(--card);
