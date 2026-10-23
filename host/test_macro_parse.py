@@ -25,38 +25,38 @@ import app as host_app
 def test_parse_app_cmd_simple():
     exe, args = host_app._parse_app_cmd("C:\\path\\app.exe")
     assert exe == "C:\\path\\app.exe"
-    assert args == ""
+    assert args == []
 
 
 def test_parse_app_cmd_with_args():
     exe, args = host_app._parse_app_cmd("C:\\path\\app.exe --flag --port 8080")
     assert exe == "C:\\path\\app.exe"
-    assert args == "--flag --port 8080"
+    assert args == ["--flag", "--port", "8080"]
 
 
 def test_parse_app_cmd_quoted_path_with_spaces():
     exe, args = host_app._parse_app_cmd(
         '"C:\\Program Files\\App\\app.exe" --new')
     assert exe == "C:\\Program Files\\App\\app.exe"
-    assert args == "--new"
+    assert args == ["--new"]
 
 
 def test_parse_app_cmd_quoted_arg_with_spaces():
     exe, args = host_app._parse_app_cmd('myapp.exe "hello world"')
     assert exe == "myapp.exe"
-    assert args == "hello world"
+    assert args == ["hello world"]
 
 
 def test_parse_app_cmd_path_name():
     exe, args = host_app._parse_app_cmd("notepad")
     assert exe == "notepad"
-    assert args == ""
+    assert args == []
 
 
 def test_parse_app_cmd_empty():
     exe, args = host_app._parse_app_cmd("")
     assert exe == ""
-    assert args == ""
+    assert args == []
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +180,35 @@ def test_open_app_env_var_expansion(tmp_path):
                 with mock.patch.object(host_app.subprocess, "Popen") as popen:
                     host_app._open_app("%TEST_APP_EXE% --flag")
                     popen.assert_called_once()
+
+
+def test_open_app_quoted_arg_with_spaces():
+    """A quoted argument with spaces survives the parse→Popen round-trip.
+
+    This is the regression test for the bug where ``_parse_app_cmd`` joined
+    args with spaces and ``_open_app`` re-split them, destroying the quote
+    boundaries that ``shlex.split`` had worked to preserve — turning
+    ``"hello world"`` into two separate ``"hello"`` / ``"world"`` tokens.
+    """
+    with mock.patch.object(host_app.sys, "platform", "win32"):
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="C:\\app.exe"):
+            with mock.patch.object(host_app.subprocess, "Popen") as popen:
+                host_app._open_app('C:\\app.exe "hello world" --flag')
+                popen.assert_called_once_with(
+                    ["C:\\app.exe", "hello world", "--flag"])
+
+
+def test_open_app_multiple_quoted_args():
+    """Multiple quoted arguments each survive as single tokens."""
+    with mock.patch.object(host_app.sys, "platform", "linux"):
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/usr/bin/app"):
+            with mock.patch.object(host_app.subprocess, "Popen") as popen:
+                host_app._open_app(
+                    '/usr/bin/app "arg one" "arg two" --normal')
+                popen.assert_called_once_with(
+                    ["/usr/bin/app", "arg one", "arg two", "--normal"])
 
 
 # ---------------------------------------------------------------------------

@@ -991,8 +991,8 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
-def _parse_app_cmd(value: str) -> tuple[str, str]:
-    """Split an ``app:<exe> [args]`` value into ``(exe, args)``.
+def _parse_app_cmd(value: str) -> tuple[str, list[str]]:
+    """Split an ``app:<exe> [args]`` value into ``(exe, [args])``.
 
     This is the **single** parsing entry point for the ``app:`` macro step —
     ``run_action``, ``_open_app`` and the unit tests all call this function,
@@ -1000,14 +1000,19 @@ def _parse_app_cmd(value: str) -> tuple[str, str]:
     keeps Windows backslashes literal while honouring quoted paths that
     contain spaces; surrounding quotes are then stripped from every token
     (a quoted ``"arg with spaces"`` stays one argument).
+
+    The args are returned as a **list**, never a joined string: joining
+    with spaces and re-splitting downstream would lose the quote
+    boundaries that ``shlex.split`` worked so hard to preserve (a
+    ``"hello world"`` argument would come back as two separate tokens).
     """
     if not value:
-        return "", ""
+        return "", []
     parts = shlex.split(value, posix=False)
     if not parts:
-        return "", ""
+        return "", []
     parts = [p.strip('"') for p in parts]
-    return parts[0], " ".join(parts[1:])
+    return parts[0], parts[1:]
 
 
 def _resolve_exe(value: str) -> str:
@@ -1049,13 +1054,14 @@ def _open_app(value: str):
     the exe is started directly (the user is expected to give a
     PATH-resolvable name or full path).
     """
-    exe_raw, args_str = _parse_app_cmd(value)
+    exe_raw, args = _parse_app_cmd(value)
     if not exe_raw:
         return None
     exe = _resolve_exe(exe_raw)
     if not exe:
         return None
-    args = shlex.split(args_str, posix=False) if args_str else []
+    # args is already a list from _parse_app_cmd — never re-split it,
+    # otherwise quoted arguments with spaces would break apart again.
     if sys.platform.startswith("win"):
         return subprocess.Popen([exe] + args)
     elif sys.platform == "darwin":
