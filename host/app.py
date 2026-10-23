@@ -991,13 +991,34 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
-def _resolve_exe(value: str) -> str:
-    """Resolve an executable path from a user-supplied string.
+def _parse_app_cmd(value: str) -> tuple[str, str]:
+    """Split an ``app:<exe> [args]`` value into ``(exe, args)``.
 
-    Tries in order: ``%VAR%`` / ``~`` expansion → absolute path check →
-    relative path check → ``shutil.which`` (PATH lookup).  Returns the
-    resolved path, or ``""`` when nothing matches.  This lets users write
-    ``app:notepad`` (PATH name) as well as ``app:"C:\\Program Files\\App\\app.exe"``
+    This is the **single** parsing entry point for the ``app:`` macro step —
+    ``run_action``, ``_open_app`` and the unit tests all call this function,
+    never ``shlex.split`` directly.  ``shlex.split(value, posix=False)``
+    keeps Windows backslashes literal while honouring quoted paths that
+    contain spaces; surrounding quotes are then stripped from every token
+    (a quoted ``"arg with spaces"`` stays one argument).
+    """
+    if not value:
+        return "", ""
+    parts = shlex.split(value, posix=False)
+    if not parts:
+        return "", ""
+    parts = [p.strip('"') for p in parts]
+    return parts[0], " ".join(parts[1:])
+
+
+def _resolve_exe(value: str) -> str:
+    """Resolve an executable path from a user-supplied **exe name**.
+
+    The caller must pass the bare exe name (the first token from
+    ``_parse_app_cmd``), never the full command line.  Tries in order:
+    ``%VAR%`` / ``~`` expansion → absolute path check → relative path check →
+    ``shutil.which`` (PATH lookup).  Returns the resolved path, or ``""``
+    when nothing matches.  This lets users write ``app:notepad`` (PATH name)
+    as well as ``app:"C:\\Program Files\\App\\app.exe"``
     and ``app:%LOCALAPPDATA%\\App\\app.exe``.
     """
     if not value:
@@ -1013,37 +1034,36 @@ def _resolve_exe(value: str) -> str:
 
 
 def _open_app(value: str):
-    """Launch a desktop application, splitting the exe path from its args.
+    """Launch a desktop application, returning the ``Popen`` object (or ``None``).
 
     ``value`` is the full command line the user writes after ``app:``, e.g.
-    ``C:\\Program Files\\App\\app.exe --flag --port 8080``.  ``shlex.split``
-    with ``posix=False`` keeps Windows backslashes literal while still
-    honouring quoted paths that contain spaces.  The first token is the
-    executable; the rest are passed verbatim.  On Windows ``subprocess.Popen``
-    is used directly (``os.startfile`` cannot pass extra args); on macOS the
-    ``open`` command carries the args behind ``--args`` (otherwise ``open``
-    treats ``-``-prefixed args as its own options); on Linux the exe is
-    started directly (the user is expected to give a PATH-resolvable name
-    or full path).
+    ``C:\\Program Files\\App\\app.exe --flag --port 8080``.  Uses
+    ``_parse_app_cmd`` for the single split, ``_resolve_exe`` for the exe
+    resolution, and passes the **resolved** exe + args to ``Popen`` so that
+    ``%LOCALAPPDATA%`` / ``~`` / ``$MY_APP`` expansions are not lost.
+
+    On Windows ``subprocess.Popen`` is used directly (``os.startfile``
+    cannot pass extra args); on macOS the ``open`` command is invoked as
+    ``open <exe> --args <args>`` (``--args`` must come *after* the target,
+    otherwise ``open`` has no target and the app never starts); on Linux
+    the exe is started directly (the user is expected to give a
+    PATH-resolvable name or full path).
     """
-    if not value:
-        return
-    parts = shlex.split(value, posix=False)
-    if not parts:
-        return
-    # posix=False keeps Windows backslashes literal but leaves surrounding
-    # quotes on every token; strip them so os.path.exists / Popen see real
-    # paths and args (a quoted "arg with spaces" stays one argument).
-    parts = [p.strip('"') for p in parts]
-    exe = parts[0]
-    args = parts[1:]
+    exe_raw, args_str = _parse_app_cmd(value)
+    if not exe_raw:
+        return None
+    exe = _resolve_exe(exe_raw)
+    if not exe:
+        return None
+    args = shlex.split(args_str, posix=False) if args_str else []
     if sys.platform.startswith("win"):
-        subprocess.Popen([exe] + args)
+        return subprocess.Popen([exe] + args)
     elif sys.platform == "darwin":
-        # open 会把 - 开头的参数当成自己的选项，必须加 --args 分隔
-        subprocess.Popen(["open", "--args", exe] + args)
+        # open <target> --args <args...>：--args 必须在目标之后，
+        # 否则 open 没有目标，应用根本不会启动。
+        return subprocess.Popen(["open", exe, "--args"] + args)
     else:
-        subprocess.Popen([exe] + args)
+        return subprocess.Popen([exe] + args)
 
 
 def _win_foreground_hwnd() -> int:
@@ -1054,16 +1074,20 @@ def _win_foreground_hwnd() -> int:
     return int(api[0].GetForegroundWindow() or 0)
 
 
-def _win_find_app_window(exe_name: str) -> int:
-    """Return the topmost visible window whose title contain ``exe_name``.
+def _win_find_app_window(pid: int) -> int:
+    """Return the topmost visible window owned by ``pid`` (Windows).
 
     Used as a fallback when the launched app opens behind the current
-    window: enumerate every visible window and pick the first one whose
-    title mentions the exe name (case-insensitive).  Returns 0 when no
-    match is found or we are off Windows.
+    window: enumerate every visible window, resolve its owning process
+    via ``GetWindowThreadProcessId``, and pick the first match for ``pid``.
+    Returns 0 when no match is found or we are off Windows.
+
+    Matching by PID (rather than by window-title substring) is deliberate:
+    real window titles such as "Untitled - Notepad" or "Google Chrome"
+    do not contain the exe basename, so title matching would never hit.
     """
     api = _win32_api()
-    if api is None or not exe_name:
+    if api is None or not pid:
         return 0
     user32 = api[0]
     found = []
@@ -1072,10 +1096,9 @@ def _win_find_app_window(exe_name: str) -> int:
     def _cb(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
-        buf = ctypes.create_unicode_buffer(256)
-        if not user32.GetWindowTextW(hwnd, buf, 256):
-            return True
-        if exe_name.lower() in buf.value.lower():
+        proc_id = ctypes.c_uint32(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+        if proc_id.value == pid:
             found.append(hwnd)
             return False  # stop at the first (topmost) match
         return True
@@ -1085,8 +1108,8 @@ def _win_find_app_window(exe_name: str) -> int:
     return found[0] if found else 0
 
 
-def _wait_app_foreground(prev_hwnd: int, exe_name: str = "",
-                         timeout: float | None = None) -> bool:
+def _wait_app_foreground(prev_hwnd: int, pid: int = 0,
+                         timeout: float | None = None):
     """Wait for the just-launched desktop app to take the foreground (Windows).
 
     Desktop apps start slower than browsers and may open behind the current
@@ -1099,17 +1122,19 @@ def _wait_app_foreground(prev_hwnd: int, exe_name: str = "",
        something other than ``prev_hwnd`` (the handle captured before the
        launch).  Returns ``True`` as soon as a new window is focused.
     2. Force — if phase 1 times out, enumerate visible windows looking for
-       one whose title mentions ``exe_name`` and call ``_force_foreground``
-       on it (the same fallback ``_wait_url_foreground`` uses for browsers).
-       This catches apps that open in the background or were reused.
+       the one owned by ``pid`` (via ``GetWindowThreadProcessId``) and call
+       ``_force_foreground`` on it (the same fallback ``_wait_url_foreground``
+       uses for browsers).  This catches apps that open in the background
+       or were reused.
 
-    Returns ``True`` when a window ends up focused, ``False`` on timeout.
-    A no-op off Windows, where window managers already focus new windows.
-    ``delay:`` remains the manual fallback when the app refuses focus
-    (foreground lock, UAC, ...).
+    Returns:
+        ``True``  — a window ended up focused.
+        ``False`` — Windows: timed out without focusing anything.
+        ``None``  — off Windows; the caller must NOT treat this as a
+                    failure (window managers already focus new windows).
     """
     if not sys.platform.startswith("win"):
-        return False
+        return None
     if timeout is None:
         timeout = MACRO_APP_FOCUS_TIMEOUT
     deadline = time.monotonic() + max(0.0, timeout)
@@ -1121,9 +1146,9 @@ def _wait_app_foreground(prev_hwnd: int, exe_name: str = "",
         if time.monotonic() >= deadline:
             break
         time.sleep(0.1)
-    # Phase 2: try to find and force the app window forward.
-    if exe_name:
-        hwnd = _win_find_app_window(exe_name)
+    # Phase 2: try to find and force the app window forward by PID.
+    if pid:
+        hwnd = _win_find_app_window(pid)
         if hwnd:
             return _force_foreground(hwnd)
     return False
@@ -1198,6 +1223,8 @@ def _win32_api():
         user32.GetClassNameW.restype = ctypes.c_int
         user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(ctypes.c_uint32)]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
         user32.IsIconic.argtypes = [wintypes.HWND]
@@ -1678,15 +1705,15 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                     # take the foreground so the following text:/key:/paste:
                     # steps land in the right window.  A missing exe is reported
                     # and skipped — the rest of the macro keeps running.
+                    #
+                    # 单次解析：_parse_app_cmd 拆出 (exe, args)，_resolve_exe
+                    # 只对 exe 做展开/PATH 查找，_open_app 用解析后的结果
+                    # Popen，避免整条命令行去 exists/which 导致带参数时
+                    # 一律判死，以及环境变量展开在启动时丢失。
                     app_val = step.get("value", "")
                     if app_val:
-                        app_parts = shlex.split(app_val, posix=False)
-                        app_exe_raw = app_parts[0].strip('"') if app_parts else ""
-                        # 用 _resolve_exe 同时支持完整路径、~/%VAR% 展开与
-                        # PATH 程序名（shutil.which），避免只写 notepad 时
-                        # os.path.exists 直接判死。
-                        app_exe = _resolve_exe(app_val)
-                        app_name = os.path.basename(app_exe) if app_exe else ""
+                        app_exe_raw, _app_args = _parse_app_cmd(app_val)
+                        app_exe = _resolve_exe(app_exe_raw)
                         if not app_exe:
                             add_event("error",
                                       f"app: 未找到可执行文件 "
@@ -1697,28 +1724,32 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                             add_event("action",
                                       f"正在启动 {app_val}", dev_id, "ok")
                             prev_hwnd = _win_foreground_hwnd()
+                            proc = None
                             try:
-                                _open_app(app_val)
+                                proc = _open_app(app_val)
                             except (FileNotFoundError, PermissionError,
                                     OSError) as e:
                                 add_event("error",
                                           f"app: 启动失败 "
                                           f"{type(e).__name__}: {e}",
                                           dev_id, "error")
-                            else:
+                            if proc is not None:
                                 # Desktop apps start slower than browsers;
                                 # without this the following text:/key:
                                 # steps land in the previous window.
+                                # _wait_app_foreground returns None off
+                                # Windows (not a failure — window managers
+                                # already focus new windows); only warn on
+                                # a real Windows timeout (False).
                                 focused = _wait_app_foreground(
-                                    prev_hwnd, app_name)
-                                if not focused:
-                                    add_event("warning",
-                                              f"app: 等待 {app_name} 窗口到"
-                                              "前台超时（"
+                                    prev_hwnd, proc.pid)
+                                if focused is False:
+                                    add_event("warn",
+                                              f"app: 等待窗口到前台超时（"
                                               f"{MACRO_APP_FOCUS_TIMEOUT} "
                                               "秒），后续 text:/key:/paste:"
                                               "可能打到别的窗口",
-                                              dev_id, "warning")
+                                              dev_id, "warn")
                 elif st == "browser":
                     browser_target, browser_used, browser_err = (
                         resolve_macro_browser(step.get("value", "")))
