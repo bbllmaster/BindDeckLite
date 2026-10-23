@@ -523,6 +523,42 @@ def _serve_headless(server, flask_thread, url, use_tray):
     return 0
 
 
+def make_on_closing(state, close_ref, use_tray, url, window_ref):
+    """Factory for the window-close handler registered on
+    ``window.events.closing``.
+
+    Extracted from ``run_webview`` so the pywebview ``Event.set()`` contract
+    can be tested with a real ``webview.event.Event`` (WS-382 review #3).
+
+    The handler takes NO parameters: pywebview calls ``Event.set()`` with
+    no arguments, so a handler requiring a positional argument raises
+    ``TypeError`` inside ``set()``; the exception is caught and the return
+    value discarded, making ``set()`` report "no cancel" and the window
+    closes anyway.  ``window_ref[0]`` is the same ``Window`` object the
+    handler would have received had pywebview injected it.
+    """
+    def _on_closing():
+        allow_close, hide_window = close_decision(
+            state["force_quit"], close_ref["behavior"], use_tray
+        )
+        if not allow_close and hide_window:
+            try:
+                window_ref[0].hide()
+            except Exception:
+                # Hide failed: the window stays on screen and clicks on X do
+                # nothing.  Let the close proceed instead of trapping the
+                # user in an unresponsive window (WS-374 review #4).
+                return True
+            STATE["window_hidden"] = True
+            # No tray icon to click later — open the web UI in a browser so the
+            # user actually sees the recovery path (显示窗口 / 退出上位机).
+            if not STATE.get("tray_active"):
+                open_url(url)
+            return False
+        return True
+    return _on_closing
+
+
 def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
                 use_tray: bool = True, log_path: str = "",
                 close_ref: dict | None = None) -> int:
@@ -623,40 +659,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     if close_ref is None:
         close_ref = {"behavior": "minimize"}
 
-    def _on_closing(win):
-        """Fired when the user hits the window close button.
-
-        Return False to cancel the close (minimize to tray), True to allow it.
-        pywebview's WinForms backend runs this on the GUI thread, so hiding the
-        window here is safe and immediate.
-
-        ``close_ref`` is read at close time so the user can switch the behavior
-        at runtime through the settings page without restarting the app.
-
-        When the user asks to minimize but no tray is available (old exe,
-        missing pystray/Pillow, headless backend) the app must not silently
-        degrade that into an exit: hide the window, keep serving, and let the
-        web UI be the recovery path (``/api/show-window`` / ``/api/quit``).
-        """
-        allow_close, hide_window = close_decision(
-            state["force_quit"], close_ref["behavior"], use_tray
-        )
-        if not allow_close and hide_window:
-            try:
-                win.hide()
-            except Exception:
-                # Hide failed: the window stays on screen and clicks on X do
-                # nothing.  Let the close proceed instead of trapping the
-                # user in an unresponsive window (WS-374 review #4).
-                return True
-            STATE["window_hidden"] = True
-            # No tray icon to click later — open the web UI in a browser so the
-            # user actually sees the recovery path (显示窗口 / 退出上位机).
-            if not STATE.get("tray_active"):
-                open_url(url)
-            return False
-        return True
-
+    _on_closing = make_on_closing(state, close_ref, use_tray, url, window_ref)
     window.events.closing += _on_closing
 
     # 4. Start the tray icon (if available).  pywebview's
