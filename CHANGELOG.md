@@ -1,5 +1,32 @@
 # Changelog
 
+## 宏新增 `app:` 步骤：启动桌面应用程序后再输入文字 — 2026-10-22（WS-387）
+
+- **新增宏步骤 `app:<exe> [args]`**（`host/app.py` `_parse_app_cmd` /
+  `_resolve_exe` / `_open_app` / `_wait_app_foreground` + `run_action` macro
+  分支）：一个按键完成「打开桌面应用 → 自动输入文字」。复用
+  `subprocess.Popen`，不新增动作类型，保持「一个按键 = 一个宏」模型。
+- **单次解析**（`_parse_app_cmd`）：全仓只 split 一次 → `_resolve_exe(exe)`
+  → `Popen([resolved] + args)`；`run_action` / `_open_app` / 测试共用同一
+  函数，避免各拆各的导致带参数时 exe 预检判死、环境变量展开在启动时丢失。
+- **PATH 程序名解析**（`_resolve_exe`）：支持 `%VAR%` / `~` 展开 +
+  `os.path.exists` + `shutil.which`，只对 exe token（非整条命令行）做解析。
+- **焦点等待两阶段策略**（`_wait_app_foreground`）：Windows 先被动等前台
+  句柄变化，超时后按 **PID**（`GetWindowThreadProcessId` + `Popen.pid`）匹配
+  窗口并 `_force_foreground` 兜底（替代按标题 substring 匹配，真实标题如
+  "Untitled - Notepad" 不含 exe 名）；非 Windows 返回 `None`（不是
+  `False`），调用方仅在 `False` 时告警，避免 macOS/Linux 误报超时。
+- **macOS 参数顺序**：`open <exe> --args <args>`（`--args` 必须在目标
+  之后，否则 open 没有目标，应用根本不会启动）。
+- **文档**：`README.md` 宏表新增 `app:`；`index.html` 帮助新增语法行、
+  完整示例与两条排查条目，并注明等待仅 Windows 有效。
+- **测试**：`host/test_macro_parse.py`（27 例）直接 import 生产函数，
+  覆盖 `_parse_app_cmd` / `_resolve_exe` / `_open_app` / `_wait_app_foreground`
+  及 `run_action` 的 `app:` 分支（含带参数、环境变量展开失败、非 Windows
+  不误报、Windows 超时告警四种 case）。
+- 未触碰 `url:` / `browser:` / `key:` / `paste:` / `delay:` 与 `launch` /
+  `command` / `media` 分支，无回归面。
+
 ## OTA 校验与诊断：设备错误详情 + 上位机发送前镜像预校验 — 2026-10-22（WS-363）
 
 - **设备端 `end_failed` 详情**（`src/main.cpp`）：`Update.end(true)` 失败时回复
