@@ -470,7 +470,8 @@ function parseMacro(text) {
       }
       if (kind === "app") {
         // 启动桌面应用程序：可执行文件路径，可带参数（引号包裹含空格的路径）。
-        // 主机端 _resolve_exe / shlex.split 后取第一个 token 作为 exe，其余为参数。
+        // 主机端 _parse_app_cmd 拆出 (exe, args)：第一个 token 作为 exe 交给
+        // _resolve_exe 解析，其余为参数，原样传给 Popen。
         return { type: "app", value };
       }
       return { type: "key", value: line };

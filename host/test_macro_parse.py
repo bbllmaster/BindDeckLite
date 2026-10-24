@@ -59,6 +59,25 @@ def test_parse_app_cmd_empty():
     assert args == []
 
 
+def test_parse_app_cmd_unbalanced_quote_does_not_raise():
+    """An unbalanced quote degrades to a normal parse instead of raising.
+
+    ``shlex.split`` raises ``ValueError`` on a dangling quote.  Uncaught, that
+    exception propagates out of the macro loop and aborts *every* following
+    step, so a single typo would silence the rest of the macro.
+    """
+    exe, args = host_app._parse_app_cmd('myapp.exe "unclosed')
+    assert exe == "myapp.exe"
+    assert args == ["unclosed"]
+
+
+def test_parse_app_cmd_empty_quoted_arg_preserved():
+    """An explicitly empty argument (``""``) survives as an empty token."""
+    exe, args = host_app._parse_app_cmd('myapp.exe "" --flag')
+    assert exe == "myapp.exe"
+    assert args == ["", "--flag"]
+
+
 # ---------------------------------------------------------------------------
 # _resolve_exe
 # ---------------------------------------------------------------------------
@@ -84,10 +103,22 @@ def test_resolve_exe_relative_path(tmp_path):
         os.chdir(cwd)
 
 
-def test_resolve_exe_path_name():
-    """A bare program name is resolved through PATH (shutil.which)."""
-    result = host_app._resolve_exe("python3")
-    assert result, "python3 should be resolvable via PATH"
+def test_resolve_exe_path_name(tmp_path, monkeypatch):
+    """A bare program name is resolved through PATH (shutil.which).
+
+    Builds a throw-away program in a temp dir and puts that dir on PATH,
+    instead of relying on a hard-coded ``python3``: the CI runner is
+    windows-latest, where ``python3.exe`` does not exist, and the lookup
+    rules differ per platform (Windows needs a PATHEXT extension).
+    """
+    name = "resolve_probe.exe" if sys.platform.startswith("win") else "resolve_probe"
+    probe = tmp_path / name
+    probe.write_text("dummy")
+    if not sys.platform.startswith("win"):
+        probe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path), prepend=os.pathsep)
+    result = host_app._resolve_exe(name)
+    assert result, f"{name} should be resolvable via PATH"
     assert os.path.exists(result)
 
 
@@ -141,6 +172,20 @@ def test_open_app_macos_uses_open_args():
                 host_app._open_app("/Applications/App.app --flag")
                 popen.assert_called_once_with(
                     ["open", "/Applications/App.app", "--args", "--flag"])
+
+
+def test_open_app_macos_without_args_omits_args_flag():
+    """On macOS without arguments ``--args`` is not appended.
+
+    ``open <exe> --args`` with nothing after the flag makes ``open`` pass a
+    dangling ``--args`` down to the app instead of just launching it.
+    """
+    with mock.patch.object(host_app.sys, "platform", "darwin"):
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/Applications/App.app"):
+            with mock.patch.object(host_app.subprocess, "Popen") as popen:
+                host_app._open_app("/Applications/App.app")
+                popen.assert_called_once_with(["open", "/Applications/App.app"])
 
 
 def test_open_app_linux():
@@ -251,13 +296,18 @@ def test_run_action_app_launches_and_continues():
     with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
         kb = mock.MagicMock()
         kb_mock.return_value = kb
-        with mock.patch.object(host_app, "_open_app") as app_mock:
-            proc = mock.MagicMock()
-            proc.pid = 99999
-            app_mock.return_value = proc
-            with mock.patch.object(host_app, "_wait_app_foreground",
-                                   return_value=True):
-                result = host_app.run_action(action, dev_id="test-dev")
+        # _resolve_exe is mocked: "/bin/echo" does not exist on the
+        # windows-latest CI runner, and an unresolved exe would skip the
+        # step and never reach _open_app.
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/bin/echo"):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                proc = mock.MagicMock()
+                proc.pid = 99999
+                app_mock.return_value = proc
+                with mock.patch.object(host_app, "_wait_app_foreground",
+                                       return_value=True):
+                    result = host_app.run_action(action, dev_id="test-dev")
     assert result["ok"] is True
     app_mock.assert_called_once_with("/bin/echo hello")
     kb.write.assert_called_once_with("world",
@@ -282,6 +332,29 @@ def test_run_action_app_missing_exe_skips_step():
                                      delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
 
 
+def test_run_action_app_unbalanced_quote_does_not_block_later_steps():
+    """``app:`` with a dangling quote must not abort the rest of the macro.
+
+    Regression: ``shlex.split`` raised ``ValueError`` on the unbalanced
+    quote, the exception escaped the macro loop, and the following
+    ``text:`` step never ran — one typo silenced the whole macro.
+    """
+    action = _make_macro_action([
+        {"type": "app", "value": 'myapp.exe "unclosed'},
+        {"type": "text", "value": "hello"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        with mock.patch.object(host_app, "_resolve_exe", return_value=""):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                result = host_app.run_action(action, dev_id="test-dev")
+    assert result["ok"] is True
+    app_mock.assert_not_called()
+    kb.write.assert_called_once_with("hello",
+                                     delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
+
+
 def test_run_action_app_with_delay_step():
     """``app:`` + ``delay:`` + ``text:`` — delay between launch and type."""
     action = _make_macro_action([
@@ -292,14 +365,18 @@ def test_run_action_app_with_delay_step():
     with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
         kb = mock.MagicMock()
         kb_mock.return_value = kb
-        with mock.patch.object(host_app, "_open_app") as app_mock:
-            proc = mock.MagicMock()
-            proc.pid = 88888
-            app_mock.return_value = proc
-            with mock.patch.object(host_app, "_wait_app_foreground",
-                                   return_value=True):
-                with mock.patch.object(host_app.time, "sleep") as sleep_mock:
-                    result = host_app.run_action(action, dev_id="test-dev")
+        # _resolve_exe is mocked so the step resolves on every platform
+        # (see test_run_action_app_launches_and_continues).
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/bin/echo"):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                proc = mock.MagicMock()
+                proc.pid = 88888
+                app_mock.return_value = proc
+                with mock.patch.object(host_app, "_wait_app_foreground",
+                                       return_value=True):
+                    with mock.patch.object(host_app.time, "sleep") as sleep_mock:
+                        result = host_app.run_action(action, dev_id="test-dev")
     assert result["ok"] is True
     # delay step should have called time.sleep with 0.5 seconds
     sleep_mock.assert_called_once_with(0.5)
@@ -316,14 +393,18 @@ def test_run_action_app_off_windows_no_false_warning():
     with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
         kb = mock.MagicMock()
         kb_mock.return_value = kb
-        with mock.patch.object(host_app, "_open_app") as app_mock:
-            proc = mock.MagicMock()
-            proc.pid = 77777
-            app_mock.return_value = proc
-            with mock.patch.object(host_app, "_wait_app_foreground",
-                                   return_value=None):
-                with mock.patch.object(host_app, "add_event") as event_mock:
-                    result = host_app.run_action(action, dev_id="test-dev")
+        # _resolve_exe is mocked so the step resolves on every platform
+        # (see test_run_action_app_launches_and_continues).
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/bin/echo"):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                proc = mock.MagicMock()
+                proc.pid = 77777
+                app_mock.return_value = proc
+                with mock.patch.object(host_app, "_wait_app_foreground",
+                                       return_value=None):
+                    with mock.patch.object(host_app, "add_event") as event_mock:
+                        result = host_app.run_action(action, dev_id="test-dev")
     assert result["ok"] is True
     # No warning event should be added (None ≠ False)
     event_types = [call.args[0] for call in event_mock.call_args_list]

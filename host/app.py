@@ -1005,10 +1005,22 @@ def _parse_app_cmd(value: str) -> tuple[str, list[str]]:
     with spaces and re-splitting downstream would lose the quote
     boundaries that ``shlex.split`` worked so hard to preserve (a
     ``"hello world"`` argument would come back as two separate tokens).
+
+    An unbalanced quote (``app:myapp.exe "oops``) makes ``shlex.split``
+    raise ``ValueError``.  That must not abort the whole macro — a typo in
+    one step would otherwise skip every following ``text:`` / ``key:``
+    step.  The value is re-split with the dangling quote closed, so the
+    step simply fails to resolve its exe and is skipped like any other
+    missing executable.
     """
     if not value:
         return "", []
-    parts = shlex.split(value, posix=False)
+    try:
+        parts = shlex.split(value, posix=False)
+    except ValueError:
+        # Unbalanced quote: close it and retry so the step degrades to a
+        # normal "exe not found" instead of killing the whole macro.
+        parts = shlex.split(value + '"', posix=False)
     if not parts:
         return "", []
     parts = [p.strip('"') for p in parts]
@@ -1066,8 +1078,12 @@ def _open_app(value: str):
         return subprocess.Popen([exe] + args)
     elif sys.platform == "darwin":
         # open <target> --args <args...>：--args 必须在目标之后，
-        # 否则 open 没有目标，应用根本不会启动。
-        return subprocess.Popen(["open", exe, "--args"] + args)
+        # 否则 open 没有目标，应用根本不会启动。没有参数时不要拼
+        # --args：open 会把 "--args" 当成应用的参数传下去。
+        cmd = ["open", exe]
+        if args:
+            cmd += ["--args"] + args
+        return subprocess.Popen(cmd)
     else:
         return subprocess.Popen([exe] + args)
 

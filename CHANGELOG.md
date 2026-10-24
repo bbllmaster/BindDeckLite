@@ -16,14 +16,26 @@
   窗口并 `_force_foreground` 兜底（替代按标题 substring 匹配，真实标题如
   "Untitled - Notepad" 不含 exe 名）；非 Windows 返回 `None`（不是
   `False`），调用方仅在 `False` 时告警，避免 macOS/Linux 误报超时。
+  PID 兜底的前提：`Popen.pid` 只对**自身持有窗口**的进程有效；Chrome /
+  VS Code / 微软商店应用会把窗口交给子进程，此时按 PID 匹配不到，需要
+  用户用 `wait:` 手动兜底。
+- **引号参数不拆碎**（`_parse_app_cmd`）：参数以 **列表** 返回，`_open_app`
+  直接使用、不再二次 `shlex.split`，否则 `"hello world"` 会在
+  「拼接 → 再切分」中丢掉引号边界，变成两个参数。
+- **引号不配对不中断宏**（`_parse_app_cmd`）：`shlex.split` 遇到落单的引号
+  会抛 `ValueError`，异常逃出宏循环会让**后续所有步骤都不执行**。现在按
+  「补齐引号后重试」降级处理，该步按「未找到可执行文件」跳过，宏继续跑。
 - **macOS 参数顺序**：`open <exe> --args <args>`（`--args` 必须在目标
-  之后，否则 open 没有目标，应用根本不会启动）。
+  之后，否则 open 没有目标，应用根本不会启动）；无参数时不拼 `--args`，
+  避免把悬空的 `--args` 传给应用。
 - **文档**：`README.md` 宏表新增 `app:`；`index.html` 帮助新增语法行、
   完整示例与两条排查条目，并注明等待仅 Windows 有效。
-- **测试**：`host/test_macro_parse.py`（27 例）直接 import 生产函数，
+- **测试**：`host/test_macro_parse.py`（33 例）直接 import 生产函数，
   覆盖 `_parse_app_cmd` / `_resolve_exe` / `_open_app` / `_wait_app_foreground`
-  及 `run_action` 的 `app:` 分支（含带参数、环境变量展开失败、非 Windows
-  不误报、Windows 超时告警四种 case）。
+  及 `run_action` 的 `app:` 分支（含带参数、引号参数不拆碎、引号不配对
+  不中断宏、环境变量展开失败、非 Windows 不误报、Windows 超时告警）。
+  用例不依赖平台专有路径（`/bin/echo`、`python3`），保证 windows-latest
+  的 CI 门禁可用。
 - 未触碰 `url:` / `browser:` / `key:` / `paste:` / `delay:` 与 `launch` /
   `command` / `media` 分支，无回归面。
 
