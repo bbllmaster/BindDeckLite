@@ -534,11 +534,16 @@ function setEncRowRunning(row, secs) {
   row.classList.toggle("running", live);
   const btn = $(".test", row);
   if (!btn) return;
-  btn.disabled = live;
+  // 非「上位机动作」模式整卡置灰：测试按钮必须一直保持禁用。
+  // 这里不能只写 btn.disabled = live —— 状态轮询每轮都会调用本函数，
+  // 会把上面 renderEncoderActions 设的 disabled=true 覆盖掉，
+  // 于是灰卡上的按钮又能点，出现「假成功」（WS-390 评审 #1）。
+  const locked = row.dataset.locked === "1";
+  btn.disabled = live || locked;
   btn.textContent = live ? "执行中…" : "测试动作";
   btn.title = live
     ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
-    : TEST_BTN_IDLE_TITLE;
+    : (locked ? "切到「上位机动作」模式后可配置旋转动作" : TEST_BTN_IDLE_TITLE);
 }
 
 function applyEncoderRunningState() {
@@ -547,6 +552,25 @@ function applyEncoderRunningState() {
   $$(".enc-action-row").forEach((row) => {
     setEncRowRunning(row, running[row.dataset.dir]);
   });
+}
+
+function encoderStatusText(actions, editable) {
+  // 顶部状态说明。必须跟着当前配置走：改完动作类型后要立刻反映出来，
+  // 不能一直显示旧文案（WS-390 评审 #3）。
+  if (!editable) return "切到「上位机动作」模式后可配置";
+  const cw = actions.CW || defaultEncoderAction();
+  const ccw = actions.CCW || defaultEncoderAction();
+  const cwType = cw.type || "none";
+  const ccwType = ccw.type || "none";
+  if (cwType === "none" && ccwType === "none") {
+    return "未配置：旋转只会发送 F23/F24，不会有任何效果";
+  }
+  const nameOf = (t) => {
+    const hit = ACTION_TYPES.find((a) => a.id === t);
+    return hit ? hit.name : t;
+  };
+  return `顺时针：${nameOf(cwType)} · 逆时针：${nameOf(ccwType)}；` +
+    "上位机动作模式下设备仍会额外发送 F23/F24，如与现有软件冲突请改用其他模式";
 }
 
 function renderEncoderActions() {
@@ -569,17 +593,13 @@ function renderEncoderActions() {
   const card = document.createElement("div");
   card.className = "enc-action-card" + (editable ? "" : " disabled");
 
-  // Top status line, tuned to the active mode / configuration state.
-  let statusText;
-  if (!editable) {
-    statusText = "切到「上位机动作」模式后可配置";
-  } else if (!(actions.CW.type && actions.CW.type !== "none")
-              && !(actions.CCW.type && actions.CCW.type !== "none")) {
-    statusText = "未配置：旋转只会发送 F23/F24，不会有任何效果";
-  } else {
-    statusText = "上位机动作模式下设备仍会额外发送 F23/F24，如与现有软件冲突请改用其他模式";
-  }
-  card.innerHTML = `<p class="enc-action-status">${escapeHtml(statusText)}</p>`;
+  const statusEl = document.createElement("p");
+  statusEl.className = "enc-action-status";
+  const refreshStatus = () => {
+    statusEl.textContent = encoderStatusText(actions, editable);
+  };
+  refreshStatus();
+  card.appendChild(statusEl);
 
   const dirs = [
     { dir: "CW", label: "顺时针" },
@@ -590,6 +610,9 @@ function renderEncoderActions() {
     const row = document.createElement("div");
     row.className = "enc-action-row";
     row.dataset.dir = dir;
+    // 其他模式下整卡置灰：记住这个状态，状态轮询刷新执行中态时不能把
+    // 测试按钮重新启用（WS-390 评审 #1）。
+    row.dataset.locked = editable ? "0" : "1";
     row.innerHTML = `
       <span class="enc-dir-label">${label}</span>
       <select class="sel-enc-act">
@@ -608,6 +631,7 @@ function renderEncoderActions() {
       actions[dir] = { type: sel.value, value: "", macro: [] };
       renderActionInput(holder, { action: actions[dir] },
                        { dataset: { idx: "enc-" + dir } });
+      refreshStatus();
       markDirty();
     };
     renderActionInput(holder, { action: action },
@@ -626,6 +650,11 @@ function renderEncoderActions() {
       if (row.classList.contains("running")) {
         // 按钮此时本应 disabled，兜底防止键盘触发第二次动作。
         toast("该方向的动作仍在执行", "warn");
+        return;
+      }
+      if (!editable) {
+        // 灰卡上的按钮本应 disabled，兜底挡住键盘触发。
+        toast("切到「上位机动作」模式后可配置旋转动作", "warn");
         return;
       }
       const devId = state.selected;

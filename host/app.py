@@ -1794,7 +1794,8 @@ def _prune_stuck_encoder_actions(now: float | None = None):
                   dev_id, "warn")
 
 
-def _begin_encoder_action(dev_id: str, direction: str, action: dict):
+def _begin_encoder_action(dev_id: str, direction: str, action: dict,
+                          ignore_cooldown: bool = False):
     """Claim ``(dev_id, direction)`` for one encoder action.
 
     Returns ``(token, None)`` on success — the caller must pass that token
@@ -1803,6 +1804,12 @@ def _begin_encoder_action(dev_id: str, direction: str, action: dict):
     ``(None, None)`` when the one-shot cooldown has not elapsed yet (caller
     drops silently). The cooldown check and the claim are atomic under
     ``_lock`` so two near-simultaneous detents cannot both trigger.
+
+    ``ignore_cooldown`` skips the one-shot cooldown for an explicit user
+    action (the "测试动作" button). A manual test must never be swallowed by
+    the rotation debounce, and it must not push the debounce window for the
+    following rotations either — the cooldown models *rotation detents*, not
+    clicks. The "still running" preemption still applies to both paths.
     """
     global _encoder_action_token_seq
     now = time.monotonic()
@@ -1811,15 +1818,17 @@ def _begin_encoder_action(dev_id: str, direction: str, action: dict):
         entry = _encoder_action_running.get((dev_id, direction))
         if entry is not None:
             return None, now - entry["started"]
-        if (action or {}).get("type", "none") in _ENCODER_ONE_SHOT:
-            last = _encoder_last_trigger.get((dev_id, direction))
-            if last is not None and now - last < _ENCODER_COOLDOWN_S:
-                return None, None
+        if not ignore_cooldown:
+            if (action or {}).get("type", "none") in _ENCODER_ONE_SHOT:
+                last = _encoder_last_trigger.get((dev_id, direction))
+                if last is not None and now - last < _ENCODER_COOLDOWN_S:
+                    return None, None
         _encoder_action_token_seq += 1
         token = _encoder_action_token_seq
         _encoder_action_running[(dev_id, direction)] = {
             "started": now, "token": token, "thread": None}
-        if (action or {}).get("type", "none") in _ENCODER_ONE_SHOT:
+        if (not ignore_cooldown
+                and (action or {}).get("type", "none") in _ENCODER_ONE_SHOT):
             _encoder_last_trigger[(dev_id, direction)] = now
         return token, None
 
@@ -2028,17 +2037,20 @@ def api_encoder_action_test(dev_id, direction):
     cfg = device_cfg(dev_id)
     if cfg.get("encoder", {}).get("mode") != 4:
         # Not in 上位机动作 mode: the card is greyed out in the UI, so this is
-        # only reached if the user somehow clicks. Nothing to run.
-        return jsonify({"ok": True, "error": ""})
+        # only reached if the user somehow clicks. Report the refusal instead
+        # of a fake success (WS-390 review #1).
+        return jsonify({"ok": False,
+                        "error": "仅「上位机动作」模式可测试旋转动作"})
     actions = cfg.get("encoder", {}).get("actions", {}) or {}
     action = actions.get(direction) or {}
     if not action or action.get("type", "none") == "none":
         return jsonify({"ok": True, "error": ""})
 
-    token, busy_for = _begin_encoder_action(dev_id, direction, action)
-    if token is None and busy_for is None:
-        # One-shot cooldown: nothing to do, report success silently.
-        return jsonify({"ok": True, "error": ""})
+    # An explicit test is a user action, not a rotation detent: it must not
+    # be swallowed by the 800 ms one-shot cooldown (WS-390 review #2). The
+    # "still running" preemption still applies.
+    token, busy_for = _begin_encoder_action(dev_id, direction, action,
+                                            ignore_cooldown=True)
     if token is None:
         return jsonify({"ok": False, "error": "该方向的动作仍在执行",
                         "running": True, "elapsed": round(busy_for, 1)}), 200

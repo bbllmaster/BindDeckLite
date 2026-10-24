@@ -60,10 +60,10 @@ jobs:
           taskkill /PID $p.Id /T /F
           Write-Host "smoke test ok"
 
-      - name: Unit tests (close_decision branches)
+      - name: Unit tests (close_decision + encoder rotation actions)
         working-directory: host
         run: |
-          python -m pytest test_close_decision.py -v
+          python -m pytest test_close_decision.py test_encoder_actions.py -v
 
       - uses: actions/upload-artifact@v4
         with:
