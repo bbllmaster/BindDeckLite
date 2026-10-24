@@ -30,6 +30,7 @@
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <esp_log.h>
+#include <esp_ota_ops.h>   // esp_ota_get_next_update_partition() (WS-378 diag)
 #include <nvs_flash.h>
 #include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
@@ -150,6 +151,41 @@ static bool g_otaShaActive = false;
 static uint8_t g_otaHdr[0x24];
 static size_t g_otaHdrLen = 0;
 static bool g_otaHdrOk = false;
+
+// === OTA header capture (WS-378) ===========================================
+// The Arduino Update library stashes the first 16 bytes of the image in its
+// private _skipBuffer and writes them back to offset 0 of the target slot
+// when it verifies the image (Updater.cpp:88). The readback probe below
+// repeats that write, so it needs the same 16 bytes.
+//
+// The library frees _skipBuffer as soon as the verification fails
+// (_abort() -> _reset(), Updater.cpp:116-121), so by the time we run the
+// probe the bytes are gone. We therefore keep our own copy of the leading
+// image bytes while the OTA stream is still arriving.
+//
+// Note: the bytes are identical to the library's _skipBuffer as long as the
+// slot is not flash-encrypted (the library stashes the *decrypted* buffer).
+// These boards run without flash encryption, so raw == what was written.
+static uint8_t g_otaSkip[16];
+static size_t g_otaSkipLen = 0;
+static bool g_otaSkipOk = false;
+
+static void otaResetSkip() {
+  g_otaSkipLen = 0;
+  g_otaSkipOk = false;
+}
+
+// Collect the leading image bytes. Both OTA paths deliver the image as one
+// contiguous stream starting at image offset 0, so the bytes may arrive split
+// over several chunks (small BLE MTU) and are accumulated here.
+static void otaCaptureSkip(const uint8_t* data, size_t len) {
+  if (g_otaSkipOk || !data || !len) return;
+  size_t take = sizeof(g_otaSkip) - g_otaSkipLen;
+  if (take > len) take = len;
+  memcpy(g_otaSkip + g_otaSkipLen, data, take);
+  g_otaSkipLen += take;
+  if (g_otaSkipLen == sizeof(g_otaSkip)) g_otaSkipOk = true;
+}
 
 static bool g_nvsOk = false;
 static unsigned long g_lastActivity = 0;
@@ -451,7 +487,8 @@ static String cfgPage() {
 
 static const char* otaUpdateErrorText(int code);  // defined below, used by the
                                                     // config-portal /update handler
-static void otaDiagReadback(int code);             // WS-378: defined below, used by both OTA paths
+static void otaDiagReadback(int code);           // defined below, used by both
+                                                    // OTA paths (BLE + config portal)
 
 static void setupProvisioning() {
   WiFi.mode(WIFI_AP_STA);
@@ -546,10 +583,13 @@ static void setupProvisioning() {
       HTTPUpload& up = cfgServer.upload();
       if (up.status == UPLOAD_FILE_START) {
         g_otaProgress = 0;
+        otaResetSkip();
         log_e("[ota] start: %s", up.filename.c_str());
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) log_e("[ota] Update.begin failed");
       } else if (up.status == UPLOAD_FILE_WRITE) {
         if (up.totalSize > 0) g_otaProgress = (int)(up.currentSize * 100 / up.totalSize);
+        // up.buf holds the chunk just received; the first one starts the image.
+        otaCaptureSkip(up.buf, up.currentSize);
         if (Update.write(up.buf, up.currentSize) != up.currentSize) log_e("[ota] write failed");
       } else if (up.status == UPLOAD_FILE_END) {
         g_otaProgress = 100;
@@ -560,7 +600,7 @@ static void setupProvisioning() {
           // config-portal channel is diagnosable from CDC logs too.
           int code = Update.getError();
           const char* detail = otaUpdateErrorText(code);
-          otaDiagReadback(code);   // WS-378: distinguish write failure vs readback mismatch
+          otaDiagReadback(code);
           log_e("[ota] Update.end failed (end_failed:%s(%d))", detail, code);
         }
       }
@@ -603,6 +643,7 @@ static void otaResetState() {
   g_otaAcked = 0;
   g_otaHdrLen = 0;
   g_otaHdrOk = false;
+  otaResetSkip();
   if (g_otaShaActive) {
     mbedtls_sha256_free(&g_otaSha);
     g_otaShaActive = false;
@@ -654,34 +695,79 @@ static const char* otaUpdateErrorText(int code) {
   }
 }
 
-// WS-378: after Update.end() fails with UPDATE_ERROR_READ, read back the first
-// byte of every OTA partition to distinguish the two causes that the library
-// folds into the same code:
-//   case A — _enablePartition() write to offset 0 failed  → byte != 0xE9
-//   case B — _enablePartition() wrote ok but _partitionIsBootable() read back
-//            a different value (cache / address-map inconsistency near the
-//            4 MB boundary on 16 MB C3) → byte == 0xE9, verify still failed
-// Only logs; does not change the error code or the end_failed:<detail>(code)
-// protocol format. Uses only public APIs — the internal _verifyEnd() path is
-// not accessible from main.cpp.
+// === OTA read-back diagnosis (WS-378) =====================================
+// Update::end() ends in _verifyEnd() (Updater.cpp:784-789):
+//     if (!_enablePartition(_partition) || !_partitionIsBootable(_partition))
+//         _abort(UPDATE_ERROR_READ);
+// with
+//     _enablePartition()    = ESP.partitionWrite(slot, 0, header16, 16)
+//     _partitionIsBootable()= ESP.partitionRead(slot, 0, buf, 16) && buf[0]==0xE9
+// Both failures collapse into UPDATE_ERROR_READ (3), so the host only ever
+// sees "read_error" and cannot tell a dead write channel from a dead read
+// channel. This probe repeats the same two calls on the *target* slot only
+// and reports which one broke:
+//
+//   write_failed  - the 16-byte write to offset 0 was rejected
+//   read_failed   - the 16-byte read from offset 0 was rejected
+//   read_mismatch - the read worked but byte 0 is not the 0xE9 magic
+//   readback_ok   - write and read-back agree, the channel itself is fine
+//
+// The target is esp_ota_get_next_update_partition(NULL) - the same call
+// Update::begin() makes (Updater.cpp:264) - so the probe hits the very slot
+// the updater was writing to. The running image is never touched: the target
+// is compared against the running partition and the probe is skipped when
+// they are the same (single-slot boards).
 static void otaDiagReadback(int code) {
   if (code != UPDATE_ERROR_READ) return;
-  const esp_partition_t* otas[16] = {};
-  int n = 0;
-  for (int i = 0; i < 16; i++) {
-    const esp_partition_t* p = esp_partition_find_first(
-        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_OTA(i), NULL);
-    if (p) otas[n++] = p;
+
+  const esp_partition_t* target = esp_ota_get_next_update_partition(NULL);
+  if (!target) {
+    log_e("[ota][diag] verdict=no_target");
+    return;
   }
-  for (int i = 0; i < n; i++) {
-    uint32_t m = 0;
-    if (ESP.partitionRead(otas[i], 0, &m, 1)) {
-      log_e("[ota][diag] %s offset0 readback=0x%02X (expect 0xE9)%s",
-            otas[i]->label, (unsigned)m, (m & 0xFF) == 0xE9 ? " [write ok, read mismatch?]" : " [write failed?]");
-    } else {
-      log_e("[ota][diag] %s offset0 partitionRead FAILED", otas[i]->label);
-    }
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (target == running) {
+    log_e("[ota][diag] verdict=target_is_running (%s) - skipped", target->label);
+    return;
   }
+  log_e("[ota][diag] target=%s addr=0x%06X size=0x%05X flash_kb=%u",
+        target->label, (unsigned)target->address, (unsigned)target->size,
+        (unsigned)(ESP.getFlashChipSize() / 1024));
+
+  // What the updater itself left at offset 0: 0xFF means its header write
+  // never landed, 0xE9 means it landed and only the read-back disagreed.
+  uint32_t pre[4] = {0, 0, 0, 0};
+  bool preOk = ESP.partitionRead(target, 0, pre, sizeof(pre));
+  log_e("[ota][diag] updater-left read=%d byte0=0x%02X",
+        (int)preOk, preOk ? (unsigned)(pre[0] & 0xFF) : 0u);
+
+  if (!g_otaSkipOk) {
+    log_e("[ota][diag] verdict=no_header_bytes");
+    return;
+  }
+
+  // Repeat the updater's own write, but keep the return value it drops.
+  // The bytes are the ones the updater wrote, so this is a bit-identical
+  // rewrite and cannot damage the slot beyond what the failed OTA already did.
+  uint32_t hdr[4];
+  memcpy(hdr, g_otaSkip, sizeof(g_otaSkip));
+  if (!ESP.partitionWrite(target, 0, hdr, sizeof(hdr))) {
+    log_e("[ota][diag] verdict=write_failed (16-byte write to offset 0 rejected)");
+    return;
+  }
+  log_e("[ota][diag] write ok=1");
+
+  uint32_t back[4] = {0, 0, 0, 0};
+  if (!ESP.partitionRead(target, 0, back, sizeof(back))) {
+    log_e("[ota][diag] verdict=read_failed (16-byte read from offset 0 rejected)");
+    return;
+  }
+  unsigned b0 = (unsigned)(back[0] & 0xFF);
+  if (b0 != 0xE9) {
+    log_e("[ota][diag] verdict=read_mismatch (byte0=0x%02X, expected 0xE9)", b0);
+    return;
+  }
+  log_e("[ota][diag] verdict=readback_ok (byte0=0xE9)");
 }
 
 static int otaHexNibble(char c) {
@@ -889,7 +975,7 @@ static void processCommand(String data) {
       // end_failed prefix.
       int code = Update.getError();
       const char* detail = otaUpdateErrorText(code);
-      otaDiagReadback(code);   // WS-378: distinguish write failure vs readback mismatch
+      otaDiagReadback(code);
       log_e("[ota] Update.end failed (code %d: %s)", code, detail);
       String reason = String("end_failed:") + detail + "(" + String(code) + ")";
       otaAbort(reason.c_str());
@@ -951,6 +1037,7 @@ static void processCommand(String data) {
     g_otaAcked = 0;
     g_otaHdrLen = 0;
     g_otaHdrOk = false;
+    otaResetSkip();
     memcpy(g_otaShaExp, sha, OTA_SHA_LEN);
     mbedtls_sha256_init(&g_otaSha);
     mbedtls_sha256_starts(&g_otaSha, 0);
@@ -1145,6 +1232,10 @@ void setup() {
       otaAbort("size");
       return;
     }
+
+    // Keep the first 16 bytes for the WS-378 readback probe: they are the same
+    // bytes the Update library stashes in its private _skipBuffer.
+    otaCaptureSkip(data, len);
 
     // App-image header check. A BLE write can be smaller than the 0x24 bytes
     // we need (small MTU), so collect the first bytes across writes and
