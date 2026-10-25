@@ -8,7 +8,7 @@ const ENCODER_MODES = [
   { id: 1, name: "缩放", desc: "Ctrl + / Ctrl -" },
   { id: 2, name: "标签页", desc: "Ctrl + Tab / Ctrl + Shift + Tab" },
   { id: 3, name: "撤销 / 重做", desc: "Ctrl + Z / Ctrl + Y" },
-  { id: 4, name: "应用音量", desc: "F23 / F24，交给上位机宏处理" },
+  { id: 4, name: "上位机动作", desc: "旋转方向由下方「旋转动作」决定" },
 ];
 
 const ACTION_TYPES = [
@@ -47,6 +47,7 @@ const state = {
   ota: null,           // {status, sent, total, percent, error, filename}
   otaFile: null,       // File object chosen by the user
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
+  encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status（WS-389）
 };
 
 async function api(path, opts = {}) {
@@ -74,6 +75,8 @@ async function pollStatus() {
     state.devices = s.devices || [];
     state.actionsEnabled = !!s.actions_enabled;
     state.running = s.running || {};
+    // WS-389: additive field — old front-ends simply ignore it.
+    state.encRunning = s.encoder_running || {};
     $("#actionsToggle").checked = state.actionsEnabled;
 
     if (!state.selected || !state.devices.some((d) => d.dev_id === state.selected)) {
@@ -119,6 +122,7 @@ async function pollStatus() {
     }
     highlightKeys(s.last_press || {});
     applyRunningState();
+    applyEncoderRunningState();
   } catch (e) {
     $("#statusDot").className = "dot bad";
     $("#statusText").textContent = "上位机未就绪";
@@ -506,6 +510,199 @@ function renderEncoder() {
     };
     grid.appendChild(el);
   });
+  // WS-389: the rotation-action card depends on the active mode, so redraw it
+  // whenever the mode grid is (re)rendered.
+  renderEncoderActions();
+}
+
+/* ---------------- encoder rotation actions (WS-389) ---------------- */
+
+function defaultEncoderAction() {
+  return { type: "none", value: "", macro: [] };
+}
+
+function encRunningFor(devId) {
+  return (state.encRunning && state.encRunning[devId]) || {};
+}
+
+function markEncRunning(devId, dir, elapsed = 0) {
+  state.encRunning = state.encRunning || {};
+  const map = state.encRunning[devId] || (state.encRunning[devId] = {});
+  if (map[dir] === undefined) map[dir] = elapsed;
+}
+
+function clearEncRunning(devId, dir) {
+  const map = encRunningFor(devId);
+  delete map[dir];
+}
+
+function setEncRowRunning(row, secs) {
+  const live = secs !== undefined && secs !== null;
+  row.classList.toggle("running", live);
+  const btn = $(".test", row);
+  if (!btn) return;
+  // 非「上位机动作」模式整卡置灰：测试按钮必须一直保持禁用。
+  // 这里不能只写 btn.disabled = live —— 状态轮询每轮都会调用本函数，
+  // 会把上面 renderEncoderActions 设的 disabled=true 覆盖掉，
+  // 于是灰卡上的按钮又能点，出现「假成功」（WS-390 评审 #1）。
+  const locked = row.dataset.locked === "1";
+  btn.disabled = live || locked;
+  btn.textContent = live ? "执行中…" : "测试动作";
+  btn.title = live
+    ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
+    : (locked ? "切到「上位机动作」模式后可配置旋转动作" : TEST_BTN_IDLE_TITLE);
+}
+
+function applyEncoderRunningState() {
+  // 预览 / 无选中设备时没有任何运行项；status 缺少该项即按未运行渲染。
+  const running = state.preview || !state.selected ? {} : encRunningFor(state.selected);
+  $$(".enc-action-row").forEach((row) => {
+    setEncRowRunning(row, running[row.dataset.dir]);
+  });
+}
+
+function encoderStatusText(actions, editable) {
+  // 顶部状态说明。必须跟着当前配置走：改完动作类型后要立刻反映出来，
+  // 不能一直显示旧文案（WS-390 评审 #3）。
+  if (!editable) return "切到「上位机动作」模式后可配置";
+  const cw = actions.CW || defaultEncoderAction();
+  const ccw = actions.CCW || defaultEncoderAction();
+  const cwType = cw.type || "none";
+  const ccwType = ccw.type || "none";
+  if (cwType === "none" && ccwType === "none") {
+    return "未配置：旋转只会发送 F23/F24，不会有任何效果";
+  }
+  const nameOf = (t) => {
+    const hit = ACTION_TYPES.find((a) => a.id === t);
+    return hit ? hit.name : t;
+  };
+  return `顺时针：${nameOf(cwType)} · 逆时针：${nameOf(ccwType)}；` +
+    "上位机动作模式下设备仍会额外发送 F23/F24，如与现有软件冲突请改用其他模式";
+}
+
+function renderEncoderActions() {
+  const box = $("#encoderActions");
+  box.innerHTML = "";
+  if (!state.cfg) return;
+
+  const enc = state.cfg.encoder || {};
+  // 旧 config.json 没有 actions 字段：按「未配置」渲染，不报错。
+  // 键名必须与 ENC: 方向值一致（"CW"|"CCW"），不能用小写。
+  if (!enc.actions) {
+    enc.actions = { CW: defaultEncoderAction(), CCW: defaultEncoderAction() };
+  }
+  const actions = enc.actions;                 // live reference into state.cfg
+  if (!actions.CW) actions.CW = defaultEncoderAction();
+  if (!actions.CCW) actions.CCW = defaultEncoderAction();
+  const mode = enc.mode || 0;
+  const editable = mode === 4;
+
+  const card = document.createElement("div");
+  card.className = "enc-action-card" + (editable ? "" : " disabled");
+
+  const statusEl = document.createElement("p");
+  statusEl.className = "enc-action-status";
+  const refreshStatus = () => {
+    statusEl.textContent = encoderStatusText(actions, editable);
+  };
+  refreshStatus();
+  card.appendChild(statusEl);
+
+  const dirs = [
+    { dir: "CW", label: "顺时针" },
+    { dir: "CCW", label: "逆时针" },
+  ];
+  dirs.forEach(({ dir, label }) => {
+    const action = actions[dir];
+    const row = document.createElement("div");
+    row.className = "enc-action-row";
+    row.dataset.dir = dir;
+    // 其他模式下整卡置灰：记住这个状态，状态轮询刷新执行中态时不能把
+    // 测试按钮重新启用（WS-390 评审 #1）。
+    row.dataset.locked = editable ? "0" : "1";
+    row.innerHTML = `
+      <span class="enc-dir-label">${label}</span>
+      <select class="sel-enc-act">
+        ${ACTION_TYPES.map((a) =>
+          `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${a.name}</option>`).join("")}
+      </select>
+      <div class="enc-act-input"></div>
+      <button class="btn tiny test">测试动作</button>`;
+    card.appendChild(row);
+
+    const sel = row.querySelector("select");
+    const holder = row.querySelector(".enc-act-input");
+    const btn = row.querySelector("button");
+
+    sel.onchange = () => {
+      actions[dir] = { type: sel.value, value: "", macro: [] };
+      renderActionInput(holder, { action: actions[dir] },
+                       { dataset: { idx: "enc-" + dir } });
+      refreshStatus();
+      markDirty();
+    };
+    renderActionInput(holder, { action: action },
+                     { dataset: { idx: "enc-" + dir } });
+
+    // 其他 4 个模式下整卡置灰且不可编辑：动作类型、输入区、测试按钮全禁用。
+    if (!editable) {
+      sel.disabled = true;
+      btn.disabled = true;
+      holder.querySelectorAll("input, select, textarea").forEach((el) => {
+        el.disabled = true;
+      });
+    }
+
+    btn.onclick = async () => {
+      if (row.classList.contains("running")) {
+        // 按钮此时本应 disabled，兜底防止键盘触发第二次动作。
+        toast("该方向的动作仍在执行", "warn");
+        return;
+      }
+      if (!editable) {
+        // 灰卡上的按钮本应 disabled，兜底挡住键盘触发。
+        toast("切到「上位机动作」模式后可配置旋转动作", "warn");
+        return;
+      }
+      const devId = state.selected;
+      if (!devId || !state.selectedConnected) {
+        toast("未连接设备", "bad");
+        return;
+      }
+      const noAction = !actions[dir] || (actions[dir].type || "none") === "none";
+      if (!noAction) {
+        markEncRunning(devId, dir);
+        applyEncoderRunningState();
+      }
+      let r = null;
+      try {
+        r = await api(`/api/encoder/action/test/${encodeURIComponent(devId)}/${dir}`,
+                      { method: "POST" });
+        if (r.ok) {
+          const used = r.browser_used && r.browser_used !== "default"
+            ? ` · ${r.browser_used}` : "";
+          toast("动作执行成功：" + (actions[dir].type === "none"
+            ? "无上位机动作" : actions[dir].type) + used, "ok");
+        } else if (r.running) {
+          if (devId) markEncRunning(devId, dir, r.elapsed || 0);
+          applyEncoderRunningState();
+          toast(r.error || "该方向的动作仍在执行", "warn");
+        } else {
+          toast("动作执行失败：" + (r.error || "未知错误"), "bad");
+        }
+      } catch (e) {
+        toast(e.message, "bad");
+      } finally {
+        if (!(r && r.running)) {
+          if (devId) clearEncRunning(devId, dir);
+          applyEncoderRunningState();
+        }
+      }
+    };
+  });
+
+  box.appendChild(card);
+  applyEncoderRunningState();
 }
 
 /* ---------------- device ---------------- */

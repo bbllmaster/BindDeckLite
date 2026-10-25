@@ -60,10 +60,10 @@ jobs:
           taskkill /PID $p.Id /T /F
           Write-Host "smoke test ok"
 
-      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic)
+      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic + encoder rotation actions)
         working-directory: host
         run: |
-          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py -v
+          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_encoder_actions.py -v
 
       - uses: actions/upload-artifact@v4
         with:
