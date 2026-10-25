@@ -48,7 +48,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.1"   // WS-336: CMD:GET_CFG replies were coalesced on BLE
+#define FW_VERSION "1.3.2"   // WS-378: OTA readback diagnosis ([ota][diag])
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
