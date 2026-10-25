@@ -114,6 +114,46 @@ def _is_security_error(err) -> bool:
     return "nsum" in e or "uthentic" in e or "ncrypt" in e
 
 
+# 摘要文本的长度上限：超长错误只留一行，完整文本放前端的 title 里。
+REASON_MAX_LEN = 120
+# 判定「系统没给蓝牙权限」的关键词（Linux/Windows 的措辞各不相同）。
+_PERMISSION_KEYWORDS = ("not permitted", "unauthorized", "access is denied")
+
+
+def scan_reason(n_raw, n_found, error=None):
+    """把一次扫描的结果归一成给用户看的一行中文结论。
+
+    ``n_raw`` 是扫描到的 BLE 设备总数，``n_found`` 是其中 BindDeckLite 的
+    台数，``error`` 是扫描本身抛出的错误文本（没有则 None）。
+
+    返回 None 表示「没有需要展示的诊断结论」——有可用设备时不必打扰用户。
+    """
+    if error:
+        text = str(error)
+        low = text.lower()
+        if any(k in low for k in _PERMISSION_KEYWORDS):
+            return "扫描失败：系统未授予蓝牙权限"
+        return f"扫描出错：{text}"
+    if n_found > 0:
+        return None
+    if n_raw == 0:
+        return "扫描未发现任何 BLE 设备（系统蓝牙已关闭 / 未授权 / 设备未广播）"
+    return f"看到 {n_raw} 个 BLE 设备，没有 BindDeckLite"
+
+
+def conn_reason(err):
+    """把连接异常归一成给用户看的一行中文摘要（不含英文类名原文）。
+
+    只做字符串判断，不引用 bleak 的异常类，因此 bleak 没装也能 import。
+    """
+    if _is_security_error(err):
+        return "配对失败：请在系统蓝牙设置里删除该设备的旧配对后重试"
+    if type(err).__name__ == "BleakDeviceNotFoundError":
+        return "设备不在广播范围（可能已断电或换了地址）"
+    # 其余异常：类名 + 消息，消息本身截断到 120 字符（完整文本放 title）。
+    return f"{type(err).__name__}：{str(err)[:REASON_MAX_LEN]}"
+
+
 def dev_id_from_name(name):
     """Turn a BLE advertisement name into the short device id.
 
@@ -152,6 +192,9 @@ class BleLink:
         self._dev_key = dev_id or ("@" + address)
         self._stopped = False
         self._last_seen = time.monotonic()
+        # 最近一次连接失败的原因（WS-395）。连接成功即清空；界面用它在侧栏
+        # 条目上给出真实原因，而不是一律显示「未连接」。
+        self.last_error = None
         # Negotiated ATT MTU, refreshed on every connect. OTA uses it to keep
         # each write inside one ATT payload (max_payload property below).
         self._mtu = 23
@@ -241,8 +284,9 @@ class BleLinkManager:
     correctly across multiple decks.
     """
 
-    def __init__(self, on_line=None, cache_path=None):
+    def __init__(self, on_line=None, cache_path=None, on_diag=None):
         self._on_line = on_line
+        self._on_diag = on_diag
         self._cache_path = cache_path
         self._links = {}            # address -> BleLink
         self._links_by_dev = {}     # dev_id  -> BleLink
@@ -253,6 +297,8 @@ class BleLinkManager:
         self._running = False
         self._last_scan_sig = None
         self._force_scan = False
+        # 最近一次扫描的结论（WS-395）。界面读它来回答「为什么找不到设备」。
+        self.last_scan = {"at": None, "seen": 0, "found": 0, "error": None}
         self._load_cache()
 
     # ---- properties used by the app --------------------------------------
@@ -384,12 +430,15 @@ class BleLinkManager:
         resolved."""
         if self._scan_lock is None:
             self._scan_lock = asyncio.Lock()
+        scan_error = None
         async with self._scan_lock:
             try:
                 raw = await _BleakScanner.discover(timeout=timeout)
             except Exception as e:  # noqa: BLE001
                 print("[ble] scan error:", type(e).__name__, e)
                 raw = []
+                # 扫描失败本身也是一条诊断结论（适配器关闭 / 无权限）。
+                scan_error = str(e)
 
         items = self._normalise(raw)
         if not items:
@@ -397,7 +446,11 @@ class BleLinkManager:
             async with self._scan_lock:
                 try:
                     raw2 = await _BleakScanner.discover(timeout=timeout, return_adv=True)
-                except Exception:  # noqa: BLE001
+                    scan_error = None  # the retry worked — no scan failure to report
+                except Exception as e:  # noqa: BLE001
+                    print("[ble] scan error:", type(e).__name__, e)
+                    if scan_error is None:
+                        scan_error = str(e)
                     raw2 = None
             items = self._normalise(raw2)
 
@@ -429,7 +482,7 @@ class BleLinkManager:
                               "name": cached.get("name", "") or "BindDeckLite",
                               "address": addr})
 
-        self._log_scan(items, found)
+        self._log_scan(items, found, scan_error)
         return found
 
     @staticmethod
@@ -449,17 +502,30 @@ class BleLinkManager:
                 items.append((v, None))
         return items
 
-    def _log_scan(self, items, found):
+    def _log_scan(self, items, found, error=None):
         """Throttled scan diagnostics, so the console shows whether BLE is
-        seeing anything at all and why a deck was/wasn't matched."""
+        seeing anything at all and why a deck was/wasn't matched.
+
+        The state refresh is NOT throttled (only the print is): the UI reads
+        ``last_scan`` on every poll and must see the newest scan result even
+        when the device set has not changed.
+        """
         raw = []
         for d, adv in items:
             name = getattr(d, "name", None) or (getattr(adv, "local_name", None) if adv else None) or "?"
             raw.append(f"{name}@{getattr(d, 'address', '?')}")
         sig = tuple(sorted(raw))
-        if sig == self._last_scan_sig:
-            return  # nothing changed since the last scan; stay quiet
+        changed = sig != self._last_scan_sig
         self._last_scan_sig = sig
+        with self._lock:
+            self.last_scan = {
+                "at": time.time(),
+                "seen": len(raw),
+                "found": len(found),
+                "error": error,
+            }
+        if not changed:
+            return  # nothing changed since the last scan; stay quiet
         if found:
             print("[ble] scan found:", ", ".join(f"{r['name']}@{r['address']}" for r in found))
         elif raw:
@@ -468,6 +534,40 @@ class BleLinkManager:
         else:
             print("[ble] scan: no BLE devices seen "
                   "(adapter off / not permitted / deck not advertising)")
+
+    # ---- diagnostics (WS-395) ---------------------------------------------
+    def _note_link_error(self, link, err):
+        """Remember why a deck could not be connected, and report it once.
+
+        The reason lives on the link itself (``last_error``) so the UI shows
+        the same data the device list exposes. The log is de-duplicated by
+        ``(dev_id, text)``: the same device failing the same way again does
+        not add another line, only a *changed* reason or a recovery does.
+        """
+        text = conn_reason(err)
+        prev = link.last_error
+        link.last_error = {"at": time.time(), "kind": type(err).__name__, "text": text}
+        if prev is None or prev.get("text") != text:
+            self._emit_diag(link.dev_id, text, "error")
+
+    def _note_link_connected(self, link):
+        """Clear the failure reason after a successful connect.
+
+        A recovery is reported once, so the log shows "failed -> recovered"
+        instead of a wall of identical connect errors."""
+        if link.last_error is None:
+            return
+        link.last_error = None
+        self._emit_diag(link.dev_id, "连接已恢复", "ok")
+
+    def _emit_diag(self, dev_id, text, level):
+        """Hand a connection diagnosis to the app (it writes the log page)."""
+        if not self._on_diag:
+            return
+        try:
+            self._on_diag(dev_id, text, level)
+        except Exception as e:  # noqa: BLE001
+            print("[ble] diag handler error:", e)
 
     async def _discover_and_connect(self, quick=False):
         # A shorter first scan gives the user fast feedback at startup.
@@ -577,6 +677,7 @@ class BleLinkManager:
                 link.touch()
                 link._mtu = int(getattr(client, "mtu_size", 0) or 23)
                 print(f"[ble {tag}] connected {client.address} mtu={link._mtu}")
+                self._note_link_connected(link)
                 while client.is_connected and not link.stopped:
                     try:
                         cmd = await asyncio.wait_for(link._queue.get(), timeout=1.0)
@@ -595,6 +696,7 @@ class BleLinkManager:
                 if link.stopped:
                     return
                 print(f"[ble {tag}] session error:", type(e).__name__, e)
+                self._note_link_error(link, e)
                 if type(e).__name__ == "BleakDeviceNotFoundError":
                     link._not_found += 1
                     if link._not_found >= MAX_NOT_FOUND:
@@ -765,12 +867,14 @@ class BleLinkManager:
                 "name": info.get("name", ""),
                 "address": addr,
                 "connected": False,
+                "last_error": None,
             }
         out = []
         for key in order:
             v = by_key[key]
             if isinstance(v, BleLink):
-                out.append({"dev_id": v.dev_id, "name": v.name, "address": v.address, "connected": v.connected})
+                out.append({"dev_id": v.dev_id, "name": v.name, "address": v.address,
+                            "connected": v.connected, "last_error": v.last_error})
             else:
                 out.append(v)
         return out
@@ -780,6 +884,9 @@ class BleLinkManager:
         it is up so it never spins a competing asyncio loop (WinRT dislikes
         that); falls back to a throwaway loop before start()."""
         if not _load_bleak():
+            # bleak is missing entirely - record why, so the UI can say so
+            # instead of "no devices found".
+            self._note_scan_error(str(_BLEAK_ERROR or "bleak 不可用"))
             return []
         loop = self._loop
         if loop is not None and loop.is_running():
@@ -788,9 +895,24 @@ class BleLinkManager:
                 return fut.result(timeout=timeout + 15)
             except Exception as e:  # noqa: BLE001
                 print("[ble] discover error:", e)
+                self._note_scan_error(str(e))
                 return []
         try:
             return asyncio.run(self._scan(timeout))
         except Exception as e:  # noqa: BLE001
             print("[ble] discover error:", e)
+            self._note_scan_error(str(e))
             return []
+
+    def _note_scan_error(self, message):
+        """Remember why a one-shot scan failed (WS-395).
+
+        The scan itself already records its own failures in ``last_scan``;
+        this covers the errors raised around it (timeout, event loop closed),
+        which would otherwise leave the UI without any explanation.
+        """
+        with self._lock:
+            state = dict(self.last_scan)
+            state["error"] = message
+            state["at"] = time.time()
+            self.last_scan = state
