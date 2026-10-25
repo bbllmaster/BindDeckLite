@@ -342,8 +342,8 @@ function renderActionInput(holder, item, card) {
     // 哪些键名；完整示例与语法说明见右上角「帮助」。
     ta.placeholder =
       "键名：" + MACRO_KEY_HINT + "\n" +
-      "每行一步：browser: / url: / wait:（毫秒）/ text: / text!80: / paste: / key:\n" +
-      "例：browser:chrome → url:https://example.com/login → paste:密码";
+      "每行一步：app: / browser: / url: / wait:（毫秒）/ text: / text!80: / paste: / key:\n" +
+      "例：app:C:\\path\\app.exe → text:hello";
     ta.title = "每行一步；完整语法与键名对照见右上角「帮助」";
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
@@ -430,6 +430,7 @@ function formatMacro(steps) {
       if (s.type === "paste") return "paste:" + (s.value || "");
       if (s.type === "url") return "url:" + (s.value || "");
       if (s.type === "browser") return "browser:" + (s.value || "");
+      if (s.type === "app") return "app:" + (s.value || "");
       return "key:" + (s.value || "");
     })
     .join("\n");
@@ -470,6 +471,12 @@ function parseMacro(text) {
         // 只存键名本身；旧版本曾把整行（含 key: 前缀）写进 value，这里把
         // 累积的前缀去掉，否则重启后会变成 key:key:tab。
         return { type: "key", value: value.replace(/^(?:key:)+/i, "") };
+      }
+      if (kind === "app") {
+        // 启动桌面应用程序：可执行文件路径，可带参数（引号包裹含空格的路径）。
+        // 主机端 _parse_app_cmd 拆出 (exe, args)：第一个 token 作为 exe 交给
+        // _resolve_exe 解析，其余为参数，原样传给 Popen。
+        return { type: "app", value };
       }
       return { type: "key", value: line };
     });
