@@ -74,6 +74,8 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; bor
 .dot.ok { background: var(--ok); box-shadow: 0 0 10px rgba(61, 220, 132, 0.65); }
 .dot.warn { background: var(--warn); box-shadow: 0 0 10px rgba(245, 181, 68, 0.5); }
 .dot.bad { background: var(--danger); box-shadow: 0 0 10px rgba(255, 107, 107, 0.5); }
+/* 侧栏条目里的失败状态点：同样用琥珀色，但光晕比顶栏收敛（列表里点很多） */
+.device .dot.warn { box-shadow: 0 0 6px rgba(245, 181, 68, 0.45); }
 
 /* ---------- switch ---------- */
 .switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
@@ -146,8 +148,13 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; bor
 .device.active { background: var(--card); border-color: rgba(53, 224, 194, 0.35); }
 .dev-main { display: flex; flex-direction: column; min-width: 0; }
 .dev-main b { font-size: 13px; }
+/* 地址在正常时保持原样；连接失败时换成失败原因摘要（单行省略，悬停看全文） */
 .dev-main small { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+.dev-main small.reason { white-space: nowrap; color: var(--warn); }
 .device-empty { color: var(--muted); font-size: 12px; padding: 12px; }
+.device-empty b { display: block; color: var(--text); margin-bottom: 6px; }
+.device-empty span { display: block; line-height: 1.8; }
+.device-empty .dev-scan { margin-top: 6px; color: var(--muted); opacity: .85; }
 
 .side-note {
   margin-top: auto; border-top: 1px solid var(--line); padding-top: 12px;
