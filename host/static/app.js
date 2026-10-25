@@ -47,6 +47,7 @@ const state = {
   ota: null,           // {status, sent, total, percent, error, filename}
   otaFile: null,       // File object chosen by the user
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
+  scan: null,          // 最近一次扫描的结论，来源 /api/status（WS-395）
 };
 
 async function api(path, opts = {}) {
@@ -74,6 +75,8 @@ async function pollStatus() {
     state.devices = s.devices || [];
     state.actionsEnabled = !!s.actions_enabled;
     state.running = s.running || {};
+    // WS-395: 最近一次扫描的结论（为什么没找到设备）。
+    state.scan = s.scan || null;
     $("#actionsToggle").checked = state.actionsEnabled;
 
     if (!state.selected || !state.devices.some((d) => d.dev_id === state.selected)) {
@@ -110,13 +113,26 @@ async function pollStatus() {
     if (sel) {
       $("#statusDot").className = "dot " + (sel.connected ? "ok" : "warn");
       $("#statusText").textContent = sel.connected ? "已连接" : "未连接";
-      const fw = sel.fw && sel.fw.version ? `固件 ${sel.fw.version} · ${sel.fw.chip || ""}` : "等待设备信息";
-      $("#statusSub").textContent = `${sel.name} · ${fw}`;
     } else {
       $("#statusDot").className = "dot bad";
       $("#statusText").textContent = "未发现设备";
-      $("#statusSub").textContent = state.preview ? "显示默认配置（预览）" : "请给设备上电";
     }
+    // WS-395: 副标题按优先级说明「为什么连不上」（蓝牙不可用 > 单设备失败
+    // 原因 > 扫描结论），而不是一律显示「请给设备上电」。
+    let sub;
+    if (s.ble_ok === false) {
+      sub = `蓝牙依赖不可用：${s.ble_error || "未知原因"}`;
+    } else if (sel && !sel.connected && sel.last_error) {
+      sub = `未连接 · ${sel.last_error.text}`;
+    } else if (!sel) {
+      sub = scanDiagSub(state.scan)
+        || (state.preview ? "显示默认配置（预览）" : "请给设备上电");
+    } else {
+      const fw = sel.fw && sel.fw.version
+        ? `固件 ${sel.fw.version} · ${sel.fw.chip || ""}` : "等待设备信息";
+      sub = `${sel.name} · ${fw}`;
+    }
+    $("#statusSub").textContent = sub;
     highlightKeys(s.last_press || {});
     applyRunningState();
   } catch (e) {
@@ -126,24 +142,63 @@ async function pollStatus() {
   }
 }
 
+/**
+ * 扫描诊断文案（WS-395）。
+ *
+ * - 没有 scan 字段 = 旧后端：返回 null，界面保持原样。
+ * - at 为 null = 还没扫完：显示「扫描中…」，不要显示「0 个 BLE 设备」。
+ * - 有 reason = 说明这次扫描为什么没找到设备。
+ */
+function scanDiagSub(scan) {
+  if (!scan) return null;
+  if (scan.at === null || scan.at === undefined) return "扫描中…";
+  if (scan.reason) return `未发现设备：${scan.reason}`;
+  return null;
+}
+
+/** 扫描时间戳 → HH:MM:SS（本地时区）。 */
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function renderDevices() {
   const ul = $("#deviceList");
   ul.innerHTML = "";
   if (!state.devices.length) {
     const li = document.createElement("li");
     li.className = "device-empty";
-    li.textContent = "未发现 BindDeckLite 设备";
+    // WS-395: 没找到设备时给出下一步该做什么，而不是只丢一句「未发现」。
+    const scan = state.scan;
+    const parts = [
+      "<b>未发现 BindDeckLite 设备</b>",
+      "<span>① 系统蓝牙已开启</span>",
+      "<span>② 设备已上电且在 1 米内</span>",
+      "<span>③ 刚进过配网模式的话，长按编码器约 1 秒退出</span>",
+    ];
+    if (scan && scan.at !== null && scan.at !== undefined) {
+      const tail = scan.reason ? ` · ${escapeHtml(scan.reason)}` : "";
+      parts.push(`<span class="dev-scan">最后扫描 ${fmtClock(scan.at)}${tail}</span>`);
+    }
+    li.innerHTML = parts.join("");
     ul.appendChild(li);
     return;
   }
   state.devices.forEach((d) => {
     const li = document.createElement("li");
     li.className = "device" + (d.dev_id === state.selected ? " active" : "");
+    // WS-395: 未连接且已知失败原因时，用原因摘要代替地址，点变琥珀色。
+    const reason = !d.connected && d.last_error ? d.last_error.text : "";
+    const dot = d.connected ? "ok" : (reason ? "warn" : "");
+    const sub = reason
+      ? `<small class="reason" title="${escapeHtml(d.last_error.text)}">${escapeHtml(reason)}</small>`
+      : `<small>${escapeHtml(d.address || "")}</small>`;
     li.innerHTML = `
-      <span class="dot ${d.connected ? "ok" : ""}"></span>
+      <span class="dot ${dot}"></span>
       <span class="dev-main">
         <b>${escapeHtml(d.name || d.dev_id || "BindDeckLite")}</b>
-        <small>${escapeHtml(d.address || "")}</small>
+        ${sub}
       </span>`;
     li.onclick = () => selectDevice(d.dev_id);
     ul.appendChild(li);
@@ -1073,7 +1128,8 @@ async function init() {
     toast("正在扫描…");
     try {
       const r = await api("/api/scan");
-      toast(`扫描到 ${r.found ? r.found.length : 0} 台设备`);
+      // WS-395: 说清楚为什么没扫到，而不是只报一个「0 台设备」。
+      toast(r.reason ? `扫描未发现设备：${r.reason}` : `扫描到 ${r.found ? r.found.length : 0} 台设备`);
     } catch (e) {
       toast("扫描失败：" + e.message, "bad");
     }

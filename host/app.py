@@ -45,7 +45,7 @@ from flask import Flask, jsonify, render_template, request
 
 import autostart
 import desktop
-from ble_link import BleLinkManager
+from ble_link import BleLinkManager, scan_reason
 
 SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -470,8 +470,20 @@ def add_event(kind: str, text: str, dev_id: str = "", level: str = "info"):
 
 
 # --- BLE ------------------------------------------------------------------
+def _on_ble_diag(dev_id: str, text: str, level: str):
+    """Write a BLE diagnosis to the event log (WS-395).
+
+    The BLE layer reports a connect failure / a changed reason / a recovery;
+    the app turns that into one log line so the user can see *why* a deck is
+    not reachable, instead of guessing from the console (which the packaged
+    exe does not even have).
+    """
+    add_event("ble", text, dev_id, level)
+
+
 ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
-                     cache_path=os.path.join(DATA_DIR, "ble_cache.json"))
+                     cache_path=os.path.join(DATA_DIR, "ble_cache.json"),
+                     on_diag=_on_ble_diag)
 
 
 def _on_line(dev_id: str, line: str):
@@ -655,11 +667,31 @@ def device_list():
             "name": cfg.get("name") or info.get("name") or dev_id,
             "address": info.get("address", ""),
             "connected": connected,
+            # WS-395: why this deck is not reachable (None when there is no
+            # known failure). Lets the UI say more than "not connected".
+            "last_error": info.get("last_error"),
             "chip": cfg.get("chip", ""),
             "fw": cfg.get("fw", {}),
             "bond": cfg.get("bond", {"bound": False, "addr": ""}),
         })
     return out
+
+
+def _scan_state() -> dict:
+    """The last scan's conclusion for the UI (WS-395).
+
+    ``ble.last_scan`` holds the raw counters; ``reason`` adds the one-line
+    explanation the user actually reads ("the adapter is off" vs "we saw 3
+    BLE devices but none was a BindDeckLite"). Before the first scan there
+    is no conclusion yet (``at`` is None), so ``reason`` stays None.
+    """
+    state = dict(ble.last_scan)
+    if state.get("at") is None:
+        state["reason"] = None
+    else:
+        state["reason"] = scan_reason(state.get("seen", 0), state.get("found", 0),
+                                      state.get("error"))
+    return state
 
 
 # --- command transport ----------------------------------------------------
@@ -1763,6 +1795,9 @@ def api_status():
         # WS-359: additive field — old front-ends simply ignore it.
         "running": _running_snapshot(),
         "event_seq": _event_seq,
+        # WS-395: additive field — the last scan's conclusion ("why is no
+        # device found?"). ``at`` is None until the first scan finished.
+        "scan": _scan_state(),
     })
 
 
@@ -1774,7 +1809,8 @@ def api_defaults():
 @app.route("/api/scan")
 def api_scan():
     found = ble.discover(timeout=6.0)
-    return jsonify({"ok": True, "found": found})
+    reason = _scan_state()["reason"]
+    return jsonify({"ok": True, "found": found, "reason": reason})
 
 
 @app.route("/api/config/<dev_id>", methods=["GET", "POST"])
