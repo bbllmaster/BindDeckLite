@@ -32,7 +32,6 @@ import hashlib
 import json
 import os
 import queue
-import shlex
 import shutil
 import socket
 import subprocess
@@ -991,40 +990,125 @@ def _open_target(value: str):
         subprocess.Popen(["xdg-open", value])
 
 
+def _is_word_char(ch: str) -> bool:
+    """True for characters that can appear inside a word (letters, digits, _)."""
+    return ch.isalnum() or ch == "_"
+
+
+def _split_app_tokens(value: str) -> list[str]:
+    """Split a command line into tokens, honouring quotes anywhere.
+
+    A double quote may open and close a quoted section **anywhere** inside
+    a token, and only the *matching* quote character closes it — so inside
+    ``"…"`` a single quote is literal and vice versa.  Text between the
+    quotes is taken verbatim (spaces included) and the quote characters
+    themselves are removed::
+
+        '"C:\\\\Program Files\\\\App\\\\app.exe" --new'  ->  2 tokens
+        'myapp.exe --title="My App"'                    ->  2 tokens
+
+    A single quote opens a quoted section as well (POSIX-style paths such
+    as ``'/usr/bin/foo'``), except when it is an **apostrophe** inside a
+    word (``Bob's``) — that stays a literal character.
+
+    Backslashes are **literal** (never escapes): Windows paths such as
+    ``C:\\Program Files\\App\\app.exe`` must survive untouched.
+
+    An unbalanced quote raises ``ValueError`` — the caller turns that into
+    a skipped step, never into a silently mangled command line.
+    """
+    tokens: list[str] = []
+    cur: list[str] = []
+    quote = ""      # "" = outside a quoted section
+    started = False  # current token exists (it may be empty, e.g. `""`)
+    for i, ch in enumerate(value):
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                cur.append(ch)
+            continue
+        if ch == '"':
+            quote = ch
+            started = True
+            continue
+        if ch == "'":
+            # Apostrophe inside a word (Bob's) is literal, not a quote.
+            prev = cur[-1] if cur else ""
+            nxt = value[i + 1] if i + 1 < len(value) else ""
+            if prev and nxt and _is_word_char(prev) and _is_word_char(nxt):
+                cur.append(ch)
+                started = True
+                continue
+            quote = ch
+            started = True
+            continue
+        if ch.isspace():
+            if started:
+                tokens.append("".join(cur))
+                cur = []
+                started = False
+            continue
+        cur.append(ch)
+        started = True
+    if quote:
+        raise ValueError("unbalanced quote")
+    if started:
+        tokens.append("".join(cur))
+    return tokens
+
+
 def _parse_app_cmd(value: str) -> tuple[str, list[str]]:
     """Split an ``app:<exe> [args]`` value into ``(exe, [args])``.
 
     This is the **single** parsing entry point for the ``app:`` macro step —
     ``run_action``, ``_open_app`` and the unit tests all call this function,
-    never ``shlex.split`` directly.  ``shlex.split(value, posix=False)``
-    keeps Windows backslashes literal while honouring quoted paths that
-    contain spaces; surrounding quotes are then stripped from every token
-    (a quoted ``"arg with spaces"`` stays one argument).
+    never ``shlex.split`` directly.  ``shlex.split`` is not used here because
+    it cannot express what users actually type: with ``posix=False`` a quote
+    is only recognised at the **start** of a token, so ``--title="My App"``
+    would be torn into ``--title="My`` + ``App"``.  ``_split_app_tokens``
+    accepts quotes anywhere in a token and keeps backslashes literal.
 
     The args are returned as a **list**, never a joined string: joining
     with spaces and re-splitting downstream would lose the quote
-    boundaries that ``shlex.split`` worked so hard to preserve (a
+    boundaries that the tokenizer worked so hard to preserve (a
     ``"hello world"`` argument would come back as two separate tokens).
 
-    An unbalanced quote (``app:myapp.exe "oops``) makes ``shlex.split``
-    raise ``ValueError``.  That must not abort the whole macro — a typo in
-    one step would otherwise skip every following ``text:`` / ``key:``
-    step.  The value is re-split with the dangling quote closed, so the
-    step simply fails to resolve its exe and is skipped like any other
-    missing executable.
+    An unbalanced quote (``app:myapp.exe "oops``) makes the tokenizer raise
+    ``ValueError``.  That must not abort the whole macro — a typo in one
+    step would otherwise skip every following ``text:`` / ``key:`` step.
+    The error is swallowed here and reported as ``("", [])``, so the step
+    is skipped (the exe is never resolved, nothing is launched) while the
+    rest of the macro keeps running.
     """
     if not value:
         return "", []
     try:
-        parts = shlex.split(value, posix=False)
+        parts = _split_app_tokens(value)
     except ValueError:
-        # Unbalanced quote: close it and retry so the step degrades to a
-        # normal "exe not found" instead of killing the whole macro.
-        parts = shlex.split(value + '"', posix=False)
+        # Unbalanced quote: the command line is not trustworthy, so do not
+        # launch anything with a guessed argv — skip the step instead.
+        return "", []
     if not parts:
         return "", []
-    parts = [p.strip('"') for p in parts]
     return parts[0], parts[1:]
+
+
+def _app_cmd_error(value: str) -> str:
+    """Explain why an ``app:`` value cannot be launched ("" when it is fine).
+
+    Used by ``run_action`` to tell the user *which* mistake they made —
+    "unbalanced quote" and "no executable given" need different wording.
+    """
+    if not value.strip():
+        return "未指定可执行文件"
+    try:
+        parts = _split_app_tokens(value)
+    except ValueError:
+        return "命令行引号不配对"
+    if not parts or not parts[0]:
+        return "未指定可执行文件"
+    return ""
 
 
 def _resolve_exe(value: str) -> str:
@@ -1050,6 +1134,24 @@ def _resolve_exe(value: str) -> str:
     return shutil.which(v) or ""
 
 
+# Launched desktop apps: keep a reference to every child so it is not
+# garbage-collected while still running (which would leave a zombie).
+_APP_PROCS: list = []
+
+
+def _reap_app_procs() -> None:
+    """Drop finished children from ``_APP_PROCS``.
+
+    A ``Popen`` object that is garbage-collected while its child is still
+    running leaves a zombie behind (and emits a ``ResourceWarning``).  The
+    launched apps are long-lived, so keep a reference to every one of them
+    and reap the ones that already exited.
+    """
+    for proc in list(_APP_PROCS):
+        if proc.poll() is not None:
+            _APP_PROCS.remove(proc)
+
+
 def _open_app(value: str):
     """Launch a desktop application, returning the ``Popen`` object (or ``None``).
 
@@ -1065,6 +1167,9 @@ def _open_app(value: str):
     otherwise ``open`` has no target and the app never starts); on Linux
     the exe is started directly (the user is expected to give a
     PATH-resolvable name or full path).
+
+    An unparsable command line (unbalanced quote) yields ``None`` — the
+    app is **not** launched with a guessed argument list.
     """
     exe_raw, args = _parse_app_cmd(value)
     if not exe_raw:
@@ -1075,7 +1180,7 @@ def _open_app(value: str):
     # args is already a list from _parse_app_cmd — never re-split it,
     # otherwise quoted arguments with spaces would break apart again.
     if sys.platform.startswith("win"):
-        return subprocess.Popen([exe] + args)
+        cmd = [exe] + args
     elif sys.platform == "darwin":
         # open <target> --args <args...>：--args 必须在目标之后，
         # 否则 open 没有目标，应用根本不会启动。没有参数时不要拼
@@ -1083,9 +1188,15 @@ def _open_app(value: str):
         cmd = ["open", exe]
         if args:
             cmd += ["--args"] + args
-        return subprocess.Popen(cmd)
     else:
-        return subprocess.Popen([exe] + args)
+        cmd = [exe] + args
+    proc = subprocess.Popen(cmd)
+    # Keep a reference to the child and reap finished ones: a Popen that
+    # is garbage-collected while the process is still running leaves a
+    # zombie behind (and emits a ResourceWarning).
+    _APP_PROCS.append(proc)
+    _reap_app_procs()
+    return proc
 
 
 def _win_foreground_hwnd() -> int:
@@ -1725,53 +1836,68 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                 elif st == "app":
                     # Launch a desktop application, then wait for its window to
                     # take the foreground so the following text:/key:/paste:
-                    # steps land in the right window.  A missing exe is reported
-                    # and skipped — the rest of the macro keeps running.
+                    # steps land in the right window.  A missing exe or an
+                    # unparsable command line is reported and skipped — the
+                    # rest of the macro keeps running.
                     #
                     # 单次解析：_parse_app_cmd 拆出 (exe, args)，_resolve_exe
                     # 只对 exe 做展开/PATH 查找，_open_app 用解析后的结果
                     # Popen，避免整条命令行去 exists/which 导致带参数时
                     # 一律判死，以及环境变量展开在启动时丢失。
                     app_val = step.get("value", "")
-                    if app_val:
-                        app_exe_raw, _app_args = _parse_app_cmd(app_val)
-                        app_exe = _resolve_exe(app_exe_raw)
-                        if not app_exe:
-                            add_event("error",
-                                      f"app: 未找到可执行文件 "
-                                      f"{app_exe_raw}（已尝试路径展开与 PATH "
-                                      "解析），本步跳过，继续执行后续步骤",
-                                      dev_id, "error")
-                        else:
-                            add_event("action",
-                                      f"正在启动 {app_val}", dev_id, "ok")
-                            prev_hwnd = _win_foreground_hwnd()
-                            proc = None
-                            try:
-                                proc = _open_app(app_val)
-                            except (FileNotFoundError, PermissionError,
-                                    OSError) as e:
-                                add_event("error",
-                                          f"app: 启动失败 "
-                                          f"{type(e).__name__}: {e}",
-                                          dev_id, "error")
-                            if proc is not None:
-                                # Desktop apps start slower than browsers;
-                                # without this the following text:/key:
-                                # steps land in the previous window.
-                                # _wait_app_foreground returns None off
-                                # Windows (not a failure — window managers
-                                # already focus new windows); only warn on
-                                # a real Windows timeout (False).
-                                focused = _wait_app_foreground(
-                                    prev_hwnd, proc.pid)
-                                if focused is False:
-                                    add_event("warn",
-                                              f"app: 等待窗口到前台超时（"
-                                              f"{MACRO_APP_FOCUS_TIMEOUT} "
-                                              "秒），后续 text:/key:/paste:"
-                                              "可能打到别的窗口",
-                                              dev_id, "warn")
+                    if not app_val.strip():
+                        add_event("error",
+                                  "app: 未指定可执行文件，本步跳过，"
+                                  "继续执行后续步骤",
+                                  dev_id, "error")
+                        continue
+                    app_exe_raw, _app_args = _parse_app_cmd(app_val)
+                    if not app_exe_raw:
+                        # 引号不配对（或只写了一个空的可执行文件名）：整条
+                        # 命令行不可信，绝不带着猜测的参数去启动应用。
+                        # _app_cmd_error 只在出错这条路径上再解析一次，
+                        # 用于区分「引号不配对」和「没写可执行文件」。
+                        add_event("error",
+                                  f"app: {_app_cmd_error(app_val)}，本步跳过，"
+                                  "继续执行后续步骤",
+                                  dev_id, "error")
+                        continue
+                    app_exe = _resolve_exe(app_exe_raw)
+                    if not app_exe:
+                        add_event("error",
+                                  f"app: 未找到可执行文件 "
+                                  f"{app_exe_raw}（已尝试路径展开与 PATH "
+                                  "解析），本步跳过，继续执行后续步骤",
+                                  dev_id, "error")
+                        continue
+                    add_event("action", f"正在启动 {app_val}", dev_id, "ok")
+                    prev_hwnd = _win_foreground_hwnd()
+                    proc = None
+                    try:
+                        proc = _open_app(app_val)
+                    except (FileNotFoundError, PermissionError,
+                            OSError) as e:
+                        add_event("error",
+                                  f"app: 启动失败 "
+                                  f"{type(e).__name__}: {e}",
+                                  dev_id, "error")
+                    if proc is not None:
+                        # Desktop apps start slower than browsers;
+                        # without this the following text:/key:
+                        # steps land in the previous window.
+                        # _wait_app_foreground returns None off
+                        # Windows (not a failure — window managers
+                        # already focus new windows); only warn on
+                        # a real Windows timeout (False).
+                        focused = _wait_app_foreground(
+                            prev_hwnd, proc.pid)
+                        if focused is False:
+                            add_event("warn",
+                                      f"app: 等待窗口到前台超时（"
+                                      f"{MACRO_APP_FOCUS_TIMEOUT} "
+                                      "秒），后续 text:/key:/paste:"
+                                      "可能打到别的窗口",
+                                      dev_id, "warn")
                 elif st == "browser":
                     browser_target, browser_used, browser_err = (
                         resolve_macro_browser(step.get("value", "")))

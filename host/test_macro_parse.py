@@ -59,16 +59,77 @@ def test_parse_app_cmd_empty():
     assert args == []
 
 
-def test_parse_app_cmd_unbalanced_quote_does_not_raise():
-    """An unbalanced quote degrades to a normal parse instead of raising.
+def test_parse_app_cmd_unbalanced_quote_is_skipped():
+    """An unbalanced quote makes the whole step skipped instead of raising.
 
-    ``shlex.split`` raises ``ValueError`` on a dangling quote.  Uncaught, that
+    The tokenizer raises ``ValueError`` on a dangling quote.  Uncaught, that
     exception propagates out of the macro loop and aborts *every* following
-    step, so a single typo would silence the rest of the macro.
+    step, so a single typo would silence the rest of the macro.  A dangling
+    quote also means the command line cannot be trusted, so no exe is
+    returned — the step must be skipped rather than launched with a
+    guessed argument list.
     """
     exe, args = host_app._parse_app_cmd('myapp.exe "unclosed')
+    assert exe == ""
+    assert args == []
+
+
+def test_parse_app_cmd_unbalanced_single_quote_is_skipped():
+    """A dangling **single** quote is caught the same way as a double one.
+
+    Regression: the old implementation only recovered from an unbalanced
+    double quote by appending one and retrying — a dangling single quote
+    raised a second time and aborted the entire macro.
+    """
+    exe, args = host_app._parse_app_cmd("myapp.exe 'unclosed")
+    assert exe == ""
+    assert args == []
+
+
+def test_parse_app_cmd_unbalanced_quote_does_not_fabricate_argv():
+    """An unbalanced quote must not yield a half-parsed argument list.
+
+    The old fallback (append a quote, re-split) produced argv
+    ``['myapp.exe', 'unclosed']`` and launched the app with that bogus
+    argument.  Nothing may be launched from an unparsable command line.
+    """
+    exe, args = host_app._parse_app_cmd('myapp.exe "unclosed')
+    assert exe == ""
+    assert args == []
+
+
+def test_parse_app_cmd_single_quoted_path():
+    """A single-quoted path is unquoted (POSIX users write it that way)."""
+    exe, args = host_app._parse_app_cmd("'/usr/bin/foo' --flag")
+    assert exe == "/usr/bin/foo"
+    assert args == ["--flag"]
+
+
+def test_parse_app_cmd_apostrophe_inside_word_is_literal():
+    """``Bob's`` keeps its apostrophe — it is not a quote character."""
+    exe, args = host_app._parse_app_cmd("/opt/Bob's Tools/app.exe")
+    assert exe == "/opt/Bob's"
+    assert args == ["Tools/app.exe"]
+
+
+def test_parse_app_cmd_equals_form_quoted_value():
+    """``--title="My App"`` stays one argument with the quotes removed.
+
+    ``shlex.split(posix=False)`` only recognises a quote at the *start* of
+    a token, so it tore this into ``--title="My`` + ``App"`` and the app
+    received the wrong argv.
+    """
+    exe, args = host_app._parse_app_cmd('myapp.exe --title="My App"')
     assert exe == "myapp.exe"
-    assert args == ["unclosed"]
+    assert args == ["--title=My App"]
+
+
+def test_parse_app_cmd_equals_form_quoted_value_with_path():
+    """The ``=``-form also survives a quoted Windows path argument."""
+    exe, args = host_app._parse_app_cmd(
+        'C:\\app.exe --profile-directory="Profile 1"')
+    assert exe == "C:\\app.exe"
+    assert args == ["--profile-directory=Profile 1"]
 
 
 def test_parse_app_cmd_empty_quoted_arg_preserved():
@@ -76,6 +137,27 @@ def test_parse_app_cmd_empty_quoted_arg_preserved():
     exe, args = host_app._parse_app_cmd('myapp.exe "" --flag')
     assert exe == "myapp.exe"
     assert args == ["", "--flag"]
+
+
+# ---------------------------------------------------------------------------
+# _app_cmd_error — the reason a command line cannot be launched
+# ---------------------------------------------------------------------------
+
+def test_app_cmd_error_empty_value():
+    """An empty value is reported as "no executable given"."""
+    assert host_app._app_cmd_error("") == "未指定可执行文件"
+    assert host_app._app_cmd_error("   ") == "未指定可执行文件"
+
+
+def test_app_cmd_error_unbalanced_quote():
+    """An unbalanced quote is reported as such (not as "not found")."""
+    assert host_app._app_cmd_error('myapp.exe "unclosed') == "命令行引号不配对"
+    assert host_app._app_cmd_error("myapp.exe 'unclosed") == "命令行引号不配对"
+
+
+def test_app_cmd_error_valid_value():
+    """A valid value has no error."""
+    assert host_app._app_cmd_error('myapp.exe --title="My App"') == ""
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +417,9 @@ def test_run_action_app_missing_exe_skips_step():
 def test_run_action_app_unbalanced_quote_does_not_block_later_steps():
     """``app:`` with a dangling quote must not abort the rest of the macro.
 
-    Regression: ``shlex.split`` raised ``ValueError`` on the unbalanced
-    quote, the exception escaped the macro loop, and the following
-    ``text:`` step never ran — one typo silenced the whole macro.
+    Regression: the parser raised ``ValueError`` on the unbalanced quote,
+    the exception escaped the macro loop, and the following ``text:`` step
+    never ran — one typo silenced the whole macro.
     """
     action = _make_macro_action([
         {"type": "app", "value": 'myapp.exe "unclosed'},
@@ -351,6 +433,115 @@ def test_run_action_app_unbalanced_quote_does_not_block_later_steps():
                 result = host_app.run_action(action, dev_id="test-dev")
     assert result["ok"] is True
     app_mock.assert_not_called()
+    kb.write.assert_called_once_with("hello",
+                                     delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
+
+
+def test_run_action_app_unbalanced_single_quote_does_not_block_later_steps():
+    """A dangling **single** quote must not abort the rest of the macro.
+
+    Regression: only the double-quote case was recovered from — the single
+    quote raised a second time and killed every following step.
+    """
+    action = _make_macro_action([
+        {"type": "app", "value": "myapp.exe 'unclosed"},
+        {"type": "text", "value": "after"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        with mock.patch.object(host_app, "_resolve_exe", return_value=""):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                result = host_app.run_action(action, dev_id="test-dev")
+    assert result["ok"] is True
+    app_mock.assert_not_called()
+    kb.write.assert_called_once_with("after",
+                                     delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
+
+
+def test_run_action_app_unbalanced_quote_launches_nothing():
+    """An unbalanced quote must not launch the app with a guessed argv.
+
+    The old fallback (append a quote, re-split) produced the argv
+    ``['myapp.exe', 'unclosed']`` and started the app anyway.
+    """
+    action = _make_macro_action([
+        {"type": "app", "value": 'myapp.exe "unclosed'},
+        {"type": "text", "value": "hello"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        # The exe *is* resolvable — the step must still be skipped,
+        # because the argument list is not trustworthy.
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/usr/bin/myapp"):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                result = host_app.run_action(action, dev_id="test-dev")
+    assert result["ok"] is True
+    app_mock.assert_not_called()
+    kb.write.assert_called_once_with("hello",
+                                     delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
+
+
+def test_run_action_app_unbalanced_quote_reports_reason():
+    """The error message says the quotes are unbalanced."""
+    action = _make_macro_action([
+        {"type": "app", "value": "myapp.exe 'unclosed"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        with mock.patch.object(host_app, "_resolve_exe", return_value=""):
+            with mock.patch.object(host_app, "add_event") as event_mock:
+                host_app.run_action(action, dev_id="test-dev")
+    errors = [call.args[1] for call in event_mock.call_args_list
+              if call.args[0] == "error"]
+    assert errors, "an error event should be logged"
+    assert any("引号不配对" in msg for msg in errors), errors
+
+
+def test_run_action_app_equals_form_quoted_value():
+    """``--title="My App"`` reaches the app as one argument."""
+    action = _make_macro_action([
+        {"type": "app", "value": '/usr/bin/myapp --title="My App"'},
+        {"type": "text", "value": "hello"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        with mock.patch.object(host_app, "_resolve_exe",
+                               return_value="/usr/bin/myapp"):
+            with mock.patch.object(host_app, "_open_app") as app_mock:
+                proc = mock.MagicMock()
+                proc.pid = 55555
+                app_mock.return_value = proc
+                with mock.patch.object(host_app, "_wait_app_foreground",
+                                       return_value=True):
+                    result = host_app.run_action(action, dev_id="test-dev")
+    assert result["ok"] is True
+    app_mock.assert_called_once_with('/usr/bin/myapp --title="My App"')
+    kb.write.assert_called_once_with("hello",
+                                     delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
+
+
+def test_run_action_app_empty_value_reports_error():
+    """An empty ``app:`` value is reported instead of silently skipped."""
+    action = _make_macro_action([
+        {"type": "app", "value": ""},
+        {"type": "text", "value": "hello"},
+    ])
+    with mock.patch.object(host_app, "_load_keyboard") as kb_mock:
+        kb = mock.MagicMock()
+        kb_mock.return_value = kb
+        with mock.patch.object(host_app, "_open_app") as app_mock:
+            with mock.patch.object(host_app, "add_event") as event_mock:
+                result = host_app.run_action(action, dev_id="test-dev")
+    assert result["ok"] is True
+    app_mock.assert_not_called()
+    errors = [call.args[1] for call in event_mock.call_args_list
+              if call.args[0] == "error"]
+    assert errors, "an error event should be logged"
     kb.write.assert_called_once_with("hello",
                                      delay=host_app.MACRO_TEXT_DEFAULT_DELAY)
 

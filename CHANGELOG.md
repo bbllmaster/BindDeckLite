@@ -22,20 +22,35 @@
 - **引号参数不拆碎**（`_parse_app_cmd`）：参数以 **列表** 返回，`_open_app`
   直接使用、不再二次 `shlex.split`，否则 `"hello world"` 会在
   「拼接 → 再切分」中丢掉引号边界，变成两个参数。
-- **引号不配对不中断宏**（`_parse_app_cmd`）：`shlex.split` 遇到落单的引号
-  会抛 `ValueError`，异常逃出宏循环会让**后续所有步骤都不执行**。现在按
-  「补齐引号后重试」降级处理，该步按「未找到可执行文件」跳过，宏继续跑。
+- **自研分词器**（`_split_app_tokens`）：不再用 `shlex.split` —— 它
+  （`posix=False`）只在 token **开头**识别引号，`--title="My App"` 会被
+  拆成 `--title="My` + `App"`，应用收到错误 argv 且无任何提示。现在引号
+  可出现在 token 任意位置（`--title="My App"` → 一个参数
+  `--title=My App`），反斜杠保持字面量（Windows 路径不被吃掉），单引号
+  也可用（`'/usr/bin/foo'`），词内撇号（`Bob's`）仍按字面量处理。
+- **引号不配对不中断宏**（`_parse_app_cmd` / `_app_cmd_error`）：落单的
+  引号（`"` 或 `'`）会让分词器抛 `ValueError`，异常逃出宏循环会让
+  **后续所有步骤都不执行**。现在整条命令行判为不可信 —— **不启动任何
+  进程**（旧实现会「补齐引号后重试」，把伪造的参数 `unclosed` 传给应用
+  并照常打开），该步跳过并记「app: 命令行引号不配对」，宏继续跑。
+- **`app:` 值为空有日志**（`run_action`）：空值原先静默跳过，现在记
+  「app: 未指定可执行文件」。
+- **子进程不残留僵尸**（`_APP_PROCS` / `_reap_app_procs`）：`_open_app`
+  返回的 `Popen` 此前从不 `poll()`，进程退出后会在宿主里留下僵尸并触发
+  `ResourceWarning`。现在保留引用并回收已退出的子进程。
 - **macOS 参数顺序**：`open <exe> --args <args>`（`--args` 必须在目标
   之后，否则 open 没有目标，应用根本不会启动）；无参数时不拼 `--args`，
   避免把悬空的 `--args` 传给应用。
 - **文档**：`README.md` 宏表新增 `app:`；`index.html` 帮助新增语法行、
   完整示例与两条排查条目，并注明等待仅 Windows 有效。
-- **测试**：`host/test_macro_parse.py`（33 例）直接 import 生产函数，
-  覆盖 `_parse_app_cmd` / `_resolve_exe` / `_open_app` / `_wait_app_foreground`
-  及 `run_action` 的 `app:` 分支（含带参数、引号参数不拆碎、引号不配对
-  不中断宏、环境变量展开失败、非 Windows 不误报、Windows 超时告警）。
-  用例不依赖平台专有路径（`/bin/echo`、`python3`），保证 windows-latest
-  的 CI 门禁可用。
+- **测试**：`host/test_macro_parse.py`（47 例）直接 import 生产函数，
+  覆盖 `_split_app_tokens` / `_parse_app_cmd` / `_app_cmd_error` /
+  `_resolve_exe` / `_open_app` / `_wait_app_foreground` 及 `run_action` 的
+  `app:` 分支（含带参数、引号参数不拆碎、`=` 形式引号参数、落单双引号 /
+  单引号不中断宏且不启动进程、空值有日志、环境变量展开失败、非 Windows
+  不误报、Windows 超时告警）。
+  用例不依赖平台专有路径（`/bin/echo`、`sys.executable`），保证
+  windows-latest 的 CI 门禁可用。
 - 未触碰 `url:` / `browser:` / `key:` / `paste:` / `delay:` 与 `launch` /
   `command` / `media` 分支，无回归面。
 

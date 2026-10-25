@@ -188,7 +188,7 @@ build.bat
 | 打开网址 | 默认浏览器 |
 | 执行命令 | `shell=True`，请只填可信命令 |
 | 媒体键 | 音量 / 播放 / 上下曲（需 `keyboard`） |
-| 宏 | 每行一步：`key:ctrl+alt+t`、`text:hello`（逐字符，默认 20ms 间隔）、`text!80:hello`（自定义逐字符延迟毫秒）、`paste:文本`（走剪贴板 + Ctrl/Cmd+V，中文/符号/密码框用这个）、`wait:200`、`url:https://…`、`browser:chrome`（指定后续 `url:` 用 Chrome / Firefox / Edge / Safari，未安装时回退默认浏览器）、`app:C:\path\app.exe --arg`（启动桌面应用程序，支持 PATH 程序名与环境变量写法，Windows 会等待窗口到前台）；键名可用 `Tab` / `PageUp` / `LCtrl` 等界面名称（对照表见上位机右上角「帮助」） |
+| 宏 | 每行一步：`key:ctrl+alt+t`、`text:hello`（逐字符，默认 20ms 间隔）、`text!80:hello`（自定义逐字符延迟毫秒）、`paste:文本`（走剪贴板 + Ctrl/Cmd+V，中文/符号/密码框用这个）、`wait:200`、`url:https://…`、`browser:chrome`（指定后续 `url:` 用 Chrome / Firefox / Edge / Safari，未安装时回退默认浏览器）、`app:C:\path\app.exe --arg`（启动桌面应用程序，支持 PATH 程序名与环境变量写法，含空格的路径/参数用引号包裹（如 `--title="My App"`），Windows 会等待窗口到前台）；键名可用 `Tab` / `PageUp` / `LCtrl` 等界面名称（对照表见上位机右上角「帮助」） |
 
 > 上位机动作默认开启，可在右上角关闭；关闭后设备仍然正常发 HID 键。
 
