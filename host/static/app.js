@@ -49,6 +49,7 @@ const state = {
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
   scan: null,          // 最近一次扫描的结论，来源 /api/status（WS-395）
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status（WS-389）
+  readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段（WS-409）
 };
 
 async function api(path, opts = {}) {
@@ -80,6 +81,12 @@ async function pollStatus() {
     state.scan = s.scan || null;
     // WS-389: additive field — old front-ends simply ignore it.
     state.encRunning = s.encoder_running || {};
+    // WS-409: the server remembers the last read-back per device, so the
+    // device page keeps showing "上次读取" across a page reload.
+    state.devices.forEach((d) => {
+      if (d.read) state.readStatus[d.dev_id] = d.read;
+    });
+    renderReadStatus();
     $("#actionsToggle").checked = state.actionsEnabled;
 
     if (!state.selected || !state.devices.some((d) => d.dev_id === state.selected)) {
@@ -793,6 +800,8 @@ function renderDeviceMeta() {
     ? "C3 预设：按键 GPIO0-8、编码器按压 GPIO10、编码器 A/B=GPIO20/21；避开 11-17（Flash）与 18/19（USB）。"
     : "经典 ESP32：避开 6-11（Flash）与 34-39（仅输入）。编码器固定 18/19/5。";
   $("#pinHint").textContent = hint;
+  // WS-409: 设备页的「上次读取」状态行。
+  renderReadStatus();
 }
 
 function renderPins() {
@@ -883,7 +892,20 @@ async function updateDesktop(patch) {
 
 function markDirty() {
   setDirty(true);
-  clearTimeout(state.saveTimer);
+  armPendingSave();
+}
+
+/** 取消挂起的自动保存（读取设备配置时必须先停掉，否则旧副本会写回服务端）。 */
+function cancelPendingSave() {
+  if (state.saveTimer) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+  }
+}
+
+/** 重新挂起自动保存。 */
+function armPendingSave() {
+  cancelPendingSave();
   state.saveTimer = setTimeout(saveConfig, 500);
 }
 
@@ -1069,7 +1091,7 @@ function renderApplyResults(items) {
     }
 
     const actionBtn = (item.status !== "ok")
-      ? `<button class="btn tiny" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
+      ? `<button class="btn tiny accept-device-value" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
       : "";
 
     row.innerHTML = `
@@ -1082,6 +1104,8 @@ function renderApplyResults(items) {
   // 浮层挂在 body 上并脱离文档流，不占用顶部栏的布局空间。
   document.body.appendChild(container);
   positionApplyResults();
+  // WS-409: 动态生成的「以设备为准」按钮也要服从 OTA 锁。
+  applyOtaLock();
 
   // Highlight the form fields whose value was rejected.
   items.forEach((item) => {
@@ -1120,27 +1144,115 @@ function highlightFormField(field) {
   }
 }
 
+/* ---------------- 读取设备配置（WS-409） ---------------- */
+
+// 设备回报的配置分组（与服务端 app.py 的 _CFG_READ_FIELDS 一致）。
+// 这四组全部回来才算一次完整的回读；缺任何一组都按「设备未回报」处理。
+const READ_FIELDS = ["pins", "keys", "enc", "sleep"];
+const READ_FIELD_LABELS = {
+  pins: "按键引脚",
+  keys: "按键码",
+  enc: "编码器模式",
+  sleep: "休眠",
+};
+
+/** 回读结果里设备回报了几组配置。 */
+function readFieldCount(fields) {
+  const f = fields || {};
+  return READ_FIELDS.filter((k) => f[k]).length;
+}
+
+/**
+ * 读取设备配置：发 CMD:GET_CFG，等设备把配置回报回来。
+ *
+ * 两个入口（「读取设备配置」与结果浮层里的「以设备为准」）都走这里，
+ * 都会用设备回报的值整体覆盖 state.cfg，所以：
+ *
+ * - OTA 进行中直接拒绝（applyOtaLock 之外的第二道保险）。
+ * - state.dirty 时先确认：取消则不发送任何命令，表单保持原样。
+ * - 请求期间用户切到别的设备 → 丢弃这次结果（多设备）。
+ * - 设备没回报完整配置 → 不改表单，也不改服务端配置，只提示失败。
+ */
+async function readDeviceConfig(devId) {
+  if (!devId) return null;
+  if (otaBusy()) {
+    toast("OTA 进行中，设备指令已锁定", "bad");
+    return null;
+  }
+  if (state.dirty) {
+    if (!window.confirm("有修改尚未下发到设备，读取设备配置会丢弃它们")) return null;
+  }
+  // 挂起的自动保存必须先停掉：它会把前端旧副本写回服务端，把刚读回来的
+  // 设备真值覆盖掉（WS-409）。
+  const wasDirty = state.dirty;
+  cancelPendingSave();
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/refresh`, { method: "POST" });
+    // 多设备：请求期间用户切到了另一台 → 这次结果作废。
+    if (state.selected !== devId) return null;
+    state.readStatus[devId] = { at: r.at, fields: r.fields || {}, ok: !!r.ok };
+    renderReadStatus();
+    if (!r.ok) {
+      // 表单与本地配置都不动，但用户原本的修改仍要能存下去。
+      if (wasDirty) armPendingSave();
+      toast(`${r.reason || "设备未回报配置"}，可能固件过旧`, "bad");
+      return r;
+    }
+    applyReadback(r);
+    return r;
+  } catch (e) {
+    if (wasDirty) armPendingSave();
+    toast("读取设备配置失败：" + (e.message || e), "bad");
+    return null;
+  }
+}
+
+/** 用设备回报的配置覆盖 state.cfg 并重绘整个表单。 */
+function applyReadback(r) {
+  if (!r || !r.cfg) return;
+  state.cfg = r.cfg;
+  setDirty(false);
+  renderKeys();
+  renderEncoder();
+  renderPins();
+  renderDeviceMeta();
+  renderReadStatus();
+  const got = readFieldCount(r.fields);
+  toast(`已读取设备配置（${fmtClock(r.at)}）· ${got}/${READ_FIELDS.length} 项`, "ok");
+}
+
+/** 设备页状态行：上次读取时间 + 设备回报了几组（缺的标「设备未回报」）。 */
+function renderReadStatus() {
+  const el = $("#cfgReadStatus");
+  if (!el) return;
+  const st = state.readStatus[state.selected];
+  if (!st || !st.at) {
+    el.textContent = "尚未读取设备配置";
+    return;
+  }
+  const got = readFieldCount(st.fields);
+  const missing = READ_FIELDS.filter((k) => !(st.fields || {})[k]);
+  let text = `上次读取：${fmtClock(st.at)}（设备回报 ${got}/${READ_FIELDS.length} 项）`;
+  if (!got) {
+    // 设备一句都没回：不要笼统报成功。
+    text += " · 设备未回报配置";
+  } else if (missing.length) {
+    text += " · " + missing.map((k) => `${READ_FIELD_LABELS[k]} 设备未回报`).join("、");
+  }
+  el.textContent = text;
+}
+
+/**
+ * 「以设备为准」：把设备回报的值填回表单。
+ *
+ * 它和「读取设备配置」走同一条回读路径，所以同样受 OTA 锁与 dirty 确认
+ * 约束；只有真的读到设备配置时才收起结果浮层，读失败时保留提示让用户
+ * 看到原因。
+ */
 async function acceptDeviceValue(field) {
   if (!state.selected) return;
-  try {
-    // Trigger a fresh read from the device so the local form reflects what
-    // the device actually has. The CFG_* lines that come back update the
-    // local config through the normal _on_line path.
-    await api(`/api/device/${encodeURIComponent(state.selected)}/refresh`, { method: "POST" });
-    toast("已请求设备配置，更新中…", "ok");
-    // Give the device a moment to respond, then re-render the affected parts.
-    setTimeout(() => {
-      if (state.cfg) {
-        renderKeys();
-        renderEncoder();
-        renderPins();
-        renderDeviceMeta();
-      }
-      clearApplyResults();
-    }, 600);
-  } catch (e) {
-    toast("刷新失败：" + (e.message || e), "bad");
-  }
+  const r = await readDeviceConfig(state.selected);
+  if (r && r.ok) clearApplyResults();
 }
 
 /* ---------------- log ---------------- */
@@ -1445,7 +1557,8 @@ async function init() {
     }
   };
   $("#btnPing").onclick = () => devAction("ping", "已发送 Ping");
-  $("#btnRefresh").onclick = () => devAction("refresh", "已请求设备配置");
+  // WS-409: 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
+  $("#btnRefresh").onclick = () => readDeviceConfig(state.selected);
   $("#btnPortal").onclick = () => devAction("portal", "设备将重启进入配网模式");
   $("#btnReboot").onclick = () => devAction("reboot", "设备重启中");
   // WS-321: clear the persisted host binding so a new central can take over.
@@ -1582,6 +1695,10 @@ function applyOtaLock() {
       const el = $("#" + id);
       if (el) el.disabled = busy;
     });
+  // WS-409: 「以设备为准」按钮是运行时动态生成的，OTA 期间同样要锁住。
+  $$(".accept-device-value").forEach((el) => {
+    el.disabled = busy;
+  });
 }
 
 async function pollOta() {
