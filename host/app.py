@@ -27,6 +27,7 @@ own the tray, native dialogs and login-start bits.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes  # only used by the Windows clipboard / window helpers below
 import hashlib
 import json
@@ -245,6 +246,27 @@ _apply_lock = threading.RLock()
 _ota_windows: dict = {}
 _ota_lock = threading.RLock()
 
+# Read-back capture (WS-409) — one window per device for an explicit
+# "读取设备配置" request.  The device answers CMD:GET_CFG with CFG_* lines;
+# they are collected here instead of being written into the stored config
+# right away, so the request can wait for a *complete* answer and merge it
+# in one go (an old or silent firmware must not half-update the config).
+_read_windows: dict = {}
+_read_lock = threading.RLock()
+
+# Per-device record of the last explicit read-back (WS-409): when it happened
+# and which config groups the device actually reported.  It lives outside the
+# device config so a failed read leaves the stored config untouched.
+_read_status: dict = {}
+
+# The device-managed fields the UI shows.  A read-back only counts as
+# complete when every one of them came back; the timezone (CFG_TZ) is
+# captured as well but is not one of the configurable groups.
+_CFG_READ_FIELDS = ["pins", "keys", "enc", "sleep"]
+
+# How long a read-back waits for the device's answer (WS-409).
+CFG_READ_TIMEOUT = 2.0
+
 # OTA constants (must match src/main.cpp).
 OTA_CHUNK_MIN = 200          # never go below this even on a small MTU
 OTA_CHUNK_MAX = 512          # CFG RX characteristic capacity (firmware guard)
@@ -315,6 +337,47 @@ class ApplyWindow:
         return self._done.wait(timeout)
 
 
+class ReadWindow:
+    """Captures the CFG_* answer of one explicit "读取设备配置" request.
+
+    The BLE line callback runs on a different thread than the Flask route
+    handler that waits for the answer, so the collected values are guarded
+    by a lock and "everything arrived" is signalled by an event.
+
+    Only the four device-managed groups (pins / keys / enc / sleep) decide
+    whether the answer is complete.  ``tz`` is captured as well but stays
+    optional — it is merged when it happens to arrive, never waited for.
+    """
+
+    def __init__(self, dev_id: str):
+        self.dev_id = dev_id
+        self.values: dict = {}      # field -> raw value string
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._tz = threading.Event()
+
+    def on_value(self, field: str, value: str):
+        with self._lock:
+            self.values[field] = value
+            complete = all(f in self.values for f in _CFG_READ_FIELDS)
+        if complete:
+            self._done.set()
+        if field == "tz":
+            self._tz.set()
+
+    def wait(self, timeout: float) -> bool:
+        """Block until every tracked field arrived (False on timeout)."""
+        return self._done.wait(timeout)
+
+    def wait_tz(self, timeout: float) -> bool:
+        """Block briefly for the optional timezone line."""
+        return self._tz.wait(timeout)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self.values)
+
+
 class OtaWindow:
     """Per-device OTA push state, owning the ACK capture for one push.
 
@@ -377,6 +440,89 @@ class OtaWindow:
 
     def percent(self) -> int:
         return (100 * self.acked // self.total) if self.total else 0
+
+
+def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
+    """Apply one device-reported ``CFG_*`` value to *cfg*.
+
+    *raw* is the part after the ``CFG_<FIELD>:`` prefix.  Only the fields
+    the device owns are touched — the host-side extras (per-key actions,
+    rotation actions, the device name) stay as they are.  Returns True
+    when the value was understood and applied.
+    """
+    if field == "keys":
+        vals = [v for v in raw.split(",") if v.strip()]
+        try:
+            codes = [int(v.strip()) for v in vals]
+        except ValueError:
+            return False
+        for i, code in enumerate(codes[:10]):
+            if i >= len(cfg.get("keys", [])):
+                break
+            cfg["keys"][i]["code"] = code
+            cfg["keys"][i]["label"] = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
+        return True
+    if field == "pins":
+        vals = [v for v in raw.split(",") if v.strip()]
+        try:
+            pins = [int(v.strip()) for v in vals]
+        except ValueError:
+            return False
+        if len(pins) != 9:
+            return False
+        cfg["pins"] = pins
+        return True
+    if field == "enc":
+        try:
+            mode = int(raw.strip())
+        except ValueError:
+            return False
+        cfg.setdefault("encoder", {})["mode"] = mode
+        return True
+    if field == "sleep":
+        payload = raw.split(",")
+        try:
+            enabled = payload[0].strip() == "1"
+            mins = int(payload[1]) if len(payload) > 1 else 5
+        except (ValueError, IndexError):
+            return False
+        cfg["sleep"] = {"enabled": enabled, "minutes": mins}
+        return True
+    if field == "tz":
+        cfg["tz"] = raw
+        return True
+    return False
+
+
+def _split_cfg_line(line: str):
+    """Split a ``CFG_<FIELD>:<value>`` line into (field, value).
+
+    All five device-reported groups are recognized.  Only the four tracked
+    ones (pins / keys / enc / sleep) decide whether the answer is complete;
+    ``tz`` is captured as well but never waited for.
+    """
+    for field, prefix, _ in _CFG_READBACK_FIELDS:
+        if line.startswith("CFG_" + prefix + ":"):
+            return field, line[len("CFG_") + len(prefix) + 1:]
+    return None, ""
+
+
+def _capture_read_window(dev_id: str, field: str, raw: str) -> bool:
+    """Hand one device-reported field to a pending read-back request.
+
+    Returns True when a read-back window was waiting for *dev_id* — the
+    caller then knows the line belongs to that request and must not write
+    it into the stored configuration on its own.
+    """
+    with _read_lock:
+        read_window = _read_windows.get(dev_id)
+    if read_window is None:
+        return False
+    read_window.on_value(field, raw)
+    # Log the raw line so the user can cross-check the values that land in
+    # the form against what the device actually reported.
+    add_event("cfg", "设备回报 CFG_" + field.upper() + ":" + raw, dev_id)
+    return True
 
 
 def _rejection_reason(field: str, expected: str, actual: str) -> str:
@@ -600,65 +746,54 @@ def _on_line(dev_id: str, line: str):
     if window and window.phase == "readback":
         for field, prefix, _ in _CFG_READBACK_FIELDS:
             if line.startswith("CFG_" + prefix + ":"):
-                window.on_readback(field, line[len("CFG_") + len(prefix) + 1:])
+                raw = line[len("CFG_") + len(prefix) + 1:]
+                window.on_readback(field, raw)
+                # WS-409: an explicit "读取设备配置" may be waiting for the very
+                # same answer — let it see the line too.
+                _capture_read_window(dev_id, field, raw)
                 return
         # Any other line during the readback window is ignored on purpose:
         # no silent overwrite of the local config while we compare.
         return
 
-    if line.startswith("CFG_KEYS:"):
-        vals = [v for v in line[len("CFG_KEYS:"):].split(",") if v.strip()]
-        try:
-            codes = [int(v.strip()) for v in vals]
-        except ValueError:
+    # WS-409: a pending "读取设备配置" request collects the CFG_* answer
+    # itself.  The lines are NOT written into the stored configuration
+    # here — the request decides whether the answer was complete enough to
+    # accept (see collect_cfg_snapshot).
+    field, raw = _split_cfg_line(line)
+    if field is not None:
+        if _capture_read_window(dev_id, field, raw):
             return
+
+    if line.startswith("CFG_KEYS:"):
         cfg = device_cfg(dev_id)
         with _lock:
-            for i, code in enumerate(codes[:10]):
-                cfg["keys"][i]["code"] = code
-                label = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
-                cfg["keys"][i]["label"] = label
+            _apply_cfg_field(cfg, "keys", line[len("CFG_KEYS:"):])
             save_config()
         add_event("cfg", "已读取设备按键配置", dev_id)
         return
     if line.startswith("CFG_PINS:"):
-        vals = [v for v in line[len("CFG_PINS:"):].split(",") if v.strip()]
-        try:
-            pins = [int(v.strip()) for v in vals]
-        except ValueError:
-            return
-        if len(pins) == 9:
-            cfg = device_cfg(dev_id)
-            with _lock:
-                cfg["pins"] = pins
-                save_config()
-        return
-    if line.startswith("CFG_ENC:"):
-        try:
-            mode = int(line[len("CFG_ENC:"):])
-        except ValueError:
-            return
         cfg = device_cfg(dev_id)
         with _lock:
-            cfg["encoder"]["mode"] = mode
+            _apply_cfg_field(cfg, "pins", line[len("CFG_PINS:"):])
+            save_config()
+        return
+    if line.startswith("CFG_ENC:"):
+        cfg = device_cfg(dev_id)
+        with _lock:
+            _apply_cfg_field(cfg, "enc", line[len("CFG_ENC:"):])
             save_config()
         return
     if line.startswith("CFG_SLEEP:"):
-        payload = line[len("CFG_SLEEP:"):].split(",")
-        try:
-            enabled = payload[0].strip() == "1"
-            mins = int(payload[1]) if len(payload) > 1 else 5
-        except (ValueError, IndexError):
-            return
         cfg = device_cfg(dev_id)
         with _lock:
-            cfg["sleep"] = {"enabled": enabled, "minutes": mins}
+            _apply_cfg_field(cfg, "sleep", line[len("CFG_SLEEP:"):])
             save_config()
         return
     if line.startswith("CFG_TZ:"):
         cfg = device_cfg(dev_id)
         with _lock:
-            cfg["tz"] = line[len("CFG_TZ:"):]
+            _apply_cfg_field(cfg, "tz", line[len("CFG_TZ:"):])
             save_config()
         return
     # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
@@ -737,6 +872,10 @@ def device_list():
             "chip": cfg.get("chip", ""),
             "fw": cfg.get("fw", {}),
             "bond": cfg.get("bond", {"bound": False, "addr": ""}),
+            # WS-409: the last explicit "读取设备配置" — when it happened and
+            # which config groups the device actually reported (None when
+            # nothing was read back yet).
+            "read": _read_status.get(dev_id),
         })
     return out
 
@@ -890,6 +1029,81 @@ def apply_device(dev_id: str) -> dict:
     finally:
         with _apply_lock:
             _apply_windows.pop(dev_id, None)
+
+
+def read_device_config(dev_id: str, timeout: float = CFG_READ_TIMEOUT) -> dict:
+    """Ask the device for its config and wait for the answer.
+
+    Sends ``CMD:GET_CFG`` and collects the ``CFG_*`` lines for at most
+    *timeout* seconds.  A complete answer is merged into the stored config
+    and returned; a partial or missing answer leaves the stored config
+    untouched (an old or silent firmware must not half-update it).
+
+    Returns ``{ok, cfg, fields, at, reason}`` — *fields* says which of the
+    config groups the device reported, *cfg* is the merged configuration
+    (only when *ok*).
+    """
+    window = ReadWindow(dev_id)
+    with _read_lock:
+        _read_windows[dev_id] = window
+    try:
+        deadline = time.monotonic() + timeout
+        send(dev_id, "CMD:GET_CFG")
+        window.wait(timeout)
+        # The timezone is optional — the firmware sends it last. Give it a
+        # short grace period, but never past the overall deadline.
+        grace = min(0.2, max(0.0, deadline - time.monotonic()))
+        if grace:
+            window.wait_tz(grace)
+        values = window.snapshot()
+    finally:
+        with _read_lock:
+            if _read_windows.get(dev_id) is window:
+                del _read_windows[dev_id]
+
+    result = collect_cfg_snapshot(dev_id, values)
+    with _lock:
+        _read_status[dev_id] = {"at": result["at"], "fields": result["fields"],
+                                 "ok": result["ok"]}
+    return result
+
+
+def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
+    """Merge the values a device reported into its stored configuration.
+
+    *values* maps a config group to the raw string the device sent
+    ("240,241,..." for keys, "13,12,..." for pins, ...).  The merge is
+    atomic: the stored config is only rewritten when **every** group came
+    back *and* every value could be parsed, so a partial or broken answer
+    never leaves a half-updated config behind.
+
+    Returns ``{ok, cfg, fields, at, reason}``: *fields* says which groups
+    the device reported, *cfg* is the merged configuration (only when *ok*).
+    """
+    fields = {f: (f in values) for f in _CFG_READ_FIELDS}
+    got = sum(1 for v in fields.values() if v)
+    total = len(_CFG_READ_FIELDS)
+    if not at:
+        at = time.time()
+    if got < total:
+        reason = "设备未回报配置" if got == 0 else "设备未回报完整配置"
+        return {"ok": False, "cfg": None, "fields": fields,
+                "at": at, "reason": reason}
+
+    # Work on a copy first: a malformed value must not leave the stored
+    # config half-updated either.  The whole read-modify-write happens under
+    # the lock so a concurrent writer cannot slip in between.
+    with _lock:
+        cfg = device_cfg(dev_id)
+        merged = copy.deepcopy(cfg)
+        for field, _prefix, _label in _CFG_READBACK_FIELDS:
+            if field in values and not _apply_cfg_field(merged, field, values[field]):
+                return {"ok": False, "cfg": None, "fields": fields, "at": at,
+                        "reason": "设备回报的配置无法解析"}
+        cfg.clear()
+        cfg.update(merged)
+        save_config()
+    return {"ok": True, "cfg": cfg, "fields": fields, "at": at, "reason": ""}
 
 
 # --- host-side actions ----------------------------------------------------
@@ -2546,10 +2760,13 @@ def api_device_action(dev_id, action):
     if action == "portal":
         return jsonify(send(dev_id, "CMD:BOOT_CFG"))
     if action == "refresh":
+        # WS-409: the firmware/bond info is refreshed as before, but the
+        # config read-back is *awaited* — the answer carries the device's
+        # real values so the UI can redraw them.  A device that does not
+        # answer at all leaves the stored config untouched.
         send(dev_id, "CMD:VERSION")
-        send(dev_id, "CMD:GET_CFG")
         send(dev_id, "CMD:GET_BOND")   # WS-321
-        return jsonify({"ok": True})
+        return jsonify(read_device_config(dev_id))
     if action == "ping":
         _ping_sent[dev_id] = time.time()
         return jsonify(send(dev_id, "CMD:PING"))

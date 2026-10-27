@@ -34,6 +34,7 @@
 #include <nvs_flash.h>
 #include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
+#include <vector>         // KeysForm::errors (config portal re-render, WS-408)
 
 // === ESP32-C3 console =====================================================
 // On this board GPIO20/21 are the EC11 A/B lines (UART0's default pins), so the
@@ -252,6 +253,44 @@ static bool isValidPinSet(const int pins[NUM_BUTTONS]) {
   return true;
 }
 
+// Explains why button `idx` cannot use `pin`; an empty string means accepted.
+// The accept/reject rule is exactly isValidButtonPin() - this only adds a
+// human-readable reason so the portal can name the offending row instead of
+// one generic "invalid or duplicate pin" page (WS-408).
+static String pinRejectReason(int idx, int pin) {
+  String btn = "按键 " + String(idx + 1);
+  if (pin < 0 || pin > 39) return btn + " 必须填 0-39 的整数";
+  String who = btn + " 的 GPIO " + String(pin);
+#ifdef TARGET_ESP32C3
+  if (pin > 21) return who + " 在 C3 上不存在（C3 只有 GPIO0-10、20、21）";
+  if (pin >= 11 && pin <= 17) return who + " 在 C3 上是内部 Flash 引脚，不能用作按键";
+#else
+  if (pin >= 6 && pin <= 11) return who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键";
+  if (pin >= 34) return who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键";
+#endif
+  if (pin == ENCODER_CLK) return who + " 与编码器 A 相脚（CLK）冲突";
+  if (pin == ENCODER_DT)  return who + " 与编码器 B 相脚（DT）冲突";
+  if (pin == ENCODER_SW)  return who + " 与编码器按压脚冲突";
+  return "";
+}
+
+// Strict decimal parse: String::toInt() turns "" / "abc" into 0, which used to
+// land silently on GPIO0 and save it.
+static bool parsePinText(const String& s, int& out) {
+  if (!s.length()) return false;
+  unsigned int i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+  if (i >= s.length()) return false;
+  long v = 0;
+  for (; i < s.length(); i++) {
+    char c = s[i];
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + (c - '0');
+    if (v > 9999) return false;
+  }
+  out = (s[0] == '-') ? (int)-v : (int)v;
+  return true;
+}
+
 // === Buttons ==============================================================
 Bounce2::Button switches[NUM_BUTTONS];
 
@@ -430,7 +469,30 @@ static String htmlEsc(const String& s) {
 
 static WebServer cfgServer(80);
 
-static String cfgPage() {
+// Names of the five encoder modes, in encMode order. Index 4 matches the host
+// app ("上位机动作", WS-389) so both surfaces show the same wording.
+static const char* const ENC_MODE_LABELS[5] = {
+  "0 音量", "1 缩放 (Ctrl +/-)", "2 浏览器标签页", "3 撤销/重做", "4 上位机动作"
+};
+
+// State of the button-wiring form. Passed to cfgPage() when a /keys POST is
+// rejected so the page is re-rendered in place with the submitted values, the
+// reasons and the bad rows marked, instead of dropping everything the user
+// typed (WS-408).
+struct KeysForm {
+  String pins[NUM_BUTTONS];            // raw submitted text, echoed verbatim
+  bool   bad[NUM_BUTTONS];             // mark the row red / aria-invalid
+  std::vector<String> errors;          // reasons for the banner, one per line
+  int    enc;                          // encoder mode to keep selected
+  bool   sleepEnabled;
+  unsigned long sleepMs;
+
+  KeysForm() : enc(0), sleepEnabled(true), sleepMs(300000) {
+    for (int i = 0; i < NUM_BUTTONS; i++) bad[i] = false;
+  }
+};
+
+static String cfgPage(const KeysForm* form = nullptr) {
   String ssid, pwd;
   loadWifiCreds(ssid, pwd);
 
@@ -439,7 +501,21 @@ static String cfgPage() {
     "<title>BindDeckLite</title>"
     "<style>body{font-family:sans-serif;max-width:480px;margin:24px auto;padding:0 16px}"
     "input,select{width:100%;padding:6px;box-sizing:border-box}"
-    "table{width:100%;border-collapse:collapse}td{padding:3px}</style></head><body>");
+    "table{width:100%;border-collapse:collapse}td{padding:3px}"
+    ".err{background:#fdecea;border:1px solid #d93025;color:#8c1d18;padding:8px 10px;"
+    "border-radius:6px;margin:0 0 12px;font-size:14px;word-break:break-word}"
+    ".err ul{margin:6px 0 0;padding-left:18px}"
+    ".bad input{border:2px solid #d93025;background:#fff5f5}"
+    "</style></head><body>");
+  if (form && !form->errors.empty()) {
+    h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
+    for (const String& e : form->errors) {
+      h += "<li>";
+      h += e;
+      h += "</li>";
+    }
+    h += F("</ul></div>");
+  }
   h += F("<h2>BindDeckLite 配置</h2><p>设备: <b>");
   h += g_bleName;
   h += F("</b><br>固件: ");
@@ -463,19 +539,32 @@ static String cfgPage() {
 
   h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys'><table>");
   for (int i = 0; i < NUM_BUTTONS; i++) {
-    h += "<tr><td>按键" + String(i + 1) + " GPIO</td><td><input name='pin" + String(i) +
-         "' type='number' min='0' max='39' value='" + String(buttonPins[i]) + "'></td></tr>";
+    bool bad = form && form->bad[i];
+    h += bad ? "<tr class='bad'>" : "<tr>";
+    h += "<td>按键" + String(i + 1) + " GPIO</td><td><input name='pin" + String(i) +
+         "' type='number' min='0' max='39'";
+    if (bad) h += " aria-invalid='true'";
+    h += " value='";
+    h += htmlEsc(form ? form->pins[i] : String(buttonPins[i]));
+    h += "'></td></tr>";
   }
-  h += F("</table><p><b>编码器模式</b><br><select name='enc'>"
-         "<option value='0'>0 音量</option>"
-         "<option value='1'>1 缩放 (Ctrl +/-)</option>"
-         "<option value='2'>2 浏览器标签页</option>"
-         "<option value='3'>3 撤销/重做</option>"
-         "<option value='4'>4 应用音量</option></select></p>");
+  int selEnc = form ? form->enc : encMode;
+  if (selEnc < 0 || selEnc > 4) selEnc = 0;
+  h += F("</table><p><b>编码器模式</b><br><select name='enc'>");
+  for (int m = 0; m < 5; m++) {
+    h += "<option value='" + String(m) + "'";
+    if (m == selEnc) h += " selected";
+    h += ">";
+    h += ENC_MODE_LABELS[m];
+    h += "</option>";
+  }
+  h += F("</select></p>");
+  bool sleepOn = form ? form->sleepEnabled : sleepEnabled;
+  unsigned long sleepMs = form ? form->sleepMs : sleepTimeoutMs;
   h += F("<p><b>自动休眠</b> <label><input type='checkbox' name='sleep' value='1'");
-  if (sleepEnabled) h += " checked";
+  if (sleepOn) h += " checked";
   h += F("> 启用</label> 延时(分钟) <input name='sleeptime' type='number' min='1' value='");
-  h += String(sleepTimeoutMs / 60000);
+  h += String(sleepMs / 60000);
   h += F("' style='width:80px'></p><button style='padding:10px 20px'>保存按键配置</button></form>");
 
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
@@ -530,28 +619,65 @@ static void setupProvisioning() {
   });
   cfgServer.on("/keys", HTTP_POST, []() {
     int pins[NUM_BUTTONS];
+    KeysForm form;
     bool ok = true;
+
+    // Echo back what was submitted (including the encoder/sleep choices) so a
+    // rejected save never loses the user's work.
+    form.enc = cfgServer.hasArg("enc") ? cfgServer.arg("enc").toInt() : encMode;
+    if (form.enc < 0 || form.enc > 4) form.enc = encMode;
+    form.sleepEnabled = (cfgServer.arg("sleep") == "1");
+    int mins = cfgServer.arg("sleeptime").toInt();
+    if (mins < 1) mins = 5;
+    form.sleepMs = (unsigned long)mins * 60000UL;
+
     for (int i = 0; i < NUM_BUTTONS; i++) {
-      pins[i] = cfgServer.arg("pin" + String(i)).toInt();
-      if (!isValidButtonPin(pins[i])) ok = false;
+      form.pins[i] = cfgServer.arg("pin" + String(i));
+      form.pins[i].trim();
+      pins[i] = -1;
+      if (!parsePinText(form.pins[i], pins[i])) {
+        pins[i] = -1;
+        form.bad[i] = true;
+        form.errors.push_back("按键 " + String(i + 1) + " 必须填 0-39 的整数");
+        ok = false;
+        continue;
+      }
+      String why = pinRejectReason(i, pins[i]);
+      if (why.length()) {
+        form.bad[i] = true;
+        form.errors.push_back(why);
+        ok = false;
+      }
     }
+    // Duplicate pins: one message per clashing pair, both rows marked.
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+      if (form.bad[i]) continue;
+      for (int j = i + 1; j < NUM_BUTTONS; j++) {
+        if (form.bad[j] || pins[i] != pins[j]) continue;
+        form.bad[i] = form.bad[j] = true;
+        form.errors.push_back("按键 " + String(i + 1) + " 与按键 " + String(j + 1) +
+                              " 都使用了 GPIO " + String(pins[i]));
+        ok = false;
+      }
+    }
+
     if (ok && isValidPinSet(pins)) {
       for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = pins[i];
       applyButtonPins();
-      encMode = cfgServer.arg("enc").toInt();
-      if (encMode < 0 || encMode > 4) encMode = 0;
-      sleepEnabled = (cfgServer.arg("sleep") == "1");
-      int mins = cfgServer.arg("sleeptime").toInt();
-      if (mins < 1) mins = 5;
-      sleepTimeoutMs = (unsigned long)mins * 60000UL;
+      // Only touch encMode when the form actually carried it: a field the page
+      // did not submit must not silently reset the mode to "0 音量" (WS-408).
+      if (cfgServer.hasArg("enc")) {
+        encMode = cfgServer.arg("enc").toInt();
+        if (encMode < 0 || encMode > 4) encMode = 0;
+      }
+      sleepEnabled = form.sleepEnabled;
+      sleepTimeoutMs = form.sleepMs;
       saveConfig();
       cfgServer.send(200, "text/html; charset=utf-8",
                      "<meta charset='utf-8'><meta http-equiv='refresh' content='1;url=/'>"
                      "<p>已保存。</p>");
     } else {
-      cfgServer.send(400, "text/html; charset=utf-8",
-                     "<meta charset='utf-8'><p>引脚无效或重复（避开 6-11、34-39 和编码器引脚）。"
-                     "<a href='/'>返回</a></p>");
+      cfgServer.send(400, "text/html; charset=utf-8", cfgPage(&form));
     }
   });
 
