@@ -329,6 +329,32 @@ static void applyButtonPins() {
 }
 
 // === Config persistence ===================================================
+// WS-429: what the NVS looked like BEFORE this boot touched it. The BLE layer
+// needs it to tell "brand-new deck" from "the deck lost its identity": the
+// config schema alone is not enough, because loadConfig() writes the current
+// schema on the very first boot as well. These flags are captured before the
+// first write of this boot and handed to bleKeyboard.begin() via bootFacts().
+static bool g_cfgSchemaMigrated = false;
+static bool g_cfgHadPriorConfig = false;
+// Set when nvs_flash_init() failed and the partition had to be erased: the
+// deck definitely carried state before, so an empty namespace afterwards is a
+// lost identity, not a brand-new device.
+static bool g_nvsErased = false;
+// Set when the deck already booted since the last power cycle. A first boot
+// writes the IRK to the NVS, so a later boot without an IRK means the identity
+// was lost in between (WS-429).
+static bool g_deckRebooted = false;
+
+// WS-429: the facts the BLE layer needs to tell "brand-new deck" from "the
+// deck lost its identity" (see blepol::classifyIdentity).
+static BleBootFacts bootFacts() {
+  BleBootFacts f;
+  f.priorConfig = g_cfgHadPriorConfig;
+  f.schemaMigrated = g_cfgSchemaMigrated;
+  f.rebooted = g_deckRebooted;
+  return f;
+}
+
 static void saveConfig() {
   preferences.begin("binddecklite", false);
   preferences.putInt("encMode", encMode);
@@ -359,6 +385,23 @@ static void loadConfig() {
     log_e("[cfg] NVS unavailable - defaults only");
     return;
   }
+
+  // WS-429: capture the pre-load NVS state BEFORE anything is written. The
+  // old code used getInt("cfgVer", 1), which cannot tell "never written" from
+  // "written as schema 1" - and that difference is exactly what separates a
+  // brand-new deck from a deck that was upgraded and lost its identity.
+  // getInt("cfgVer", -1) returns -1 only when the key is absent.
+  const int schemaRaw = preferences.getInt("cfgVer", -1);
+  const bool cfgVerPresent = schemaRaw >= 0;
+  g_cfgSchemaMigrated = cfgVerPresent && schemaRaw < CFG_SCHEMA;
+  g_cfgHadPriorConfig = g_nvsErased ||
+                        cfgVerPresent ||
+                        preferences.getInt("encMode", -1) >= 0 ||
+                        preferences.getULong("sleepTimeoutMs", 0) > 0 ||
+                        preferences.getBytesLength("tz") > 0 ||
+                        preferences.getBytesLength("prevIrk") > 0 ||
+                        preferences.getBytesLength("hostAddr") > 0;
+
   encMode = preferences.getInt("encMode", 0);
   if (encMode < 0 || encMode > 4) encMode = 0;
   sleepEnabled = preferences.getBool("sleepEnabled", true);
@@ -372,7 +415,7 @@ static void loadConfig() {
     tzString[sizeof(tzString) - 1] = '\0';
   }
 
-  int schema = preferences.getInt("cfgVer", 1);
+  int schema = cfgVerPresent ? schemaRaw : 1;
   bool staleSchema = (schema < CFG_SCHEMA);
 
   int loaded[NUM_BUTTONS];
@@ -385,7 +428,8 @@ static void loadConfig() {
     if (!isValidButtonPin(loaded[i])) bad = true;
   }
   if (staleSchema) {
-    log_e("[cfg] pin schema v%d -> v%d: using the board defaults", schema, CFG_SCHEMA);
+    log_e("[cfg] pin schema v%d -> v%d: using the board defaults%s", schema, CFG_SCHEMA,
+          cfgVerPresent ? "" : " (no stored schema)");
   }
   if (isValidPinSet(loaded)) {
     for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = loaded[i];
@@ -1562,6 +1606,9 @@ static void ensureNvs() {
   esp_err_t err = nvs_flash_init();
   if (err == ESP_OK) { g_nvsOk = true; return; }
   log_e("[nvs] init failed (%d) - erasing NVS", (int)err);
+  // WS-429: an erased NVS means the deck DID carry state before. The BLE layer
+  // must read that as a lost identity, not as a brand-new device.
+  g_nvsErased = true;
   if (nvs_flash_erase() == ESP_OK) {
     g_nvsOk = (nvs_flash_init() == ESP_OK);
   }
@@ -1615,6 +1662,10 @@ void setup() {
     g_bootCount = 0;
   }
   g_bootCount++;
+  // WS-429: remember that this deck already booted in this power cycle - a
+  // first boot stores the IRK, so a later boot without an IRK means the
+  // identity was lost (the field log: "bootCount=2" + "irk NOT_FOUND").
+  g_deckRebooted = (g_bootCount > 1);
   if (g_bootCount >= 4) {
     g_safeMode = true;
     g_bootCount = 0;
@@ -1799,7 +1850,7 @@ void setup() {
     }
   };
   if (g_nvsOk && !g_configMode) {
-    bleKeyboard.begin();
+    bleKeyboard.begin(bootFacts());
     g_bleStarted = true;
   }
 }
@@ -1882,7 +1933,7 @@ void loop() {
 
   if (!g_configMode && g_nvsOk && !g_bleStarted) {
     applyDeviceIdentity();   // re-assert the name before the deferred begin()
-    bleKeyboard.begin();
+    bleKeyboard.begin(bootFacts());
     g_bleStarted = true;
     log_e("[cfg] BLE started after config mode");
   }
@@ -1892,6 +1943,9 @@ void loop() {
     switches[i].update();
     if (switches[i].pressed()) {
       g_lastActivity = millis();
+      // WS-429: the user is at the deck -> do not make them wait out a
+      // stale-peer advertising backoff.
+      bleKeyboard.notifyUserActivity();
       log_e("[btn] %d (ble=%d)", i, (int)bleKeyboard.isConnected());
       sendKeyForInput(i);
       sendToHost("BTN:" + g_devId + ":" + String(i));
@@ -1925,6 +1979,7 @@ void loop() {
         }
         lastPressAt = now;
         g_lastActivity = now;
+        bleKeyboard.notifyUserActivity();   // WS-429: user present -> resume advertising
         log_e("[btn] encoder push");
         sendKeyForInput(NUM_INPUTS - 1);
         sendToHost("BTN:" + g_devId + ":" + String(NUM_INPUTS - 1));

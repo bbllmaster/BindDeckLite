@@ -35,11 +35,20 @@ struct MediaKeyReport { uint16_t usage; };
 const MediaKeyReport KEY_MEDIA_VOLUME_UP   = { 0x00E9 };
 const MediaKeyReport KEY_MEDIA_VOLUME_DOWN = { 0x00EA };
 
+// WS-429: what main.cpp observed BEFORE this boot wrote anything into the
+// NVS. It is what tells "brand-new deck" from "the deck lost its identity" -
+// see blepol::classifyIdentity().
+struct BleBootFacts {
+  bool priorConfig = false;      // the NVS still holds an earlier configuration
+  bool schemaMigrated = false;   // an older config schema was upgraded this boot
+  bool rebooted = false;         // the deck already booted since the last power cycle
+};
+
 class BleKeyboard {
 public:
   BleKeyboard(const char* deviceName, const char* deviceManufacturer, uint8_t batteryLevel);
 
-  void   begin();
+  void   begin(const BleBootFacts& facts);
   bool   isConnected();
 
   // Set the BLE device name (used for advertising + NimBLEDevice::init). Must be
@@ -51,6 +60,12 @@ public:
   // Called from the main loop: if we are connected but no longer advertising,
   // restart advertising so the device stays discoverable for the config app.
   void   keepAdvertising();
+
+  // WS-429: the user touched a key / the encoder, so the deck is in use.
+  // Cancels a stale-peer advertising backoff right away instead of making the
+  // user wait out the remaining seconds.
+  void   notifyUserActivity();
+
   void   setBatteryLevel(uint8_t level);
   void   setDelay(uint32_t /*ms*/) {}
 
