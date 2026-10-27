@@ -1,5 +1,37 @@
 # Changelog
 
+## 16MB C3 根因修复：`flash_mode` 未固定导致运行时读路径失效 — 2026-10-27（WS-377）
+
+`[env:esp32c3_16mb]` 一直没有设置 `board_build.flash_mode`，于是 app 继承了
+pioarduino 的默认值 **QIO**，而 16 MB 专用 bootloader（`bl_idf/`）跑的是
+**DIO**（`CONFIG_ESPTOOLPY_FLASHMODE_DIO=y`）。模式不一致时坏的是**读**，不是写：
+
+- `esp_flash_read()` / `esp_partition_read()` 对**所有**地址都返回 `0xFF` 或陈旧值，
+  连 0x0 的 bootloader 与正在运行的 app 自己的镜像头都读不出来；
+- 写入一直是好的（PC 侧 `esptool read-flash` 能在预期地址找到 app 写进去的字节）。
+
+由此串起此前所有症状：`Update.end()` 的读回校验必然失败（`read_error(3)`）；
+`[ota][wt]` 探针判 `flash_write_dead`（app1 与 storage、1/256/4080 字节全不匹配，
+绕过分区层直接 `esp_flash_write` 也一样）；NVS 静默不持久（`CFG:ENC:3` 生效并回
+ACK、重启回到 0），BLE 身份因此每次重启重置。
+
+修复是一行配置：给 `[env:esp32c3_16mb]` 显式补 `board_build.flash_mode = dio`。
+真机验证（16 MB C3，`/dev/ttyACM0`）：
+
+- 驱动 `read_mode` 由 5 → 3，`[ota][wt]` 全部 `match=1`，五个偏移的
+  `spi`/`mmap` 双视图 `same=1`；
+- NVS 持久化恢复：`CFG:ENC:3` 重启后仍为 3；
+- 端到端 OTA 通过：1,365,488 字节经 `Update` 流式写入 → `end(true)` 成功 →
+  重启进入新镜像，`CMD:VERSION` 报 `1.3.6`。
+
+```bash
+python tools/check_flash_mode.py          # 改前 FAIL，改后 OK
+cd host && python -m pytest test_flash_mode.py -q   # 5 passed（含 4 个变异用例）
+```
+
+`tools/check_flash_mode.py` 交叉校验 `platformio.ini` 与 `bl_idf/sdkconfig.defaults`
+的 mode/freq/size 三项，任一侧漂移都会报红，避免这行配置再被悄悄删掉。
+
 ## 16MB C3 OTA：写后逐块校验 + 按页重写 + `[ota][wt]` 写探针 — 2026-10-27（WS-433）
 
 固件侧（`src/main.cpp`）。16 MB C3 上 OTA 一路 `ESP_OK`、槽里读回全 `0xFF`，
