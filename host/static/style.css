@@ -389,6 +389,25 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
 .card h3 { font-size: 13px; margin-bottom: 14px; font-weight: 600; }
 .card .muted.small { margin-top: 10px; line-height: 1.7; }
 
+/* 卡片标题行：标题在左、操作按钮在右（WS-445 运行状态卡片的「刷新」）。 */
+.card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 14px;
+}
+.card-head h3 { margin-bottom: 0; }
+
+/* 运行状态：固定两列标签/值，窄屏下值换行而不是横向溢出。 */
+.sys-grid {
+  display: grid; grid-template-columns: minmax(64px, auto) minmax(0, 1fr);
+  gap: 10px 14px; font-size: 13px; align-items: baseline;
+}
+.sys-grid .k { color: var(--muted); font-size: 12px; }
+.sys-grid .v { min-width: 0; overflow-wrap: anywhere; }
+.sys-grid .v.warn { color: var(--warn); }
+.sys-grid .v.bad { color: var(--danger); }
+.sys-notes { margin: 10px 0 0; padding: 0; list-style: none; }
+.sys-notes li { color: var(--warn); font-size: 11px; line-height: 1.7; }
+
 .pins { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 10px; }
 .pin { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--muted); }
 .pin input { text-align: center; }

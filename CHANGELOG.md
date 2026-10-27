@@ -1,5 +1,27 @@
 # Changelog
 
+## 设备页「运行状态」卡片 + `CMD:SYSINFO` — 2026-10-27（WS-445）
+
+固件早就算出了运行时长、上次复位原因、NVS 是否可用和空闲堆，但只打到 Serial：
+打包版 exe 没有控制台，C3 不插 USB 线也看不到，设备自己重启时用户只能猜是深度睡眠、
+掉电、看门狗还是自己点了重启。
+
+- 固件新增只读命令 `CMD:SYSINFO`，回一行
+  `SYS:uptime=<秒>,reset=<esp_reset_reason()>,nvs=<0|1>,heap=<字节>,safe=<0|1>,boots=<n>`。
+  只回不播，不改 `VERSION:` / `CFG:*`，不动启动、NVS、OTA 路径。
+- 上位机新增 `POST /api/device/<dev_id>/sysinfo`（2 秒超时，结果只放运行时字典，
+  不写 `config.json`）与设备页「运行状态」卡片：上次复位、运行时长、NVS、空闲堆，
+  右上「刷新」+ `采样 HH:MM:SS`。打开设备页 / 重连 / 点刷新各采样一次。
+- 着色与提示：`nvs=0` 红；`heap < 20 KB` 琥珀 + 「内存偏低，可能影响 OTA」；
+  `safe=1` 安全模式说明；`reset=deepsleep` 补「设备是睡着了，不是死机」；
+  断开时保留上次值并标「已断开，非实时」。旧固件 2 秒无响应按
+  「当前固件不支持运行状态（需更新固件）」渲染，不弹 toast、不写 error 日志。
+- 回归：`cd host && python -m pytest test_sysinfo.py -q`。
+
+```bash
+cd host && python -m pytest test_sysinfo.py -q     # 19 passed
+```
+
 ## 16MB C3 根因修复：`flash_mode` 未固定导致运行时读路径失效 — 2026-10-27（WS-377）
 
 `[env:esp32c3_16mb]` 一直没有设置 `board_build.flash_mode`，于是 app 继承了

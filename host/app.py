@@ -259,6 +259,25 @@ _read_lock = threading.RLock()
 # device config so a failed read leaves the stored config untouched.
 _read_status: dict = {}
 
+# Runtime health samples (WS-445). One record per device, kept in memory only:
+# a sample is worth nothing after a host restart, and writing it into
+# config.json would mean one disk write per page open / reconnect.
+# Shape: {dev_id: {"ok": bool, "supported": bool|None, "at": float|None,
+#                  "sample": {...}, "display": {...}, "flags": {...},
+#                  "notes": {flag: 说明文字}}}
+_sysinfo: dict = {}
+# One pending SYS:* wait per device (same cross-thread pattern as _read_windows).
+_sysinfo_windows: dict = {}
+_sysinfo_lock = threading.RLock()
+
+# How long CMD:SYSINFO may take before we call the firmware "unsupported".
+SYSINFO_TIMEOUT = 2.0
+
+# Free-heap warning threshold for the device card (WS-445). Deliberately
+# conservative: a C3 running BLE + OTA dips well below this during a push, so
+# anything under ~20 KB at rest means an OTA is likely to fail.
+SYSINFO_HEAP_WARN = 20 * 1024
+
 # The device-managed fields the UI shows.  A read-back only counts as
 # complete when every one of them came back; the timezone (CFG_TZ) is
 # captured as well but is not one of the configurable groups.
@@ -376,6 +395,36 @@ class ReadWindow:
     def snapshot(self) -> dict:
         with self._lock:
             return dict(self.values)
+
+
+class SysinfoWindow:
+    """Captures the single ``SYS:`` answer to one ``CMD:SYSINFO`` request.
+
+    The BLE line callback runs on a different thread than the Flask route
+    handler that waits for it, so the payload is handed over under a lock and
+    completion is signalled with an Event (no polling).
+    """
+
+    def __init__(self, dev_id: str):
+        self.dev_id = dev_id
+        self.payload = None
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+
+    def on_payload(self, payload: str):
+        with self._lock:
+            # Keep the first answer: a second line (duplicate command) must
+            # not overwrite the sample this request is already returning.
+            if self.payload is None:
+                self.payload = payload
+        self._done.set()
+
+    def wait(self, timeout: float) -> bool:
+        return self._done.wait(timeout)
+
+    def result(self):
+        with self._lock:
+            return self.payload
 
 
 class OtaWindow:
@@ -675,6 +724,148 @@ def parse_bond_diag(payload: str) -> dict:
     return out
 
 
+# --- WS-445: SYS: health line ---------------------------------------------
+# Wire format (firmware CMD:SYSINFO branch):
+#   SYS:uptime=<s>,reset=<esp_reset_reason()>,nvs=<0|1>,heap=<bytes>,safe=<0|1>,boots=<n>
+# Every field is parsed independently: a deck that omits one (or sends a
+# garbage value) must still render the rest, with the bad field shown as
+# 「未知」 rather than blank.
+_SYSINFO_FIELDS = ("uptime", "reset", "nvs", "heap", "safe", "boots")
+
+# esp_reset_reason_t values from ESP-IDF 5.5 (esp_system.h). Codes added by a
+# newer IDF fall through to 「未知(N)」 so they still reach the user verbatim.
+RESET_REASON_TEXT = {
+    0: "未知",
+    1: "上电",
+    2: "外部复位",
+    3: "软件重启",
+    4: "软件崩溃（panic）",
+    5: "中断看门狗",
+    6: "任务看门狗",
+    7: "看门狗",
+    8: "深度睡眠唤醒",
+    9: "掉电（欠压）",
+    10: "SDIO 复位",
+    11: "USB 复位",
+    12: "JTAG 复位",
+    13: "EFUSE 错误",
+    14: "电源毛刺",
+    15: "CPU 锁死",
+}
+
+
+def _sysinfo_int(field: str, value: str):
+    """Parse one ``SYS:`` value, or None when it is missing / out of range."""
+    try:
+        n = int(value.strip())
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    # nvs / safe are flags: anything but 0/1 is a broken line, not a state.
+    if field in ("nvs", "safe") and n not in (0, 1):
+        return None
+    return n
+
+
+def parse_sysinfo(payload: str) -> dict:
+    """Turn the part after ``SYS:`` into ``{uptime, reset, nvs, heap, safe, boots}``.
+
+    Missing or non-numeric fields are None instead of raising, so one bad
+    value never costs the user the other five.  Unknown keys are ignored.
+    """
+    out = {k: None for k in _SYSINFO_FIELDS}
+    for field in (payload or "").split(","):
+        key, sep, value = field.partition("=")
+        key = key.strip()
+        if not sep or key not in out:
+            continue
+        out[key] = _sysinfo_int(key, value)
+    return out
+
+
+def reset_reason_text(code) -> str:
+    """Chinese label for an ``esp_reset_reason()`` code, with the code in parens.
+
+    Known codes read 「深度睡眠唤醒(8)」; anything this host does not know —
+    including the code 0 (ESP_RST_UNKNOWN) — still shows the raw number as
+    「未知(12)」 so a user can report it instead of seeing a blank cell.
+    """
+    if code is None:
+        return "未知"
+    label = RESET_REASON_TEXT.get(code, "未知")
+    return f"{label}({code})"
+
+
+def uptime_text(seconds) -> str:
+    """「3 小时 12 分」/「4 分 5 秒」/「42 秒」."""
+    if seconds is None:
+        return "未知"
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    if minutes:
+        return f"{minutes} 分 {secs} 秒"
+    return f"{secs} 秒"
+
+
+def heap_text(free_bytes) -> str:
+    """「96 KB」— one decimal below 100 KB so a tight heap stays visible."""
+    if free_bytes is None:
+        return "未知"
+    kb = max(0, int(free_bytes)) / 1024.0
+    if kb >= 100 or abs(kb - round(kb)) < 0.05:
+        return f"{kb:.0f} KB"
+    return f"{kb:.1f} KB"
+
+
+def nvs_text(nvs) -> str:
+    """「可用」/「不可用：配置不会保存」."""
+    if nvs == 1:
+        return "可用"
+    if nvs == 0:
+        return "不可用：配置不会保存"
+    return "未知"
+
+
+def sysinfo_view(payload: str) -> dict:
+    """Build the display record the device card renders from one ``SYS:`` line.
+
+    All wording lives here (not in app.js) so the Chinese labels are covered
+    by the same tests that cover the parser.  ``flags`` carries the raw
+    booleans the UI needs for colouring; ``notes`` carries the one-line
+    explanations the parent task asks for.
+    """
+    sample = parse_sysinfo(payload)
+    flags = {
+        "nvs_bad": sample["nvs"] == 0,
+        "heap_low": sample["heap"] is not None and sample["heap"] < SYSINFO_HEAP_WARN,
+        "safe": sample["safe"] == 1,
+        "deepsleep": sample["reset"] == 8,
+    }
+    notes = {}
+    if flags["safe"]:
+        notes["safe"] = "安全模式：连续多次启动未稳定，本次跳过配网手势"
+    if flags["deepsleep"]:
+        notes["deepsleep"] = "设备是睡着了，不是死机"
+    if flags["heap_low"]:
+        notes["heap"] = "内存偏低，可能影响 OTA"
+    return {
+        "sample": sample,
+        "display": {
+            "reset": reset_reason_text(sample["reset"]),
+            "uptime": uptime_text(sample["uptime"]),
+            "nvs": nvs_text(sample["nvs"]),
+            "heap": heap_text(sample["heap"]),
+        },
+        "flags": flags,
+        "notes": notes,
+    }
+
+
+
 ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
                      cache_path=os.path.join(DATA_DIR, "ble_cache.json"),
                      on_diag=_on_ble_diag)
@@ -843,6 +1034,15 @@ def _on_line(dev_id: str, line: str):
         sent = _ping_sent.pop(dev_id, None)
         rtt = int((time.time() - sent) * 1000) if sent else 0
         add_event("pong", f"设备响应 {rtt} ms", dev_id, "ok")
+        return
+    # WS-445: the answer to CMD:SYSINFO. Hand it to the request that is
+    # waiting; an unsolicited line (a newer deck, a duplicate answer) is
+    # ignored quietly instead of landing in the log as an unknown line.
+    if line.startswith("SYS:"):
+        with _sysinfo_lock:
+            win = _sysinfo_windows.get(dev_id)
+        if win is not None:
+            win.on_payload(line[len("SYS:"):])
         return
     add_event("line", line, dev_id)
 
@@ -1066,6 +1266,63 @@ def read_device_config(dev_id: str, timeout: float = CFG_READ_TIMEOUT) -> dict:
         _read_status[dev_id] = {"at": result["at"], "fields": result["fields"],
                                  "ok": result["ok"]}
     return result
+
+
+def read_sysinfo(dev_id: str, timeout: float = SYSINFO_TIMEOUT) -> dict:
+    """Ask one deck for ``CMD:SYSINFO`` and return the rendered health record.
+
+    Sent from the device page (open / reconnect / refresh).  A deck that does
+    not answer within *timeout* is an old firmware: the caller renders
+    「当前固件不支持运行状态（需更新固件）」.  That case is logged at info
+    level only — a device page refresh must not fill the log with errors.
+
+    The result is cached per device in ``_sysinfo`` (memory only, never
+    config.json) so a disconnect can keep showing the last real sample.
+    """
+    if not dev_id:
+        return {"ok": False, "supported": None, "at": None,
+                "reason": "no_device"}
+
+    window = SysinfoWindow(dev_id)
+    with _sysinfo_lock:
+        _sysinfo_windows[dev_id] = window
+    try:
+        sent = send(dev_id, "CMD:SYSINFO")
+        if not sent.get("sent"):
+            # Nothing reached the deck: keep the previous sample, the UI adds
+            # 「已断开，非实时」. Not a firmware-support statement.
+            return {"ok": False, "supported": None, "at": None,
+                    "reason": "disconnected"}
+        completed = window.wait(timeout)
+        payload = window.result()
+    finally:
+        with _sysinfo_lock:
+            if _sysinfo_windows.get(dev_id) is window:
+                del _sysinfo_windows[dev_id]
+
+    at = time.time()
+    if not completed or payload is None:
+        add_event("device", "运行状态：设备未响应 CMD:SYSINFO（固件可能不支持）",
+                  dev_id)
+        result = {"ok": False, "supported": False, "at": at,
+                  "reason": "timeout"}
+        with _sysinfo_lock:
+            _sysinfo[dev_id] = result
+        return result
+
+    view = sysinfo_view(payload)
+    result = {"ok": True, "supported": True, "at": at, "reason": ""}
+    result.update(view)
+    with _sysinfo_lock:
+        _sysinfo[dev_id] = result
+    return result
+
+
+def sysinfo_snapshot() -> dict:
+    """Copy of the cached samples, for /api/status (additive field)."""
+    with _sysinfo_lock:
+        return {k: dict(v) for k, v in _sysinfo.items()}
+
 
 
 def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
@@ -2604,6 +2861,9 @@ def api_status():
         # WS-395: additive field — the last scan's conclusion ("why is no
         # device found?"). ``at`` is None until the first scan finished.
         "scan": _scan_state(),
+        # WS-445: additive — the last runtime-health sample per device, so a
+        # page reload (or a disconnect) keeps showing the real last values.
+        "sysinfo": sysinfo_snapshot(),
     })
 
 
@@ -2775,6 +3035,17 @@ def api_device_action(dev_id, action):
         # the HID primary. The device ACKs on the same CFG channel.
         return jsonify(send(dev_id, "CMD:CLEARBOND"))
     return jsonify({"ok": False, "error": "unknown action"}), 404
+
+
+@app.route("/api/device/<dev_id>/sysinfo", methods=["POST"])
+def api_device_sysinfo(dev_id):
+    """WS-445: sample one deck's uptime / reset reason / NVS / free heap.
+
+    Kept as its own route (not an `action`) because it *waits* for the answer
+    and returns the rendered card data; the generic device actions only fire
+    and forget.
+    """
+    return jsonify(read_sysinfo(dev_id))
 
 
 # --- OTA (host-driven firmware push) --------------------------------------

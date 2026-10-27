@@ -140,6 +140,7 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 - 编码器 5 种模式（音量 / 缩放 / 标签页 / 撤销重做 / 上位机动作）
 - 引脚、休眠配置，一键下发
 - 实时按键高亮与日志、Ping、重启、进入配网
+- 设备页「运行状态」：运行时长、上次复位原因、NVS、空闲堆（`CMD:SYSINFO`）
 
 ### 运行
 
