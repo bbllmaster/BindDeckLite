@@ -17,6 +17,10 @@
 #include <cstdlib>
 #include <cstring>
 #include "ble_config.h"   // secondary GATT service for CFG/CMD over BLE
+// WS-429: pure link policy (identity classification, stale-peer guard,
+// while-connected advertising gate). No Arduino/NimBLE dependencies, so the
+// host test compiles the very same header with g++.
+#include "ble_link_policy.h"
 
 // WS-274: NimBLE ships a hard-coded default IRK (ble_hs_pvcy_default_irk in
 // ble_hs_pvcy.c) and ble_hs_startup installs it when the app never sets one.
@@ -114,6 +118,112 @@ static int             s_bondDeleteFails = 0;
 // without unplugging the old one first.
 static volatile bool   s_allowRebind = false;
 
+// --- WS-429: connection bookkeeping -----------------------------------------
+// The NimBLE callbacks run on the NimBLE host task, the advertising
+// supervisor runs on the Arduino loop task. Both need to know how long the
+// current links have been up and whether they ever encrypted, so keep one
+// record per connection handle.
+#define BD_MAX_CONNS 4
+struct BdConnRec {
+  uint16_t handle;
+  uint32_t startMs;
+  bool     encrypted;
+  bool     used;
+};
+static BdConnRec s_conns[BD_MAX_CONNS];
+// Number of connected peers whose link completed encryption (paired). Only
+// the NimBLE callbacks write it; the Arduino loop task only reads it.
+static int s_encryptedConns = 0;
+
+// --- WS-429: stale-peer guard + advertising backoff -------------------------
+// The strike counter itself is pure policy state (src/ble_link_policy.h), so
+// the host test can drive it. Here we only keep the radio-side bookkeeping.
+static blepol::StalePeer s_stale;
+// Set while a pre-encryption teardown backoff is running: the radio stays
+// quiet so the failing peer cannot reconnect every 200 ms.
+static volatile bool s_advBackoff = false;
+// ms timestamp (millis()) at which advertising may resume.
+static uint32_t      s_advResumeAt = 0;
+// The device name, for the HOST_STALE_KEY conclusion.
+static char          s_deviceName[32] = { 0 };
+
+static BdConnRec* connRec(uint16_t handle) {
+  for (int i = 0; i < BD_MAX_CONNS; i++) {
+    if (s_conns[i].used && s_conns[i].handle == handle) return &s_conns[i];
+  }
+  return nullptr;
+}
+
+static void connRecAdd(uint16_t handle) {
+  BdConnRec* r = connRec(handle);
+  if (r == nullptr) {
+    for (int i = 0; i < BD_MAX_CONNS; i++) {
+      if (!s_conns[i].used) { r = &s_conns[i]; break; }
+    }
+  }
+  if (r == nullptr) r = &s_conns[0];   // table full: reuse the first slot
+  r->handle = handle;
+  r->startMs = (uint32_t)millis();
+  r->encrypted = false;
+  r->used = true;
+}
+
+// Age of the oldest connected peer that never encrypted. UINT32_MAX when
+// every peer is encrypted (nothing to wait for).
+static uint32_t oldestUnencryptedAgeMs() {
+  uint32_t oldest = 0;
+  bool found = false;
+  const uint32_t now = (uint32_t)millis();
+  for (int i = 0; i < BD_MAX_CONNS; i++) {
+    if (!s_conns[i].used || s_conns[i].encrypted) continue;
+    const uint32_t age = now - s_conns[i].startMs;
+    if (!found || age > oldest) { oldest = age; found = true; }
+  }
+  return found ? oldest : UINT32_MAX;
+}
+
+// WS-429: keep the radio quiet for `ms` so the peer that keeps failing before
+// encryption stops reconnecting every 200 ms. Advertising resumes
+// automatically when the deadline expires (serviceAdvertising) or right away
+// when the user touches the deck (notifyUserActivity).
+static void armAdvBackoff(uint32_t ms) {
+  s_advBackoff = true;
+  s_advResumeAt = (uint32_t)millis() + ms;
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  if (adv && adv->isAdvertising()) adv->stop();
+  ESP_LOGE("BIND", "[ble] stale-peer backoff %lums -> radio quiet (advertising resumes on expiry)",
+           (unsigned long)ms);
+}
+
+static void clearAdvBackoff() {
+  s_advBackoff = false;
+  s_advResumeAt = 0;
+}
+
+// The peer address used to match a peer across connections: the identity
+// address when it resolved (stable across reconnects), the over-the-air
+// address otherwise. The bytes are COPIED into `out` on purpose:
+// NimBLEAddress::getVal() points into the address object itself, and the
+// local copies below would be gone when this function returns.
+static bool peerKey(NimBLEConnInfo& connInfo, uint8_t out[6]) {
+  NimBLEAddress idAddr = connInfo.getIdAddress();
+  if (!idAddr.isNull()) {
+    memcpy(out, idAddr.getVal(), 6);
+    return true;
+  }
+  NimBLEAddress otaAddr = connInfo.getAddress();
+  if (otaAddr.isNull()) return false;
+  memcpy(out, otaAddr.getVal(), 6);
+  return true;
+}
+
+// WS-429: a HID subscription means the deck is really being used, so the
+// stale-peer strikes are over. Clear them and lift the radio backoff.
+static void noteHidSubscriber() {
+  blepol::staleReset(&s_stale);
+  clearAdvBackoff();
+}
+
 // Load the persisted host binding into the statics above. Safe to call
 // before BLE is up (only touches NVS).
 static void loadHostBinding() {
@@ -173,7 +283,11 @@ static void notifyOne(uint16_t conn, NimBLECharacteristic* ch, const uint8_t* da
 // persisting one on first boot. Without this every deck handed the same
 // hard-coded NimBLE default IRK to the OS, which is what made Windows treat
 // two BindDecks as one device (WS-274).
-static void getOrCreateIrk(uint8_t irk[16]) {
+//
+// WS-429: `wasPresent` reports whether a usable IRK was found in NVS. When it
+// is false we minted a NEW identity, so every pairing the host still holds
+// refers to an identity this deck no longer has.
+static void getOrCreateIrk(uint8_t irk[16], bool* wasPresent) {
   Preferences p;
   bool prefsOk = p.begin("binddecklite", false);
   bool valid = false;
@@ -186,6 +300,7 @@ static void getOrCreateIrk(uint8_t irk[16]) {
     }
     if (allZero) valid = false;
   }
+  if (wasPresent) *wasPresent = valid;
 
   if (!valid) {
     esp_fill_random(irk, 16);
@@ -256,6 +371,7 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
 
       if (acceptHidSubscriber(idMatch, peerBonded)) {
         // Bound host — allow it to become (or stay) the HID primary.
+        noteHidSubscriber();   // WS-429: a working HID host clears the strikes
         if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
           s_hid_conn = conn;
           ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (bound host,id-match,bonded=%d, char=0x%04X sub=0x%04X)",
@@ -296,6 +412,8 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
     const bool canClaim = (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) ||
                           (s_allowRebind && conn != s_hid_conn);
     if (canClaim) {
+      // WS-429: the deck is in use -> clear the stale-peer strikes.
+      noteHidSubscriber();
       // Persist the identity address (peer_id_addr), falling back to the
       // over-the-air address when identity resolution produced nothing.
       NimBLEAddress idAddr  = connInfo.getIdAddress();
@@ -386,12 +504,15 @@ static_assert(isBondKeyFailureReason(0x206),  "case-A reset on pin/key missing")
 static_assert(!isBondKeyFailureReason(0x208), "case-A reset never on timeout");
 
 class HidServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s, NimBLEConnInfo& /*connInfo*/) override {
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     // NimBLE allows several centrals (Windows HID plus the config app). Track
     // the *count*, not a single bool: otherwise closing the config app clears
     // the flag while HID is still up and every button press stops working
     // (WS-271).
     s_connected = s && s->getConnectedCount() > 0;
+    // WS-429: remember when this link came up so the teardown can tell a
+    // rapid pre-encryption drop from an ordinary disconnect.
+    connRecAdd(connInfo.getConnHandle());
     // The stack stops advertising when the link comes up. Clear the library's
     // advertising state here, but do NOT restart it from this callback - doing
     // stop+start inside the connection callback races and silently fails.
@@ -402,6 +523,23 @@ class HidServerCB : public NimBLEServerCallbacks {
                (int)(s ? s->getConnectedCount() : 0), (int)adv->isAdvertising());
       adv->stop();
     }
+  }
+
+  // WS-429: the link reached encryption - the peer paired with us and can
+  // talk to the deck. Remember it (the advertising gate needs it) and clear
+  // the strikes of that peer: it is not a suspect any more.
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    BdConnRec* r = connRec(connInfo.getConnHandle());
+    if (r != nullptr && !r->encrypted) {
+      r->encrypted = true;
+      s_encryptedConns++;
+    }
+    uint8_t key[6];
+    if (peerKey(connInfo, key) && blepol::stalePeerSucceeded(&s_stale, key)) {
+      clearAdvBackoff();
+    }
+    ESP_LOGE("BIND", "[ble] pairing complete enc=%d (encrypted links=%d)",
+             (int)(r != nullptr && r->encrypted), s_encryptedConns);
   }
   // WS-275: when the primary HID host goes away, stop sending reports until a
   // new central subscribes. Do NOT promote an already-connected second host
@@ -428,7 +566,41 @@ class HidServerCB : public NimBLEServerCallbacks {
     // NimBLE removes the peer before invoking this callback, so the count here
     // is "centrals still attached". Only re-advertise once the last one is gone.
     s_connected = s && s->getConnectedCount() > 0;
-    if (!s_connected) {
+
+    // WS-429: how long this link lived, and whether it ever encrypted. A
+    // connection that was dropped before it encrypted, right after it came up,
+    // is the "the PC holds a pairing for an older identity" pattern.
+    const uint16_t handle = connInfo.getConnHandle();
+    BdConnRec* rec = connRec(handle);
+    const uint32_t durationMs = rec != nullptr ? ((uint32_t)millis() - rec->startMs) : 0;
+    const bool wasEncrypted = rec != nullptr ? rec->encrypted : false;
+    if (rec != nullptr) {
+      if (rec->encrypted && s_encryptedConns > 0) s_encryptedConns--;
+      rec->used = false;
+    }
+
+    // WS-429 (WS-407 defect 2): count "connected, then torn down before
+    // encryption" per peer and back off instead of re-advertising immediately.
+    // Without this the field log showed the same peer reconnecting every
+    // 200-500 ms forever, with nothing but reason=0x0213 and no conclusion.
+    uint8_t key[6];
+    if (peerKey(connInfo, key)) {
+      const blepol::StaleAction act = blepol::staleNoteTeardown(
+          &s_stale, key, encrypted || wasEncrypted, bonded, durationMs,
+          blepol::STALE_THRESHOLD);
+      if (act == blepol::STALE_REPORTED) {
+        char msg[224];
+        blepol::formatStaleMessage(msg, sizeof(msg), otaAddr.toString().c_str(),
+                                   s_deviceName,
+                                   blepol::staleStrikes(&s_stale, key));
+        ESP_LOGE("BIND", "%s", msg);
+      }
+      if (act != blepol::STALE_IGNORED) {
+        armAdvBackoff(blepol::staleBackoffMs(blepol::staleStrikes(&s_stale, key)));
+      }
+    }
+
+    if (!s_connected && !s_advBackoff) {
       NimBLEDevice::startAdvertising();
     }
 
@@ -496,8 +668,11 @@ void BleKeyboard::setName(const char* name) {
   }
 }
 
-void BleKeyboard::begin() {
+void BleKeyboard::begin(const BleBootFacts& boot) {
   NimBLEDevice::init(_name);
+
+  // WS-429: remember the advertised name for the HOST_STALE_KEY conclusion.
+  snprintf(s_deviceName, sizeof(s_deviceName), "%s", _name ? _name : "");
 
   // WS-274: install this deck's unique IRK before the GATT server / pairing
   // exists. init() only returns once the host has synced with the controller,
@@ -505,7 +680,8 @@ void BleKeyboard::begin() {
   // here. Keep sm_our_key_dist = ENC | ID (set in NimBLEDevice::init) so the
   // unique IRK is actually distributed during pairing.
   uint8_t irk[16];
-  getOrCreateIrk(irk);
+  bool irkWasPresent = false;
+  getOrCreateIrk(irk, &irkWasPresent);
   int irkRc = ble_hs_pvcy_set_our_irk(irk);
   // WS-410: print the FULL 16-byte IRK fingerprint (not just 2 octets) so two
   // reboots can be compared byte-for-byte. If the fp changes across reboots,
@@ -537,22 +713,42 @@ void BleKeyboard::begin() {
   // WS-410 (review must-fix #4): auto-classify the reconnect failure so the
   // log names the case instead of leaving it to a human to infer:
   //   B -> the persisted IRK changed since the previous boot (identity drift)
+  //        OR the IRK was missing while NVS still held an older config
+  //        (identity reset - the deck minted a brand-new identity)
   //   A -> the app still has a binding but there is no BLE bond
   //   C -> binding + bond both present (reconnect failure = address/identity)
   //   none -> no binding yet (fresh device, first pairing)
+  //
+  // WS-429 (WS-407 defect 1): the old rule only reported B when a prevIrk
+  // blob existed AND differed. A deck whose IRK was lost (the field case:
+  // "irk NOT_FOUND" plus "pin schema v1 -> v2") had no prevIrk either, so it
+  // fell through to "none" - telling the user "brand new device, no problem"
+  // while the deck had just minted a new identity the PC knows nothing about.
+  // The BleBootFacts are captured by main.cpp BEFORE this boot writes anything
+  // into NVS, so "genuinely new" stays distinguishable from "identity lost".
   {
     Preferences p;
     bool ok = p.begin("binddecklite", false);
     uint8_t prev[16];
     bool havePrev = ok && p.getBytesLength("prevIrk") == 16 &&
                     p.getBytes("prevIrk", prev, 16) == 16;
-    const char* c;
-    if (havePrev && memcmp(prev, irk, 16) != 0) c = "B";
-    else if (s_hostBound && bondN == 0)         c = "A";
-    else if (s_hostBound)                       c = "C";
-    else                                         c = "none";
-    ESP_LOGE("BIND", "[ble] CASE=%s (prevIrk=%s bonds=%d hostBound=%d)",
-             c, havePrev ? "present" : "none", bondN, (int)s_hostBound);
+
+    blepol::IdentityFacts idFacts;
+    idFacts.irkPresent     = irkWasPresent;
+    idFacts.havePrevIrk    = havePrev;
+    idFacts.prevIrkMatches = havePrev && memcmp(prev, irk, 16) == 0;
+    idFacts.hostBound      = s_hostBound;
+    idFacts.bondCount      = bondN;
+    idFacts.schemaMigrated = boot.schemaMigrated;
+    idFacts.priorConfig    = boot.priorConfig;
+    idFacts.rebooted       = boot.rebooted;
+
+    const blepol::IdentityVerdict verdict = blepol::classifyIdentity(idFacts);
+    char caseStr[112];
+    blepol::formatIdentityCase(verdict, caseStr, sizeof(caseStr));
+    ESP_LOGE("BIND", "[ble] CASE=%s (irk=%s prevIrk=%s bonds=%d hostBound=%d)",
+             caseStr, irkWasPresent ? "present" : "absent",
+             havePrev ? "present" : "none", bondN, (int)s_hostBound);
     if (ok) {
       p.putBytes("prevIrk", irk, 16);
       p.end();
@@ -632,10 +828,63 @@ bool BleKeyboard::isConnected() { return s_connected; }
 
 void BleKeyboard::keepAdvertising() {
   if (!s_connected) return;
+
+  // WS-429: a stale-peer backoff owns the radio until its deadline expires.
+  if (s_advBackoff) return;
+
+  // WS-429 (WS-407 defect 3): while a link is up we only keep advertising when
+  // that link is trustworthy.
+  //  * encrypted     -> the host is paired; the config app must be able to
+  //                     join this deck while Windows holds the HID link
+  //                     (WS-271).
+  //  * hidSubscribed -> a HID host already subscribed, i.e. the deck is in use.
+  // An unencrypted link that is still young is the reconnect-loop pattern
+  // (the field peer was dropped after 200-500 ms, over and over). Advertising
+  // there is what kept feeding that loop, so stay quiet instead.
+  const bool hidSubscribed = (s_hid_conn != BLE_HS_CONN_HANDLE_NONE);
+  if (!blepol::mayAdvertiseWhileConnected(s_encryptedConns > 0, hidSubscribed,
+                                          oldestUnencryptedAgeMs())) {
+    return;
+  }
+
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (adv && !adv->isAdvertising()) {
     bool ok = NimBLEDevice::startAdvertising();
     ESP_LOGE("BIND", "[ble] re-advertise while connected -> %d", (int)ok);
+  }
+}
+
+// WS-429: the user pressed a key / turned the encoder. The deck is in front
+// of the user, so there is no point in staying quiet for the rest of a
+// backoff: advertise again right away.
+void BleKeyboard::notifyUserActivity() {
+  if (!s_advBackoff) return;
+  ESP_LOGE("BIND", "[ble] user activity -> stale-peer backoff cancelled, advertising resumes");
+  clearAdvBackoff();
+  if (!s_connected) {
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (adv && !adv->isAdvertising()) {
+      bool ok = NimBLEDevice::startAdvertising();
+      ESP_LOGE("BIND", "[ble] re-advertise after user activity -> %d", (int)ok);
+    }
+  }
+}
+
+// WS-429: the advertising supervisor. Runs on the Arduino loop task (from
+// processPendingBleWork) and lifts the stale-peer backoff when its deadline
+// expires, so the device is never locked out for more than the capped
+// backoff (30 s).
+static void serviceAdvertising() {
+  if (!s_advBackoff) return;
+  if ((int32_t)((uint32_t)millis() - s_advResumeAt) < 0) return;   // still waiting
+  clearAdvBackoff();
+  ESP_LOGE("BIND", "[ble] stale-peer backoff over -> advertising resumes");
+  if (!s_connected) {
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    if (adv && !adv->isAdvertising()) {
+      bool ok = NimBLEDevice::startAdvertising();
+      ESP_LOGE("BIND", "[ble] re-advertise after backoff -> %d", (int)ok);
+    }
   }
 }
 
@@ -711,6 +960,11 @@ void requestClearHostBinding() {
 }
 
 void processPendingBleWork() {
+  // WS-429: lift the stale-peer advertising backoff when its deadline
+  // expires. Runs on the Arduino loop task, so the radio is only touched from
+  // a safe context.
+  serviceAdvertising();
+
   // WS-410 CASE=A self-heal: drop the app-layer binding so a host whose BLE
   // bond was lost can re-pair and bind again. Preferences writes stay here on
   // the Arduino loop task, never on the NimBLE task.
