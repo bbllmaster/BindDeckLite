@@ -1,5 +1,43 @@
 # Changelog
 
+## 重启后无法重连：诊断 + 自愈 + 清除绑定真正生效 — 2026-10-27（WS-410 / WS-407）
+
+固件侧（`src/nimble_hid.cpp` / `src/main.cpp`）。设备重启后电脑在「已连接 /
+已配对」之间反复闪、需手动删设备才能恢复的根因与修复。
+
+- **诊断 + 自动定性**：`onDisconnect` 打印断开 `reason` 数值 + 名称、对端 OTA 与
+  identity 地址、`isEncrypted()` / `isBonded()`；`begin()` 把 `IRK fp` 扩到完整
+  16 字节、新增 `bonds(PEER_SEC)=N`，并**自动打 `CASE=`**：NVS 存上次 IRK 比较
+  （变→B）、`hostBound && bonds==0`→A、否则绑定态→C。不再靠人工推断。
+- **自愈只认密钥类失败（评审 must-fix #2）**：`isSecurityFailureReason` 只含
+  0x205（认证失败）/0x206（PIN/key missing）/25（EENCRYPT）/SM 0x5xx；
+  **排除 0x208（supervision timeout = 走远/断电）、0x213/0x214/0x216、0x23E**，
+  正常断开绝不写 bond。并用 `static_assert` 对真实分类函数做构建期回归护栏：
+  把 0x208 加回「清 bond」集合会直接编译失败。
+- **删 bond 真正成功（评审 must-fix #1）**：`ble_gap_unpair()` 在对端分发过 IRK
+  且广播/扫描进行中时返回 `BLE_HS_EBUSY`（本工程 `onDisconnect`/`keepAdvertising`
+  几乎一直在广播），原实现必失败且失败后清了 pending 不重试。现改为：删前
+  `stopAdvertising()` 并记录原状态、删后恢复；直接调 `ble_gap_unpair` 取 rc，
+  `EBUSY` 保留 pending 重试（250ms 节流），`ENOENT` 视为已删/无记录并清请求。
+- **订阅门只认 identity（评审 must-fix #3）**：`peerBonded || idMatch` 会把「刚配
+  对成功的第二台 PC」也放行（`sec_state.bonded` 只说明有 bond，不说明是不是本机
+  绑的那台）。改为**只按解析出的 identity 地址 == 存储的绑定地址**放行，陌生
+  主机一律拒绝（WS-319 不回退）。
+- **A 类自愈（评审 should-fix #5）**：`app 已绑定 + 无 BLE bond + 密钥类失败` 时，
+  延后清应用层绑定，让对端重新配对后再绑定，避免 identity-only 门在 bond 丢失后
+  永久锁死。
+- **C 地址匹配**：identity 解析不出来时单独打 `reject CASE=C: ... identity NOT
+  resolved`，与「未绑定的新主机」区分开。
+- **清除绑定真正清干净（part 4 / 评审 WS-411 #4）**：`CMD:CLEARBOND` 同时删
+  NimBLE bond。**对端仍连接时不当场拆链**：记下地址，等所有 central 断开后再
+  unpair（延后到 `loop()` 的 `processPendingBleWork()`），并打
+  `CLEARBOND: link active -> bond will be removed after disconnect`。
+  `CMD:GET_BOND` 的 `BOND_STATUS:bound,<masked>` / `unbound` **字段数不变**
+  （WS-423：诊断走独立行 `BOND_DIAG:peer_sec=N,nimble_bond=0/1`，不再追加到
+  `BOND_STATUS`，否则旧上位机 `split(",", 1)` 会把 `addr` 变成整段尾巴）。
+- **回归**：四个 env `pio run -e esp32dev / esp32c3 / esp32c3_2mb / esp32c3_16mb`
+  全绿；`pio run -e esp32dev` 同时是分类回归命令（`static_assert` 失败即红）。
+
 ## 配网页：编码器模式回显、不再静默重置、引脚错误原地回填 — 2026-10-27（WS-408）
 
 - **回显**（`src/main.cpp` `cfgPage()`）：编码器下拉按当前 `encMode` 输出
@@ -14,7 +52,7 @@
   非 0-39 整数），出错输入框红框 + `aria-invalid='true'`，回填本次提交的
   9 个引脚与 enc / sleep 选择，不写 NVS。
 - 判定规则未变：`isValidButtonPin()` / `isValidPinSet()` 保持原样，
-  `pinRejectReason()` 只负责把拒绝原因讲清楚；`CFG:PINS` / `CFG:ENC`
+  `pinRejectReason()` 只负责把拒绝原因讲清楚；  `CFG:PINS` / `CFG:ENC`
   协议与 `/keys` 字段名不变。
 
 ## 宏新增 `app:` 步骤：启动桌面应用程序后再输入文字 — 2026-10-22（WS-387）

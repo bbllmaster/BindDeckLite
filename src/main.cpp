@@ -1047,6 +1047,11 @@ static void processCommand(String data) {
   } else if (data.startsWith("CMD:GET_BOND")) {
     // WS-321: report the current host binding. The address is masked after the
     // first two octets so the full BLE address never leaves the device.
+    // WS-423: BOND_STATUS stays exactly `bound,<masked>` / `unbound` (the
+    // WS-321 wire format). WS-410 used to comma-append the NimBLE bond state
+    // to this line, which broke the old host's `split(",", 1)` — `addr` became
+    // `AB12:**:**:**:**,peer_sec=1,nimble_bond=1`. The diagnostics now travel
+    // on their own BOND_DIAG line, which old hosts ignore as an unknown line.
     if (bleKeyboard.isHostBound()) {
       uint8_t addr[6];
       if (bleKeyboard.getHostAddr(addr)) {
@@ -1057,6 +1062,8 @@ static void processCommand(String data) {
       } else {
         sendToHost("BOND_STATUS:bound,<unavailable>");
       }
+      sendToHost(String("BOND_DIAG:peer_sec=") + String(bleKeyboard.bondCount()) +
+                 ",nimble_bond=" + (bleKeyboard.isHostBonded() ? "1" : "0"));
     } else {
       sendToHost("BOND_STATUS:unbound");
     }
@@ -1447,6 +1454,14 @@ void loop() {
     }
     delay(250);   // let the loop-task ACK/notify flush before reset
     ESP.restart();
+  }
+
+  // ---- WS-410: deferred bond/BLE work ----------------------------------
+  // Armed by onDisconnect self-heal or CMD:CLEARBOND (both run on the NimBLE
+  // task, where an HCI unpair + NVS write is unsafe). Drain it here on the
+  // Arduino loop task.
+  if (g_bleStarted) {
+    processPendingBleWork();
   }
 
   // ---- OTA mode ----------------------------------------------------------

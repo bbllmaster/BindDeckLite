@@ -787,7 +787,11 @@ function renderDeviceMeta() {
   const bondEl = $("#bondStatus");
   const clearBtn = $("#btnClearBond");
   if (bond.bound) {
-    bondEl.innerHTML = `<span class="dot ok"></span>已绑定 <b>${escapeHtml(bond.addr || "—")}</b>`;
+    // WS-423: the live NimBLE bond state now arrives on BOND_DIAG (separate
+    // from BOND_STATUS), so the address stays clean. Show it next to the addr.
+    const diag = bond.peer_sec === undefined ? "" :
+      ` <span class="muted small">· 配对 ${bond.peer_sec} 个 · NimBLE 绑定 ${bond.nimble_bond ? "正常" : "缺失"}</span>`;
+    bondEl.innerHTML = `<span class="dot ok"></span>已绑定 <b>${escapeHtml(bond.addr || "—")}</b>${diag}`;
     clearBtn.hidden = false;
     $("#bondHint").textContent = "只有已绑定的主机能发送 HID 按键；清除后任何主机均可接入。";
   } else {
