@@ -31,6 +31,7 @@
 #include <esp_timer.h>
 #include <esp_log.h>
 #include <esp_ota_ops.h>   // esp_ota_get_next_update_partition() (WS-378 diag)
+#include <esp_flash.h>    // driver/physical size + write-protect gate (WS-420)
 #include <nvs_flash.h>
 #include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
@@ -49,7 +50,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.2"   // WS-378: OTA readback diagnosis ([ota][diag])
+#define FW_VERSION "1.3.3"   // WS-420: [ota][test] probes + write gate
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -167,7 +168,13 @@ static bool g_otaHdrOk = false;
 // Note: the bytes are identical to the library's _skipBuffer as long as the
 // slot is not flash-encrypted (the library stashes the *decrypted* buffer).
 // These boards run without flash encryption, so raw == what was written.
-static uint8_t g_otaSkip[16];
+//
+// WS-420: the window is 64 bytes, not 16. The first 16 are what the library
+// withholds until end() (so the WS-378 diag can replay that write), and
+// 16..63 are written with the first 4 KB block — the earliest bytes the
+// streaming write path actually puts on the slot, which is what the
+// fail-fast read-back in otaVerifyFirstBlock() compares.
+static uint8_t g_otaSkip[64];
 static size_t g_otaSkipLen = 0;
 static bool g_otaSkipOk = false;
 
@@ -187,6 +194,25 @@ static void otaCaptureSkip(const uint8_t* data, size_t len) {
   g_otaSkipLen += take;
   if (g_otaSkipLen == sizeof(g_otaSkip)) g_otaSkipOk = true;
 }
+
+// === OTA write target (WS-420) =============================================
+// Target of the OTA session in flight, kept so the fail-fast read-back
+// (otaVerifyFirstBlock) and the end-of-stream diagnostic read back the exact
+// partition that was written, on both channels (BLE and config portal).
+static const esp_partition_t* g_otaPart = nullptr;
+static bool g_otaFirstBlockChecked = false;
+// WS-420: why the config-portal upload never got off the ground (gate refusal
+// or a lost first block). The POST completion handler reports it instead of
+// claiming success.
+static const char* g_portalOtaError = nullptr;
+
+// Defined below the OTA helpers, used by the config portal (which is set up
+// earlier in the file) and by processCommand().
+static bool otaFlashPrepare(const esp_partition_t* part, uint32_t total,
+                            const char** reason);
+static bool otaVerifyFirstBlock();
+static void otaTestRun(const char* trigger, bool withRestart);
+static void otaTestOnBoot();
 
 static bool g_nvsOk = false;
 static unsigned long g_lastActivity = 0;
@@ -699,6 +725,16 @@ static void setupProvisioning() {
   cfgServer.on("/update", HTTP_POST,
     []() {
       String msg = F("<meta charset='utf-8'><p>升级");
+      if (g_portalOtaError) {
+        // WS-420: the gate refused the slot before anything was written. Say
+        // so and stay in the portal — reporting "完成" would be a lie.
+        msg += F("未开始：");
+        msg += g_portalOtaError;
+        msg += F("</p><p><a href='/update'>返回</a></p>");
+        g_portalOtaError = nullptr;
+        cfgServer.send(200, "text/html; charset=utf-8", msg);
+        return;
+      }
       msg += Update.hasError() ? F("失败") : F("完成");
       msg += F("，设备重启中…</p>");
       cfgServer.send(200, "text/html; charset=utf-8", msg);
@@ -709,17 +745,37 @@ static void setupProvisioning() {
       HTTPUpload& up = cfgServer.upload();
       if (up.status == UPLOAD_FILE_START) {
         g_otaProgress = 0;
+        g_portalOtaError = nullptr;
         otaResetSkip();
         log_e("[ota] start: %s", up.filename.c_str());
+        // WS-420: same capacity/write-protect gate as the BLE channel. The
+        // upload length is not known yet (Update uses UPDATE_SIZE_UNKNOWN), so
+        // the gate checks that the whole target slot is addressable.
+        const char* gate = "ok";
+        if (!otaFlashPrepare(esp_ota_get_next_update_partition(NULL), 0, &gate)) {
+          log_e("[ota] portal gate refused: %s", gate);
+          g_portalOtaError = gate;
+          return;
+        }
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) log_e("[ota] Update.begin failed");
       } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (g_portalOtaError) return;   // never write an ungated slot
         if (up.totalSize > 0) g_otaProgress = (int)(up.currentSize * 100 / up.totalSize);
         // up.buf holds the chunk just received; the first one starts the image.
         otaCaptureSkip(up.buf, up.currentSize);
         if (Update.write(up.buf, up.currentSize) != up.currentSize) log_e("[ota] write failed");
+        // Same fail-fast read-back as the BLE path (WS-420).
+        g_otaReceived = up.currentSize;
+        if (!otaVerifyFirstBlock()) {
+          log_e("[ota] portal: written bytes are not on the slot, aborting");
+          g_portalOtaError = "flash_not_written";
+          Update.abort();
+        }
       } else if (up.status == UPLOAD_FILE_END) {
         g_otaProgress = 100;
-        if (Update.end(true)) {
+        if (g_portalOtaError) {
+          log_e("[ota] portal: not committing (%s)", g_portalOtaError);
+        } else if (Update.end(true)) {
           log_e("[ota] done, %u bytes", up.totalSize);
         } else {
           // Same end_failed:<detail>(code) detail as the BLE path so the
@@ -769,6 +825,8 @@ static void otaResetState() {
   g_otaAcked = 0;
   g_otaHdrLen = 0;
   g_otaHdrOk = false;
+  g_otaPart = nullptr;
+  g_otaFirstBlockChecked = false;
   otaResetSkip();
   if (g_otaShaActive) {
     mbedtls_sha256_free(&g_otaSha);
@@ -876,7 +934,10 @@ static void otaDiagReadback(int code) {
   // The bytes are the ones the updater wrote, so this is a bit-identical
   // rewrite and cannot damage the slot beyond what the failed OTA already did.
   uint32_t hdr[4];
-  memcpy(hdr, g_otaSkip, sizeof(g_otaSkip));
+  // Only the leading 16 bytes: the library's _skipBuffer and the read-back
+  // check are both ENCRYPTED_BLOCK_SIZE wide (WS-420 widened g_otaSkip to 64
+  // for the streaming read-back, so bound the copy by the destination).
+  memcpy(hdr, g_otaSkip, sizeof(hdr));
   if (!ESP.partitionWrite(target, 0, hdr, sizeof(hdr))) {
     log_e("[ota][diag] verdict=write_failed (16-byte write to offset 0 rejected)");
     return;
@@ -894,6 +955,280 @@ static void otaDiagReadback(int code) {
     return;
   }
   log_e("[ota][diag] verdict=readback_ok (byte0=0xE9)");
+}
+
+// === OTA flash probes + write gate (WS-420) ===============================
+// WS-378 proved the two halves of the failure apart from each other but could
+// not tell *why* they disagree, so WS-420 asks the decisive question: does a
+// 16-byte pattern written to the OTA slot survive, and does a reboot change
+// the answer?
+//
+// Why the read-back values below are authoritative
+// ------------------------------------------------
+// ESP.partitionRead() -> esp_partition_read() -> esp_flash_read() ->
+// chip_drv->read(), i.e. a direct SPI read issued with the cache disabled
+// (esp_flash_api.c: esp_flash_read() -> rom_spiflash_api_funcs->start/end),
+// NOT an MMU/cache read. So a 0xFF read back after a write that returned
+// ESP_OK means the bytes are not in the array. The one way that argument
+// could be wrong is a stale cache line in the *mapped* view, so every
+// round-trip here prints the mmap (cache) view next to the SPI view.
+//
+// The write path, for the same reason, cannot fail silently on a healthy
+// part: esp_flash_write() range-checks against chip->size (esp_flash_api.c:
+// 1118) and returns the chip driver's error. A write that reports ESP_OK but
+// leaves 0xFF therefore points at the chip ignoring the program op (status
+// register block protect, WP# pin) or at a part that does not really have the
+// capacity the driver believes in.
+//
+// Every line is one data point with the [ota][test] prefix so the log can be
+// pasted back verbatim. Two triggers:
+//   * CMD:FLASHTEST            full suite + pattern/restart persistence
+//   * CMD:FLASHTEST:NORESTART  same, without the reboot at the end
+// and once at boot on large-flash boards (>= 8 MB, i.e. the module class
+// this bug is about) so a power cycle alone produces the evidence.
+#define OTA_TEST_PATTERN_LEN 16
+static const uint8_t OTA_TEST_PATTERN[OTA_TEST_PATTERN_LEN] = {
+  0xDE, 0xAD, 0xBE, 0xEF, 0x5A, 0xA5, 0x00, 0xFF,
+  0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+};
+// app1 offsets. 0x0F0000 is the point where the absolute address crosses the
+// 4 MB line (0x310000 + 0x0F0000 = 0x400000); 0x200000 is 5.1 MB absolute.
+static const uint32_t OTA_TEST_OFFSETS[] = {
+  0x000000u, 0x040000u, 0x0E0000u, 0x0F0000u, 0x200000u,
+};
+#define OTA_TEST_OFFSET_COUNT (sizeof(OTA_TEST_OFFSETS) / sizeof(OTA_TEST_OFFSETS[0]))
+#define OTA_TEST_ERASE_LEN   4096u
+// Survives ESP.restart() (not a power cycle). Set right before the probe
+// reboots; read first thing on the next boot.
+#define OTA_TEST_RESTART_MAGIC 0x4207E57u
+RTC_NOINIT_ATTR static uint32_t g_otaTestRestart;
+// Auto-run only on boards big enough to be the 16 MB C3 case: the round-trip
+// below erases 4 KB of app1 five times, which is pointless (and needless wear)
+// on the 2 MB / 4 MB builds where OTA already works.
+#define OTA_TEST_AUTORUN_MIN_SIZE 0x800000u
+
+// The OTA slot, unless the slot to write would be the running app (single-slot
+// boards) — the probes must never touch the firmware that is executing.
+static const esp_partition_t* otaTestTarget(const char** why) {
+  const esp_partition_t* target = esp_ota_get_next_update_partition(NULL);
+  if (!target) { *why = "no_ota_partition"; return nullptr; }
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (target == running) { *why = "target_is_running"; return nullptr; }
+  if (target->address + target->size > 0x1000000u) { *why = "target_past_16mb"; return nullptr; }
+  *why = "ok";
+  return target;
+}
+
+// Item 1: capacity / identity. The driver size (chip->size, used for every
+// range check) and the physical size (JEDEC/SFDP detect) disagreeing is the
+// headline clue: the driver only lets the app address what the configure-time
+// flash size said, while the chip may well be larger (or smaller).
+static void otaTestDumpIdentity() {
+  uint32_t drvSize = 0, physSize = 0, chipId = 0;
+  esp_err_t eDrv = esp_flash_get_size(esp_flash_default_chip, &drvSize);
+  esp_err_t ePhys = esp_flash_get_physical_size(esp_flash_default_chip, &physSize);
+  esp_err_t eId = esp_flash_read_id(esp_flash_default_chip, &chipId);
+  bool wp = false;
+  esp_err_t eWp = esp_flash_get_chip_write_protect(esp_flash_default_chip, &wp);
+  log_e("[ota][test] id drv_size=0x%06X err=%d phys_size=0x%06X err=%d jedec_kb=%u",
+        (unsigned)drvSize, (int)eDrv, (unsigned)physSize, (int)ePhys,
+        (unsigned)(ESP.getFlashChipSize() / 1024));
+  log_e("[ota][test] id chip_id=0x%06X err=%d wp=%d err=%d", (unsigned)chipId,
+        (int)eId, (int)wp, (int)eWp);
+  if (wp) {
+    // esp_flash_get_chip_write_protect() reports SR.WEL, which is 0 (=> "1")
+    // whenever no program/erase is in flight, so 1 at rest is normal and is
+    // NOT evidence of block protection. The round-trip lines are the evidence.
+    log_e("[ota][test] id wp_note=SR.WEL_based_1_at_rest_is_normal");
+  }
+  if (eDrv == ESP_OK && ePhys == ESP_OK && drvSize != physSize) {
+    log_e("[ota][test] id verdict=driver_phys_mismatch drv=0x%06X phys=0x%06X",
+          (unsigned)drvSize, (unsigned)physSize);
+  }
+}
+
+// Item 2 (and item 4): read -> erase 4 KB -> write pattern -> read back at
+// each offset, printing both the SPI view (esp_partition_read) and the mapped
+// cache view (esp_partition_mmap). "pre" is the first byte before the erase,
+// "erased" the first byte right after it: an erase that returns OK without
+// changing anything is the write-protect signature.
+static void otaTestRoundTrip(const esp_partition_t* part) {
+  for (size_t i = 0; i < OTA_TEST_OFFSET_COUNT; i++) {
+    uint32_t off = OTA_TEST_OFFSETS[i];
+    if (off + OTA_TEST_ERASE_LEN > part->size) {
+      log_e("[ota][test] rt off=0x%06X skipped=past_partition_size", (unsigned)off);
+      continue;
+    }
+    uint8_t pre[OTA_TEST_PATTERN_LEN] = {0};
+    uint8_t post[OTA_TEST_PATTERN_LEN] = {0};
+    uint8_t erased = 0xFF;
+    esp_err_t ePre = esp_partition_read(part, off, pre, sizeof(pre));
+    esp_err_t eErase = esp_partition_erase_range(part, off, OTA_TEST_ERASE_LEN);
+    esp_err_t eErased = esp_partition_read(part, off, &erased, 1);
+    esp_err_t eWrite = esp_partition_write(part, off, OTA_TEST_PATTERN, sizeof(OTA_TEST_PATTERN));
+    esp_err_t ePost = esp_partition_read(part, off, post, sizeof(post));
+    bool match = (ePost == ESP_OK) && memcmp(post, OTA_TEST_PATTERN, sizeof(post)) == 0;
+    log_e("[ota][test] rt off=0x%06X abs=0x%06X pre=0x%02X erase_err=%d erased_err=%d "
+          "erased=0x%02X write_err=%d read_err=%d post=0x%02X match=%d",
+          (unsigned)off, (unsigned)(part->address + off),
+          (unsigned)(ePre == ESP_OK ? pre[0] : 0xFF), (int)eErase, (int)eErased,
+          (unsigned)erased, (int)eWrite, (int)ePost,
+          (unsigned)(ePost == ESP_OK ? post[0] : 0xFF), (int)(match ? 1 : 0));
+
+    // Item 4: same 16 bytes through the MMU/cache. "same=0" with post=0xFF
+    // would mean the write landed and only the cache view is stale (W2);
+    // "same=1" with post=0xFF means both views agree the bytes are gone (W1).
+    const void* mapped = nullptr;
+    esp_partition_mmap_handle_t handle = 0;
+    esp_err_t eMap = esp_partition_mmap(part, off, sizeof(post), ESP_PARTITION_MMAP_DATA,
+                                        &mapped, &handle);
+    if (eMap == ESP_OK && mapped) {
+      unsigned m0 = (unsigned)((const uint8_t*)mapped)[0];
+      log_e("[ota][test] rt off=0x%06X spi=0x%02X mmap=0x%02X same=%d",
+            (unsigned)off, (unsigned)(ePost == ESP_OK ? post[0] : 0xFF), m0,
+            (int)(m0 == (unsigned)(ePost == ESP_OK ? post[0] : 0xFF)));
+      esp_partition_munmap(handle);
+    } else {
+      log_e("[ota][test] rt off=0x%06X mmap_err=%d", (unsigned)off, (int)eMap);
+    }
+  }
+}
+
+// Item 3: the pattern is on the slot, reboot, and let the next boot say
+// whether it is still there. The reboot itself is deferred to loop() (WS-366:
+// processCommand runs on the NimBLE host task).
+static void otaTestArmPersistence(const esp_partition_t* part) {
+  esp_err_t eErase = esp_partition_erase_range(part, 0, OTA_TEST_ERASE_LEN);
+  esp_err_t eWrite = esp_partition_write(part, 0, OTA_TEST_PATTERN, sizeof(OTA_TEST_PATTERN));
+  uint8_t back[OTA_TEST_PATTERN_LEN] = {0};
+  esp_err_t eRead = esp_partition_read(part, 0, back, sizeof(back));
+  log_e("[ota][test] persist write off=0x000000 erase_err=%d write_err=%d read_err=%d post=0x%02X",
+        (int)eErase, (int)eWrite, (int)eRead, (unsigned)(eRead == ESP_OK ? back[0] : 0xFF));
+  g_otaTestRestart = OTA_TEST_RESTART_MAGIC;
+}
+
+static void otaTestRun(const char* trigger, bool withRestart) {
+  log_e("[ota][test] begin trigger=%s flash_kb=%u", trigger,
+        (unsigned)(ESP.getFlashChipSize() / 1024));
+  otaTestDumpIdentity();
+
+  const char* why = "ok";
+  const esp_partition_t* target = otaTestTarget(&why);
+  if (!target) {
+    log_e("[ota][test] target=none reason=%s verdict=skipped", why);
+    return;
+  }
+  log_e("[ota][test] target=%s addr=0x%06X size=0x%05X", target->label,
+        (unsigned)target->address, (unsigned)target->size);
+  otaTestRoundTrip(target);
+  if (withRestart) otaTestArmPersistence(target);
+  log_e("[ota][test] end");
+}
+
+// Boot entry point: report what the previous run left at app1+0 *before*
+// anything (including the rest of this probe) touches the slot, then run the
+// suite once on large-flash boards.
+static void otaTestOnBoot() {
+  if (g_otaTestRestart == OTA_TEST_RESTART_MAGIC) {
+    g_otaTestRestart = 0;   // consume first: a crash here must not loop
+    const char* why = "ok";
+    const esp_partition_t* target = otaTestTarget(&why);
+    if (!target) {
+      log_e("[ota][test] persist_read skipped reason=%s", why);
+    } else {
+      uint8_t back[OTA_TEST_PATTERN_LEN] = {0};
+      esp_err_t err = esp_partition_read(target, 0, back, sizeof(back));
+      bool kept = (err == ESP_OK) && memcmp(back, OTA_TEST_PATTERN, sizeof(back)) == 0;
+      log_e("[ota][test] persist_read off=0x000000 err=%d byte0=0x%02X match=%d verdict=%s",
+            (int)err, (unsigned)(err == ESP_OK ? back[0] : 0xFF), (int)(kept ? 1 : 0),
+            kept ? "survived_reboot(W2_data_is_there)" : "lost_across_reboot(W1_data_absent)");
+    }
+  }
+  // Decided on the JEDEC size, not on esp_flash_get_size(): a driver that
+  // only believes in 4 MB is exactly one of the failures this probe is for,
+  // and it must not be able to switch its own diagnostic off.
+  uint32_t jedecSize = (uint32_t)ESP.getFlashChipSize();
+  if (jedecSize < OTA_TEST_AUTORUN_MIN_SIZE) {
+    log_e("[ota][test] autorun=skipped jedec_kb=%u (below %u KB, use CMD:FLASHTEST)",
+          (unsigned)(jedecSize / 1024), (unsigned)(OTA_TEST_AUTORUN_MIN_SIZE / 1024));
+    return;
+  }
+  otaTestRun("boot", false);
+}
+
+// Write gate, run before the first OTA byte on both channels (BLE + portal).
+// Two things it settles early, while the slot is still untouched:
+//   1. capacity: refuse when the target slot is not fully addressable by the
+//      flash driver (chip->size), instead of streaming 1.3 MB and failing at
+//      the end — this is the `esp_flash_get_size() != 16 MB` case;
+//   2. write protection: clear it and log the before/after state.
+// It never widens a check and never pretends a write worked. `total` may be 0
+// when the channel does not know the length yet (config portal upload).
+static bool otaFlashPrepare(const esp_partition_t* part, uint32_t total, const char** reason) {
+  *reason = "ok";
+  if (!part) { *reason = "no_partition"; return false; }
+
+  const uint32_t partEnd = part->address + part->size;
+  const uint32_t imgEnd = total ? (part->address + total) : partEnd;
+  uint32_t drvSize = 0, physSize = 0;
+  esp_err_t eDrv = esp_flash_get_size(esp_flash_default_chip, &drvSize);
+  esp_err_t ePhys = esp_flash_get_physical_size(esp_flash_default_chip, &physSize);
+  log_e("[ota][wp] part=%s addr=0x%06X total=%u img_end=0x%06X part_end=0x%06X "
+        "drv=0x%06X err=%d phys=0x%06X err=%d",
+        part->label, (unsigned)part->address, (unsigned)total, (unsigned)imgEnd,
+        (unsigned)partEnd, (unsigned)drvSize, (int)eDrv, (unsigned)physSize, (int)ePhys);
+  if (eDrv == ESP_OK && partEnd > drvSize) {
+    log_e("[ota][wp] verdict=flash_too_small need=0x%06X drv=0x%06X", (unsigned)partEnd,
+          (unsigned)drvSize);
+    *reason = "flash_too_small";
+    return false;
+  }
+
+  bool wp = false;
+  esp_err_t eGet = esp_flash_get_chip_write_protect(esp_flash_default_chip, &wp);
+  log_e("[ota][wp] protected=%d err=%d", (int)wp, (int)eGet);
+  if (eGet == ESP_OK && wp) {
+    esp_err_t eSet = esp_flash_set_chip_write_protect(esp_flash_default_chip, false);
+    bool after = wp;
+    esp_err_t eAfter = esp_flash_get_chip_write_protect(esp_flash_default_chip, &after);
+    log_e("[ota][wp] cleared err=%d now=%d err=%d", (int)eSet, (int)after, (int)eAfter);
+  }
+  g_otaPart = part;
+  g_otaFirstBlockChecked = false;
+  return true;
+}
+
+// Fail-fast check of the *streaming* write path, run once per session after
+// the first 4 KB block has been flushed. Returns false when the slot does not
+// hold the bytes that were just written; the caller aborts its own channel.
+//
+// Offset 0 cannot be used here: the Update library deliberately withholds the
+// first 16 bytes (_skipBuffer) and only writes them in end(), so the header is
+// still 0xFF mid-stream by design. Bytes 16.. are written with the first
+// block, so they are the earliest honest sample.
+static bool otaVerifyFirstBlock() {
+  if (g_otaFirstBlockChecked || !g_otaSkipOk || !g_otaPart) return true;
+  // Update buffering: SPI_FLASH_SEC_SIZE (4 KB) per flush, so wait for two
+  // blocks to be sure the first one is out.
+  if (g_otaReceived < 2 * 4096) return true;
+  g_otaFirstBlockChecked = true;
+
+  const size_t off = 16;
+  const size_t len = sizeof(g_otaSkip) - off;
+  uint8_t back[sizeof(g_otaSkip)] = {0};
+  esp_err_t err = esp_partition_read(g_otaPart, off, back, len);
+  bool match = (err == ESP_OK) && memcmp(back, g_otaSkip + off, len) == 0;
+  log_e("[ota][verify] off=0x%04X addr=0x%06X err=%d sent=0x%02X got=0x%02X match=%d",
+        (unsigned)off, (unsigned)(g_otaPart->address + off), (int)err,
+        (unsigned)g_otaSkip[off], (unsigned)(err == ESP_OK ? back[0] : 0xFF),
+        (int)(match ? 1 : 0));
+  if (match) return true;
+
+  // Capacity/identity as seen by the same boot, so the log alone decides
+  // whether this is a driver-size problem, a protected part or a dead slot.
+  otaTestDumpIdentity();
+  log_e("[ota][verify] verdict=first_block_lost - flash accepted the write but the bytes are not there");
+  return false;
 }
 
 static int otaHexNibble(char c) {
@@ -1177,6 +1512,14 @@ static void processCommand(String data) {
     g_otaShaActive = true;
     bleConfig.setOtaMode(true);
 
+    // WS-420: capacity + write-protect gate before a single byte is streamed.
+    const char* gate = "ok";
+    if (!otaFlashPrepare(esp_ota_get_next_update_partition(NULL), g_otaTotal, &gate)) {
+      log_e("[ota] gate refused: %s", gate);
+      otaAbort(gate);
+      return;
+    }
+
     // Exact size: Update checks it against the target partition up front.
     if (!Update.begin(g_otaTotal)) {
       log_e("[ota] Update.begin(%lu) failed", (unsigned long)g_otaTotal);
@@ -1185,6 +1528,18 @@ static void processCommand(String data) {
     }
     log_e("[ota] armed: %lu bytes, sha256=%s", (unsigned long)g_otaTotal, shaHex.c_str());
     sendToHost("ACK:CMD:OTA");
+  } else if (data.startsWith("CMD:FLASHTEST")) {
+    // WS-420 flash probes. "CMD:FLASHTEST" runs the full suite and ends with
+    // the pattern/reboot persistence experiment; ":NORESTART" keeps the device
+    // running. The reboot itself is deferred to loop() (WS-366).
+    if (g_otaMode) {
+      sendToHost("ACK:OTA:ERROR:busy");
+      return;
+    }
+    bool restart = (data.indexOf("NORESTART") < 0);
+    sendToHost("ACK:CMD:FLASHTEST");
+    otaTestRun(restart ? "cmd" : "cmd_norestart", restart);
+    if (restart) g_bootReq = BOOT_REBOOT;
   }
 
   if (data.startsWith("CFG:")) sendToHost("ACK:" + data.substring(0, 96));
@@ -1230,6 +1585,13 @@ void setup() {
   // USB CDC: never block the boot if the host is not reading the port.
   Serial.setTxTimeoutMs(0);
 #endif
+
+  // WS-420: the flash probe runs before anything else so the first lines of a
+  // cold boot are its data points (and so the persistence marker is read
+  // before any other code can touch the OTA slot). The short wait is USB-CDC
+  // enumeration: without it the first lines fall into the void on the C3.
+  delay(250);
+  otaTestOnBoot();
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
   // WS-321: a 5 s hold is a *separate* gesture that clears the host binding
@@ -1404,6 +1766,15 @@ void setup() {
     }
     mbedtls_sha256_update(&g_otaSha, data, len);
     g_otaReceived += len;
+
+    // WS-420: read the first flushed block back instead of trusting the
+    // ESP_OK from esp_ota_write(). Fail fast (and say why) rather than
+    // streaming the remaining ~1.3 MB into a slot that is not taking writes.
+    if (!otaVerifyFirstBlock()) {
+      log_e("[ota] aborting: streamed bytes are not on the slot");
+      otaAbort("flash_not_written");
+      return;
+    }
 
     // Windowed ACK: one notification per OTA_ACK_WINDOW bytes (plus the final
     // byte) instead of one per chunk — the host pipelines and only stalls
