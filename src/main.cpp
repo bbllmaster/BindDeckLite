@@ -51,7 +51,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.5"   // WS-433: OTA verified writes + [ota][wt] write probe
+#define FW_VERSION "1.3.6"   // WS-433: OTA verified writes + [ota][wt] write probe
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
