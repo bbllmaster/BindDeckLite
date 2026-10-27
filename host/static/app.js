@@ -50,6 +50,8 @@ const state = {
   scan: null,          // 最近一次扫描的结论，来源 /api/status（WS-395）
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status（WS-389）
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段（WS-409）
+  sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status（WS-445）
+  sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
 };
 
 async function api(path, opts = {}) {
@@ -86,6 +88,9 @@ async function pollStatus() {
     state.devices.forEach((d) => {
       if (d.read) state.readStatus[d.dev_id] = d.read;
     });
+    // WS-445: 运行状态采样只存在服务端内存里，页面刷新后靠这个字段恢复；
+    // 断开时卡片显示的就是这份「上次采样」。
+    state.sysinfo = Object.assign({}, state.sysinfo, s.sysinfo || {});
     renderReadStatus();
     $("#actionsToggle").checked = state.actionsEnabled;
 
@@ -117,8 +122,15 @@ async function pollStatus() {
     const sel = state.devices.find((d) => d.dev_id === state.selected);
     // 设备断开后，上一次的配置结果已经无法再操作，直接收起浮层。
     const nowConnected = !!(sel && sel.connected);
-    if (state.selectedConnected && !nowConnected) clearApplyResults();
+    const wasConnected = state.selectedConnected;
+    if (wasConnected && !nowConnected) clearApplyResults();
+    // WS-445: 重新连上时立刻补一次运行状态（断开期间卡片保留旧值）。
+    if (state.selected && !wasConnected && nowConnected) {
+      loadSysinfo(state.selected);
+    }
     state.selectedConnected = nowConnected;
+    // 连接状态变化时重绘卡片：断开后必须出现「已断开，非实时」。
+    if (state.selected && wasConnected !== nowConnected) renderSysinfo();
     const connected = state.devices.filter((d) => d.connected).length;
     if (sel) {
       $("#statusDot").className = "dot " + (sel.connected ? "ok" : "warn");
@@ -231,6 +243,8 @@ async function selectDevice(devId) {
     renderDeviceMeta();
     state.dirty = false;
     setDirty(false);
+    // WS-445: 切换设备后按设备各自采样，不与上一台的缓存混用。
+    loadSysinfo(devId);
   } catch (e) {
     toast("读取配置失败：" + e.message, "bad");
   }
@@ -769,6 +783,104 @@ function renderEncoderActions() {
 
 /* ---------------- device ---------------- */
 
+/* 运行状态（WS-445）：固件只回报事实，文案与着色都在这里。
+   采样值保存在服务端内存（/api/status 的 sysinfo 字段），断开时继续显示
+   上一次的值并标注「已断开，非实时」，绝不把旧值当实时值渲染。 */
+function sysinfoFor(devId) {
+  return (state.sysinfo && state.sysinfo[devId]) || null;
+}
+
+async function loadSysinfo(devId) {
+  if (!devId || state.sysinfoBusy[devId]) return null;
+  // OTA 期间设备忙于固件通道：不发命令，卡片显示「OTA 中，暂停查询」。
+  if (otaBusy()) {
+    if (state.selected === devId) renderSysinfo();
+    return null;
+  }
+  const dev = state.devices.find((d) => d.dev_id === devId);
+  if (dev && !dev.connected) {
+    // 断开时不发请求，保留上次采样值。
+    if (state.selected === devId) renderSysinfo();
+    return null;
+  }
+  state.sysinfoBusy[devId] = true;
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/sysinfo`, { method: "POST" });
+    // reason=disconnected：命令根本没送到，保留旧值；其余（含超时=固件不支持）
+    // 都是新的一次采样结论。
+    if (r && r.reason !== "disconnected" && r.reason !== "no_device") {
+      state.sysinfo[devId] = r;
+    }
+  } catch (_) {
+    // 上位机自身异常不弹红 toast、不写 error 日志：卡片标注为暂时读不到。
+    const prev = sysinfoFor(devId) || {};
+    state.sysinfo[devId] = Object.assign({}, prev, { stale: true });
+  } finally {
+    state.sysinfoBusy[devId] = false;
+    if (state.selected === devId) renderSysinfo();
+  }
+  return sysinfoFor(devId);
+}
+
+function renderSysinfo() {
+  const box = $("#sysInfo");
+  const atEl = $("#sysSampleAt");
+  if (!box || !atEl) return;
+  const devId = state.selected;
+  if (!devId || state.preview) {
+    box.innerHTML = `<span class="k">状态</span><span class="v muted">未选择设备</span>`;
+    atEl.textContent = "";
+    return;
+  }
+  if (otaBusy()) {
+    box.innerHTML = `<span class="k">状态</span><span class="v warn">OTA 中，暂停查询</span>`;
+    atEl.textContent = "";
+    return;
+  }
+  const dev = state.devices.find((d) => d.dev_id === devId);
+  const connected = !!(dev && dev.connected);
+  const info = sysinfoFor(devId);
+
+  if (!info) {
+    box.innerHTML = `<span class="k">状态</span><span class="v muted">${
+      connected ? "读取中…" : "设备未连接，暂无采样"
+    }</span>`;
+    atEl.textContent = "";
+    return;
+  }
+
+  if (info.supported === false) {
+    // 旧固件：2 秒内没有 SYS: 行。这是「不支持」，不是错误。
+    box.innerHTML = `<span class="k">状态</span><span class="v muted">当前固件不支持运行状态（需更新固件）</span>`;
+    atEl.textContent = (info.at ? `采样 ${fmtClock(info.at)}` : "")
+      + (connected ? "" : " · 已断开，非实时");
+    return;
+  }
+
+  const d = info.display || {};
+  const flags = info.flags || {};
+  const notes = info.notes || {};
+  const resetNote = notes.deepsleep
+    ? `<span class="muted small"> · ${escapeHtml(notes.deepsleep)}</span>` : "";
+  const rows = [
+    ["上次复位", escapeHtml(d.reset || "未知") + resetNote, flags.deepsleep ? "warn" : ""],
+    ["运行时长", escapeHtml(d.uptime || "未知"), ""],
+    ["NVS", escapeHtml(d.nvs || "未知"), flags.nvs_bad ? "bad" : ""],
+    ["空闲堆", escapeHtml(d.heap || "未知"), flags.heap_low ? "warn" : ""],
+  ];
+  const extraNotes = [];
+  if (notes.safe) extraNotes.push(`<li>${escapeHtml(notes.safe)}</li>`);
+  if (notes.heap) extraNotes.push(`<li>${escapeHtml(notes.heap)}</li>`);
+  box.innerHTML = rows
+    .map(([k, v, cls]) => `<span class="k">${k}</span><span class="v ${cls}">${v}</span>`)
+    .join("") + (extraNotes.length
+      ? `<span class="k"></span><ul class="sys-notes">${extraNotes.join("")}</ul>` : "");
+
+  const when = info.at ? `采样 ${fmtClock(info.at)}` : "";
+  const stale = connected ? "" : " · 已断开，非实时";
+  atEl.textContent = when + stale;
+}
+
 function renderDeviceMeta() {
   if (!state.cfg) return;
   const chip = state.cfg.chip || "ESP32";
@@ -806,6 +918,8 @@ function renderDeviceMeta() {
   $("#pinHint").textContent = hint;
   // WS-409: 设备页的「上次读取」状态行。
   renderReadStatus();
+  // WS-445: 运行状态卡片（采样请求由 selectDevice / 重连 / 刷新 / 打开设备页触发）。
+  renderSysinfo();
 }
 
 function renderPins() {
@@ -1375,7 +1489,11 @@ function bindTabs() {
       $$(".panel").forEach((p) => p.classList.remove("active"));
       tab.classList.add("active");
       $("#tab-" + tab.dataset.tab).classList.add("active");
-      if (tab.dataset.tab === "device") renderDeviceMeta();
+      if (tab.dataset.tab === "device") {
+        renderDeviceMeta();
+        // WS-445: 打开设备页采样一次运行状态。
+        loadSysinfo(state.selected);
+      }
     };
   });
 }
@@ -1561,6 +1679,20 @@ async function init() {
     }
   };
   $("#btnPing").onclick = () => devAction("ping", "已发送 Ping");
+  // WS-445: 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
+  $("#btnSysRefresh").onclick = async () => {
+    const btn = $("#btnSysRefresh");
+    if (!state.selected) {
+      toast("没有选中设备", "bad");
+      return;
+    }
+    btn.disabled = true;
+    try {
+      await loadSysinfo(state.selected);
+    } finally {
+      btn.disabled = false;
+    }
+  };
   // WS-409: 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
   $("#btnRefresh").onclick = () => readDeviceConfig(state.selected);
   $("#btnPortal").onclick = () => devAction("portal", "设备将重启进入配网模式");
@@ -1694,7 +1826,8 @@ function otaBusy() {
 
 function applyOtaLock() {
   const busy = otaBusy();
-  ["btnApply", "btnOta", "btnPing", "btnRefresh", "btnPortal", "btnReboot", "btnClearBond"]
+  ["btnApply", "btnOta", "btnPing", "btnRefresh", "btnPortal", "btnReboot", "btnClearBond",
+   "btnSysRefresh"]
     .forEach((id) => {
       const el = $("#" + id);
       if (el) el.disabled = busy;

@@ -37,6 +37,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CMD:BOOT_CFG` | | 重启并进入配网 / OTA 模式 |
 | `CMD:CLEARBOND` | | 清除已绑定的 HID 主机（WS-321） |
 | `CMD:GET_BOND` | | 查询当前主机绑定状态（WS-321） |
+| `CMD:SYSINFO` | | 查询运行状态：运行时长 / 上次复位 / NVS / 空闲堆 / 安全模式（WS-445），回一行 `SYS:` |
 | `CMD:OTA:<size>:<sha256>` | `CMD:OTA:1234567:9f86d0…` | 进入上位机推送 OTA 模式（仅绑定主机 / HID 主连接） |
 | `CMD:OTA_END` | | 固件接收完毕，校验长度与 SHA256 后重启 |
 | `CMD:OTA_CANCEL` | | 取消进行中的 OTA，丢弃已写入数据 |
@@ -146,6 +147,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `BOND_STATUS:` | `BOND_STATUS:bound,A1B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |
 | `BOND_STATUS:` | `BOND_STATUS:unbound` | `CMD:GET_BOND` 应答；未绑定任何主机 |
 | `BOND_DIAG:` | `BOND_DIAG:peer_sec=1,nimble_bond=1` | `CMD:GET_BOND` 应答的独立诊断行（已绑定时才发）；`peer_sec` = NimBLE 中的配对记录数，`nimble_bond` = 绑定主机是否仍有 BLE bond。旧上位机忽略未知行 |
+| `SYS:` | `SYS:uptime=11520,reset=1,nvs=1,heap=98304,safe=0,boots=1` | `CMD:SYSINFO` 应答（只在被请求时发，不广播）；`uptime` 秒、`reset` = `esp_reset_reason()` 原始码、`nvs` 0/1、`heap` 空闲字节、`safe` 0/1 安全模式、`boots` 本次上电周期内第几次启动。旧上位机忽略未知行 |
 
 ## HID 键码
 

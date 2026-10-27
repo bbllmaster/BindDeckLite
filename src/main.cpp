@@ -229,6 +229,10 @@ static unsigned long g_lastActivity = 0;
 RTC_NOINIT_ATTR static uint32_t g_bootMagic;
 RTC_NOINIT_ATTR static uint32_t g_bootCount;
 static bool g_safeMode = false;
+// WS-445: boot number of *this* startup, captured before the guard clears
+// g_bootCount. g_bootCount itself is reset once the deck has been up for 30 s,
+// so reading it live would report "0 boots" for a perfectly healthy device.
+static uint32_t g_bootSeq = 0;
 // True once the encoder push has been seen idle (HIGH at least once). Gestures
 // stay disarmed until then so a pin that is permanently LOW cannot fire them.
 static bool g_encSeenIdle = false;
@@ -1845,6 +1849,23 @@ static void processCommand(String data) {
     }
   } else if (data.startsWith("CMD:PING")) {
     sendToHost("PONG:" + String(millis()));
+  } else if (data.startsWith("CMD:SYSINFO")) {
+    // WS-445: read-only health snapshot for the host device page. It is only
+    // ever sent in answer to this command — never broadcast — so an old host
+    // sees no extra traffic and an old deck simply stays silent (the host
+    // renders "firmware does not support it" after its 2 s timeout).
+    // `reset` is the raw esp_reset_reason() code: the wording lives in the
+    // host, so a code this firmware knows nothing about still reaches the UI
+    // as "未知(N)" instead of being swallowed here.
+    // `boots` is this startup's boot number (see g_bootSeq); `safe` marks a
+    // boot-loop-guard start that skipped the config/portal gesture.
+    char sys[160];
+    snprintf(sys, sizeof(sys),
+             "SYS:uptime=%lu,reset=%d,nvs=%d,heap=%lu,safe=%d,boots=%lu",
+             (unsigned long)(millis() / 1000UL), (int)esp_reset_reason(),
+             (int)g_nvsOk, (unsigned long)ESP.getFreeHeap(),
+             (int)g_safeMode, (unsigned long)g_bootSeq);
+    sendToHost(sys);
   } else if (data.startsWith("CMD:BOOT_CFG")) {
     // WS-366: defer the NVS write + restart to loop(). This callback runs on the
     // NimBLE host task, where sendToHost()/preferences/ESP.restart() are unsafe
@@ -2108,6 +2129,8 @@ void setup() {
   // first boot stores the IRK, so a later boot without an IRK means the
   // identity was lost (the field log: "bootCount=2" + "irk NOT_FOUND").
   g_deckRebooted = (g_bootCount > 1);
+  // WS-445: keep this boot's number for CMD:SYSINFO before the guard zeroes it.
+  g_bootSeq = g_bootCount;
   if (g_bootCount >= 4) {
     g_safeMode = true;
     g_bootCount = 0;
