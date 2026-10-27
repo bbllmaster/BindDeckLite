@@ -1,5 +1,32 @@
 # Changelog
 
+## 16MB C3 OTA：写后逐块校验 + 按页重写 + `[ota][wt]` 写探针 — 2026-10-27（WS-433）
+
+固件侧（`src/main.cpp`）。16 MB C3 上 OTA 一路 `ESP_OK`、槽里读回全 `0xFF`，
+`Update.end()` 报 `read_error(3)`。本版不再信任写返回值。
+
+- **写后立即校验（`otaWbCheckBlock`）**：数据按 4 KB 块暂存后交给 `Update`，
+  每块落地即用 `esp_partition_read`（SPI 直读，非 MMU/cache）比对；因为
+  `Update` 的缓冲正好 4 KB 且滞后一块（前 16 字节留到 `end()`），块 N 交出后
+  0..N-1 一定已在槽上，校验偏移因此是确定的。块 0 跳过 `0x00..0x0F`。
+- **一次自愈（`otaWbRepair`）**：校验不一致时按 `chip_drv->sector_size` 擦除，
+  再按 `chip_drv->page_size`（本芯片 256）逐页重写，从不跨页；重写后再校验，
+  两次都不一致才 `ACK:OTA:ERROR:write_not_verified`。配网页同样显示「升级未开始：
+  write_not_verified」。
+- **尾部扇区先擦（第二个缺陷）**：`Updater::_writeBuffer()` 只在 64 KB 边界擦除，
+  镜像最后不足 64 KB 的那一块会被直接编到旧镜像残留上（NOR 只能 1→0），镜像
+  校验因此必失败。`otaWriteFinish()` 现在先擦尾部扇区再写（只影响镜像末尾之后
+  的字节）。
+- **`[ota][wt]` 探针**：app1+0x2000（不碰镜像头）与 `storage` 尾部各 4 KB 上，
+  分别写 1 / 256 / 4080 字节并立即读回，逐组打印 `erase_err`/`write_err`/
+  `read_err`/`mismatch` 与发送/读回 hex，另打一次直接 `esp_flash_write()` 的
+  返回码；再打印 `chip_drv` 的 page/sector/block_erase、`esp_flash_get_size`、
+  写保护位与 `chip->read_mode`。结论行 `verdict=` 四选一：`page_crossing` /
+  `app1_only` / `flash_write_dead` / `partition_vs_chip`。随 `CMD:FLASHTEST`
+  与 ≥8 MB 板开机自检运行。
+- **回归**：`python tools/check_ota_write_verify.py`（改动前 14 条 FAIL，改动后
+  OK）；`cd host && python -m pytest -q` 162 passed；四个 env 全绿。
+
 ## 重启后无法重连：诊断 + 自愈 + 清除绑定真正生效 — 2026-10-27（WS-410 / WS-407）
 
 固件侧（`src/nimble_hid.cpp` / `src/main.cpp`）。设备重启后电脑在「已连接 /
