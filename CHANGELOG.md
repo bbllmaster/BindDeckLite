@@ -1,5 +1,36 @@
 # Changelog
 
+## 重启后无法重连：诊断 + 自愈 + 清除绑定真正生效 — 2026-10-27（WS-410 / WS-407）
+
+固件侧（`src/nimble_hid.cpp` / `src/main.cpp`）。设备重启后电脑在「已连接 /
+已配对」之间反复闪、需手动删设备才能恢复的根因与修复。
+
+- **诊断（必须先有，判断才有依据）**：`onDisconnect` 现在打印断开
+  `reason` 数值 + 名称（`reasonName`，覆盖 0x205 认证失败 / 0x206 密钥缺失 /
+  0x208 超时 / 0x23E 建链失败 / SM 0x5xx 等）、对端 OTA 地址与 identity 地址、
+  `isEncrypted()` / `isBonded()`；`begin()` 启动段把 `IRK fp=` 从 2 字节扩到
+  完整 16 字节，并新增 `bonds(PEER_SEC)=N`（NimBLE bond 记录数）日志。
+  一次真实重启日志即可判定 A（bond 丢失）/ B（IRK 变了）/ C（地址对不上）。
+- **自愈（无论 A/B/C）**：断开 reason 属认证失败类（`isSecurityFailureReason`）
+  或「已绑定的链路以未加密状态断开」（典型 LTK 丢失/不匹配）时，若该 peer 是本机
+  绑定主机，则 `requestDeleteBond` 删掉本地旧密钥，让 Windows 自己重配，不再需要
+  用户去「删除设备」。普通断开（对方关机、走远、上位机主动断开 = 0x13/0x14/0x16）
+  **一律不动 bond**，避免正常断开被误清。bond 删写在 NimBLE 任务不安全，改为
+  `loop()` 里 `processPendingBondDelete()` 延后执行。
+- **C 地址匹配修法**：`onSubscribe` 绑定态下不再只看一次性地址快照 `memcmp`。
+  优先按 `connInfo.isBonded()`（身份已解析且有 bond）放行，其次按 identity 地址
+  比对；identity 解析不出来时不误判成「非绑定主机」直接丢弃，单独打
+  「bound host identity NOT resolved」日志，区分「未绑定的新主机」与「已绑定但
+  地址解析失败」。
+- **清除绑定真正清干净（part 4）**：`CMD:CLEARBOND` 不再只清应用层 NVS，还会
+  删除对应 peer 的 NimBLE bond（延后到 `loop()` 执行），用户无需再去 Windows
+  手动删设备即可让另一台主机接上。`CMD:GET_BOND` 回报在保持旧
+  `BOND_STATUS:bound,<masked>` 前缀兼容的前提下，追加 `peer_sec=N` 与
+  `nimble_bond=0/1`，让上位机看见 NimBLE 侧是否仍有活 bond。
+- **回归**：四个 env `pio run -e esp32dev / esp32c3 / esp32c3_2mb / esp32c3_16mb`
+  全绿；固件无单测，靠构建 + 现场日志（`IRK fp` 两次重启一致、`bonds(PEER_SEC)`
+  重启后仍为 1、断开 reason 不再出现 0x206）回归。
+
 ## 宏新增 `app:` 步骤：启动桌面应用程序后再输入文字 — 2026-10-22（WS-387）
 
 - **新增宏步骤 `app:<exe> [args]`**（`host/app.py` `_parse_app_cmd` /

@@ -72,6 +72,12 @@ public:
   bool   getHostAddr(uint8_t out[6]) const;   // fill out[6]; false when unbound
   void   clearHostBinding();                  // drop hostAddr + hostBound from NVS
 
+  // WS-410: query the NimBLE bond store so the host app (CMD:GET_BOND) can
+  // report whether the persisted binding still has a live BLE bond, and how
+  // many peer-security records survive a reboot.
+  int    bondCount() const;                   // BLE_STORE_OBJ_TYPE_PEER_SEC count
+  bool   isHostBonded() const;                // true if s_hostAddr has a BLE bond
+
 private:
   void sendKeyboard();
 
@@ -88,3 +94,9 @@ private:
   uint8_t _modifiers = 0;
   uint8_t _keys[6]   = { 0, 0, 0, 0, 0, 0 };
 };
+
+// WS-410: bond writes (NVS + HCI unpair) must not run on the NimBLE host/SM
+// task, so onDisconnect / CLEARBOND only arm a request here; loop() (Arduino
+// task) drains it via processPendingBondDelete().
+void requestDeleteBond(const NimBLEAddress& addr);
+void processPendingBondDelete();

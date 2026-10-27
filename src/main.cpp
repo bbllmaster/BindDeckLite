@@ -921,13 +921,19 @@ static void processCommand(String data) {
   } else if (data.startsWith("CMD:GET_BOND")) {
     // WS-321: report the current host binding. The address is masked after the
     // first two octets so the full BLE address never leaves the device.
+    // WS-410: append the live NimBLE bond state (peer_sec count + whether the
+    // bound host still has a BLE bond). The original 2-field format is kept as
+    // the prefix so old hosts keep parsing; new fields are comma-appended.
     if (bleKeyboard.isHostBound()) {
       uint8_t addr[6];
       if (bleKeyboard.getHostAddr(addr)) {
         char masked[32];
         snprintf(masked, sizeof(masked), "%02X%02X:**:**:**:**",
                  addr[0], addr[1]);
-        sendToHost(String("BOND_STATUS:bound,") + masked);
+        String status = String("BOND_STATUS:bound,") + masked;
+        status += String(",peer_sec=") + String(bleKeyboard.bondCount());
+        status += String(",nimble_bond=") + (bleKeyboard.isHostBonded() ? "1" : "0");
+        sendToHost(status);
       } else {
         sendToHost("BOND_STATUS:bound,<unavailable>");
       }
@@ -1321,6 +1327,14 @@ void loop() {
     }
     delay(250);   // let the loop-task ACK/notify flush before reset
     ESP.restart();
+  }
+
+  // ---- WS-410: deferred bond deletion ----------------------------------
+  // Armed by onDisconnect self-heal or CMD:CLEARBOND (both run on the NimBLE
+  // task, where an HCI unpair + NVS write is unsafe). Drain it here on the
+  // Arduino loop task.
+  if (g_bleStarted) {
+    processPendingBondDelete();
   }
 
   // ---- OTA mode ----------------------------------------------------------
