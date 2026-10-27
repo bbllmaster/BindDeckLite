@@ -50,7 +50,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.3"   // WS-420: [ota][test] probes + write gate
+#define FW_VERSION "1.3.4"   // WS-425: portal OTA first-block gate accumulates per session
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -746,6 +746,10 @@ static void setupProvisioning() {
       if (up.status == UPLOAD_FILE_START) {
         g_otaProgress = 0;
         g_portalOtaError = nullptr;
+        // WS-425: the read-back gate below needs a per-session byte count.
+        // Without this reset a second portal OTA in the same power cycle
+        // inherits the previous run's bytes and trips the gate early.
+        g_otaReceived = 0;
         otaResetSkip();
         log_e("[ota] start: %s", up.filename.c_str());
         // WS-420: same capacity/write-protect gate as the BLE channel. The
@@ -765,7 +769,8 @@ static void setupProvisioning() {
         otaCaptureSkip(up.buf, up.currentSize);
         if (Update.write(up.buf, up.currentSize) != up.currentSize) log_e("[ota] write failed");
         // Same fail-fast read-back as the BLE path (WS-420).
-        g_otaReceived = up.currentSize;
+        // up.currentSize is this chunk only, so accumulate (WS-425).
+        g_otaReceived += up.currentSize;
         if (!otaVerifyFirstBlock()) {
           log_e("[ota] portal: written bytes are not on the slot, aborting");
           g_portalOtaError = "flash_not_written";
