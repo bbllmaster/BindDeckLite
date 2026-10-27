@@ -32,6 +32,7 @@
 #include <esp_log.h>
 #include <esp_ota_ops.h>   // esp_ota_get_next_update_partition() (WS-378 diag)
 #include <esp_flash.h>    // driver/physical size + write-protect gate (WS-420)
+#include <spi_flash_chip_driver.h>  // chip_drv page/sector geometry (WS-433)
 #include <nvs_flash.h>
 #include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
@@ -50,7 +51,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.4"   // WS-425: portal OTA first-block gate accumulates per session
+#define FW_VERSION "1.3.5"   // WS-433: OTA verified writes + [ota][wt] write probe
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -213,6 +214,12 @@ static bool otaFlashPrepare(const esp_partition_t* part, uint32_t total,
 static bool otaVerifyFirstBlock();
 static void otaTestRun(const char* trigger, bool withRestart);
 static void otaTestOnBoot();
+// WS-433: verified write path (read-back per 4 KB block + page-wise repair),
+// used by both OTA channels, and the [ota][wt] write probe.
+static const char* otaWrite(const uint8_t* data, size_t len);
+static const char* otaWriteFinish();
+static void otaWriteReset();
+static void otaWriteProbe(const esp_partition_t* appPart);
 
 static bool g_nvsOk = false;
 static unsigned long g_lastActivity = 0;
@@ -795,6 +802,7 @@ static void setupProvisioning() {
         // inherits the previous run's bytes and trips the gate early.
         g_otaReceived = 0;
         otaResetSkip();
+        otaWriteReset();   // WS-433: per-session block/verify bookkeeping
         log_e("[ota] start: %s", up.filename.c_str());
         // WS-420: same capacity/write-protect gate as the BLE channel. The
         // upload length is not known yet (Update uses UPDATE_SIZE_UNKNOWN), so
@@ -811,19 +819,33 @@ static void setupProvisioning() {
         if (up.totalSize > 0) g_otaProgress = (int)(up.currentSize * 100 / up.totalSize);
         // up.buf holds the chunk just received; the first one starts the image.
         otaCaptureSkip(up.buf, up.currentSize);
-        if (Update.write(up.buf, up.currentSize) != up.currentSize) log_e("[ota] write failed");
+        // WS-433: verified write. Every 4 KB block is read back and, when the
+        // slot did not keep it, erased and reprogrammed page by page first.
+        const char* wErr = otaWrite(up.buf, up.currentSize);
+        if (wErr) log_e("[ota] portal write: %s", wErr);
         // Same fail-fast read-back as the BLE path (WS-420).
         // up.currentSize is this chunk only, so accumulate (WS-425).
         g_otaReceived += up.currentSize;
-        if (!otaVerifyFirstBlock()) {
+        if (wErr) {
+          log_e("[ota] portal: written bytes are not on the slot, aborting");
+          g_portalOtaError = wErr;
+          Update.abort();
+        } else if (!otaVerifyFirstBlock()) {
           log_e("[ota] portal: written bytes are not on the slot, aborting");
           g_portalOtaError = "flash_not_written";
           Update.abort();
         }
       } else if (up.status == UPLOAD_FILE_END) {
         g_otaProgress = 100;
-        if (g_portalOtaError) {
-          log_e("[ota] portal: not committing (%s)", g_portalOtaError);
+        // WS-433: flush the trailing partial block and read back whatever it
+        // put on the slot. Bytes still buffered inside Update are covered by
+        // end(true), whose esp_image_verify walks the whole image.
+        const char* fErr = g_portalOtaError ? g_portalOtaError : otaWriteFinish();
+        if (fErr) {
+          // No end(): the slot keeps whatever it has, the upload is reported
+          // as not started and the deck stays on the running firmware.
+          g_portalOtaError = fErr;
+          log_e("[ota] portal: not committing (%s)", fErr);
         } else if (Update.end(true)) {
           log_e("[ota] done, %u bytes", up.totalSize);
         } else {
@@ -877,6 +899,7 @@ static void otaResetState() {
   g_otaPart = nullptr;
   g_otaFirstBlockChecked = false;
   otaResetSkip();
+  otaWriteReset();   // WS-433
   if (g_otaShaActive) {
     mbedtls_sha256_free(&g_otaSha);
     g_otaShaActive = false;
@@ -1170,6 +1193,7 @@ static void otaTestRun(const char* trigger, bool withRestart) {
   log_e("[ota][test] target=%s addr=0x%06X size=0x%05X", target->label,
         (unsigned)target->address, (unsigned)target->size);
   otaTestRoundTrip(target);
+  otaWriteProbe(target);   // WS-433: 1 / 256 / 4080-byte write probe
   if (withRestart) otaTestArmPersistence(target);
   log_e("[ota][test] end");
 }
@@ -1297,6 +1321,414 @@ static bool otaParseSha256Hex(const String& hex, uint8_t out[OTA_SHA_LEN]) {
     out[i] = (uint8_t)((hi << 4) | lo);
   }
   return true;
+}
+
+// === OTA verified write path + write probe (WS-433) =======================
+// WS-420 separated "the write was rejected" from "the read was rejected" and
+// both came back clean: on the 16 MB C3 the slot takes every byte with
+// ESP_OK, the read-back is 0xFF, and only the erase is visible afterwards. So
+// this build stops trusting return codes and asks the silicon twice:
+//
+//   1. the [ota][wt] probe writes 1 / 256 / 4080 bytes to app1+0x2000 (never
+//      the image header) and to the tail of `storage`, each group erased and
+//      read back with its own esp_err, plus the raw esp_flash_write() return
+//      code Update keeps and never prints. One flash of this build says
+//      whether the loss is page crossing, app1-only or flash-wide.
+//   2. the write path reads every 4 KB block back through esp_partition_read
+//      (SPI, not the MMU/cache) and, when a block does not match, erases it
+//      and reprograms it page by page (chip_drv->page_size). Only a second
+//      mismatch aborts the session, as `write_not_verified`.
+//
+// Block staging is what makes the read-back deterministic: Update's internal
+// buffer is exactly SPI_FLASH_SEC_SIZE (4 KB) and it flushes one block behind,
+// because it withholds the first 16 bytes until end(). So once block N has
+// been handed over, blocks 0..N-1 are on the slot - and two buffers, picked by
+// block-index parity, keep block N-1 alive while block N is being filled.
+#define OTA_WB_BLOCK  4096u   // Update's buffer == one SPI flash sector
+#define OTA_WB_PAGE   256u    // fallback program granularity
+#define OTA_WB_HEADER 16u     // bytes Update withholds until end()
+
+static uint8_t  g_otaWbBuf[2][OTA_WB_BLOCK];
+static uint32_t g_otaWbBlock = 0;     // index of the block being filled
+static size_t   g_otaWbLen = 0;       // bytes in it so far
+static uint32_t g_otaWbChecked = 0;   // next block to read back
+static uint32_t g_otaWbRepairs = 0;   // blocks that needed a reprogram
+
+// Physical geometry as the running chip driver sees it. Reading it (instead
+// of assuming 256/4096) is the point: a driver that believes in 4 KB sectors
+// is one of the candidate root causes, and the repair loop must program at
+// the granularity the chip really has.
+static const spi_flash_chip_t* otaWbDriver() {
+  return esp_flash_default_chip ? esp_flash_default_chip->chip_drv : nullptr;
+}
+
+static uint32_t otaWbPageSize() {
+  const spi_flash_chip_t* drv = otaWbDriver();
+  uint32_t page = (drv && drv->page_size) ? drv->page_size : OTA_WB_PAGE;
+  return (page && page <= OTA_WB_BLOCK) ? page : OTA_WB_PAGE;
+}
+
+static uint32_t otaWbSectorSize() {
+  const spi_flash_chip_t* drv = otaWbDriver();
+  uint32_t sector = (drv && drv->sector_size) ? drv->sector_size : OTA_WB_BLOCK;
+  return (sector && sector <= OTA_WB_BLOCK) ? sector : OTA_WB_BLOCK;
+}
+
+static void otaWriteReset() {
+  g_otaWbBlock = 0;
+  g_otaWbLen = 0;
+  g_otaWbChecked = 0;
+  g_otaWbRepairs = 0;
+}
+
+// Outcome of one read-back comparison.
+struct OtaWbVerdict {
+  esp_err_t err;      // error of the read itself (ESP_OK when it ran)
+  size_t mismatch;    // differing bytes
+  uint32_t firstOff;  // partition offset of the first difference
+  uint8_t want;       // byte that was streamed
+  uint8_t got;        // byte that came back
+};
+
+// Read [off, off+len) back and compare it with what the host sent. Small
+// chunks keep the stack use trivial; a partial tail is bounded the same way.
+static OtaWbVerdict otaWbCompare(const esp_partition_t* part, uint32_t off,
+                                 const uint8_t* want, size_t len) {
+  OtaWbVerdict v = { ESP_OK, 0, 0, 0, 0 };
+  uint8_t back[64];
+  for (size_t done = 0; done < len; done += sizeof(back)) {
+    size_t n = (len - done < sizeof(back)) ? (len - done) : sizeof(back);
+    memset(back, 0, sizeof(back));
+    esp_err_t err = esp_partition_read(part, off + done, back, n);
+    if (err != ESP_OK) { v.err = err; return v; }
+    for (size_t i = 0; i < n; i++) {
+      if (back[i] == want[done + i]) continue;
+      if (!v.mismatch) {
+        v.firstOff = off + (uint32_t)done + (uint32_t)i;
+        v.want = want[done + i];
+        v.got = back[i];
+      }
+      v.mismatch++;
+    }
+  }
+  return v;
+}
+
+// One repair attempt: erase the sector(s) the range covers, then program it
+// back a page at a time. A single call never crosses a page boundary - that
+// "one write spanning 16 pages" shape is exactly what the probe tests.
+static const char* otaWbRepair(const esp_partition_t* part, uint32_t off,
+                               const uint8_t* want, size_t len) {
+  const uint32_t page = otaWbPageSize();
+  const uint32_t sector = otaWbSectorSize();
+  const uint32_t first = off - (off % sector);
+  const uint32_t last = off + (uint32_t)len;
+  for (uint32_t a = first; a < last; a += sector) {
+    esp_err_t e = esp_partition_erase_range(part, a, sector);
+    log_e("[ota][wv] repair erase abs=0x%06X len=%u err=%d",
+          (unsigned)(part->address + a), (unsigned)sector, (int)e);
+    if (e != ESP_OK) return "erase_failed";
+  }
+  for (size_t done = 0; done < len; ) {
+    const uint32_t abs = off + (uint32_t)done;
+    size_t n = page - (abs % page);
+    if (n > len - done) n = len - done;
+    esp_err_t e = esp_partition_write(part, abs, want + done, n);
+    if (e != ESP_OK) {
+      log_e("[ota][wv] repair write off=0x%06X len=%u err=%d",
+            (unsigned)abs, (unsigned)n, (int)e);
+      return "write_failed";
+    }
+    done += n;
+  }
+  return nullptr;
+}
+
+// Read one flushed block back; on a mismatch repair it once and read it back
+// again. nullptr = the block is on the slot.
+static const char* otaWbCheckBlock(const esp_partition_t* part, uint32_t index) {
+  if (!part) return "no_partition";
+  const uint32_t base = index * OTA_WB_BLOCK;
+  // Block 0 still misses its first 16 bytes mid-stream: Update stashes them
+  // privately and only writes them in end(), so they are 0xFF on purpose.
+  const size_t skip = (index == 0) ? OTA_WB_HEADER : 0;
+  const uint8_t* want = g_otaWbBuf[index & 1u];
+  OtaWbVerdict v = otaWbCompare(part, base + (uint32_t)skip, want + skip,
+                                OTA_WB_BLOCK - skip);
+  log_e("[ota][wv] blk=%lu base=0x%06X abs=0x%06X err=%d mismatch=%u "
+        "first=0x%06X want=0x%02X got=0x%02X",
+        (unsigned long)index, (unsigned)base,
+        (unsigned)(part->address + base + skip), (int)v.err, (unsigned)v.mismatch,
+        (unsigned)(v.mismatch ? part->address + v.firstOff : 0),
+        (unsigned)v.want, (unsigned)v.got);
+  if (v.err == ESP_OK && v.mismatch == 0) return nullptr;
+
+  const char* r = otaWbRepair(part, base + (uint32_t)skip, want + skip,
+                              OTA_WB_BLOCK - skip);
+  if (r) return r;
+  g_otaWbRepairs++;
+
+  v = otaWbCompare(part, base + (uint32_t)skip, want + skip, OTA_WB_BLOCK - skip);
+  log_e("[ota][wv] blk=%lu repaired=1 err=%d mismatch=%u first=0x%06X "
+        "want=0x%02X got=0x%02X",
+        (unsigned long)index, (int)v.err, (unsigned)v.mismatch,
+        (unsigned)(v.mismatch ? part->address + v.firstOff : 0),
+        (unsigned)v.want, (unsigned)v.got);
+  if (v.err == ESP_OK && v.mismatch == 0) return nullptr;
+  return "write_not_verified";
+}
+
+// Read back every block Update has already flushed, oldest first.
+static const char* otaWbCheckReady() {
+  const uint32_t flushed = (uint32_t)(Update.progress() / OTA_WB_BLOCK);
+  while (g_otaWbChecked < flushed) {
+    const char* err = otaWbCheckBlock(g_otaPart, g_otaWbChecked);
+    if (err) return err;
+    g_otaWbChecked++;
+  }
+  return nullptr;
+}
+
+// Streaming entry point for both OTA channels. Returns nullptr while every
+// byte so far is confirmed on the slot, or a stable reason token for
+// otaAbort() (same vocabulary the host already parses).
+static const char* otaWrite(const uint8_t* data, size_t len) {
+  if (!g_otaPart) return "no_partition";
+  while (len) {
+    const size_t room = OTA_WB_BLOCK - g_otaWbLen;
+    const size_t take = (len < room) ? len : room;
+    memcpy(g_otaWbBuf[g_otaWbBlock & 1u] + g_otaWbLen, data, take);
+    g_otaWbLen += take;
+    data += take;
+    len -= take;
+    if (g_otaWbLen < OTA_WB_BLOCK) break;
+
+    // Always hand over exactly one block: with a 4 KB feed Update's flush
+    // boundary stays 4 KB aligned (and one block behind), which is what makes
+    // the read-back offsets predictable.
+    const size_t w = Update.write(g_otaWbBuf[g_otaWbBlock & 1u], OTA_WB_BLOCK);
+    if (w != OTA_WB_BLOCK) {
+      log_e("[ota][wv] blk=%lu Update.write short: %u/%u",
+            (unsigned long)g_otaWbBlock, (unsigned)w, (unsigned)OTA_WB_BLOCK);
+      return "write_failed";
+    }
+    g_otaWbBlock++;
+    g_otaWbLen = 0;
+    const char* err = otaWbCheckReady();
+    if (err) return err;
+  }
+  return nullptr;
+}
+
+// Push the trailing partial block and read back whatever that flushed. Bytes
+// still sitting in Update's buffer are written and image-verified by
+// Update.end(true), whose esp_image_verify walks the whole image.
+static const char* otaWriteFinish() {
+  if (!g_otaPart) return "no_partition";
+  if (g_otaWbLen) {
+    // The trailing block is shorter than a sector, and Update only tests for
+    // an erase at 64 KB boundaries (Updater.cpp: block_erase), so it would
+    // program this one straight over whatever the previous image left there -
+    // NOR cannot turn a 0 back into a 1 and the checksum in end() would fail.
+    // Only bytes past the image end share the sector, so erasing it first is
+    // free of collateral.
+    const uint32_t base = g_otaWbBlock * OTA_WB_BLOCK;
+    esp_err_t eTail = esp_partition_erase_range(g_otaPart, base, otaWbSectorSize());
+    log_e("[ota][wv] tail erase base=0x%06X abs=0x%06X len=%u err=%d",
+          (unsigned)base, (unsigned)(g_otaPart->address + base),
+          (unsigned)g_otaWbLen, (int)eTail);
+    if (eTail != ESP_OK) return "erase_failed";
+    const size_t w = Update.write(g_otaWbBuf[g_otaWbBlock & 1u], g_otaWbLen);
+    if (w != g_otaWbLen) {
+      log_e("[ota][wv] tail Update.write short: %u/%u", (unsigned)w,
+            (unsigned)g_otaWbLen);
+      return "write_failed";
+    }
+    g_otaWbBlock++;
+    g_otaWbLen = 0;
+  }
+  const char* err = otaWbCheckReady();
+  if (err) return err;
+  log_e("[ota][wv] done verified=%lu repaired=%lu blocks=%lu",
+        (unsigned long)(g_otaWbChecked * OTA_WB_BLOCK),
+        (unsigned long)g_otaWbRepairs, (unsigned long)g_otaWbChecked);
+  return nullptr;
+}
+
+// --- [ota][wt] write probe ------------------------------------------------
+// Every line is one data point; prefix is uniform so the log can be pasted
+// back verbatim. Runs from otaTestRun(), i.e. at boot on >= 8 MB boards and
+// on CMD:FLASHTEST, and never during an OTA (CMD:FLASHTEST refuses a busy
+// session, and setup() runs it before BLE exists).
+#define OTA_WT_OFF  0x2000u   // +8 KB into the slot: far from the image header
+#define OTA_WT_RAW  4080u     // the shape of the first OTA block (16 pages)
+#define OTA_WT_HEX  8u        // bytes of hex per line
+
+static const size_t OTA_WT_LEN[3] = { 1u, OTA_WB_PAGE, OTA_WT_RAW };
+
+// Not 0x00/0xFF and not periodic over 256 bytes, so a partial write or a write
+// that landed at the wrong address shows up instead of coinciding.
+static uint8_t otaWtPattern(size_t i) {
+  return (uint8_t)(0x5Au ^ (uint8_t)(i & 0xFFu) ^ (uint8_t)((i >> 8) & 0xFFu));
+}
+
+static void otaWtHex(char* out, size_t outLen, const uint8_t* buf, size_t len) {
+  const size_t n = (len < OTA_WT_HEX) ? len : OTA_WT_HEX;
+  size_t pos = 0;
+  out[0] = '\0';
+  for (size_t i = 0; i < n && pos + 3 <= outLen; i++) {
+    snprintf(out + pos, outLen - pos, "%02X", (unsigned)buf[i]);
+    pos += 2;
+    if (i + 1 < n) {
+      out[pos++] = ' ';
+      out[pos] = '\0';
+    }
+  }
+}
+
+static void otaWtDumpDriver() {
+  esp_flash_t* chip = esp_flash_default_chip;
+  const spi_flash_chip_t* drv = otaWbDriver();
+  uint32_t drvSize = 0;
+  esp_err_t eSize = esp_flash_get_size(chip, &drvSize);
+  bool wp = false;
+  esp_err_t eWp = esp_flash_get_chip_write_protect(chip, &wp);
+  // IDF 5.x has no spi_flash_get_chip_mode() any more; chip->read_mode is the
+  // field that carries the configured DIO/QIO/DOUT mode.
+  log_e("[ota][wt] drv name=%s page=%u sector=%u block_erase=%u "
+        "drv_size=0x%06X size_err=%d wp=%d wp_err=%d read_mode=%d",
+        drv ? drv->name : "none", (unsigned)otaWbPageSize(),
+        (unsigned)otaWbSectorSize(),
+        (unsigned)(drv ? drv->block_erase_size : 0), (unsigned)drvSize,
+        (int)eSize, (int)wp, (int)eWp, chip ? (int)chip->read_mode : -1);
+}
+
+// One length through esp_partition_write (what Update uses).
+static bool otaWtGroup(const char* tag, const esp_partition_t* part,
+                       uint32_t off, size_t len) {
+  uint8_t* tx = g_otaWbBuf[0];
+  uint8_t* rx = g_otaWbBuf[1];
+  for (size_t i = 0; i < len; i++) tx[i] = otaWtPattern(i);
+
+  const uint32_t sector = otaWbSectorSize();
+  esp_err_t eErase = esp_partition_erase_range(part, off, sector);
+  uint8_t erased = 0xFF;
+  esp_err_t eErased = esp_partition_read(part, off, &erased, 1);
+  esp_err_t eWrite = esp_partition_write(part, off, tx, len);
+  memset(rx, 0, len);
+  esp_err_t eRead = esp_partition_read(part, off, rx, len);
+
+  size_t mismatch = 0;
+  size_t first = 0;
+  if (eRead == ESP_OK) {
+    for (size_t i = 0; i < len; i++) {
+      if (rx[i] == tx[i]) continue;
+      if (!mismatch) first = i;
+      mismatch++;
+    }
+  }
+  char txHex[3 * OTA_WT_HEX + 1];
+  char rxHex[3 * OTA_WT_HEX + 1];
+  otaWtHex(txHex, sizeof(txHex), tx, len);
+  otaWtHex(rxHex, sizeof(rxHex), rx, len);
+  log_e("[ota][wt] %s len=%u off=0x%06X abs=0x%06X erase_err=%d erased=0x%02X "
+        "erased_err=%d write_err=%d read_err=%d mismatch=%u sent=%s got=%s",
+        tag, (unsigned)len, (unsigned)off, (unsigned)(part->address + off),
+        (int)eErase, (unsigned)erased, (int)eErased, (int)eWrite, (int)eRead,
+        (unsigned)mismatch, txHex, rxHex);
+  if (mismatch) {
+    log_e("[ota][wt] %s first_mismatch off=0x%06X want=0x%02X got=0x%02X",
+          tag, (unsigned)first, (unsigned)tx[first], (unsigned)rx[first]);
+  }
+  return eErase == ESP_OK && eWrite == ESP_OK && eRead == ESP_OK && mismatch == 0;
+}
+
+// Same 4080 bytes, but straight at the chip driver: this is the call whose
+// return code Update keeps and never prints.
+static bool otaWtRaw(const char* tag, const esp_partition_t* part,
+                     uint32_t off, size_t len) {
+  uint8_t* tx = g_otaWbBuf[0];
+  uint8_t* rx = g_otaWbBuf[1];
+  for (size_t i = 0; i < len; i++) tx[i] = otaWtPattern(i);
+
+  esp_err_t eErase = esp_partition_erase_range(part, off, otaWbSectorSize());
+  esp_err_t eRaw = esp_flash_write(esp_flash_default_chip, tx,
+                                   part->address + off, len);
+  memset(rx, 0, len);
+  esp_err_t eRead = esp_partition_read(part, off, rx, len);
+  size_t mismatch = 0;
+  if (eRead == ESP_OK) {
+    for (size_t i = 0; i < len; i++) {
+      if (rx[i] != tx[i]) mismatch++;
+    }
+  }
+  bool ok = (eRaw == ESP_OK) && (eRead == ESP_OK) && (mismatch == 0);
+  log_e("[ota][wt] %s raw len=%u abs=0x%06X erase_err=%d "
+        "esp_flash_write_err=%d read_err=%d mismatch=%u match=%d",
+        tag, (unsigned)len, (unsigned)(part->address + off), (int)eErase,
+        (int)eRaw, (int)eRead, (unsigned)mismatch, (int)(ok ? 1 : 0));
+  return ok;
+}
+
+static void otaWriteProbe(const esp_partition_t* appPart) {
+  log_e("[ota][wt] begin");
+  otaWtDumpDriver();
+
+  bool app1[3] = { false, false, false };
+  bool app1Raw = false;
+  if (!appPart) {
+    log_e("[ota][wt] app1 skipped reason=no_target");
+  } else if ((uint32_t)OTA_WT_OFF + OTA_WB_BLOCK > appPart->size) {
+    log_e("[ota][wt] app1 skipped reason=past_slot size=0x%05X",
+          (unsigned)appPart->size);
+  } else {
+    for (int i = 0; i < 3; i++) {
+      app1[i] = otaWtGroup("app1", appPart, OTA_WT_OFF, OTA_WT_LEN[i]);
+    }
+    app1Raw = otaWtRaw("app1", appPart, OTA_WT_OFF, OTA_WT_RAW);
+  }
+
+  // Same three groups against the tail 4 KB of `storage`: that tells "app1
+  // address range is special" apart from "this chip takes no writes at all".
+  // Only the 16 MB table has the partition, so this is a no-op elsewhere.
+  bool store[3] = { false, false, false };
+  bool storeRaw = false;
+  bool storePresent = false;
+  const esp_partition_t* sp = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+  if (!sp) {
+    log_e("[ota][wt] storage skipped reason=no_partition");
+  } else if (sp->size < OTA_WB_BLOCK) {
+    log_e("[ota][wt] storage skipped reason=too_small size=0x%05X",
+          (unsigned)sp->size);
+  } else {
+    storePresent = true;
+    const uint32_t off = (uint32_t)(sp->size - OTA_WB_BLOCK);
+    for (int i = 0; i < 3; i++) {
+      store[i] = otaWtGroup("storage", sp, off, OTA_WT_LEN[i]);
+    }
+    storeRaw = otaWtRaw("storage", sp, off, OTA_WT_RAW);
+  }
+
+  const bool anyApp = app1[0] || app1[1] || app1[2];
+  const bool anyStore = store[0] || store[1] || store[2];
+  const char* verdict = "inconclusive";
+  if (app1[0] && app1[1] && app1[2]) {
+    verdict = "app1_write_ok";
+  } else if (app1Raw) {
+    // esp_flash_write() reached the chip, esp_partition_write() did not.
+    verdict = "partition_vs_chip";
+  } else if (app1[0] && app1[1] && !app1[2]) {
+    verdict = "page_crossing";     // one page fine, 16 pages lost
+  } else if (storePresent && anyStore) {
+    verdict = "app1_only";         // storage takes writes, app1 does not
+  } else if (storePresent) {
+    verdict = "flash_write_dead";  // nothing on the chip takes a write
+  }
+  log_e("[ota][wt] result app1=%d%d%d app1_raw=%d storage=%d%d%d storage_raw=%d",
+        (int)app1[0], (int)app1[1], (int)app1[2], (int)app1Raw,
+        (int)store[0], (int)store[1], (int)store[2], (int)storeRaw);
+  log_e("[ota][wt] verdict=%s", verdict);
 }
 
 // === Command parser =======================================================
@@ -1475,6 +1907,15 @@ static void processCommand(String data) {
       otaAbort("hash");
       return;
     }
+    // WS-433: flush the trailing partial block and read back every block it
+    // put on the slot; the bytes still inside Update's buffer are written and
+    // image-verified by end(true) right below.
+    const char* wErr = otaWriteFinish();
+    if (wErr) {
+      log_e("[ota] write not verified: %s", wErr);
+      otaAbort(wErr);
+      return;
+    }
     // Report the final confirmed offset before the DONE marker.
     sendToHost("ACK:OTA:" + String(g_otaReceived));
     if (Update.end(true)) {
@@ -1555,6 +1996,7 @@ static void processCommand(String data) {
     g_otaHdrLen = 0;
     g_otaHdrOk = false;
     otaResetSkip();
+    otaWriteReset();   // WS-433: fresh block/verify bookkeeping per session
     memcpy(g_otaShaExp, sha, OTA_SHA_LEN);
     mbedtls_sha256_init(&g_otaSha);
     mbedtls_sha256_starts(&g_otaSha, 0);
@@ -1812,12 +2254,16 @@ void setup() {
       }
     }
 
-    // UpdateClass::write() takes a non-const buffer but only reads from it,
-    // so the const_cast is safe here.
-    size_t written = Update.write(const_cast<uint8_t*>(data), len);
-    if (written != len) {
-      log_e("[ota] Update.write short: %u/%u", (unsigned)written, (unsigned)len);
-      otaAbort("write_failed");
+    // WS-433: verified write. Every 4 KB block is read back through
+    // esp_partition_read and, when the slot did not keep it, erased and
+    // reprogrammed page by page before the next block is accepted. Only a
+    // second mismatch aborts, so a slot that takes the bytes late still
+    // commits instead of failing the whole 1.35 MB stream.
+    const char* wErr = otaWrite(data, len);
+    if (wErr) {
+      log_e("[ota] write not verified: %s (%lu/%lu bytes)", wErr,
+            (unsigned long)g_otaReceived, (unsigned long)g_otaTotal);
+      otaAbort(wErr);
       return;
     }
     mbedtls_sha256_update(&g_otaSha, data, len);

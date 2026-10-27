@@ -111,6 +111,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `begin_failed` / `write_failed` | `Update.begin` / `Update.write` 失败（如超出 app 分区） |
 | `flash_too_small` | OTA 槽末尾超出 flash 驱动可寻址大小（`esp_flash_get_size()`），在收第一个字节前就拒绝（WS-420） |
 | `flash_not_written` | 首块写入后读回不一致：flash 接受了写但字节没落地，会话立刻终止并打印 `[ota][verify]` / `[ota][test]` 证据（WS-420） |
+| `write_not_verified` | 某个 4 KB 块写后读回不一致，且按页（`chip_drv->page_size`）擦写重试一次后仍不一致，会话终止（WS-433）。日志里对应 `[ota][wv] blk=… repaired=1` 与 `[ota][wt] verdict=…` |
+| `erase_failed` | 写后校验失败后的修复擦除报错（WS-433） |
 | `end_failed` | `Update.end(true)` 失败：镜像校验（`esp_image_verify`）或 flash 写入失败 |
 | `end_failed:<detail>(<code>)` | 同 `end_failed`，附 `Update.getError()` 的短原因与数值码；旧上位机仍按 `end_failed` 前缀匹配。`<detail>` 取值（与 `Update.h` 的 `UPDATE_ERROR_*` 宏一一对应，编译期校验）：`write_error`(1) / `erase_error`(2) / `read_error`(3) / `no_space`(4) / `bad_size`(5) / `stream`(6) / `md5`(7) / `magic_byte`(8) / `activate`(9) / `no_partition`(10) / `bad_argument`(11) / `abort`(12) / `decrypt`(13)。本设备 `Update::end()` 只走 `_enablePartition`/`_partitionIsBootable`（失败=3 READ）与 `esp_ota_set_boot_partition`（内部 `esp_image_verify`，失败=9 ACTIVATE），实际只会看到 3 或 9 |
 | `timeout` | 块间 30 秒无数据 |
