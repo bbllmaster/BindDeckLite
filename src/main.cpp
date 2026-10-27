@@ -33,6 +33,7 @@
 #include <esp_ota_ops.h>   // esp_ota_get_next_update_partition() (WS-378 diag)
 #include <esp_flash.h>    // driver/physical size + write-protect gate (WS-420)
 #include <nvs_flash.h>
+#include "nvs_boot_policy.h"   // WS-432: when may the NVS partition be erased?
 #include <esp_mac.h>       // esp_read_mac() — Arduino core 3.x / ESP-IDF 5.x
 #include <time.h>
 #include <vector>         // KeysForm::errors (config portal re-render, WS-408)
@@ -1602,15 +1603,57 @@ static void parseSerialData() {
 }
 
 // === NVS bring-up (self-healing, same rationale as BindDeck) =============
+// WS-432: NVS stores the deck's identity (IRK), the host binding, the peer
+// bonds, the pins, the sleep config, the timezone and the WiFi credentials, so
+// erasing it is expensive: it costs the user a full delete-and-re-pair.
+//
+// The Arduino core already called nvs_flash_init() from initArduino(), and in
+// ESP-IDF 5.5.5 a second init of a mounted partition just returns ESP_OK, so
+// "the framework got there first" is not an error at all. What was destructive
+// is that the old code erased on EVERY non-ESP_OK result, including codes an
+// erase cannot fix (INVALID_STATE, PART_NOT_FOUND, NO_MEM, FAIL, ...).
+// nvsboot::classifyInit() (see nvs_boot_policy.h) now decides, and the only
+// erasing call site in the firmware is the one below, gated on the verdict.
+static_assert(nvsboot::ERR_OK == ESP_OK, "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_FAIL == ESP_FAIL, "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_INVALID_STATE == ESP_ERR_INVALID_STATE,
+              "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_NO_MEM == ESP_ERR_NO_MEM,
+              "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_NVS_NO_FREE_PAGES == ESP_ERR_NVS_NO_FREE_PAGES,
+              "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_NVS_NEW_VERSION_FOUND == ESP_ERR_NVS_NEW_VERSION_FOUND,
+              "nvs_boot_policy.h drifted from esp_err.h");
+static_assert(nvsboot::ERR_NVS_PART_NOT_FOUND == ESP_ERR_NVS_PART_NOT_FOUND,
+              "nvs_boot_policy.h drifted from esp_err.h");
+
 static void ensureNvs() {
   esp_err_t err = nvs_flash_init();
-  if (err == ESP_OK) { g_nvsOk = true; return; }
-  log_e("[nvs] init failed (%d) - erasing NVS", (int)err);
+  const nvsboot::Verdict verdict = nvsboot::classifyInit((int)err);
+
+  if (verdict == nvsboot::VERDICT_USABLE) {
+    // Mounted (either by us or by the framework) - the contents are live.
+    g_nvsOk = true;
+    log_e("[nvs] usable err=0x%04X", (int)err);
+    return;
+  }
+
+  if (verdict == nvsboot::VERDICT_UNUSABLE) {
+    // Report, never wipe: an erase cannot fix this and would only destroy the
+    // user's identity and settings. The deck runs on defaults this boot.
+    log_e("[nvs] init failed (0x%04X) - keeping NVS (an erase cannot fix this)", (int)err);
+    g_nvsOk = false;
+    return;
+  }
+
+  // VERDICT_ERASE: only a partition an erase can repair (no free pages / data
+  // in a newer format) is rebuilt. The Arduino core erases for these two too.
+  log_e("[nvs] init failed (0x%04X) - erasing NVS", (int)err);
   // WS-429: an erased NVS means the deck DID carry state before. The BLE layer
   // must read that as a lost identity, not as a brand-new device.
   g_nvsErased = true;
   if (nvs_flash_erase() == ESP_OK) {
-    g_nvsOk = (nvs_flash_init() == ESP_OK);
+    g_nvsOk = nvsboot::classifyInit((int)nvs_flash_init()) == nvsboot::VERDICT_USABLE;
   }
   log_e("[nvs] usable=%d", (int)g_nvsOk);
 }
