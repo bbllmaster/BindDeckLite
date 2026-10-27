@@ -150,6 +150,43 @@ def test_missing_fields_render_unknown():
                                "nvs": "未知", "heap": "未知"}
 
 
+# --- millis() overflow after ~49 days (WS-453) ----------------------------
+
+def test_uptime_wrap_shows_connection_scoped_text():
+    """4233600 s (49 days) then 5 s is the counter wrapping, not a reboot."""
+    host_app._sysinfo_uptime.clear()
+    host_app.sysinfo_view(
+        "uptime=4233600,reset=1,nvs=1,heap=98304,safe=0,boots=1", "dev-wrap")
+    view = host_app.sysinfo_view(
+        "uptime=5,reset=1,nvs=1,heap=98304,safe=0,boots=1", "dev-wrap")
+
+    assert view["display"]["uptime"] == "本次连接内已运行"
+    assert "5 秒" not in view["display"]["uptime"]
+    assert view["notes"].get("uptime_wrap") == "设备计时已回绕"
+
+
+def test_uptime_increasing_shows_normal_duration():
+    """The normal path must stay byte-for-byte what it was."""
+    host_app._sysinfo_uptime.clear()
+    host_app.sysinfo_view(
+        "uptime=100,reset=1,nvs=1,heap=98304,safe=0,boots=1", "dev-grow")
+    view = host_app.sysinfo_view(
+        "uptime=3700,reset=1,nvs=1,heap=98304,safe=0,boots=1", "dev-grow")
+
+    assert view["display"]["uptime"] == "1 小时 1 分"
+    assert "uptime_wrap" not in view["notes"]
+
+
+def test_first_uptime_sample_is_not_a_wrap():
+    """No previous sample means nothing to compare against: show the value."""
+    host_app._sysinfo_uptime.clear()
+    view = host_app.sysinfo_view(
+        "uptime=5,reset=1,nvs=1,heap=98304,safe=0,boots=1", "dev-fresh")
+
+    assert view["display"]["uptime"] == "5 秒"
+    assert "uptime_wrap" not in view["notes"]
+
+
 # --- request path ---------------------------------------------------------
 
 def test_read_sysinfo_round_trip(monkeypatch):
@@ -180,6 +217,9 @@ def test_read_sysinfo_timeout_means_unsupported(monkeypatch):
     assert result["supported"] is False
     assert result["reason"] == "timeout"
     assert all(e["level"] != "error" for e in host_app._events)
+    # The info event is the user's only hint why the card stays empty; an
+    # assertion on "no error" alone would pass with add_event() removed.
+    assert any(e["level"] == "info" for e in host_app._events)
 
 
 def test_read_sysinfo_disconnected_keeps_the_previous_sample(monkeypatch):

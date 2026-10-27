@@ -266,6 +266,11 @@ _read_status: dict = {}
 #                  "sample": {...}, "display": {...}, "flags": {...},
 #                  "notes": {flag: 说明文字}}}
 _sysinfo: dict = {}
+# Last uptime seen per device (WS-453).  ``millis()`` is monotonic within one
+# power cycle, so a *smaller* value can only be the ~49 day overflow: without
+# remembering the previous sample the card would read the wrapped value as a
+# fresh reboot.  Memory only, like _sysinfo — never written to config.json.
+_sysinfo_uptime: dict = {}
 # One pending SYS:* wait per device (same cross-thread pattern as _read_windows).
 _sysinfo_windows: dict = {}
 _sysinfo_lock = threading.RLock()
@@ -830,15 +835,27 @@ def nvs_text(nvs) -> str:
     return "未知"
 
 
-def sysinfo_view(payload: str) -> dict:
+def sysinfo_view(payload: str, dev_id: str = "") -> dict:
     """Build the display record the device card renders from one ``SYS:`` line.
 
     All wording lives here (not in app.js) so the Chinese labels are covered
     by the same tests that cover the parser.  ``flags`` carries the raw
     booleans the UI needs for colouring; ``notes`` carries the one-line
     explanations the parent task asks for.
+
+    ``dev_id`` is optional so older call sites keep working; when it is given
+    the previous uptime of that device is remembered and a drop means the
+    firmware's ``millis()`` counter overflowed after ~49 days of uptime.
     """
     sample = parse_sysinfo(payload)
+    wrapped = False
+    cur = sample["uptime"]
+    if dev_id and cur is not None:
+        with _sysinfo_lock:
+            prev = _sysinfo_uptime.get(dev_id)
+            # Monotonic within one power cycle: smaller can only be the overflow.
+            wrapped = prev is not None and cur < prev
+            _sysinfo_uptime[dev_id] = cur
     flags = {
         "nvs_bad": sample["nvs"] == 0,
         "heap_low": sample["heap"] is not None and sample["heap"] < SYSINFO_HEAP_WARN,
@@ -852,11 +869,13 @@ def sysinfo_view(payload: str) -> dict:
         notes["deepsleep"] = "设备是睡着了，不是死机"
     if flags["heap_low"]:
         notes["heap"] = "内存偏低，可能影响 OTA"
+    if wrapped:
+        notes["uptime_wrap"] = "设备计时已回绕"
     return {
         "sample": sample,
         "display": {
             "reset": reset_reason_text(sample["reset"]),
-            "uptime": uptime_text(sample["uptime"]),
+            "uptime": "本次连接内已运行" if wrapped else uptime_text(sample["uptime"]),
             "nvs": nvs_text(sample["nvs"]),
             "heap": heap_text(sample["heap"]),
         },
@@ -1310,7 +1329,7 @@ def read_sysinfo(dev_id: str, timeout: float = SYSINFO_TIMEOUT) -> dict:
             _sysinfo[dev_id] = result
         return result
 
-    view = sysinfo_view(payload)
+    view = sysinfo_view(payload, dev_id)
     result = {"ok": True, "supported": True, "at": at, "reason": ""}
     result.update(view)
     with _sysinfo_lock:
