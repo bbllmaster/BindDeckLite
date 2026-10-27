@@ -20,6 +20,8 @@ What is guarded here
   * old firmware: no answer inside the timeout renders "unsupported" and is
     logged at info level (never ``error``);
   * a disconnected deck keeps the previous sample instead of faking one;
+  * millis() 49 天回绕（WS-449）：同一设备上次 ~4233600 秒、本次 5 秒时
+    显示「本次连接内已运行」并带「设备计时已回绕」，首次采样与递增不受影响;
   * the firmware source still emits the documented line (no hardware in CI,
     so this is a source contract test, same approach as ``test_bond_status``).
 
@@ -150,6 +152,91 @@ def test_missing_fields_render_unknown():
                                "nvs": "未知", "heap": "未知"}
 
 
+# --- millis() wrap (WS-449) -----------------------------------------------
+
+def test_uptime_wrap_says_this_connection():
+    """49 天回绕：不能把 5 秒当成"刚重启过"给用户看。"""
+    dev = "dev-wrap-basic"
+    host_app._sysinfo_uptime.pop(dev, None)
+    host_app.sysinfo_view("uptime=4233600,reset=1,nvs=1,heap=98304",
+                          dev_id=dev)
+    view = host_app.sysinfo_view("uptime=5,reset=1,nvs=1,heap=98304",
+                                 dev_id=dev)
+
+    uptime = view["display"]["uptime"]
+    assert host_app.UPTIME_WRAP_TEXT in uptime
+    assert "5 秒" not in uptime
+    assert view["notes"]["uptime_wrap"] == "设备计时已回绕"
+    assert host_app.UPTIME_WRAP_NOTE in uptime  # app.js does not render this key
+
+
+def test_growing_uptime_keeps_the_normal_display():
+    dev = "dev-wrap-grow"
+    host_app._sysinfo_uptime.pop(dev, None)
+    host_app.sysinfo_view("uptime=60,reset=1,nvs=1,heap=98304", dev_id=dev)
+    view = host_app.sysinfo_view("uptime=120,reset=1,nvs=1,heap=98304",
+                                 dev_id=dev)
+
+    assert view["display"]["uptime"] == "2 分 0 秒"
+    assert "uptime_wrap" not in view["notes"]
+
+
+def test_first_sample_is_not_a_wrap():
+    """没有历史值就没有比较基准，短时长照旧显示。"""
+    dev = "dev-wrap-first"
+    host_app._sysinfo_uptime.pop(dev, None)
+    view = host_app.sysinfo_view("uptime=5,reset=1,nvs=1,heap=98304",
+                                 dev_id=dev)
+
+    assert view["display"]["uptime"] == "5 秒"
+    assert "uptime_wrap" not in view["notes"]
+
+
+def test_small_drop_is_not_a_wrap():
+    """抖动（上一秒 300、这一秒 290）不是回绕。"""
+    dev = "dev-wrap-jitter"
+    host_app._sysinfo_uptime.pop(dev, None)
+    host_app.sysinfo_view("uptime=300,reset=1,nvs=1,heap=98304", dev_id=dev)
+    view = host_app.sysinfo_view("uptime=290,reset=1,nvs=1,heap=98304",
+                                 dev_id=dev)
+
+    assert view["display"]["uptime"] == "4 分 50 秒"
+    assert "uptime_wrap" not in view["notes"]
+
+
+def test_wrap_state_is_per_device():
+    """一台设备回绕不能把另一台的正常时长也改成"本次连接内"。"""
+    a, b = "dev-wrap-a", "dev-wrap-b"
+    host_app._sysinfo_uptime.pop(a, None)
+    host_app._sysinfo_uptime.pop(b, None)
+    host_app.sysinfo_view("uptime=4233600,reset=1,nvs=1,heap=98304", dev_id=a)
+    host_app.sysinfo_view("uptime=5,reset=1,nvs=1,heap=98304", dev_id=b)
+
+    view = host_app.sysinfo_view("uptime=5,reset=1,nvs=1,heap=98304", dev_id=b)
+    assert view["display"]["uptime"] == "5 秒"
+    assert "uptime_wrap" not in view["notes"]
+
+
+def test_read_sysinfo_detects_wrap_through_the_request_path(monkeypatch):
+    """dev_id 必须真的从请求路径传下去，而不是只在单元层能触发。"""
+    dev = "dev-wrap-request"
+    host_app._sysinfo_uptime.pop(dev, None)
+    lines = iter(["uptime=4233600,reset=1,nvs=1,heap=98304",
+                  "uptime=5,reset=1,nvs=1,heap=98304"])
+
+    def fake_send(d, cmd):
+        host_app._on_line(d, "SYS:" + next(lines))
+        return {"sent": True, "via": ["ble"]}
+
+    monkeypatch.setattr(host_app, "send", fake_send)
+    first = host_app.read_sysinfo(dev, timeout=0.5)
+    second = host_app.read_sysinfo(dev, timeout=0.5)
+
+    assert first["display"]["uptime"] == "1176 小时 0 分"
+    assert host_app.UPTIME_WRAP_TEXT in second["display"]["uptime"]
+    assert second["notes"]["uptime_wrap"] == "设备计时已回绕"
+
+
 # --- request path ---------------------------------------------------------
 
 def test_read_sysinfo_round_trip(monkeypatch):
@@ -180,6 +267,8 @@ def test_read_sysinfo_timeout_means_unsupported(monkeypatch):
     assert result["supported"] is False
     assert result["reason"] == "timeout"
     assert all(e["level"] != "error" for e in host_app._events)
+    # 光断言"没有 error"不够：add_event 被误删也会变绿。
+    assert any(e["level"] == "info" for e in host_app._events)
 
 
 def test_read_sysinfo_disconnected_keeps_the_previous_sample(monkeypatch):
