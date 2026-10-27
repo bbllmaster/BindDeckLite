@@ -921,22 +921,23 @@ static void processCommand(String data) {
   } else if (data.startsWith("CMD:GET_BOND")) {
     // WS-321: report the current host binding. The address is masked after the
     // first two octets so the full BLE address never leaves the device.
-    // WS-410: append the live NimBLE bond state (peer_sec count + whether the
-    // bound host still has a BLE bond). The original 2-field format is kept as
-    // the prefix so old hosts keep parsing; new fields are comma-appended.
+    // WS-423: BOND_STATUS stays exactly `bound,<masked>` / `unbound` (the
+    // WS-321 wire format). WS-410 used to comma-append the NimBLE bond state
+    // to this line, which broke the old host's `split(",", 1)` — `addr` became
+    // `AB12:**:**:**:**,peer_sec=1,nimble_bond=1`. The diagnostics now travel
+    // on their own BOND_DIAG line, which old hosts ignore as an unknown line.
     if (bleKeyboard.isHostBound()) {
       uint8_t addr[6];
       if (bleKeyboard.getHostAddr(addr)) {
         char masked[32];
         snprintf(masked, sizeof(masked), "%02X%02X:**:**:**:**",
                  addr[0], addr[1]);
-        String status = String("BOND_STATUS:bound,") + masked;
-        status += String(",peer_sec=") + String(bleKeyboard.bondCount());
-        status += String(",nimble_bond=") + (bleKeyboard.isHostBonded() ? "1" : "0");
-        sendToHost(status);
+        sendToHost(String("BOND_STATUS:bound,") + masked);
       } else {
         sendToHost("BOND_STATUS:bound,<unavailable>");
       }
+      sendToHost(String("BOND_DIAG:peer_sec=") + String(bleKeyboard.bondCount()) +
+                 ",nimble_bond=" + (bleKeyboard.isHostBonded() ? "1" : "0"));
     } else {
       sendToHost("BOND_STATUS:unbound");
     }

@@ -493,6 +493,42 @@ def _on_ble_diag(dev_id: str, text: str, level: str):
     add_event("ble", text, dev_id, level)
 
 
+def parse_bond_status(payload: str) -> dict:
+    """Split a ``BOND_STATUS:`` payload into ``{"bound": bool, "addr": str}``.
+
+    WS-423: only the field right after the state is the address. The old
+    parser took *everything* after the first comma, so a firmware that
+    comma-appended diagnostics turned ``addr`` into
+    ``"AB12:**:**:**:**,peer_sec=1,nimble_bond=1"`` and the UI printed that
+    as the bound host address. Extra fields are now kept out of ``addr``.
+    """
+    payload = payload.strip()
+    if payload == "unbound":
+        return {"bound": False, "addr": ""}
+    state, _, rest = payload.partition(",")
+    return {"bound": state == "bound", "addr": rest.split(",", 1)[0]}
+
+
+def parse_bond_diag(payload: str) -> dict:
+    """Parse ``BOND_DIAG:peer_sec=N,nimble_bond=0/1`` into an int dict.
+
+    Returns only the keys it understood, so an unknown/new field never
+    breaks the parse. ``{}`` means the line carried nothing usable.
+    """
+    known = ("peer_sec", "nimble_bond")
+    out = {}
+    for field in payload.split(","):
+        key, sep, value = field.partition("=")
+        key = key.strip()
+        if not sep or key not in known:
+            continue
+        try:
+            out[key] = int(value.strip())
+        except ValueError:
+            continue
+    return out
+
+
 ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
                      cache_path=os.path.join(DATA_DIR, "ble_cache.json"),
                      on_diag=_on_ble_diag)
@@ -640,21 +676,33 @@ def _on_line(dev_id: str, line: str):
     # WS-321: host binding status reported by CMD:GET_BOND. The address is
     # already masked by the firmware; we just store and display it.
     if line.startswith("BOND_STATUS:"):
-        payload = line[len("BOND_STATUS:"):]
+        parsed = parse_bond_status(line[len("BOND_STATUS:"):])
         cfg = device_cfg(dev_id)
         with _lock:
-            if payload == "unbound":
-                cfg["bond"] = {"bound": False, "addr": ""}
-            else:
-                parts = payload.split(",", 1)
-                cfg["bond"] = {
-                    "bound": True,
-                    "addr": parts[1] if len(parts) == 2 else "",
-                }
+            bond = dict(cfg.get("bond") or {})
+            bond.update(parsed)
+            if not parsed["bound"]:
+                # An unbound deck has no live bond state to report.
+                bond.pop("peer_sec", None)
+                bond.pop("nimble_bond", None)
+            cfg["bond"] = bond
             save_config()
         add_event("device",
-                  "主机绑定: " + ("已绑定" if cfg["bond"]["bound"] else "未绑定"),
+                  "主机绑定: " + ("已绑定" if parsed["bound"] else "未绑定"),
                   dev_id)
+        return
+    # WS-423: the firmware reports the live NimBLE bond state on its own line
+    # (BOND_STATUS itself stays `bound,<masked>`). Unknown lines are still
+    # ignored, so an old host keeps working against a new deck.
+    if line.startswith("BOND_DIAG:"):
+        diag = parse_bond_diag(line[len("BOND_DIAG:"):])
+        if diag:
+            cfg = device_cfg(dev_id)
+            with _lock:
+                bond = dict(cfg.get("bond") or {})
+                bond.update(diag)
+                cfg["bond"] = bond
+                save_config()
         return
     if line.startswith("PONG"):
         sent = _ping_sent.pop(dev_id, None)

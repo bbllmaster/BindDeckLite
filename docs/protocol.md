@@ -121,8 +121,9 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG_TZ:` | `CFG_TZ:CST-8` | `CMD:GET_CFG` 应答 |
 | `TZ_INFO:` | `TZ_INFO:CST-8` | `CMD:GET_TZ` 应答 |
 | `WIFI_INFO:` | `WIFI_INFO:home,192.168.1.42` | `CMD:GET_WIFI` 应答；未连接为 `DISCONNECTED,0.0.0.0` |
-| `BOND_STATUS:` | `BOND_STATUS:bound,A1:B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |
+| `BOND_STATUS:` | `BOND_STATUS:bound,A1B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |
 | `BOND_STATUS:` | `BOND_STATUS:unbound` | `CMD:GET_BOND` 应答；未绑定任何主机 |
+| `BOND_DIAG:` | `BOND_DIAG:peer_sec=1,nimble_bond=1` | `CMD:GET_BOND` 应答的独立诊断行（已绑定时才发）；`peer_sec` = NimBLE 中的配对记录数，`nimble_bond` = 绑定主机是否仍有 BLE bond。旧上位机忽略未知行 |
 
 ## HID 键码
 
