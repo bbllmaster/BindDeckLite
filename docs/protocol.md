@@ -40,8 +40,26 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CMD:OTA:<size>:<sha256>` | `CMD:OTA:1234567:9f86d0…` | 进入上位机推送 OTA 模式（仅绑定主机 / HID 主连接） |
 | `CMD:OTA_END` | | 固件接收完毕，校验长度与 SHA256 后重启 |
 | `CMD:OTA_CANCEL` | | 取消进行中的 OTA，丢弃已写入数据 |
+| `CMD:FLASHTEST` | | 运行 OTA 槽 flash 探针（见下），末尾写入持久性图案并重启 |
+| `CMD:FLASHTEST:NORESTART` | | 同上，但不在末尾重启 |
 
 任何 `CFG:` 命令都会收到 `ACK:<原命令前 96 字节>`。
+
+### OTA 槽 flash 探针（CMD:FLASHTEST，WS-420）
+
+只诊断、不改协议：探针只擦写 OTA 槽（`esp_ota_get_next_update_partition()`），
+运行中的应用分区、`storage` 与 NVS 一律不碰；目标分区就是当前运行分区时直接跳过。
+每行一个数据点，前缀统一为 `[ota][test]`，整段日志可原样贴回任务：
+
+| 行 | 含义 |
+|----|------|
+| `id drv_size=… phys_size=… jedec_kb=…` | flash 驱动可寻址大小 / 物理探测大小 / JEDEC 解码大小（三者不一致是首要线索） |
+| `id chip_id=… wp=…` | 芯片 ID 与写保护位（`wp` 取自 SR.WEL，空闲时为 1 属正常，不是保护生效的证据） |
+| `rt off=… pre=… erase_err=… erased=… write_err=… read_err=… post=… match=…` | 逐地址：读首字节 → 擦 4 KB → 写图案 → 读回 |
+| `rt off=… spi=… mmap=… same=…` | 同一 16 字节的直接 SPI 读与 MMU/缓存映射读对照（`same=0` 才是缓存陈旧） |
+| `persist write …` / `persist_read … verdict=…` | 图案写入 `app1+0` → 重启 → 下次上电第一件事读回；`survived_reboot` = 数据在（读回不可信），`lost_across_reboot` = 数据真不在 |
+
+大容量板（≥ 8 MB）上电时自动跑一次（不重启），小容量板与 2 MB 单槽板跳过。
 
 ### 上位机推送 OTA（CMD:OTA）
 
@@ -91,6 +109,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `size` | 已收字节数不等于声明长度（或流超出声明长度） |
 | `hash` | SHA256 不匹配 |
 | `begin_failed` / `write_failed` | `Update.begin` / `Update.write` 失败（如超出 app 分区） |
+| `flash_too_small` | OTA 槽末尾超出 flash 驱动可寻址大小（`esp_flash_get_size()`），在收第一个字节前就拒绝（WS-420） |
+| `flash_not_written` | 首块写入后读回不一致：flash 接受了写但字节没落地，会话立刻终止并打印 `[ota][verify]` / `[ota][test]` 证据（WS-420） |
 | `end_failed` | `Update.end(true)` 失败：镜像校验（`esp_image_verify`）或 flash 写入失败 |
 | `end_failed:<detail>(<code>)` | 同 `end_failed`，附 `Update.getError()` 的短原因与数值码；旧上位机仍按 `end_failed` 前缀匹配。`<detail>` 取值（与 `Update.h` 的 `UPDATE_ERROR_*` 宏一一对应，编译期校验）：`write_error`(1) / `erase_error`(2) / `read_error`(3) / `no_space`(4) / `bad_size`(5) / `stream`(6) / `md5`(7) / `magic_byte`(8) / `activate`(9) / `no_partition`(10) / `bad_argument`(11) / `abort`(12) / `decrypt`(13)。本设备 `Update::end()` 只走 `_enablePartition`/`_partitionIsBootable`（失败=3 READ）与 `esp_ota_set_boot_partition`（内部 `esp_image_verify`，失败=9 ACTIVATE），实际只会看到 3 或 9 |
 | `timeout` | 块间 30 秒无数据 |
