@@ -202,6 +202,20 @@ static void getOrCreateIrk(uint8_t irk[16]) {
   if (prefsOk) p.end();
 }
 
+// WS-410 (review must-fix #3): the HID-subscriber gate. A bound host may only
+// be accepted when its RESOLVED IDENTITY matches the stored binding. `peerBonded`
+// (connInfo.isBonded() == sec_state.bonded) must never be sufficient on its own:
+// a freshly-paired second PC is also "bonded" to us, and letting it through
+// would regress WS-319. Kept as a constexpr so static_assert can guard it.
+static constexpr bool acceptHidSubscriber(bool identityMatches, bool peerBonded) {
+  (void)peerBonded;   // deliberately unused — see above
+  return identityMatches;
+}
+static_assert(acceptHidSubscriber(true, false),  "identity match must accept the bound host");
+static_assert(acceptHidSubscriber(true, true),   "identity match must accept the bound host");
+static_assert(!acceptHidSubscriber(false, true), "bonded-but-foreign host must be rejected (WS-319)");
+static_assert(!acceptHidSubscriber(false, false), "unknown host must be rejected");
+
 // WS-275 + WS-321: HID input-report subscription tracking. Only reports
 // (0x0001) or indications (0x0002) in subValue mean "this central wants
 // HID input". When a host is bound, only the bound central is allowed;
@@ -240,7 +254,7 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
       const bool idMatch = !idAddr.isNull() &&
                            memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
 
-      if (idMatch) {
+      if (acceptHidSubscriber(idMatch, peerBonded)) {
         // Bound host — allow it to become (or stay) the HID primary.
         if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
           s_hid_conn = conn;
