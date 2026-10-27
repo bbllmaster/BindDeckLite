@@ -91,11 +91,17 @@ static uint8_t         s_hostAddr[6] = { 0, 0, 0, 0, 0, 0 };
 // also carries the BLE address type so NimBLEDevice::deleteBond() can match the
 // bond record exactly (ble_gap_unpair keys on type + value).
 static NimBLEAddress   s_hostAddrObj;
-// WS-410: deferred bond deletion. NimBLEDevice::deleteBond() does an HCI unpair
-// + NVS write that must not run on the NimBLE host/SM task, so it is armed here
-// and drained by processPendingBondDelete() from the Arduino loop task.
+// WS-410: deferred bond deletion. ble_gap_unpair() does an HCI unpair + NVS
+// write that must not run on the NimBLE host/SM task, so it is armed here and
+// drained by processPendingBleWork() from the Arduino loop task.
 static NimBLEAddress   s_pendingDeleteAddr;
 static bool            s_pendingDeleteBond = false;
+// WS-410: CASE=A reset — armed from onDisconnect, drained by loop().
+static bool            s_pendingClearBinding = false;
+// Retry bookkeeping for the deferred bond delete (EBUSY means "advertising
+// still active, try again"; a permanent error must not spin the log forever).
+static unsigned long   s_lastBondDeleteAttempt = 0;
+static int             s_bondDeleteFails = 0;
 // Set when the user clears the binding while a host is still connected. The
 // old host keeps working so the user is not left with a dead keyboard, but the
 // next *different* central that subscribes takes the HID primary slot over
@@ -213,14 +219,15 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
     // central may receive HID input. The CFG service never subscribes to HID
     // input reports, so the host app keeps working over the same link.
     //
-    // WS-410 fix: match by BOND, not by a one-shot address snapshot. A bonded
-    // host whose RPA has not yet been resolved (idAddr still null) must still
-    // receive HID — otherwise the deck rejects its own host and Windows
-    // flickers between "connected / paired". We accept when EITHER the
-    // connection is flagged bonded (identity resolved + bond present) OR the
-    // resolved identity address equals the stored one. Only a genuinely
-    // different central is rejected, and we log which case it was so the
-    // on-site log can tell "new host" apart from "bound host unresolved".
+    // WS-410 (review must-fix #3): gate on the RESOLVED identity address ONLY.
+    // `connInfo.isBonded()` is just sec_state.bonded — a bond exists for *some*
+    // device we paired with, and a freshly-paired second PC is "bonded" too, so
+    // trusting it would let that PC grab HID (WS-319 regression). Identity match
+    // is the only signal that proves "this is the one host I bound".
+    // Case A (our bond was lost -> identity cannot resolve) is not handled here;
+    // onDisconnect resets the app binding on a bond-key failure so the peer can
+    // re-pair and bind again, which is why identity-only matching cannot lock
+    // the legitimate host out permanently.
     if (s_hostBound) {
       NimBLEAddress idAddr  = connInfo.getIdAddress();   // peer_id_addr
       NimBLEAddress otaAddr = connInfo.getAddress();     // peer_ota_addr
@@ -228,13 +235,12 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
       const bool idMatch = !idAddr.isNull() &&
                            memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
 
-      if (peerBonded || idMatch) {
+      if (idMatch) {
         // Bound host — allow it to become (or stay) the HID primary.
         if (s_hid_conn == BLE_HS_CONN_HANDLE_NONE) {
           s_hid_conn = conn;
-          ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (bound host%s, char=0x%04X sub=0x%04X)",
-                   conn, otaAddr.toString().c_str(),
-                   peerBonded ? ",bonded" : ",id-match",
+          ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (bound host,id-match,bonded=%d, char=0x%04X sub=0x%04X)",
+                   conn, otaAddr.toString().c_str(), (int)peerBonded,
                    ch ? ch->getHandle() : 0, subValue);
         } else if (conn != s_hid_conn) {
           ESP_LOGE("BIND", "[ble] HID extra subscriber conn=0x%04X addr=%s ignored (primary=0x%04X)",
@@ -247,10 +253,10 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
       // log makes the root cause obvious:
       //  - idAddr null  -> bound host's RPA could not be resolved to its
       //                    identity (bond store / IRK mismatch, case C or B).
-      //  - idAddr set   -> a genuinely different (unbound) central tried to
-      //                    grab HID (rejected on purpose, WS-319 holds).
+      //  - idAddr set   -> a genuinely different central tried to grab HID
+      //                    (rejected on purpose, WS-319 holds).
       if (idAddr.isNull()) {
-        ESP_LOGE("BIND", "[ble] reject: bound host identity NOT resolved (RPA unresolved), "
+        ESP_LOGE("BIND", "[ble] reject CASE=C: bound host identity NOT resolved (RPA unresolved), "
                  "subscriber ota=%s (bound=%02X%02X%02X%02X%02X%02X)",
                  otaAddr.toString().c_str(),
                  s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
@@ -305,9 +311,8 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
 // WS-410: map a NimBLE disconnect reason to a short human-readable name for
 // the on-site log. `reason` arrives in the ble_hs error space: HCI disconnect
 // codes are wrapped as BLE_HS_HCI_ERR(x) = 0x200 + x, SM (pairing) failures as
-// 0x500 + x. The codes we care about for bond self-heal are the encryption /
-// key-mismatch family (0x205 auth fail, 0x206 PIN/key missing, 0x208 timeout,
-// 0x23E conn failed to establish) and SM 0x505+ (peer pairing failure).
+// 0x500 + x. 0x208 (supervision timeout = walk away / power off) and
+// 0x213/0x214/0x216 are NORMAL closes and must never be read as a broken bond.
 static const char* reasonName(int reason) {
   switch (reason) {
     case 0x205: return "HCI_AUTH_FAIL";        // 0x05 authentication failure
@@ -322,24 +327,44 @@ static const char* reasonName(int reason) {
   }
 }
 
-// WS-410: classify a disconnect reason as a security/encryption failure — the
-// signature of a broken/stale bond. Normal user/host-initiated closes
-// (remote terminated, power off, local terminated) are deliberately excluded
-// so we never nuke a healthy bond on an ordinary disconnect.
-static bool isSecurityFailureReason(int reason) {
+// WS-410 (review must-fix #2): the ONLY reasons that mean "the bond key itself
+// is wrong". 0x208 supervision timeout (walk away / power off), 0x213/0x214/
+// 0x216 (user/power/local close) and 0x23E are explicitly excluded — wiping a
+// bond on those would turn the original bug into an always-on one.
+static constexpr bool isSecurityFailureReason(int reason) {
   switch (reason) {
     case 0x205:  // HCI authentication failure
-    case 0x206:  // HCI PIN or key missing  (the classic broken-bond code)
-    case 0x208:  // HCI connection timeout
-    case 0x23E:  // HCI connection failed to be established
+    case 0x206:  // HCI PIN or key missing  (classic broken-bond code)
     case 25:     // BLE_HS_EENCRYPT
       return true;
     default:
-      // SM peer pairing failures (0x500 + code) also mean the security
-      // handshake broke down; treat them as security failures too.
+      // SM (peer) pairing failures: 0x500 + code.
       return (reason >= 0x500 && reason < 0x600);
   }
 }
+
+// WS-410 (review should-fix #5): a stricter subset that specifically proves the
+// peer tried to use a bond it no longer shares with us — i.e. it is our former
+// host, not a stranger failing a fresh pairing. Used for the case-A reset.
+static constexpr bool isBondKeyFailureReason(int reason) {
+  return reason == 0x205 || reason == 0x206 || reason == 25;
+}
+
+// WS-410 regression guard (review must-fix #2): these are compile-time checks
+// against the REAL classifiers above, so re-adding 0x208 (walk away) or a
+// normal-close code to the "wipe bond" set fails the build instead of silently
+// turning a healthy disconnect into a data-loss bug. `pio run -e esp32dev` is
+// the regression command: it fails if any assertion below is violated.
+static_assert(isSecurityFailureReason(0x205), "0x205 auth fail must self-heal");
+static_assert(isSecurityFailureReason(0x206), "0x206 pin/key missing must self-heal");
+static_assert(isSecurityFailureReason(25),    "BLE_HS_EENCRYPT must self-heal");
+static_assert(!isSecurityFailureReason(0x208), "0x208 supervision timeout (walk away) must NOT wipe bond");
+static_assert(!isSecurityFailureReason(0x213), "0x213 remote user terminated must NOT wipe bond");
+static_assert(!isSecurityFailureReason(0x214), "0x214 remote power off must NOT wipe bond");
+static_assert(!isSecurityFailureReason(0x216), "0x216 local terminated must NOT wipe bond");
+static_assert(!isSecurityFailureReason(0x23E), "0x23E conn failed to establish must NOT wipe bond");
+static_assert(isBondKeyFailureReason(0x206),  "case-A reset on pin/key missing");
+static_assert(!isBondKeyFailureReason(0x208), "case-A reset never on timeout");
 
 class HidServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& /*connInfo*/) override {
@@ -394,25 +419,32 @@ class HidServerCB : public NimBLEServerCallbacks {
       s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
     }
 
-    // WS-410 self-heal: if the bound host dropped with a broken/stale bond,
-    // delete our side of the bond so Windows re-pairs itself instead of looping
-    // "connected/paired". Two triggers, both anchored on the link being our
-    // *host* and the bond being present:
-    //   - an explicit security/encryption failure reason, or
-    //   - a bonded link that came down unencrypted (encryption never succeeded,
-    //     which is exactly what a missing/mismatched LTK looks like).
-    // A healthy bonded session is always encrypted, so ordinary user/host
-    // disconnects (remote terminated, power off, walk-away timeout) fall
-    // through and leave the bond intact.
-    if (s_hostBound && !idAddr.isNull() &&
-        memcmp(idAddr.getVal(), s_hostAddr, 6) == 0) {
-      bool hostBonded = NimBLEDevice::isBonded(idAddr);
-      if (hostBonded && (isSecurityFailureReason(reason) || !encrypted)) {
-        ESP_LOGE("BIND", "[ble] SELF-HEAL: deleting stale bond for host %s "
-                 "(reason=0x%04X(%s) enc=%d) so Windows can re-pair",
-                 idAddr.toString().c_str(), reason, reasonName(reason), (int)encrypted);
-        requestDeleteBond(idAddr);
-      }
+    // WS-410 self-heal (review must-fix #2 / should-fix #5). Only the bond-key
+    // failure family may touch a bond: 0x208 supervision timeout (walk away),
+    // 0x213/0x214/0x216 (user/power/local close) never do, so an ordinary
+    // disconnect can no longer wipe a healthy bond.
+    const bool secFail    = isSecurityFailureReason(reason);
+    const bool hostBonded = !idAddr.isNull() && NimBLEDevice::isBonded(idAddr);
+    const bool isOurHost  = s_hostBound && !idAddr.isNull() &&
+                            memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
+
+    if (isOurHost && hostBonded && secFail) {
+      // B/C: it is our host and the bond is still in the store, but the
+      // security handshake failed -> the stored key is stale. Delete it so
+      // Windows re-pairs instead of looping "connected / paired".
+      ESP_LOGE("BIND", "[ble] SELF-HEAL(B/C): deleting stale bond for host %s "
+               "(reason=0x%04X(%s))", idAddr.toString().c_str(), reason, reasonName(reason));
+      requestDeleteBond(idAddr);
+    } else if (s_hostBound && !hostBonded && isBondKeyFailureReason(reason)) {
+      // A: the app still has a binding but our BLE bond is gone/unresolvable,
+      // and the peer tried to use a key we no longer have (so it is our former
+      // host, not a stranger failing a fresh pairing). Reset the app binding so
+      // it can re-pair and bind again — without this the identity-only gate
+      // above would reject it forever.
+      ESP_LOGE("BIND", "[ble] SELF-HEAL(A): app-bound but no BLE bond "
+               "(reason=0x%04X(%s)) -> clearing app binding so the host can re-pair",
+               reason, reasonName(reason));
+      requestClearHostBinding();
     }
 
     // WS-328: a link drop during OTA must abort the write immediately. The
@@ -473,6 +505,31 @@ void BleKeyboard::begin() {
   int bondN = 0;
   ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &bondN);
   ESP_LOGE("BIND", "[ble] bonds(PEER_SEC)=%d", bondN);
+
+  // WS-410 (review must-fix #4): auto-classify the reconnect failure so the
+  // log names the case instead of leaving it to a human to infer:
+  //   B -> the persisted IRK changed since the previous boot (identity drift)
+  //   A -> the app still has a binding but there is no BLE bond
+  //   C -> binding + bond both present (reconnect failure = address/identity)
+  //   none -> no binding yet (fresh device, first pairing)
+  {
+    Preferences p;
+    bool ok = p.begin("binddecklite", false);
+    uint8_t prev[16];
+    bool havePrev = ok && p.getBytesLength("prevIrk") == 16 &&
+                    p.getBytes("prevIrk", prev, 16) == 16;
+    const char* c;
+    if (havePrev && memcmp(prev, irk, 16) != 0) c = "B";
+    else if (s_hostBound && bondN == 0)         c = "A";
+    else if (s_hostBound)                       c = "C";
+    else                                         c = "none";
+    ESP_LOGE("BIND", "[ble] CASE=%s (prevIrk=%s bonds=%d hostBound=%d)",
+             c, havePrev ? "present" : "none", bondN, (int)s_hostBound);
+    if (ok) {
+      p.putBytes("prevIrk", irk, 16);
+      p.end();
+    }
+  }
 
   NimBLEDevice::setMTU(517);                                      // room for long CFG lines
   NimBLEDevice::setPower(9);                                      // +9 dBm, max TX power
@@ -607,16 +664,76 @@ void requestDeleteBond(const NimBLEAddress& addr) {
   if (addr.isNull()) return;
   s_pendingDeleteAddr = addr;
   s_pendingDeleteBond = true;
+  s_lastBondDeleteAttempt = 0;   // first attempt runs on the next loop tick
 }
 
-void processPendingBondDelete() {
+void requestClearHostBinding() {
+  s_pendingClearBinding = true;
+}
+
+void processPendingBleWork() {
+  // WS-410 CASE=A self-heal: drop the app-layer binding so a host whose BLE
+  // bond was lost can re-pair and bind again. Preferences writes stay here on
+  // the Arduino loop task, never on the NimBLE task.
+  if (s_pendingClearBinding) {
+    s_pendingClearBinding = false;
+    ::clearHostBinding();
+    ESP_LOGE("BIND", "[ble] SELF-HEAL(A): app binding cleared -> host will re-pair");
+  }
+
   if (!s_pendingDeleteBond) return;
-  s_pendingDeleteBond = false;
+
+  // Throttle retries; the first attempt (lastAttempt==0) runs immediately.
+  if (s_lastBondDeleteAttempt != 0 &&
+      (unsigned long)(millis() - s_lastBondDeleteAttempt) < 250) {
+    return;
+  }
+  s_lastBondDeleteAttempt = millis();
+
   NimBLEAddress addr = s_pendingDeleteAddr;
-  if (addr.isNull()) return;
-  bool ok = NimBLEDevice::deleteBond(addr);
-  ESP_LOGE("BIND", "[ble] deferred deleteBond %s -> %s",
-           addr.toString().c_str(), ok ? "ok" : "FAILED");
+  if (addr.isNull()) { s_pendingDeleteBond = false; return; }
+
+  // WS-410 (review must-fix #1): ble_gap_unpair() returns BLE_HS_EBUSY while
+  // advertising or discovery is active, for any peer that distributed an IRK
+  // (every Windows bond does) — framework ble_gap.c. Advertising runs almost
+  // continuously here (onDisconnect re-advertises, keepAdvertising() restarts
+  // it), so calling deleteBond() with advertising up fails every time. Stop
+  // advertising around the unpair and restore it afterwards.
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  const bool wasAdv = adv && adv->isAdvertising();
+  if (wasAdv) adv->stop();
+
+  // Call the core directly (not NimBLEDevice::deleteBond, which collapses the
+  // result to bool) so EBUSY / ENOENT can be told apart and retried correctly.
+  const int rc = ble_gap_unpair(addr.getBase());
+
+  if (wasAdv) NimBLEDevice::startAdvertising();
+
+  if (rc == 0) {
+    s_pendingDeleteBond = false;
+    s_lastBondDeleteAttempt = 0;
+    s_bondDeleteFails = 0;
+    ESP_LOGE("BIND", "[ble] deferred deleteBond %s -> ok (wasAdv=%d)",
+             addr.toString().c_str(), (int)wasAdv);
+  } else if (rc == BLE_HS_ENOENT) {
+    // No matching store record (wrong address/type, or already gone): another
+    // retry cannot help, so clear the request and report it once.
+    s_pendingDeleteBond = false;
+    s_lastBondDeleteAttempt = 0;
+    s_bondDeleteFails = 0;
+    ESP_LOGE("BIND", "[ble] deferred deleteBond %s -> no record (rc=0x%X), cleared",
+             addr.toString().c_str(), rc);
+  } else {
+    // Keep pending and retry. EBUSY is called out; both are logged sparingly
+    // so a persistent failure does not flood the console.
+    ++s_bondDeleteFails;
+    if (s_bondDeleteFails == 1 || (s_bondDeleteFails % 40) == 0) {
+      ESP_LOGE("BIND", "[ble] deferred deleteBond %s -> FAILED rc=0x%X%s (attempt %d, will retry)",
+               addr.toString().c_str(), rc,
+               rc == BLE_HS_EBUSY ? " EBUSY(adv active)" : "",
+               s_bondDeleteFails);
+    }
+  }
 }
 
 size_t BleKeyboard::press(uint8_t k) {

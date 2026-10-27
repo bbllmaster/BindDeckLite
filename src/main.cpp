@@ -1329,12 +1329,12 @@ void loop() {
     ESP.restart();
   }
 
-  // ---- WS-410: deferred bond deletion ----------------------------------
+  // ---- WS-410: deferred bond/BLE work ----------------------------------
   // Armed by onDisconnect self-heal or CMD:CLEARBOND (both run on the NimBLE
   // task, where an HCI unpair + NVS write is unsafe). Drain it here on the
   // Arduino loop task.
   if (g_bleStarted) {
-    processPendingBondDelete();
+    processPendingBleWork();
   }
 
   // ---- OTA mode ----------------------------------------------------------

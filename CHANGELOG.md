@@ -5,31 +5,34 @@
 固件侧（`src/nimble_hid.cpp` / `src/main.cpp`）。设备重启后电脑在「已连接 /
 已配对」之间反复闪、需手动删设备才能恢复的根因与修复。
 
-- **诊断（必须先有，判断才有依据）**：`onDisconnect` 现在打印断开
-  `reason` 数值 + 名称（`reasonName`，覆盖 0x205 认证失败 / 0x206 密钥缺失 /
-  0x208 超时 / 0x23E 建链失败 / SM 0x5xx 等）、对端 OTA 地址与 identity 地址、
-  `isEncrypted()` / `isBonded()`；`begin()` 启动段把 `IRK fp=` 从 2 字节扩到
-  完整 16 字节，并新增 `bonds(PEER_SEC)=N`（NimBLE bond 记录数）日志。
-  一次真实重启日志即可判定 A（bond 丢失）/ B（IRK 变了）/ C（地址对不上）。
-- **自愈（无论 A/B/C）**：断开 reason 属认证失败类（`isSecurityFailureReason`）
-  或「已绑定的链路以未加密状态断开」（典型 LTK 丢失/不匹配）时，若该 peer 是本机
-  绑定主机，则 `requestDeleteBond` 删掉本地旧密钥，让 Windows 自己重配，不再需要
-  用户去「删除设备」。普通断开（对方关机、走远、上位机主动断开 = 0x13/0x14/0x16）
-  **一律不动 bond**，避免正常断开被误清。bond 删写在 NimBLE 任务不安全，改为
-  `loop()` 里 `processPendingBondDelete()` 延后执行。
-- **C 地址匹配修法**：`onSubscribe` 绑定态下不再只看一次性地址快照 `memcmp`。
-  优先按 `connInfo.isBonded()`（身份已解析且有 bond）放行，其次按 identity 地址
-  比对；identity 解析不出来时不误判成「非绑定主机」直接丢弃，单独打
-  「bound host identity NOT resolved」日志，区分「未绑定的新主机」与「已绑定但
-  地址解析失败」。
-- **清除绑定真正清干净（part 4）**：`CMD:CLEARBOND` 不再只清应用层 NVS，还会
-  删除对应 peer 的 NimBLE bond（延后到 `loop()` 执行），用户无需再去 Windows
-  手动删设备即可让另一台主机接上。`CMD:GET_BOND` 回报在保持旧
-  `BOND_STATUS:bound,<masked>` 前缀兼容的前提下，追加 `peer_sec=N` 与
-  `nimble_bond=0/1`，让上位机看见 NimBLE 侧是否仍有活 bond。
+- **诊断 + 自动定性**：`onDisconnect` 打印断开 `reason` 数值 + 名称、对端 OTA 与
+  identity 地址、`isEncrypted()` / `isBonded()`；`begin()` 把 `IRK fp` 扩到完整
+  16 字节、新增 `bonds(PEER_SEC)=N`，并**自动打 `CASE=`**：NVS 存上次 IRK 比较
+  （变→B）、`hostBound && bonds==0`→A、否则绑定态→C。不再靠人工推断。
+- **自愈只认密钥类失败（评审 must-fix #2）**：`isSecurityFailureReason` 只含
+  0x205（认证失败）/0x206（PIN/key missing）/25（EENCRYPT）/SM 0x5xx；
+  **排除 0x208（supervision timeout = 走远/断电）、0x213/0x214/0x216、0x23E**，
+  正常断开绝不写 bond。并用 `static_assert` 对真实分类函数做构建期回归护栏：
+  把 0x208 加回「清 bond」集合会直接编译失败。
+- **删 bond 真正成功（评审 must-fix #1）**：`ble_gap_unpair()` 在对端分发过 IRK
+  且广播/扫描进行中时返回 `BLE_HS_EBUSY`（本工程 `onDisconnect`/`keepAdvertising`
+  几乎一直在广播），原实现必失败且失败后清了 pending 不重试。现改为：删前
+  `stopAdvertising()` 并记录原状态、删后恢复；直接调 `ble_gap_unpair` 取 rc，
+  `EBUSY` 保留 pending 重试（250ms 节流），`ENOENT` 视为已删/无记录并清请求。
+- **订阅门只认 identity（评审 must-fix #3）**：`peerBonded || idMatch` 会把「刚配
+  对成功的第二台 PC」也放行（`sec_state.bonded` 只说明有 bond，不说明是不是本机
+  绑的那台）。改为**只按解析出的 identity 地址 == 存储的绑定地址**放行，陌生
+  主机一律拒绝（WS-319 不回退）。
+- **A 类自愈（评审 should-fix #5）**：`app 已绑定 + 无 BLE bond + 密钥类失败` 时，
+  延后清应用层绑定，让对端重新配对后再绑定，避免 identity-only 门在 bond 丢失后
+  永久锁死。
+- **C 地址匹配**：identity 解析不出来时单独打 `reject CASE=C: ... identity NOT
+  resolved`，与「未绑定的新主机」区分开。
+- **清除绑定真正清干净（part 4）**：`CMD:CLEARBOND` 同时删 NimBLE bond（延后到
+  `loop()` 的 `processPendingBleWork()` 执行）。`CMD:GET_BOND` 保持旧
+  `BOND_STATUS:bound,<masked>` 前缀兼容，追加 `peer_sec=N` 与 `nimble_bond=0/1`。
 - **回归**：四个 env `pio run -e esp32dev / esp32c3 / esp32c3_2mb / esp32c3_16mb`
-  全绿；固件无单测，靠构建 + 现场日志（`IRK fp` 两次重启一致、`bonds(PEER_SEC)`
-  重启后仍为 1、断开 reason 不再出现 0x206）回归。
+  全绿；`pio run -e esp32dev` 同时是分类回归命令（`static_assert` 失败即红）。
 
 ## 宏新增 `app:` 步骤：启动桌面应用程序后再输入文字 — 2026-10-22（WS-387）
 

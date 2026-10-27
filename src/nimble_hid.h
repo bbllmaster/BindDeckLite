@@ -95,8 +95,9 @@ private:
   uint8_t _keys[6]   = { 0, 0, 0, 0, 0, 0 };
 };
 
-// WS-410: bond writes (NVS + HCI unpair) must not run on the NimBLE host/SM
-// task, so onDisconnect / CLEARBOND only arm a request here; loop() (Arduino
-// task) drains it via processPendingBondDelete().
+// WS-410: bond writes (NVS + HCI unpair) and app-binding resets must not run on
+// the NimBLE host/SM task, so onDisconnect / CLEARBOND only arm a request here;
+// loop() (Arduino task) drains them via processPendingBleWork().
 void requestDeleteBond(const NimBLEAddress& addr);
-void processPendingBondDelete();
+void requestClearHostBinding();
+void processPendingBleWork();
