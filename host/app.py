@@ -268,6 +268,10 @@ _read_status: dict = {}
 _sysinfo: dict = {}
 # One pending SYS:* wait per device (same cross-thread pattern as _read_windows).
 _sysinfo_windows: dict = {}
+# Last uptime (seconds) seen per device, for millis() wrap detection (WS-449).
+# Runtime-only, same lifetime as _sysinfo: a host restart just means the next
+# sample is a "first sample" again.
+_sysinfo_uptime: dict = {}
 _sysinfo_lock = threading.RLock()
 
 # How long CMD:SYSINFO may take before we call the firmware "unsupported".
@@ -830,15 +834,48 @@ def nvs_text(nvs) -> str:
     return "未知"
 
 
-def sysinfo_view(payload: str) -> dict:
+# --- millis() wrap (WS-449) -----------------------------------------------
+# ESP32 millis() is a 32-bit millisecond counter: it wraps at ~49.7 days, so
+# SYS:uptime falls from ~4294967 s back to ~0 even though the deck never
+# rebooted.  A card showing 「0 秒」 would read as "the device just restarted",
+# which is exactly wrong.  We remember the last value per device and, when the
+# new one is clearly below it, say "已运行" relative to this connection instead.
+UPTIME_WRAP_TEXT = "本次连接内已运行"
+UPTIME_WRAP_NOTE = "设备计时已回绕"
+
+
+def uptime_wrapped(dev_id: str, seconds) -> bool:
+    """Store *seconds* as *dev_id*'s latest uptime and report a millis() wrap.
+
+    The rule is deliberately conservative — previous sample above one minute
+    and the new one below half of it — so a normal reboot (previous 3600 s,
+    new 5 s) is still a wrap report: after a reboot the counter really did
+    restart, and "已运行 5 秒" was the misleading reading either way.
+
+    Returns False for a first sample (no history), for a missing value, and
+    whenever the counter moved normally, so existing displays are untouched.
+    """
+    if not dev_id or seconds is None:
+        return False
+    with _sysinfo_lock:
+        prev = _sysinfo_uptime.get(dev_id)
+        _sysinfo_uptime[dev_id] = int(seconds)
+    return prev is not None and prev > 60 and int(seconds) < prev / 2.0
+
+
+def sysinfo_view(payload: str, dev_id: str = "") -> dict:
     """Build the display record the device card renders from one ``SYS:`` line.
 
     All wording lives here (not in app.js) so the Chinese labels are covered
     by the same tests that cover the parser.  ``flags`` carries the raw
     booleans the UI needs for colouring; ``notes`` carries the one-line
     explanations the parent task asks for.
+
+    *dev_id* enables millis() wrap detection; callers that only render one
+    line (tests, one-shot previews) may omit it and get the plain formatting.
     """
     sample = parse_sysinfo(payload)
+    wrapped = uptime_wrapped(dev_id, sample["uptime"])
     flags = {
         "nvs_bad": sample["nvs"] == 0,
         "heap_low": sample["heap"] is not None and sample["heap"] < SYSINFO_HEAP_WARN,
@@ -852,11 +889,17 @@ def sysinfo_view(payload: str) -> dict:
         notes["deepsleep"] = "设备是睡着了，不是死机"
     if flags["heap_low"]:
         notes["heap"] = "内存偏低，可能影响 OTA"
+    if wrapped:
+        notes["uptime_wrap"] = UPTIME_WRAP_NOTE
     return {
         "sample": sample,
         "display": {
             "reset": reset_reason_text(sample["reset"]),
-            "uptime": uptime_text(sample["uptime"]),
+            # app.js renders notes.safe/heap/deepsleep only, so the wrap hint
+            # is also carried in the value itself; the plain 「5 秒」 is
+            # suppressed because it reads as "just rebooted".
+            "uptime": (f"{UPTIME_WRAP_TEXT}（{UPTIME_WRAP_NOTE}）" if wrapped
+                       else uptime_text(sample["uptime"])),
             "nvs": nvs_text(sample["nvs"]),
             "heap": heap_text(sample["heap"]),
         },
@@ -1310,7 +1353,7 @@ def read_sysinfo(dev_id: str, timeout: float = SYSINFO_TIMEOUT) -> dict:
             _sysinfo[dev_id] = result
         return result
 
-    view = sysinfo_view(payload)
+    view = sysinfo_view(payload, dev_id)
     result = {"ok": True, "supported": True, "at": at, "reason": ""}
     result.update(view)
     with _sysinfo_lock:
