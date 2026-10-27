@@ -98,6 +98,11 @@ static NimBLEAddress   s_pendingDeleteAddr;
 static bool            s_pendingDeleteBond = false;
 // WS-410: CASE=A reset — armed from onDisconnect, drained by loop().
 static bool            s_pendingClearBinding = false;
+// WS-411 #4: a CLEARBOND issued while a link is up must not tear that link
+// down. Remember the old host address and unpair it only after every central
+// has gone.
+static NimBLEAddress   s_deferredBondAddr;
+static bool            s_deleteBondOnDisconnect = false;
 // Retry bookkeeping for the deferred bond delete (EBUSY means "advertising
 // still active, try again"; a permanent error must not spin the log forever).
 static unsigned long   s_lastBondDeleteAttempt = 0;
@@ -419,6 +424,15 @@ class HidServerCB : public NimBLEServerCallbacks {
       s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
     }
 
+    // WS-411 #4: a CLEARBOND issued while a link was up must not tear that
+    // link down. Unpair the old host only once every central has gone, so the
+    // user is never left with a dropped HID link right after clearing.
+    if (s_deleteBondOnDisconnect && !s_connected) {
+      s_deleteBondOnDisconnect = false;
+      ESP_LOGE("BIND", "[ble] CLEARBOND deferred: unpairing old host bond now that the link is down");
+      requestDeleteBond(s_deferredBondAddr);
+    }
+
     // WS-410 self-heal (review must-fix #2 / should-fix #5). Only the bond-key
     // failure family may touch a bond: 0x208 supervision timeout (walk away),
     // 0x213/0x214/0x216 (user/power/local close) never do, so an ordinary
@@ -643,8 +657,19 @@ void BleKeyboard::clearHostBinding() {
   // has to delete the device in Windows. Capture the typed address BEFORE the
   // file-static helper zeroes it, and arm a deferred delete (bond writes are
   // not safe on the NimBLE task — loop() drains it).
+  //
+  // WS-411 #4: if the host is still connected, do NOT unpair on the spot —
+  // ble_gap_unpair() would terminate the live HID link and make the user think
+  // "clear binding" broke their keyboard. Remember it and unpair on the next
+  // disconnect instead.
   if (s_hostBound && !s_hostAddrObj.isNull()) {
-    requestDeleteBond(s_hostAddrObj);
+    if (s_connected) {
+      s_deferredBondAddr = s_hostAddrObj;
+      s_deleteBondOnDisconnect = true;
+      ESP_LOGE("BIND", "[ble] CLEARBOND: link active -> bond will be removed after disconnect");
+    } else {
+      requestDeleteBond(s_hostAddrObj);
+    }
   }
   ::clearHostBinding();   // the file-static helper (clears NVS + RAM)
 }

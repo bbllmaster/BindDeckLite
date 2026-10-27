@@ -28,9 +28,12 @@
   永久锁死。
 - **C 地址匹配**：identity 解析不出来时单独打 `reject CASE=C: ... identity NOT
   resolved`，与「未绑定的新主机」区分开。
-- **清除绑定真正清干净（part 4）**：`CMD:CLEARBOND` 同时删 NimBLE bond（延后到
-  `loop()` 的 `processPendingBleWork()` 执行）。`CMD:GET_BOND` 保持旧
-  `BOND_STATUS:bound,<masked>` 前缀兼容，追加 `peer_sec=N` 与 `nimble_bond=0/1`。
+- **清除绑定真正清干净（part 4 / 评审 WS-411 #4）**：`CMD:CLEARBOND` 同时删
+  NimBLE bond。**对端仍连接时不当场拆链**：记下地址，等所有 central 断开后再
+  unpair（延后到 `loop()` 的 `processPendingBleWork()`），并打
+  `CLEARBOND: link active -> bond will be removed after disconnect`。
+  `CMD:GET_BOND` 保持旧 `BOND_STATUS:bound,<masked>` 前缀兼容，追加
+  `peer_sec=N` 与 `nimble_bond=0/1`。
 - **回归**：四个 env `pio run -e esp32dev / esp32c3 / esp32c3_2mb / esp32c3_16mb`
   全绿；`pio run -e esp32dev` 同时是分类回归命令（`static_assert` 失败即红）。
 
