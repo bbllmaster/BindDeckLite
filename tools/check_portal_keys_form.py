@@ -22,9 +22,11 @@ source (not a copy of it) and asserts the four invariants:
    reason list (``aria-describedby='cfgerr'``) and that id must exist on the
    banner, otherwise a screen reader announces "invalid" with no reason.
 
-4. **C3 pin range wording** -- GPIO18/19 physically exist on the C3 (they are
-   the USB D-/D+ pair, unused on this board); the rejection text must not claim
-   the C3 stops at GPIO10,20,21.
+4. **C3 GPIO18/19** -- they are the C3's USB D-/D+ pair and this build runs
+   USB-CDC on them, so they are not free pins: ``isValidButtonPin()`` must
+   reject them, ``pinRejectReason()`` must say why, and the out-of-range text
+   must not advertise "0-10、18-21" as usable (README and the host hint already
+   say "avoid 11-17 and 18/19").
 
 Usage:  python tools/check_portal_keys_form.py [path/to/main.cpp]
 Exit:   0 = all checks pass, 1 = at least one invariant is broken.
@@ -101,12 +103,56 @@ def check_aria(src: str) -> None:
         fail("aria-describedby 未随错误条一起出现（错误条不渲染时会指向悬空 id）")
 
 
+def function_body(src: str, signature: str) -> str:
+    """Return the text of a top-level function, closing brace included."""
+    start = src.find(signature)
+    if start < 0:
+        return ""
+    end = src.find("\n}", start)
+    return src[start:end + 2] if end > 0 else src[start:]
+
+
+def c3_branch(body: str) -> str:
+    """The ``#ifdef TARGET_ESP32C3`` half of a function body."""
+    start = body.find("#ifdef TARGET_ESP32C3")
+    if start < 0:
+        return ""
+    alt = body.find("#else", start)
+    end = body.find("#endif", start)
+    stop = alt if 0 <= alt and (end < 0 or alt < end) else end
+    return body[start:stop if stop > 0 else len(body)]
+
+
+def check_c3_usb_pins(src: str) -> None:
+    """GPIO18/19 are the C3's USB D-/D+; the whitelist must reject them.
+
+    The board runs USB-CDC on 18/19, so a button configured there would kill
+    the serial console.  README and the host hint already say "avoid 11-17 and
+    18/19"; ``isValidButtonPin()`` used to accept them and the portal happily
+    saved a pin that silently breaks logging.
+    """
+    accept = c3_branch(function_body(src, "static bool isValidButtonPin(int pin)"))
+    if not accept:
+        fail("找不到 isValidButtonPin() 的 C3 分支")
+    elif not re.search(r"pin\s*>=\s*18\s*&&\s*pin\s*<=\s*19\s*\)\s*return\s+false", accept):
+        fail("isValidButtonPin() 的 C3 分支仍接受 GPIO18/19：C3 上 18/19 是 USB D-/D+"
+             "（USB-CDC 占用），应判为无效引脚")
+
+    reason = c3_branch(function_body(src, "static String pinRejectReason(int idx, int pin)"))
+    if not reason:
+        fail("找不到 pinRejectReason() 的 C3 分支")
+    elif not re.search(r"pin\s*>=\s*18\s*&&\s*pin\s*<=\s*19\s*\)\s*return[^;]*USB", reason):
+        fail("pinRejectReason() 对 GPIO18/19 没有给出「USB D-/D+」原因（与白名单不同步）")
+
+
 def check_c3_range_text(src: str) -> None:
-    """GPIO18/19 exist on the C3 even though this board does not use them."""
-    if "GPIO0-10、18-21" not in src:
-        fail("C3 引脚范围文案未修正为 GPIO0-10、18-21")
+    """The C3 rejection text must not offer GPIO18/19 as usable pins."""
+    if "GPIO0-10、18-21" in src:
+        fail("C3 文案把 GPIO18/19 算作可用（「GPIO0-10、18-21」）：18/19 是 USB D-/D+")
     if "GPIO0-10、20、21" in src:
-        fail("仍残留旧文案「C3 只有 GPIO0-10、20、21」：18/19 物理存在，只是本机未用")
+        fail("仍残留旧文案「C3 只有 GPIO0-10、20、21」：18/19 物理存在，只是被 USB 占用")
+    if "C3 可用 GPIO0-10、20-21" not in src:
+        fail("C3 引脚范围文案未写成「C3 可用 GPIO0-10、20-21」")
 
 
 def main() -> int:
@@ -121,6 +167,7 @@ def main() -> int:
     check_400_fallback(src)
     check_pin_input_type(src)
     check_aria(src)
+    check_c3_usb_pins(src)
     check_c3_range_text(src)
 
     if FAILURES:

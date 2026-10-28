@@ -267,6 +267,12 @@ static bool isValidButtonPin(int pin) {
 #ifdef TARGET_ESP32C3
   if (pin < 0 || pin > 21) return false;
   if (pin >= 11 && pin <= 17) return false;   // embedded flash
+  // GPIO18/19 are the C3's USB D-/D+ pair and this build runs USB-CDC on them
+  // (ARDUINO_USB_CDC_ON_BOOT=1), so they are never free for a button: wiring
+  // one there kills the serial log. README and the host already say "avoid
+  // 11-17 and 18/19"; the whitelist has to agree or the portal will happily
+  // accept a pin that silently breaks the console.
+  if (pin >= 18 && pin <= 19) return false;
   // Do NOT apply the classic-ESP32 exclusions here: GPIO6..GPIO8 are ordinary
   // pins on the C3 and buttons 7..9 of this board sit on them. Applying the
   // classic rule made every pin set invalid on the C3, so CFG:PINS: and the
@@ -299,8 +305,9 @@ static String pinRejectReason(int idx, int pin) {
   if (pin < 0 || pin > 39) return btn + " 必须填 0-39 的整数";
   String who = btn + " 的 GPIO " + String(pin);
 #ifdef TARGET_ESP32C3
-  if (pin > 21) return who + " 在 C3 上不存在（C3 只有 GPIO0-10、18-21）";
+  if (pin > 21) return who + " 在 C3 上不存在（C3 可用 GPIO0-10、20-21）";
   if (pin >= 11 && pin <= 17) return who + " 在 C3 上是内部 Flash 引脚，不能用作按键";
+  if (pin >= 18 && pin <= 19) return who + " 在 C3 上是 USB D-/D+ 引脚（USB-CDC 串口占用），不能用作按键";
 #else
   if (pin >= 6 && pin <= 11) return who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键";
   if (pin >= 34) return who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键";
