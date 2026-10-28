@@ -10,13 +10,14 @@ Usage:
   python tools/build_release.py [--skip-build] [--target <name> ...]
 
   --target may be given several times to build only the chosen targets
-  (esp32 | c3 | c3_16mb | c3_2mb); default = all. The flag lets CI build a
+  (esp32 | c3 | c3_16mb); default = all. The flag lets CI build a
   single target without re-running the whole matrix, e.g. after a targeted
   change to one partition table.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
@@ -59,16 +60,6 @@ TARGETS = {
         "bootloader_offset": "0x0",
         "boot_app0_offset": "0xe000",
         "bootloader": IDF_BOOTLOADER,
-    },
-    # 2 MB C3 modules: single app slot, no OTA.
-    "c3_2mb": {
-        "env": "esp32c3_2mb",
-        "chip": "esp32c3",
-        "name": "c3_2mb",
-        "flash_freq": "80m",
-        "flash_size": "2MB",
-        "bootloader_offset": "0x0",
-        "boot_app0_offset": "0xd000",
     },
 }
 
@@ -200,25 +191,35 @@ def build_idf_bootloader(skip_build: bool) -> str:
     return IDF_BOOTLOADER
 
 
-def _parse_targets(argv):
-    """Return the subset of TARGETS requested on the command line.
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Build BindDeckLite firmware images for release."
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="reuse existing build output instead of running pio",
+    )
+    parser.add_argument(
+        "--target",
+        action="append",
+        choices=list(TARGETS),
+        metavar="NAME",
+        help="build only the given target (repeatable); default = all",
+    )
+    return parser.parse_args(argv)
 
-    Every --target <name> adds one; with none given, all targets are built.
-    Unknown names abort so a typo never silently builds the wrong image.
-    """
-    wanted = [a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--target"]
+
+def _select_targets(wanted):
+    """Return the subset of TARGETS requested on the command line."""
     if not wanted:
         return dict(TARGETS)
-    unknown = [w for w in wanted if w not in TARGETS]
-    if unknown:
-        raise SystemExit(
-            "unknown --target %s (choose from %s)" % (", ".join(unknown), ", ".join(TARGETS))
-        )
     return {w: TARGETS[w] for w in wanted}
 
 
 def main():
-    skip_build = "--skip-build" in sys.argv
+    args = _parse_args(sys.argv[1:])
+    skip_build = args.skip_build
     version = fw_version()
     os.makedirs(DIST, exist_ok=True)
     esptool_cmd = find_esptool()
@@ -227,7 +228,7 @@ def main():
     # Built once, used by the 16 MB image only.
     build_idf_bootloader(skip_build)
 
-    for target, t in _parse_targets(sys.argv).items():
+    for target, t in _select_targets(args.target).items():
         build_dir = os.path.join(ROOT, ".pio", "build", t["env"])
         if not skip_build:
             print(f"==> building {t['env']}")

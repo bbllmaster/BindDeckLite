@@ -1,5 +1,17 @@
 # Changelog
 
+## 移除 `esp32c3_2mb` 环境与发布产物 — 2026-10-28（WS-460）
+
+2 MB Flash 的 C3 模块不再维护：4 MB 分区表在 2 MB 芯片上会被 bootloader 判为
+无效，必须单独维护一份单槽分区表，收益不足以抵消额外的构建/发布分支。
+
+- `platformio.ini` 删除 `[env:esp32c3_2mb]` 及其说明注释；保留 `esp32dev` / `esp32c3` / `esp32c3_16mb` 三个环境。
+- 删除 `partitions/binddecklite_2mb_c3.csv`。
+- `tools/build_release.py` 的 `TARGETS` 去掉 `c3_2mb`，`--target` 只接受 `esp32 | c3 | c3_16mb`；顺带补上 argparse，`--help` 不再触发一次完整构建。
+- CI：`build-firmware.yml` 矩阵只剩 3 个 env，`release.yml` 不再校验 `merged_binddecklite_c3_2mb_*.bin`。
+- 设备运行时诊断（上报 2048 KB 无 app1 时提示不支持上位机 OTA）保持不变，已售出的 2 MB 设备仍能正确提示。
+- 回归：`pio run -e esp32c3_2mb; echo exit=$?`（改动前 `exit=0`，改动后非 0，`UnknownEnvNames`）。
+
 ## 设备页「运行状态」卡片 + `CMD:SYSINFO` — 2026-10-27（WS-445）
 
 固件早就算出了运行时长、上次复位原因、NVS 是否可用和空闲堆，但只打到 Serial：
