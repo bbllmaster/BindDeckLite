@@ -3670,7 +3670,11 @@ def api_desktop():
             # 都不是「重写条目」失败，改写文案会让用户看不懂该做什么。
             reason = str(result.get("error") or "设置失败")
             add_event("desktop", "自启动设置失败：" + reason, level="warn")
-            return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
+            # desktop_payload() also carries an "error" key (the desktop state
+            # error), so it is spread *first* - written last, the real reason
+            # below would be overwritten by that (usually empty) value and the
+            # UI would fall back to the generic "设置失败".
+            return jsonify({"ok": False, **desktop_payload(), "error": reason}), 500
         for message in messages:
             add_event("desktop", message, level="ok")
 

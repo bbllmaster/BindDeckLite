@@ -146,8 +146,16 @@ def _win_disable() -> None:
 # operation.  The only way through is a shell "runas" child, i.e. a UAC prompt
 # on demand when the user turns the mode on or off.
 _SEE_MASK_NOCLOSEPROCESS = 0x40
+# The caller is a werkzeug worker thread (``threaded=True``) with no message
+# loop.  MS documents SEE_MASK_NOASYNC as required for exactly that case:
+# without it ShellExecuteEx may return before the elevated child has started,
+# leaving ``hProcess`` not ready to wait on.
+_SEE_MASK_NOASYNC = 0x100
 _SW_HIDE = 0
 _ERROR_CANCELLED = 1223
+# "The requested operation requires elevation" - a standard account with UAC
+# turned off cannot answer the prompt at all.
+_ERROR_ELEVATION_REQUIRED = 740
 _WAIT_OBJECT_0 = 0
 _ELEVATED_TIMEOUT_MS = 120000
 
@@ -172,6 +180,21 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
         if create:
             return False, f"创建计划任务失败（{detail}），可能需要管理员账户"
         return False, f"删除计划任务失败（{detail}）"
+
+    def _after_timeout() -> tuple[bool, str]:
+        """Decide a timed-out elevation by looking at the task store.
+
+        The 120 s wait can expire while the UAC prompt is still on screen: the
+        user clicks "是" after we gave up, the task does get created, and the
+        autostart entry we kept (the Run value) would start a second instance
+        at the next logon.  Re-query before calling it a failure.
+        """
+        task = _task_query()
+        if not task["supported"] or task["error"]:
+            return _failed("等待超时")
+        if create:
+            return (True, "") if task["exists"] else _failed("等待超时")
+        return (True, "") if not task["exists"] else _failed("等待超时")
 
     if not sys.platform.startswith("win"):
         return False, "当前平台不支持 UAC 提权"
@@ -215,7 +238,7 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
 
         info = _SHELLEXECUTEINFOW()
         info.cbSize = ctypes.sizeof(info)
-        info.fMask = _SEE_MASK_NOCLOSEPROCESS
+        info.fMask = _SEE_MASK_NOCLOSEPROCESS | _SEE_MASK_NOASYNC
         info.lpVerb = "runas"
         info.lpFile = _schtasks_exe()
         info.lpParameters = subprocess.list2cmdline(args)
@@ -224,13 +247,17 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
             err = ctypes.get_last_error()
             if err == _ERROR_CANCELLED:
                 return False, "已取消提权"
-            return False, f"ShellExecuteEx 失败: {err}"
+            if err == _ERROR_ELEVATION_REQUIRED:
+                # Nothing the user can click: the account cannot elevate while
+                # UAC is off, so say what to fix instead of a bare Win32 code.
+                return _failed("需要管理员权限（740）")
+            return _failed(f"ShellExecuteEx 失败: {err}")
         handle = info.hProcess
         if not handle:
             return _failed("没有取得进程句柄")
         try:
             if wait_for(handle, _ELEVATED_TIMEOUT_MS) != _WAIT_OBJECT_0:
-                return _failed("等待超时")
+                return _after_timeout()
             code = wintypes.DWORD()
             if not get_exit_code(handle, ctypes.byref(code)):
                 return _failed("无法读取退出码")

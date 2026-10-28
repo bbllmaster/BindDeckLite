@@ -1630,11 +1630,15 @@ async function init() {
   $("#adminAutostartToggle").onchange = async (e) => {
     const target = e.target;
     const want = target.checked;
-    // 未提权时后端要靠 UAC 弹窗创建计划任务，先说清楚会发生什么。
+    // 未提权时后端要靠 UAC 弹窗创建/删除计划任务，先说清楚会发生什么。
+    // 关闭提权同样要删任务（HIGHEST 任务普通权限删不掉），也会弹 UAC。
     const auto = (state.desktop && state.desktop.autostart) || {};
-    if (want && !auto.is_admin) {
-      if (!confirm("将请求 UAC 授权（仅用于创建计划任务，不会重启上位机）")) {
-        target.checked = false;
+    if (!auto.is_admin && (want || auto.admin)) {
+      const hint = want
+        ? "将请求 UAC 授权（仅用于创建计划任务，不会重启上位机）"
+        : "将请求 UAC 授权（用于删除计划任务，不会重启上位机）";
+      if (!confirm(hint)) {
+        target.checked = !want;
         return;
       }
     }
