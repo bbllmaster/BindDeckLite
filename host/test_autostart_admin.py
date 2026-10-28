@@ -83,6 +83,9 @@ def windows(monkeypatch):
     monkeypatch.setitem(sys.modules, "winreg", module)
 
     monkeypatch.setattr(autostart, "_platform", lambda: "windows")
+    # The fixture is an already-elevated host by default so the plain
+    # subprocess path stays under test; the UAC cases below flip it.
+    monkeypatch.setattr(autostart, "is_elevated", lambda: True)
 
     def _fake_run(cmd, *args, **kwargs):
         calls.append(list(cmd))
@@ -294,4 +297,147 @@ def test_status_decodes_utf16_task_xml(windows):
 
     assert info["admin"] is True
     assert "程序 目录" in info["detail"]
+
+
+# --- 9. a non-elevated host elevates on demand (UAC) ---------------------
+# These drive ``autostart.enable`` / ``disable`` and only stub the *executor*
+# (``_elevated_schtasks``) - the argument list, the ordering and the Run-key
+# handling all stay production code.
+@pytest.fixture
+def elevation(monkeypatch):
+    """Record ``_elevated_schtasks`` calls; default result is success."""
+    calls: list[list[str]] = []
+    state = {"result": (True, "")}
+
+    def _fake_elevated(args):
+        calls.append(list(args))
+        return state["result"]
+
+    # ``raising=False`` keeps the fixture usable against a build that does not
+    # have the executor yet - then the production code below must *not* call
+    # it, which is exactly what the pre-fix behaviour did.
+    monkeypatch.setattr(autostart, "_elevated_schtasks", _fake_elevated,
+                        raising=False)
+    return {"calls": calls, "state": state}
+
+
+def test_unelevated_enable_admin_goes_through_uac(windows, elevation, monkeypatch):
+    """Without admin rights the task is created by an elevated schtasks."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+
+    result = enable(admin=True)
+
+    assert result["ok"] is True
+    assert len(elevation["calls"]) == 1
+    args = elevation["calls"][0]
+    assert args[0] == "/create"
+    assert args[args.index("/tn") + 1] == autostart.TASK_NAME
+    assert args[args.index("/sc") + 1] == "onlogon"
+    assert args[args.index("/rl") + 1] == "highest"
+    assert "/f" in args
+    assert "app.py" in args[args.index("/tr") + 1]
+    # The plain subprocess path must not be used for the privileged create.
+    assert not _schtasks_calls(windows, "/create")
+
+
+def test_unelevated_enable_admin_uac_cancelled_keeps_run_value(
+        windows, elevation, monkeypatch):
+    """Cancelling UAC must fail cleanly and leave the Run value untouched."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+    elevation["state"]["result"] = (False, "已取消提权")
+    run_key = autostart.RUN_KEY
+    windows["store"][run_key] = {autostart.VALUE_NAME: "old-command"}
+
+    result = enable(admin=True)
+
+    assert result["ok"] is False
+    assert "取消" in result["error"]
+    # The task never got created, so the old Run entry is still the autostart.
+    assert windows["store"][run_key][autostart.VALUE_NAME] == "old-command"
+    assert not [e for e in windows["log"] if e[0] == "DeleteValue"]
+    assert not _schtasks_calls(windows, "/create")
+
+
+def test_unelevated_enable_admin_reports_elevated_failure(
+        windows, elevation, monkeypatch):
+    """A refused create surfaces the executor's reason instead of a run value."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+    elevation["state"]["result"] = (False, "创建计划任务失败（退出码 1），可能需要管理员账户")
+    run_key = autostart.RUN_KEY
+    windows["store"][run_key] = {autostart.VALUE_NAME: "old-command"}
+
+    result = enable(admin=True)
+
+    assert result["ok"] is False
+    assert "管理员账户" in result["error"]
+    assert windows["store"][run_key][autostart.VALUE_NAME] == "old-command"
+
+
+def test_elevated_enable_admin_does_not_prompt_uac(windows, elevation):
+    """An already-elevated host keeps using subprocess - no UAC window."""
+    result = enable(admin=True)
+
+    assert result["ok"] is True
+    assert elevation["calls"] == []
+    assert _schtasks_calls(windows, "/create")
+
+
+def test_unelevated_disable_deletes_task_through_uac(
+        windows, elevation, monkeypatch):
+    """A HIGHEST task cannot be deleted unelevated; disable() elevates."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+    run_key = autostart.RUN_KEY
+    windows["store"][run_key] = {autostart.VALUE_NAME: "old-command"}
+    windows["query"]["xml"] = TASK_XML
+
+    result = disable()
+
+    assert result["ok"] is True
+    assert len(elevation["calls"]) == 1
+    args = elevation["calls"][0]
+    assert args[0] == "/delete"
+    assert args[args.index("/tn") + 1] == autostart.TASK_NAME
+    assert "/f" in args
+    assert not _schtasks_calls(windows, "/delete")
+    # The Run value is cleared as usual.
+    assert autostart.VALUE_NAME not in windows["store"].get(run_key, {})
+
+
+def test_unelevated_disable_without_task_does_not_prompt(
+        windows, elevation, monkeypatch):
+    """Nothing to delete -> no pointless UAC prompt on every disable."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+    windows["query"].update(
+        xml="ERROR: The system cannot find the file specified.\r\n", returncode=1)
+
+    result = disable()
+
+    assert result["ok"] is True
+    assert elevation["calls"] == []
+
+
+def test_unelevated_disable_uac_cancelled_keeps_run_value(
+        windows, elevation, monkeypatch):
+    """A cancelled delete prompt must not half-disable autostart."""
+    monkeypatch.setattr(autostart, "is_elevated", lambda: False)
+    elevation["state"]["result"] = (False, "已取消提权")
+    run_key = autostart.RUN_KEY
+    windows["store"][run_key] = {autostart.VALUE_NAME: "old-command"}
+    windows["query"]["xml"] = TASK_XML
+
+    result = disable()
+
+    assert result["ok"] is False
+    assert "取消" in result["error"]
+    assert windows["store"][run_key][autostart.VALUE_NAME] == "old-command"
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"),
+                    reason="would raise a real UAC prompt on Windows")
+def test_elevated_schtasks_is_safe_off_windows():
+    """The elevation helper must degrade to an error, never raise."""
+    ok, err = autostart._elevated_schtasks(["/create"])
+
+    assert ok is False
+    assert err
 

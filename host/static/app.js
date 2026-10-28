@@ -1630,6 +1630,14 @@ async function init() {
   $("#adminAutostartToggle").onchange = async (e) => {
     const target = e.target;
     const want = target.checked;
+    // 未提权时后端要靠 UAC 弹窗创建计划任务，先说清楚会发生什么。
+    const auto = (state.desktop && state.desktop.autostart) || {};
+    if (want && !auto.is_admin) {
+      if (!confirm("将请求 UAC 授权（仅用于创建计划任务，不会重启上位机）")) {
+        target.checked = false;
+        return;
+      }
+    }
     target.disabled = true;
     try {
       await updateDesktop({ admin_autostart: want });

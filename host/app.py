@@ -3666,8 +3666,10 @@ def api_desktop():
         if rewrite:
             result = autostart.enable(minimized, admin=admin_pref)
         if result is not None and not result.get("ok"):
-            reason = str(result.get("error", "设置失败"))
-            add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
+            # 原样带上后端原因：UAC 被取消、需要管理员账户、schtasks 报错
+            # 都不是「重写条目」失败，改写文案会让用户看不懂该做什么。
+            reason = str(result.get("error") or "设置失败")
+            add_event("desktop", "自启动设置失败：" + reason, level="warn")
             return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
         for message in messages:
             add_event("desktop", message, level="ok")
