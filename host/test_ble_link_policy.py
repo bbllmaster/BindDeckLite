@@ -328,3 +328,83 @@ def test_main_cpp_captures_the_pre_boot_nvs_state(policy):
     assert "g_deckRebooted" in src
     assert "static BleBootFacts bootFacts()" in src
     assert re.search(r"bleKeyboard\.begin\(bootFacts\(\)\)", src)
+
+
+# ---------------------------------------------------------------------------
+# WS-419b - peer admission and the config-channel gate
+# ---------------------------------------------------------------------------
+#
+# Field case: a phone paired with a deck that was already bound to a PC. The
+# log showed `reject non-bound host` at HID-subscribe time only, yet the phone
+# said "paired" and kept the link. Two defects behind it:
+#
+#   1. the gate ran in onSubscribe(), i.e. after SMP - a central that pairs and
+#      never subscribes was never rejected at all;
+#   2. rejecting the subscription left the link and the bond in place, and the
+#      CFG/CMD channel only asked for WRITE_ENC, so the phone could rewrite the
+#      deck's configuration.
+
+def _admit(binary, bound, identity_null, identity_matches):
+    return _run(binary, "admit %d %d %d" % (bound, identity_null,
+                                            identity_matches))[0]
+
+
+def test_bound_host_is_admitted(policy):
+    out = _admit(policy, 1, 0, 1)
+    assert out["verdict"] == "allow"
+    assert out["disconnect"] == "0"
+
+
+def test_stranger_that_just_paired_is_rejected(policy):
+    """A resolved identity that is not the bound host must lose the link."""
+    out = _admit(policy, 1, 0, 0)
+    assert out["verdict"] == "reject"
+    assert out["disconnect"] == "1", \
+        "the stranger's link has to be dropped, not just its HID subscription"
+
+
+def test_unresolved_identity_is_not_a_stranger(policy):
+    """CASE=C is the bound host whose RPA did not resolve - never disconnect it."""
+    out = _admit(policy, 1, 1, 0)
+    assert out["verdict"] == "undecided"
+    assert out["disconnect"] == "0"
+
+
+def test_unbound_deck_admits_every_central(policy):
+    """Before a host is bound the first central takes the slot."""
+    assert _admit(policy, 0, 0, 0)["verdict"] == "allow"
+    assert _admit(policy, 0, 1, 0)["verdict"] == "allow"
+
+
+def _cfg(binary, bound, identity_null, identity_matches):
+    return _run(binary, "cfg %d %d %d" % (bound, identity_null,
+                                          identity_matches))[0]
+
+
+def test_cfg_allows_the_bound_host(policy):
+    assert _cfg(policy, 1, 0, 1)["allow"] == "1"
+
+
+def test_cfg_denies_the_stranger_that_paired(policy):
+    """This is the security hole: the phone could write CFG:/CMD: lines."""
+    assert _cfg(policy, 1, 0, 0)["allow"] == "0"
+
+
+def test_cfg_denies_an_unresolved_identity_on_a_bound_deck(policy):
+    assert _cfg(policy, 1, 1, 0)["allow"] == "0"
+
+
+def test_cfg_allows_an_unbound_deck(policy):
+    assert _cfg(policy, 0, 0, 0)["allow"] == "1"
+
+
+def test_firmware_wires_admission_and_the_config_gate(policy):
+    """The policy is only worth testing if the firmware actually calls it."""
+    src = _read(FIRMWARE)
+    assert "admitPeer" in src, "nimble_hid.cpp must call blepol::admitPeer"
+    assert "bleConfig.peerAllowed" in src, \
+        "nimble_hid.cpp must install the CFG identity gate"
+    assert "disconnect(connInfo.getConnHandle()" in src, \
+        "a rejected peer must be disconnected, not just refused"
+    cfg = _read(os.path.join(SRC_DIR, "ble_config.cpp"))
+    assert "peerAllowed" in cfg, "the CFG write path must consult the gate"

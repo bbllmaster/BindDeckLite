@@ -31,7 +31,22 @@ static bool looksLikeTextCommand(const std::string& v) {
 // to onOtaData() verbatim. Text commands (CMD:OTA_END / CMD:OTA_CANCEL) must
 // still reach onCommand: they are what finalizes or aborts the session.
 class CfgRxCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*connInfo*/) override {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) override {
+    // WS-419b: the WRITE_ENC permission only proves the peer is *some* bonded
+    // central, and any phone that paired while the deck advertises qualifies.
+    // Without this check such a peer could rewrite pins, switch the encoder
+    // mode or reboot the deck into config mode over BLE.
+    if (bleConfig.peerAllowed) {
+      NimBLEAddress idAddr = connInfo.getIdAddress();
+      const bool idNull = idAddr.isNull();
+      if (!bleConfig.peerAllowed(idNull ? nullptr : idAddr.getVal(), idNull)) {
+        ESP_LOGE("CFG", "[cfg] reject write from non-bound peer id=%s (conn=0x%04X)",
+                 idNull ? "(unresolved)" : idAddr.toString().c_str(),
+                 connInfo.getConnHandle());
+        return;
+      }
+    }
+
     std::string v = c->getValue();
     if (v.empty()) return;
 
