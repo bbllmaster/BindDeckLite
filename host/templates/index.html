@@ -138,6 +138,10 @@
           <input type="checkbox" id="autostartToggle">
           <span>开机自启动</span>
         </label>
+        <label class="row" id="adminAutostartRow">
+          <input type="checkbox" id="adminAutostartToggle">
+          <span>以管理员身份运行（开机自启动时）</span>
+        </label>
         <label class="row">
           <input type="checkbox" id="minimizedToggle">
           <span>开机启动时最小化到托盘</span>
@@ -149,6 +153,7 @@
         <p class="muted small" id="desktopHint">读取中…</p>
         <div class="btn-row">
           <button class="btn small-btn" id="btnShowWindow" hidden>显示窗口</button>
+          <button class="btn small-btn" id="btnRestartAdmin" hidden>立即以管理员身份重启</button>
           <button class="btn danger small-btn" id="btnQuitHost" hidden>退出上位机</button>
         </div>
       </div>

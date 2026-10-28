@@ -963,9 +963,20 @@ function renderDesktop() {
   badge.textContent = d.frozen ? "打包版 exe" : d.desktop_mode ? "托盘模式" : "源码运行";
 
   const auto = d.autostart || {};
+  const isWindows = String(d.platform || "").startsWith("win");
   const toggle = $("#autostartToggle");
   toggle.checked = !!auto.enabled;
   toggle.disabled = !auto.supported;
+  // 以管理员身份运行：只有 Windows 能用（计划任务 + 最高权限）。
+  const adminToggle = $("#adminAutostartToggle");
+  adminToggle.checked = !!auto.admin;
+  // 未开自启动时禁用它：勾上会顺手把开机自启动打开，用户未必想要。
+  adminToggle.disabled = !auto.admin_supported || !auto.enabled;
+  // .row 是 display:flex（作者样式），[hidden] 的 display:none 会被覆盖，
+  // 必须直接改 style.display。
+  $("#adminAutostartRow").style.display = auto.admin_supported ? "" : "none";
+  // 提权重启靠 ShellExecuteW("runas")，同样只有 Windows 有。
+  $("#btnRestartAdmin").hidden = !isWindows;
   $("#minimizedToggle").checked = !!d.start_minimized;
   // close_button_behavior: "minimize" (default) → checked, "exit" → unchecked
   $("#closeMinimizeToggle").checked = (d.close_button_behavior || "minimize") === "minimize";
@@ -987,6 +998,13 @@ function renderDesktop() {
     bits.push("开机自启动不可用");
   }
   if (auto.error) bits.push(auto.error);
+  // auto.admin：自启动条目是不是「计划任务（最高权限）」。
+  // auto.is_admin：当前这个进程本身有没有提权。两者互相独立。
+  if (auto.admin) bits.push("当前以计划任务最高权限启动");
+  if (isWindows && !auto.is_admin) {
+    bits.push("当前未提权，宏无法输入到以管理员运行的程序，可点「立即以管理员身份重启」");
+  }
+  if (auto.admin_error) bits.push(auto.admin_error);
   const desktopError = (d.error || "").replace(/^托盘不可用：/, "");
   if (desktopError && !bits.includes(desktopError)) bits.push(desktopError);
   $("#desktopHint").textContent = bits.join("；") + "。";
@@ -1609,6 +1627,21 @@ async function init() {
       target.disabled = !auto.supported;
     }
   };
+  $("#adminAutostartToggle").onchange = async (e) => {
+    const target = e.target;
+    const want = target.checked;
+    target.disabled = true;
+    try {
+      await updateDesktop({ admin_autostart: want });
+      toast(want ? "开机自启动将以管理员身份运行" : "已改为普通权限开机自启动", "ok");
+    } catch (err) {
+      target.checked = !want;
+      toast("设置管理员自启动失败：" + err.message, "bad");
+    } finally {
+      const auto = (state.desktop && state.desktop.autostart) || {};
+      target.disabled = !auto.admin_supported || !auto.enabled;
+    }
+  };
   $("#minimizedToggle").onchange = async (e) => {
     const target = e.target;
     const want = target.checked;
@@ -1634,6 +1667,19 @@ async function init() {
       target.checked = !minimize;
       toast(err.message, "bad");
     } finally {
+      target.disabled = false;
+    }
+  };
+  $("#btnRestartAdmin").onclick = async () => {
+    const target = $("#btnRestartAdmin");
+    target.disabled = true;
+    try {
+      const res = await fetch("/api/desktop/restart-admin", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || "提权重启失败");
+      toast("已拉起管理员实例，本实例即将退出", "ok");
+    } catch (err) {
+      toast("提权重启失败：" + (err.message || err), "bad");
       target.disabled = false;
     }
   };
