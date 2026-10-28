@@ -191,9 +191,20 @@
           <h2>实时日志</h2>
           <p>按键、编码器、配置下发与设备回包。</p>
         </div>
-        <button class="btn small-btn" id="btnClearLog">清空</button>
+        <div class="log-actions">
+          <span class="log-paused-tag" id="logPausedTag" hidden>已暂停</span>
+          <button class="btn small-btn" id="btnClearLog">清空</button>
+        </div>
       </div>
-      <div class="log" id="logList"></div>
+      <div class="log-wrap">
+        <div class="log" id="logList"></div>
+        <!-- 暂停跟随时浮在底部的胶囊：N 为暂停后新到达的行数 -->
+        <div class="log-new" id="logNew" hidden>
+          <button type="button" class="log-new-btn" id="btnLogJump">
+            <span id="logNewCount" aria-live="polite">↓ 0 条新日志</span>
+          </button>
+        </div>
+      </div>
     </section>
   </main>
 </div>
@@ -340,6 +351,7 @@ key:enter</pre>
 </div>
 
 <div class="toast" id="toast"></div>
+<script src="/static/log_follow.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

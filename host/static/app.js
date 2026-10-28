@@ -40,6 +40,8 @@ const state = {
   cfg: null,
   keycodes: [],
   logSeq: 0,
+  logFollow: true,     // 日志是否跟随最新行（WS-470）；上滚即暂停
+  logPending: 0,       // 暂停期间新到达、尚未查看的行数
   dirty: false,
   saveTimer: null,
   preview: false,
@@ -1393,12 +1395,116 @@ async function acceptDeviceValue(field) {
 
 /* ---------------- log ---------------- */
 
+// WS-470：日志「跟随 / 暂停」。判据只有一条 —— 用户是否停在底部（≤ 24 px）。
+// 纯逻辑在 log_follow.js（同样的代码 Node 测试直接 import）。
+const LOG_FOLLOW_THRESHOLD = window.LogFollow.DEFAULT_THRESHOLD;
+
+/**
+ * 当前是否贴底。
+ *
+ * 返回 null 表示容器量不出高度（日志页被切到别的 tab），此时不做判定，
+ * 暂停状态与计数跨 tab 保留。
+ */
+function logIsFollowing(list) {
+  if (!list || list.clientHeight === 0) return null;
+  const { scrollTop, scrollHeight, clientHeight } = list;
+  if (Number.isFinite(scrollTop) && Number.isFinite(scrollHeight)) {
+    return window.LogFollow.shouldFollow(scrollTop, scrollHeight, clientHeight, LOG_FOLLOW_THRESHOLD);
+  }
+  // pywebview 打包版偶发读到异常度量：退化为「最后一行底边 vs 容器底边」。
+  const box = list.getBoundingClientRect();
+  const last = list.lastElementChild;
+  if (!last) return true;
+  return last.getBoundingClientRect().bottom - box.bottom <= LOG_FOLLOW_THRESHOLD;
+}
+
+// 贴到底。scrollTop 写不进去时（pywebview / 异常度量）退化为 scrollTo，
+// 一律用即时滚动，不用 smooth。
+function stickLogToBottom(list) {
+  list.scrollTop = list.scrollHeight;
+  const maxTop = list.scrollHeight - list.clientHeight;
+  if (!Number.isFinite(list.scrollTop) || maxTop - list.scrollTop > 1) {
+    if (typeof list.scrollTo === "function") list.scrollTo({ top: list.scrollHeight, behavior: "auto" });
+  }
+}
+
+// 暂停态下记住可视首行及其相对容器顶边的偏移；裁剪后据此校验补偿是否到位。
+function captureLogAnchor(list) {
+  const box = list.getBoundingClientRect();
+  for (const row of list.children) {
+    const r = row.getBoundingClientRect();
+    if (r.bottom > box.top) return { row, offset: r.top - box.top };
+  }
+  return null;
+}
+
+// compensateTrim 之后的残余偏移（子像素、或 pywebview 写不进 scrollTop）再校一次。
+function realignLogAnchor(list, anchor) {
+  if (!anchor || !anchor.row.isConnected) return;
+  const box = list.getBoundingClientRect();
+  const delta = anchor.row.getBoundingClientRect().top - box.top - anchor.offset;
+  if (Math.abs(delta) < 1) return;
+  const target = list.scrollTop + delta;
+  list.scrollTop = target;
+  if (Math.abs(list.scrollTop - target) > 1 && typeof list.scrollTo === "function") {
+    list.scrollTo({ top: target, behavior: "auto" });
+  }
+}
+
+// 渲染胶囊与「已暂停」标签。stick=true 时顺带贴底（点胶囊、清空、切回日志页）。
+function syncLogFollowUi(opts = {}) {
+  const paused = !state.logFollow;
+  const tag = $("#logPausedTag");
+  const capsule = $("#logNew");
+  const count = $("#logNewCount");
+  if (tag) tag.hidden = !paused;
+  if (capsule) capsule.hidden = !paused;
+  if (count) count.textContent = window.LogFollow.pendingLabel(state.logPending);
+  if (opts.stick && state.logFollow) {
+    const list = $("#logList");
+    if (list) stickLogToBottom(list);
+  }
+}
+
+// 上滚 / 回底只改这两个状态值，然后重绘按钮与标签。
+function bindLogFollow() {
+  const list = $("#logList");
+  if (!list) return;
+  // passive：滚动是高频事件，不需要 preventDefault。
+  list.addEventListener("scroll", () => {
+    const following = logIsFollowing(list);
+    if (following === null || following === state.logFollow) return;
+    state.logFollow = following;
+    if (following) state.logPending = 0;
+    syncLogFollowUi();
+  }, { passive: true });
+
+  const jump = $("#btnLogJump");
+  if (jump) {
+    jump.onclick = () => {
+      state.logFollow = true;
+      state.logPending = 0;
+      syncLogFollowUi({ stick: true });
+    };
+  }
+}
+
 async function pollLog() {
   try {
     const r = await api(`/api/log?since=${state.logSeq}`);
     state.logSeq = r.seq;
     if (!r.events.length) return;
     const list = $("#logList");
+
+    // 追加前判定：贴底就继续跟随，被上滚过就保持暂停。
+    const following = logIsFollowing(list);
+    if (following !== null) {
+      state.logFollow = following;
+      if (following) state.logPending = 0;
+    }
+    // 暂停态先记住可视首行，裁剪后用它校验补偿。
+    const anchor = state.logFollow ? null : captureLogAnchor(list);
+
     r.events.forEach((e) => {
       const row = document.createElement("div");
       row.className = "log-row " + (e.level || "info");
@@ -1421,10 +1527,24 @@ async function pollLog() {
         toast(e.text, "bad");
       }
     });
+
+    // 裁剪前后的内容高度差 = 被移除行占掉的高度，暂停态要补回滚动位置。
+    const heightBeforeTrim = list.scrollHeight;
     while (list.children.length > 300) list.removeChild(list.firstChild);
-    list.scrollTop = list.scrollHeight;
+    const removedHeight = Math.max(0, heightBeforeTrim - list.scrollHeight);
+
+    // 计数按实际新增行数累加（裁剪前统计），不按批次 +1。
+    state.logPending = window.LogFollow.pendingAfterAppend(state.logPending, r.events.length, state.logFollow);
+
+    if (state.logFollow) {
+      stickLogToBottom(list);
+    } else if (removedHeight > 0) {
+      list.scrollTop = window.LogFollow.compensateTrim(list.scrollTop, removedHeight);
+      realignLogAnchor(list, anchor);
+    }
+    syncLogFollowUi();
   } catch (_) {
-    /* ignore */
+    /* 轮询失败：不追加、不滚底、不重置暂停状态与计数 */
   }
 }
 
@@ -1512,6 +1632,8 @@ function bindTabs() {
         // WS-445: 打开设备页采样一次运行状态。
         loadSysinfo(state.selected);
       }
+      // 日志页隐藏期间容器量不出高度，切回来时补一次贴底 / 胶囊重绘。
+      if (tab.dataset.tab === "log") syncLogFollowUi({ stick: true });
     };
   });
 }
@@ -1571,6 +1693,8 @@ async function init() {
   bindTabs();
   bindHelp();
   bindApplyResults();
+  bindLogFollow();
+  syncLogFollowUi();
   try {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;
@@ -1593,6 +1717,10 @@ async function init() {
   $("#btnApply").onclick = applyConfig;
   $("#btnClearLog").onclick = () => {
     $("#logList").innerHTML = "";
+    // 清空后没有可读的旧行，强制回跟随。
+    state.logFollow = true;
+    state.logPending = 0;
+    syncLogFollowUi({ stick: true });
   };
   $("#actionsToggle").onchange = async (e) => {
     try {
