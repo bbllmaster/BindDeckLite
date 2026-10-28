@@ -2144,11 +2144,42 @@ void setup() {
   bool heldAtBoot = false;
   bool clearBindingAtBoot = false;
   if (!g_safeMode) {
+    // WS-419c: the bind-window gesture is encoder + key 1 held together. Key 1
+    // on its own proved unreliable to hit at power-on; pairing it with the
+    // encoder reuses the hold that already opened the portal and makes the
+    // gesture deliberate. Key 1's pin is probed from NVS read-only here because
+    // loadConfig() runs later and writes.
+    int bootKey1Pin = DEFAULT_BUTTON_PINS[0];
+    {
+      Preferences probe;
+      if (probe.begin("binddecklite", true)) {
+        bootKey1Pin = probe.getInt("pin0", bootKey1Pin);
+        probe.end();
+      }
+    }
+    pinMode(bootKey1Pin, INPUT_PULLUP);
+
     int low = 0, high = 0;
     int stableLowMs = 0;
+    int bothLowMs = 0;
     // Up to 6 s: 200 ms debounce + up to 5 s of stable hold.
     for (int i = 0; i < 300; i++) {
-      if (digitalRead(ENCODER_SW) == LOW) {
+      const bool encLow  = (digitalRead(ENCODER_SW) == LOW);
+      const bool key1Low = (digitalRead(bootKey1Pin) == LOW);
+
+      // WS-419c: encoder + key 1 -> bluetooth config mode. Checked first so it
+      // wins over both the portal and the clear-binding gestures.
+      if (encLow && key1Low) {
+        bothLowMs += 20;
+        if (bothLowMs >= 200) {
+          g_bindWindowAtBoot = true;
+          break;
+        }
+      } else {
+        bothLowMs = 0;
+      }
+
+      if (encLow) {
         low++;
         high = 0;
         if (low >= 10) {              // stable low for ~200 ms
@@ -2170,6 +2201,9 @@ void setup() {
       }
       delay(20);
     }
+    if (g_bindWindowAtBoot) {
+      log_e("[ble] encoder + key 1 held at boot -> bluetooth config mode (2 min bind window)");
+    }
   }
 
   ensureNvs();
@@ -2184,31 +2218,6 @@ void setup() {
 
   applyDeviceIdentity();
   loadConfig();
-
-  // WS-419c: hold key 1 while powering on -> "bluetooth config mode": a 2 min
-  // window in which any new host may pair and take the binding over from the
-  // current one. The binding itself is replaced only when the new host
-  // actually subscribes to HID (see nimble_hid.cpp), so letting the window
-  // expire - or losing power half way - leaves the current host working.
-  if (!g_safeMode && !clearBindingAtBoot && buttonPins[0] >= 0) {
-    const int key1Pin = buttonPins[0];
-    pinMode(key1Pin, INPUT_PULLUP);
-    delay(5);
-    int low = 0, high = 0;
-    for (int i = 0; i < 25; i++) {          // needs ~200 ms stable low
-      if (digitalRead(key1Pin) == LOW) {
-        high = 0;
-        if (++low >= 10) { g_bindWindowAtBoot = true; break; }
-      } else {
-        low = 0;
-        if (++high >= 3) break;             // clearly not held -> no delay
-      }
-      delay(20);
-    }
-    if (g_bindWindowAtBoot) {
-      log_e("[ble] key 1 held at boot -> bluetooth config mode (2 min bind window)");
-    }
-  }
 
   if (g_nvsOk) {
     preferences.begin("binddecklite", true);

@@ -453,3 +453,11 @@ def test_firmware_opens_and_expires_the_window(policy):
     main = _read(MAIN_CPP)
     assert "openBindWindow(120000)" in main, \
         "the boot gesture must open a 2 minute window"
+
+
+def test_bind_window_gesture_is_encoder_plus_key1(policy):
+    """WS-419c follow-up: key 1 alone was too hard to hit at power-on."""
+    main = _read(MAIN_CPP)
+    assert "encLow && key1Low" in main, \
+        "the gesture must require the encoder AND key 1"
+    assert "bothLowMs >= 200" in main, "the combo needs the same 200 ms debounce"
