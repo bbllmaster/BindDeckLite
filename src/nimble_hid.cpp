@@ -401,6 +401,17 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
                  conn, otaAddr.toString().c_str(), idAddr.toString().c_str(),
                  s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
                  s_hostAddr[3], s_hostAddr[4], s_hostAddr[5]);
+        // WS-419b: rejecting the subscription is not enough - the link was
+        // left up, so the stranger stayed paired with full access to the CFG
+        // channel. Drop the link. Only when the identity really resolved: the
+        // CASE=C branch above is the bound host with an unresolvable RPA and
+        // must be left to the self-heal path.
+        //
+        // The peer's bond is deliberately kept - see onAuthenticationComplete
+        // for why unpairing here would wipe the real host's binding.
+        if (NimBLEServer* srv = NimBLEDevice::getServer()) {
+          srv->disconnect(conn, 0x05 /* BLE_ERR_AUTH_FAIL */);
+        }
       }
       return;   // reject: never set s_hid_conn for this central
     }
@@ -540,6 +551,39 @@ class HidServerCB : public NimBLEServerCallbacks {
     }
     ESP_LOGE("BIND", "[ble] pairing complete enc=%d (encrypted links=%d)",
              (int)(r != nullptr && r->encrypted), s_encryptedConns);
+
+    // WS-419b: admission at the earliest point the identity is known. The old
+    // gate lived in onSubscribe(), which only fires for a central that actually
+    // subscribes to HID - a phone that pairs and stops there kept its bond and
+    // the whole CFG channel. Now a resolved identity that is not the bound host
+    // loses the link immediately, and the bond our stack just created for it is
+    // removed so it cannot hold a slot or displace the real host later.
+    //
+    // An UNRESOLVED identity is left alone on purpose: that is the CASE=C
+    // self-heal path (bond lost / IRK mismatch), not a stranger.
+    const NimBLEAddress idAddr = connInfo.getIdAddress();
+    const bool idNull  = idAddr.isNull();
+    const bool idMatch = !idNull && memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
+    const blepol::PeerVerdict verdict = blepol::admitPeer(s_hostBound, idNull, idMatch);
+    if (verdict == blepol::PEER_REJECT) {
+      ESP_LOGE("BIND", "[ble] reject non-bound peer at pairing conn=0x%04X ota=%s id=%s "
+               "(bound=%02X%02X%02X%02X%02X%02X) -> disconnect",
+               connInfo.getConnHandle(),
+               connInfo.getAddress().toString().c_str(),
+               idAddr.toString().c_str(),
+               s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
+               s_hostAddr[3], s_hostAddr[4], s_hostAddr[5]);
+      // WS-419b: do NOT delete the peer's bond here. ble_gap_unpair() would
+      // leave the central holding a key we no longer have, so its next
+      // reconnect fails with 0x205/0x25 - and onDisconnect's CASE=A self-heal
+      // (s_hostBound && !hostBonded && bond-key failure) would then wipe the
+      // REAL host's binding. That self-heal cannot tell a stranger from a host
+      // whose RPA did not resolve, so the bond stays and only the link goes.
+      if (NimBLEServer* srv = NimBLEDevice::getServer()) {
+        srv->disconnect(connInfo.getConnHandle(), 0x05 /* BLE_ERR_AUTH_FAIL */);
+      }
+      return;
+    }
   }
   // WS-275: when the primary HID host goes away, stop sending reports until a
   // new central subscribes. Do NOT promote an already-connected second host
@@ -799,6 +843,13 @@ void BleKeyboard::begin(const BleBootFacts& boot) {
   _inputConsumer->setCallbacks(reportCB);
   _hid->setBatteryLevel(_battery);
   // Create the CFG/CMD service on the same server BEFORE the GATT server starts.
+  // WS-419b: the config channel answers only to the bound host. WRITE_ENC alone
+  // let any freshly paired phone reconfigure the deck.
+  bleConfig.peerAllowed = [](const uint8_t id[6], bool idNull) -> bool {
+    const bool idMatch = !idNull && id != nullptr &&
+                         memcmp(id, s_hostAddr, 6) == 0;
+    return blepol::allowCfgAccess(s_hostBound, idNull, idMatch);
+  };
   bool cfgOk = bleConfig.begin(_server);
   ESP_LOGE("BIND", "[ble] cfg service: %s", cfgOk ? "created" : "FAILED");
   // NimBLE 2.x: the server starts every registered service; the per-service

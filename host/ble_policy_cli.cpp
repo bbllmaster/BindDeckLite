@@ -15,6 +15,8 @@
 //   backoff  <strikes>
 //   message  <addr> <deviceName> <strikes>
 //   adv      <enc> <hidSubscribed> <linkAgeMs>
+//   admit    <bound> <identityNull> <identityMatches>
+//   cfg      <bound> <identityNull> <identityMatches>
 //   reset
 //
 // Booleans are 0/1, addresses are hex with or without ':' separators.
@@ -138,8 +140,30 @@ int doAdv(std::vector<std::string>& args) {
   return 0;
 }
 
-int doReset(std::vector<std::string>&) {
-  blepol::staleReset(&g_stale);
+int doAdmit(std::vector<std::string>& args) {
+  if (args.size() < 4) { std::printf("err=usage\n"); return 1; }
+  const bool bound = parseBool(args[1]);
+  const bool idNull = parseBool(args[2]);
+  const bool idMatch = parseBool(args[3]);
+  const blepol::PeerVerdict v = blepol::admitPeer(bound, idNull, idMatch);
+  const char* code = (v == blepol::PEER_ALLOW) ? "allow"
+                     : (v == blepol::PEER_REJECT) ? "reject" : "undecided";
+  std::printf("verdict=%s disconnect=%d\n", code,
+              v == blepol::PEER_REJECT ? 1 : 0);
+  return 0;
+}
+
+int doCfg(std::vector<std::string>& args) {
+  if (args.size() < 4) { std::printf("err=usage\n"); return 1; }
+  const bool bound = parseBool(args[1]);
+  const bool idNull = parseBool(args[2]);
+  const bool idMatch = parseBool(args[3]);
+  std::printf("allow=%d\n",
+              blepol::allowCfgAccess(bound, idNull, idMatch) ? 1 : 0);
+  return 0;
+}
+
+int doReset(std::vector<std::string>&) {  blepol::staleReset(&g_stale);
   std::printf("ok=1\n");
   return 0;
 }
@@ -171,6 +195,8 @@ int main() {
     else if (cmd == "backoff")   rc = doBackoff(args);
     else if (cmd == "message")   rc = doMessage(args);
     else if (cmd == "adv")       rc = doAdv(args);
+    else if (cmd == "admit")     rc = doAdmit(args);
+    else if (cmd == "cfg")       rc = doCfg(args);
     else if (cmd == "reset")     rc = doReset(args);
     else                         std::printf("err=unknown\n");
     std::fflush(stdout);

@@ -286,4 +286,50 @@ inline bool mayAdvertiseWhileConnected(bool encrypted, bool hidSubscribed,
   return linkAgeMs >= ADV_UNENCRYPTED_GRACE_MS;
 }
 
+// ---------------------------------------------------------------------------
+// 4. Peer admission (WS-419b)
+// ---------------------------------------------------------------------------
+//
+// The bind gate used to run only in the HID subscription callback, i.e. AFTER
+// SMP had already completed. A phone therefore finished pairing (it keeps a
+// bond and the OS shows "paired"), and - worse - a central that never
+// subscribes to HID was never rejected at all: it kept the link and full
+// access to the CFG/CMD channel until it chose to leave.
+//
+// Admission is decided from the RESOLVED IDENTITY only. `bonded` is not a
+// signal: a stranger that just paired is bonded too, which is exactly the bug.
+
+enum PeerVerdict {
+  PEER_ALLOW     = 0,   // the bound host, or the deck is not bound yet
+  PEER_REJECT    = 1,   // resolved identity that is NOT the bound host
+  PEER_UNDECIDED = 2,   // identity unresolved -> leave it to the self-heal path
+};
+
+// Should this link be dropped as soon as the identity is known?
+//
+//   bound           - an app-level host binding exists
+//   identityNull    - the stack could not resolve an identity address
+//   identityMatches - that identity equals the stored bound address
+//
+// PEER_UNDECIDED is deliberate: an unresolved identity is the CASE=C self-heal
+// path (bond store / IRK mismatch) and must not be mistaken for a stranger,
+// or the legitimate host would be locked out permanently.
+inline PeerVerdict admitPeer(bool bound, bool identityNull, bool identityMatches) {
+  if (!bound) return PEER_ALLOW;
+  if (identityNull) return PEER_UNDECIDED;
+  return identityMatches ? PEER_ALLOW : PEER_REJECT;
+}
+
+// May this peer read/write CFG:/CMD: lines?
+//
+// Stricter than admitPeer(): an unresolved identity is *not* good enough here.
+// CFG writes change pins, encoder modes and can reboot the deck into config
+// mode; only OTA carries its own "bound host that owns the HID link" check, so
+// this is the only gate in front of everything else.
+inline bool allowCfgAccess(bool bound, bool identityNull, bool identityMatches) {
+  if (!bound) return true;          // unbound deck: first central configures it
+  if (identityNull) return false;   // cannot prove it is the bound host
+  return identityMatches;
+}
+
 }  // namespace blepol

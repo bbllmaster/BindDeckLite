@@ -32,6 +32,11 @@ public:
   // Any central disconnected. Used to abort an in-flight OTA immediately
   // instead of waiting for the inter-chunk timeout.
   std::function<void()> onDisconnect;
+  // WS-419b: identity gate for the config channel. Returns true when a peer
+  // with this RESOLVED identity address may read or write CFG:/CMD: lines;
+  // `id` is null when the stack could not resolve one. Left unset -> every
+  // peer is allowed (host tests / builds without a HID owner).
+  std::function<bool(const uint8_t id[6], bool idNull)> peerAllowed;
 
   bool begin(NimBLEServer* server);   // true if the service was created
   void notify(const String& data);    // device -> PC (no-op if not subscribed)
