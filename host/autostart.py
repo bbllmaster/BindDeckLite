@@ -15,6 +15,7 @@ mechanisms are mutually exclusive - turning one on removes the other.
 
 from __future__ import annotations
 
+import locale
 import os
 import plistlib
 import re
@@ -137,17 +138,47 @@ def _win_disable() -> None:
 
 
 # --- scheduled task (elevated autostart) ----------------------------------
+def _decode_output(raw: bytes | str) -> str:
+    """Decode ``schtasks`` output.
+
+    ``schtasks /query /xml`` writes UTF-16 (with a BOM when redirected), the
+    console messages use the OEM code page.  ``text=True`` would decode both
+    as the ANSI code page and garble non-ASCII paths, so the raw bytes are
+    decoded here instead.
+    """
+    if isinstance(raw, str):
+        return raw
+    if not raw:
+        return ""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    if raw.count(b"\x00") > len(raw) // 4:
+        # UTF-16LE without a BOM.
+        return raw.decode("utf-16-le", errors="replace")
+    for encoding in ("utf-8", locale.getpreferredencoding(False), "mbcs"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
 def _run_schtasks(args: list[str]) -> subprocess.CompletedProcess:
     """Run ``schtasks.exe`` with *args*.
 
     The argument list is passed without a shell, so a command containing
     spaces or quotes reaches ``schtasks`` unchanged.
     """
-    return subprocess.run(
+    proc = subprocess.run(
         ["schtasks", *args],
         capture_output=True,
-        text=True,
         creationflags=CREATE_NO_WINDOW,
+    )
+    return subprocess.CompletedProcess(
+        args=["schtasks", *args],
+        returncode=proc.returncode,
+        stdout=_decode_output(proc.stdout),
+        stderr=_decode_output(proc.stderr),
     )
 
 
@@ -312,8 +343,13 @@ def enable(minimized: bool = True, admin: bool = False) -> dict:
                     # the real reason is not overwritten.
                     return {"ok": False, **status(), "error": err}
             else:
-                # Best effort: drop a task left over from the admin mode.
-                _task_delete()
+                # The two mechanisms are mutually exclusive: a leftover task
+                # and the Run value would both start at logon and fight for
+                # the port.  A delete failure must abort *before* the Run
+                # value is written, otherwise the duplicate is silent.
+                ok, err = _task_delete()
+                if not ok:
+                    return {"ok": False, **status(), "error": err}
                 _win_enable(subprocess.list2cmdline(command))
         elif platform == "macos":
             path = _macos_path()

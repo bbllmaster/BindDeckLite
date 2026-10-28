@@ -189,8 +189,31 @@ build.bat
 - 重复双击 exe 不会启动第二份：检测到 8788 端口已监听时只打开浏览器。
 - 「设备 → 桌面应用」可开关 **开机自启动** 与 **开机启动时最小化到托盘**。自启动方式：
   Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写 `~/.config/autostart/binddecklite.desktop`，macOS 写 `~/Library/LaunchAgents/com.binddecklite.host.plist`。
+  Windows 若需要提权启动（让宏能输入到以管理员运行的程序），改用登录计划任务，见下方「以管理员身份运行」。
 - 配置、BLE 缓存与日志保存在 exe 同目录（目录不可写时退到 `%LOCALAPPDATA%\BindDeckLite`）：`config.json`、`ble_cache.json`、`host.log`。
 - 源码模式也能体验托盘：`python app.py --desktop`；`--minimized` 表示不自动打开浏览器。`run.sh` / `run.bat` 行为不变（控制台运行，无托盘）。
+
+#### 以管理员身份运行（Windows）
+
+**为什么需要**：Windows 的 UIPI 会拦截低完整性进程发往高完整性进程的 `SendInput`。上位机以普通权限运行时，宏能发到记事本、浏览器，却**输不进任何以管理员运行的程序**（任务管理器、部分游戏、管理员启动的编辑器）。`HKCU\...\Run` 只能启动普通权限进程，无法提权，所以这个模式改用**登录计划任务**：
+
+```
+schtasks /create /tn BindDeckLite /tr "<启动命令>" /sc onlogon /rl highest /f
+```
+
+- 任务名固定为 `BindDeckLite`，`/rl highest`（最高权限），登录时由计划任务服务拉起，**不弹 UAC**。
+- 两种自启动方式**互斥**：开管理员模式会自动删掉 `HKCU\...\Run` 里的 `BindDeckLite` 值，关掉管理员模式（或改回普通自启动）会自动删掉计划任务。只有一个条目生效，否则登录时两个实例会抢 8788 端口。
+- 非 Windows 平台没有这个选项（勾选框与整行都不显示）。
+- 首次勾选前请确认当前账户是管理员组的成员，否则 `schtasks /rl highest` 会失败，界面上会直接报错。
+
+**手动清理残留**（配置丢失、换机器或想彻底重来时）：
+
+```bat
+schtasks /query /tn BindDeckLite /xml     :: 看任务在不在、RunLevel 是不是 HighestAvailable
+schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
+```
+
+再检查注册表 `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` 里是否还有名为 `BindDeckLite` 的值（有就删掉）。两边都清掉后，重新在「设备 → 桌面应用」里勾选即可。
 
 > PyInstaller 不支持交叉编译，exe 必须在 Windows 上构建。仓库里的
 > `.github/workflows/build-host.yml` 可手动触发（workflow_dispatch）或在 PR

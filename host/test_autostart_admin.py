@@ -48,7 +48,10 @@ def windows(monkeypatch):
     store = {}
     log = []
     calls = []
+    kwargs_seen = []
     query = {"xml": "", "returncode": 0}
+    delete = {"returncode": 0, "stdout": "", "stderr": ""}
+    create = {"returncode": 0, "stdout": "", "stderr": ""}
 
     def _open_key(root, path, reserved=0, access=0):
         if path not in store:
@@ -83,13 +86,25 @@ def windows(monkeypatch):
 
     def _fake_run(cmd, *args, **kwargs):
         calls.append(list(cmd))
-        if cmd[0] == "schtasks" and cmd[1] == "/query":
-            return types.SimpleNamespace(returncode=query["returncode"],
-                                         stdout=query["xml"], stderr="")
+        kwargs_seen.append(dict(kwargs))
+        if cmd[0] == "schtasks":
+            verb = cmd[1]
+            if verb == "/query":
+                return types.SimpleNamespace(returncode=query["returncode"],
+                                             stdout=query["xml"], stderr="")
+            if verb == "/delete":
+                return types.SimpleNamespace(returncode=delete["returncode"],
+                                             stdout=delete["stdout"],
+                                             stderr=delete["stderr"])
+            if verb == "/create":
+                return types.SimpleNamespace(returncode=create["returncode"],
+                                             stdout=create["stdout"],
+                                             stderr=create["stderr"])
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
-    return {"store": store, "log": log, "calls": calls, "query": query}
+    return {"store": store, "log": log, "calls": calls, "query": query,
+            "delete": delete, "create": create, "kwargs": kwargs_seen}
 
 
 def _schtasks_calls(windows, verb):
@@ -235,3 +250,48 @@ def test_launch_command_is_unchanged_by_the_admin_mode():
     cmd = launch_command(minimized=True)
     assert "--desktop" in cmd
     assert "--minimized" in cmd
+
+
+# --- 6. a failed task delete must not silently leave both entries --------
+def test_enable_without_admin_aborts_when_task_delete_fails(windows):
+    """`schtasks /delete` failing must not write the Run value.
+
+    A leftover task plus a fresh Run value would start two instances at
+    logon and fight for the port - and previously that happened silently
+    because the delete result was dropped.
+    """
+    run_key = autostart.RUN_KEY
+    windows["store"][run_key] = {autostart.VALUE_NAME: "old-command"}
+    windows["delete"].update(returncode=1, stderr="ERROR: Access is denied.")
+
+    result = enable(admin=False)
+
+    assert result["ok"] is False
+    assert "Access is denied." in result["error"]
+    # The Run value must not be (re)written while the task is still there.
+    assert not [e for e in windows["log"] if e[0] == "SetValueEx"]
+    assert windows["store"][run_key][autostart.VALUE_NAME] == "old-command"
+
+
+# --- 7. schtasks is never run through a shell ---------------------------
+def test_schtasks_is_run_without_a_shell(windows):
+    """Arguments go as a list; ``shell=True`` would re-parse the command."""
+    enable(admin=True)
+    disable()
+
+    assert windows["kwargs"], "subprocess.run was never called"
+    for kwargs in windows["kwargs"]:
+        assert "shell" not in kwargs, "schtasks must not be run through a shell"
+
+
+# --- 8. UTF-16 task XML is decoded ------------------------------------
+def test_status_decodes_utf16_task_xml(windows):
+    """``schtasks /query /xml`` is UTF-16; non-ASCII paths must survive."""
+    xml = TASK_XML.replace("C:\\host\\app.py", "C:\\程序 目录\\app.py")
+    windows["query"]["xml"] = b"\xff\xfe" + xml.encode("utf-16-le")
+
+    info = status()
+
+    assert info["admin"] is True
+    assert "程序 目录" in info["detail"]
+

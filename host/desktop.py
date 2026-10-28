@@ -129,6 +129,17 @@ def is_port_busy_error(error: str) -> bool:
     return bool(error) and error.startswith(PORT_BUSY_HINT)
 
 
+def clear_port_busy_error() -> None:
+    """Drop a stale "another instance holds the port" hint.
+
+    ``/api/desktop/port-busy`` writes the hint into the instance that holds
+    the port; without this it stayed in ``desktopHint`` until the next
+    restart.  Binding the port successfully means the conflict is gone.
+    """
+    if is_port_busy_error(str(STATE.get("error") or "")):
+        STATE["error"] = ""
+
+
 def wait_port_free(port: int, timeout: float = 25.0, host: str = "127.0.0.1") -> bool:
     """Wait until *port* is free.
 
@@ -473,6 +484,7 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
             show_console()
             print("[desktop] cannot bind port:", error)
             return 1
+        clear_port_busy_error()
 
     icon = None
 
@@ -693,6 +705,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
             # 让占着端口的实例在它的日志与 desktopHint 里显示同样的话。
             report_port_busy(url, error)
         return 1
+    clear_port_busy_error()
 
     flask_thread = threading.Thread(target=server.serve_forever, name="flask", daemon=True)
     flask_thread.start()

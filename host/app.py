@@ -3606,20 +3606,14 @@ def desktop_payload() -> dict:
 def api_desktop():
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
-        with _lock:
-            minimized = bool(_config["settings"].get("start_minimized", True))
-            admin_pref = bool(_config["settings"].get("admin_autostart", False))
+        # 先把本次请求里的普通设置全部生效，再统一处理自启动条目：同一个
+        # POST 可能同时带 start_minimized 和 autostart，先读旧值再用会在
+        # 自启动项里写入过期的「启动时最小化」。
         if "start_minimized" in data:
             value = bool(data["start_minimized"])
             with _lock:
                 _config["settings"]["start_minimized"] = value
             save_config()
-            # Keep the login entry in sync when autostart is already enabled.
-            if autostart.status().get("enabled"):
-                result = autostart.enable(minimized=value, admin=admin_pref)
-                if not result.get("ok"):
-                    add_event("desktop", "重写自启动条目失败: " + str(result.get("error", "?")),
-                              level="warn")
         if "close_button_behavior" in data:
             value = str(data["close_button_behavior"])
             if value not in ("minimize", "exit"):
@@ -3631,29 +3625,56 @@ def api_desktop():
             add_event("desktop",
                       "关闭按钮行为已设为 " + ("最小化到托盘" if value == "minimize" else "直接退出"),
                       level="ok")
+
+        with _lock:
+            minimized = bool(_config["settings"].get("start_minimized", True))
+        current = autostart.status()
+        enabled = bool(current.get("enabled"))
+        # 以真实状态为准：config 可能丢失、被手改或从别的机器拷来，只有
+        # 当前条目确实是计划任务时才算「管理员模式」，否则一次只改
+        # 「启动时最小化」就会把最高权限的任务静默降级成 Run 键。
+        admin_pref = bool(current.get("admin"))
+        messages: list[str] = []
+        rewrite = False
+        result: dict | None = None
+
         if "autostart" in data:
             want = bool(data["autostart"])
-            result = autostart.enable(minimized, admin=admin_pref) if want else autostart.disable()
-            if not result.get("ok"):
-                reason = str(result.get("error", "设置失败"))
-                add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
-                return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
-            add_event("desktop", "已开启开机自启动" if want else "已关闭开机自启动", level="ok")
+            if want:
+                if "admin_autostart" in data:
+                    admin_pref = bool(data["admin_autostart"])
+                rewrite = True
+                messages.append("已开启管理员自启动" if admin_pref else "已开启开机自启动")
+            else:
+                result = autostart.disable()
+                if result.get("ok"):
+                    admin_pref = False
+                    messages.append("已关闭开机自启动")
         elif "admin_autostart" in data:
             # 提权模式变了：注册表 Run 值与计划任务互斥，重写一次。
-            want_admin = bool(data["admin_autostart"])
-            # 自启动本来就是关的、又只是「关掉提权」时，不去写 Run 值 -—
+            admin_pref = bool(data["admin_autostart"])
+            # 自启动本来就是关的、又只是「关掉提权」时不去写 Run 值 ——
             # 否则「取消开机自启动」会被这一下顺手打开。
-            if want_admin or autostart.status().get("enabled"):
-                result = autostart.enable(minimized, admin=want_admin)
-                if not result.get("ok"):
-                    reason = str(result.get("error", "设置失败"))
-                    add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
-                    return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
-                add_event("desktop", "已开启管理员自启动" if want_admin else "已改为普通权限自启动",
-                          level="ok")
+            if admin_pref or enabled:
+                rewrite = True
+                messages.append("已开启管理员自启动" if admin_pref
+                                else "已改为普通权限自启动")
+        elif enabled and "start_minimized" in data:
+            # 自启动已开、只改了「启动时最小化」：重写条目让它生效。
+            rewrite = True
+
+        if rewrite:
+            result = autostart.enable(minimized, admin=admin_pref)
+        if result is not None and not result.get("ok"):
+            reason = str(result.get("error", "设置失败"))
+            add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
+            return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
+        for message in messages:
+            add_event("desktop", message, level="ok")
+
+        if rewrite or "autostart" in data or "admin_autostart" in data:
             with _lock:
-                _config["settings"]["admin_autostart"] = want_admin
+                _config["settings"]["admin_autostart"] = admin_pref
             save_config()
     return jsonify({"ok": True, **desktop_payload()})
 

@@ -970,8 +970,11 @@ function renderDesktop() {
   // 以管理员身份运行：只有 Windows 能用（计划任务 + 最高权限）。
   const adminToggle = $("#adminAutostartToggle");
   adminToggle.checked = !!auto.admin;
-  adminToggle.disabled = !auto.admin_supported;
-  $("#adminAutostartRow").hidden = !auto.admin_supported;
+  // 未开自启动时禁用它：勾上会顺手把开机自启动打开，用户未必想要。
+  adminToggle.disabled = !auto.admin_supported || !auto.enabled;
+  // .row 是 display:flex（作者样式），[hidden] 的 display:none 会被覆盖，
+  // 必须直接改 style.display。
+  $("#adminAutostartRow").style.display = auto.admin_supported ? "" : "none";
   // 提权重启靠 ShellExecuteW("runas")，同样只有 Windows 有。
   $("#btnRestartAdmin").hidden = !isWindows;
   $("#minimizedToggle").checked = !!d.start_minimized;
@@ -1636,7 +1639,7 @@ async function init() {
       toast("设置管理员自启动失败：" + err.message, "bad");
     } finally {
       const auto = (state.desktop && state.desktop.autostart) || {};
-      target.disabled = !auto.admin_supported;
+      target.disabled = !auto.admin_supported || !auto.enabled;
     }
   };
   $("#minimizedToggle").onchange = async (e) => {
