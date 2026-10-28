@@ -229,6 +229,8 @@ static unsigned long g_lastActivity = 0;
 RTC_NOINIT_ATTR static uint32_t g_bootMagic;
 RTC_NOINIT_ATTR static uint32_t g_bootCount;
 static bool g_safeMode = false;
+// WS-419c: key 1 held at power-on -> open the BLE bind window once BLE starts.
+static bool g_bindWindowAtBoot = false;
 // WS-445: boot number of *this* startup, captured before the guard clears
 // g_bootCount. g_bootCount itself is reset once the deck has been up for 30 s,
 // so reading it live would report "0 boots" for a perfectly healthy device.
@@ -2183,6 +2185,31 @@ void setup() {
   applyDeviceIdentity();
   loadConfig();
 
+  // WS-419c: hold key 1 while powering on -> "bluetooth config mode": a 2 min
+  // window in which any new host may pair and take the binding over from the
+  // current one. The binding itself is replaced only when the new host
+  // actually subscribes to HID (see nimble_hid.cpp), so letting the window
+  // expire - or losing power half way - leaves the current host working.
+  if (!g_safeMode && !clearBindingAtBoot && buttonPins[0] >= 0) {
+    const int key1Pin = buttonPins[0];
+    pinMode(key1Pin, INPUT_PULLUP);
+    delay(5);
+    int low = 0, high = 0;
+    for (int i = 0; i < 25; i++) {          // needs ~200 ms stable low
+      if (digitalRead(key1Pin) == LOW) {
+        high = 0;
+        if (++low >= 10) { g_bindWindowAtBoot = true; break; }
+      } else {
+        low = 0;
+        if (++high >= 3) break;             // clearly not held -> no delay
+      }
+      delay(20);
+    }
+    if (g_bindWindowAtBoot) {
+      log_e("[ble] key 1 held at boot -> bluetooth config mode (2 min bind window)");
+    }
+  }
+
   if (g_nvsOk) {
     preferences.begin("binddecklite", true);
     bool force = preferences.getBool("forceCfg", false);
@@ -2404,6 +2431,7 @@ void loop() {
     applyDeviceIdentity();   // re-assert the name before the deferred begin()
     bleKeyboard.begin(bootFacts());
     g_bleStarted = true;
+    if (g_bindWindowAtBoot) bleKeyboard.openBindWindow(120000);
     log_e("[cfg] BLE started after config mode");
   }
 

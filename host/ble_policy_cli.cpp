@@ -17,6 +17,7 @@
 //   adv      <enc> <hidSubscribed> <linkAgeMs>
 //   admit    <bound> <identityNull> <identityMatches>
 //   cfg      <bound> <identityNull> <identityMatches>
+//   claim    <bound> <windowOpen> <identityNull> <identityMatches>
 //   reset
 //
 // Booleans are 0/1, addresses are hex with or without ':' separators.
@@ -163,6 +164,19 @@ int doCfg(std::vector<std::string>& args) {
   return 0;
 }
 
+int doClaim(std::vector<std::string>& args) {
+  if (args.size() < 5) { std::printf("err=usage\n"); return 1; }
+  const bool bound = parseBool(args[1]);
+  const bool window = parseBool(args[2]);
+  const bool idNull = parseBool(args[3]);
+  const bool idMatch = parseBool(args[4]);
+  const blepol::BindClaim c = blepol::classifyBindClaim(bound, window, idNull, idMatch);
+  const char* code = (c == blepol::BIND_NONE) ? "none"
+                     : (c == blepol::BIND_KEEP_HOST) ? "keep" : "takeover";
+  std::printf("claim=%s\n", code);
+  return 0;
+}
+
 int doReset(std::vector<std::string>&) {  blepol::staleReset(&g_stale);
   std::printf("ok=1\n");
   return 0;
@@ -197,6 +211,7 @@ int main() {
     else if (cmd == "adv")       rc = doAdv(args);
     else if (cmd == "admit")     rc = doAdmit(args);
     else if (cmd == "cfg")       rc = doCfg(args);
+    else if (cmd == "claim")     rc = doClaim(args);
     else if (cmd == "reset")     rc = doReset(args);
     else                         std::printf("err=unknown\n");
     std::fflush(stdout);

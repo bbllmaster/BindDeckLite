@@ -332,4 +332,29 @@ inline bool allowCfgAccess(bool bound, bool identityNull, bool identityMatches) 
   return identityMatches;
 }
 
+// ---------------------------------------------------------------------------
+// 5. Boot-time bind window (WS-419c)
+// ---------------------------------------------------------------------------
+//
+// Holding key 1 while powering on opens a timed window in which a NEW host may
+// pair and take the binding over - the "replace the paired PC without a
+// laptop" path. The window must never weaken the normal gate: outside it a
+// stranger is still rejected, and the replacement only happens on an actual
+// HID subscription (never on connect or pairing alone).
+
+enum BindClaim {
+  BIND_NONE       = 0,   // no window, deck unbound, or identity unresolved
+  BIND_KEEP_HOST  = 1,   // window open, the CURRENT host subscribed -> just close it
+  BIND_TAKEOVER   = 2,   // window open, a different resolved host -> replace
+};
+
+inline BindClaim classifyBindClaim(bool bound, bool windowOpen,
+                                   bool identityNull, bool identityMatches) {
+  if (!bound || !windowOpen) return BIND_NONE;
+  // An unresolved identity cannot be named, so it cannot become the new host -
+  // it is the CASE=C self-heal path, not a takeover.
+  if (identityNull) return BIND_NONE;
+  return identityMatches ? BIND_KEEP_HOST : BIND_TAKEOVER;
+}
+
 }  // namespace blepol
