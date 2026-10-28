@@ -409,8 +409,12 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
         //
         // The peer's bond is deliberately kept - see onAuthenticationComplete
         // for why unpairing here would wipe the real host's binding.
+        // Reason must be a plain "local host closed the link". 0x05
+        // (AUTH_FAIL) reads as "wrong PIN / passkey" on some Android stacks and
+        // as a normal close on others - the same firmware produced different
+        // phone-side messages depending on the vendor's interpretation.
         if (NimBLEServer* srv = NimBLEDevice::getServer()) {
-          srv->disconnect(conn, 0x05 /* BLE_ERR_AUTH_FAIL */);
+          srv->disconnect(conn, BLE_ERR_CONN_TERM_LOCAL);
         }
       }
       return;   // reject: never set s_hid_conn for this central
@@ -580,7 +584,7 @@ class HidServerCB : public NimBLEServerCallbacks {
       // REAL host's binding. That self-heal cannot tell a stranger from a host
       // whose RPA did not resolve, so the bond stays and only the link goes.
       if (NimBLEServer* srv = NimBLEDevice::getServer()) {
-        srv->disconnect(connInfo.getConnHandle(), 0x05 /* BLE_ERR_AUTH_FAIL */);
+        srv->disconnect(connInfo.getConnHandle(), BLE_ERR_CONN_TERM_LOCAL);
       }
       return;
     }
