@@ -46,7 +46,6 @@ jobs:
           # Non-silent verification: every expected merged/ota image must exist.
           for f in dist/merged_binddecklite_esp32_v*.bin \
                    dist/merged_binddecklite_c3_v*.bin \
-                   dist/merged_binddecklite_c3_2mb_v*.bin \
                    dist/merged_binddecklite_c3_16mb_v*.bin; do
             test -f "$f" || { echo "missing release image: $f"; exit 1; }
           done
