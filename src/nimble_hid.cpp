@@ -118,6 +118,30 @@ static int             s_bondDeleteFails = 0;
 // without unplugging the old one first.
 static volatile bool   s_allowRebind = false;
 
+// --- WS-419c: boot-time "bluetooth config mode" ------------------------------
+// Opened by holding key 1 while powering on. Inside the window any central may
+// pair and claim the binding, which is what makes "replace the paired PC
+// without a laptop" possible. The previous binding is NOT dropped up front:
+// it is replaced only when a new central actually subscribes, so a window that
+// times out (or a power cut half way) leaves the old host working.
+static volatile bool   s_bindWindowOpen = false;
+static unsigned long   s_bindWindowUntil = 0;
+static constexpr uint32_t BIND_WINDOW_MAX_MS = 120000;   // 2 minutes
+
+static void bindWindowClose() {
+  if (!s_bindWindowOpen) return;
+  s_bindWindowOpen = false;
+  s_bindWindowUntil = 0;
+}
+
+static void bindWindowOpenFor(uint32_t ms) {
+  if (ms == 0 || ms > BIND_WINDOW_MAX_MS) ms = BIND_WINDOW_MAX_MS;
+  s_bindWindowUntil = millis() + ms;
+  s_bindWindowOpen = true;
+  ESP_LOGE("BIND", "[ble] bind window OPEN for %lums - a new host may pair and replace the binding",
+           (unsigned long)ms);
+}
+
 // --- WS-429: connection bookkeeping -----------------------------------------
 // The NimBLE callbacks run on the NimBLE host task, the advertising
 // supervisor runs on the Arduino loop task. Both need to know how long the
@@ -254,6 +278,28 @@ static void saveHostBinding(const uint8_t addr[6]) {
   p.end();
 }
 
+// Bind the central behind `connInfo` as the host. Shared by the first-bind path
+// (deck not bound yet) and the WS-419c bind window (replacing an existing
+// host). Persists the RESOLVED identity address, falling back to the
+// over-the-air address when identity resolution produced nothing.
+static bool bindHostFromConn(const NimBLEConnInfo& connInfo) {
+  NimBLEAddress idAddr  = connInfo.getIdAddress();
+  NimBLEAddress otaAddr = connInfo.getAddress();
+  const uint8_t* bindAddr = !idAddr.isNull() ? idAddr.getVal() : otaAddr.getVal();
+  if (bindAddr == nullptr) return false;
+  saveHostBinding(bindAddr);
+  memcpy(s_hostAddr, bindAddr, 6);
+  // WS-410: keep the typed identity address so deleteBond() can match the bond
+  // record by type + value. Prefer the resolved identity address.
+  s_hostAddrObj = !idAddr.isNull() ? idAddr : otaAddr;
+  s_hostBound = true;
+  ESP_LOGE("BIND", "[ble] host bound to %s addr=%02X%02X%02X%02X%02X%02X",
+           !idAddr.isNull() ? "id" : "ota",
+           bindAddr[0], bindAddr[1], bindAddr[2],
+           bindAddr[3], bindAddr[4], bindAddr[5]);
+  return true;
+}
+
 // Drop the host binding (CMD:CLEARBOND / 5 s boot gesture). The in-RAM state
 // is always cleared, even when NVS is unavailable, so the device still lets a
 // new host in for this session.
@@ -368,6 +414,11 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
       const bool peerBonded = connInfo.isBonded();
       const bool idMatch = !idAddr.isNull() &&
                            memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
+      // WS-419c: could the boot-time bind window let THIS subscriber take the
+      // binding over? Decided by a pure policy function so the host test can
+      // drive the same logic the firmware runs.
+      const blepol::BindClaim claim = blepol::classifyBindClaim(
+          true, s_bindWindowOpen, idAddr.isNull(), idMatch);
 
       if (acceptHidSubscriber(idMatch, peerBonded)) {
         // Bound host — allow it to become (or stay) the HID primary.
@@ -380,6 +431,34 @@ class HidReportCB : public NimBLECharacteristicCallbacks {
         } else if (conn != s_hid_conn) {
           ESP_LOGE("BIND", "[ble] HID extra subscriber conn=0x%04X addr=%s ignored (primary=0x%04X)",
                    conn, otaAddr.toString().c_str(), s_hid_conn);
+        }
+        // A central that claims the slot also ends the WS-419c window, even if
+        // it turned out to be the host we already had.
+        if (claim == blepol::BIND_KEEP_HOST) {
+          bindWindowClose();
+          ESP_LOGE("BIND", "[ble] bind window closed: existing host subscribed");
+        }
+        return;
+      }
+
+      // WS-419c: boot-time "bluetooth config mode". Inside the window a
+      // DIFFERENT central may take the binding - that is the point of the
+      // gesture. Only a resolved identity counts (an unresolved one is the
+      // CASE=C self-heal path, not a new host we can name). The previous
+      // binding is replaced here, at the moment the new host actually takes
+      // HID, never earlier.
+      if (claim == blepol::BIND_TAKEOVER) {
+        ESP_LOGE("BIND", "[ble] bind window: replacing host %02X%02X%02X%02X%02X%02X with %s",
+                 s_hostAddr[0], s_hostAddr[1], s_hostAddr[2],
+                 s_hostAddr[3], s_hostAddr[4], s_hostAddr[5],
+                 idAddr.toString().c_str());
+        if (bindHostFromConn(connInfo)) {
+          noteHidSubscriber();
+          s_hid_conn = conn;
+          s_allowRebind = false;
+          bindWindowClose();
+          ESP_LOGE("BIND", "[ble] HID primary conn=0x%04X addr=%s (bind window, new host)",
+                   conn, otaAddr.toString().c_str());
         }
         return;
       }
@@ -568,7 +647,12 @@ class HidServerCB : public NimBLEServerCallbacks {
     const NimBLEAddress idAddr = connInfo.getIdAddress();
     const bool idNull  = idAddr.isNull();
     const bool idMatch = !idNull && memcmp(idAddr.getVal(), s_hostAddr, 6) == 0;
-    const blepol::PeerVerdict verdict = blepol::admitPeer(s_hostBound, idNull, idMatch);
+    // WS-419c: inside the boot window a stranger is expected - that is the
+    // whole point of holding key 1 at power-on. Leave the link up and let the
+    // HID subscription decide who claims the binding.
+    const blepol::PeerVerdict verdict =
+        s_bindWindowOpen ? blepol::PEER_ALLOW
+                         : blepol::admitPeer(s_hostBound, idNull, idMatch);
     if (verdict == blepol::PEER_REJECT) {
       ESP_LOGE("BIND", "[ble] reject non-bound peer at pairing conn=0x%04X ota=%s id=%s "
                "(bound=%02X%02X%02X%02X%02X%02X) -> disconnect",
@@ -992,6 +1076,12 @@ void BleKeyboard::clearHostBinding() {
   ::clearHostBinding();   // the file-static helper (clears NVS + RAM)
 }
 
+// WS-419c: boot-time bind window. The deadline is serviced from the Arduino
+// loop task (processPendingBleWork), never from a NimBLE callback.
+void BleKeyboard::openBindWindow(uint32_t ms) { bindWindowOpenFor(ms); }
+void BleKeyboard::closeBindWindow() { bindWindowClose(); }
+bool BleKeyboard::bindWindowOpen() const { return s_bindWindowOpen; }
+
 int BleKeyboard::bondCount() const {
   int n = 0;
   ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &n);
@@ -1023,6 +1113,13 @@ void processPendingBleWork() {
   // WS-410 CASE=A self-heal: drop the app-layer binding so a host whose BLE
   // bond was lost can re-pair and bind again. Preferences writes stay here on
   // the Arduino loop task, never on the NimBLE task.
+  // WS-419c: an unclaimed bind window simply expires; the previous binding is
+  // never touched, so an abandoned gesture leaves the old host working.
+  if (s_bindWindowOpen && (int32_t)(millis() - s_bindWindowUntil) >= 0) {
+    bindWindowClose();
+    ESP_LOGE("BIND", "[ble] bind window expired without a claim - binding unchanged");
+  }
+
   if (s_pendingClearBinding) {
     s_pendingClearBinding = false;
     ::clearHostBinding();

@@ -87,6 +87,16 @@ public:
   bool   getHostAddr(uint8_t out[6]) const;   // fill out[6]; false when unbound
   void   clearHostBinding();                  // drop hostAddr + hostBound from NVS
 
+  // WS-419c: "bluetooth config mode", entered by holding key 1 while powering
+  // on. While the window is open any central may pair and claim the binding,
+  // replacing the previous host. The old binding stays in effect until a new
+  // central actually subscribes to HID reports, so an abandoned window (or a
+  // power loss) leaves the old host working. Closes on the first successful
+  // claim or when the deadline passes.
+  void   openBindWindow(uint32_t ms);
+  void   closeBindWindow();
+  bool   bindWindowOpen() const;
+
   // WS-410: query the NimBLE bond store so the host app (CMD:GET_BOND) can
   // report whether the persisted binding still has a live BLE bond, and how
   // many peer-security records survive a reboot.

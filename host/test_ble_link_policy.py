@@ -408,3 +408,48 @@ def test_firmware_wires_admission_and_the_config_gate(policy):
         "a rejected peer must be disconnected, not just refused"
     cfg = _read(os.path.join(SRC_DIR, "ble_config.cpp"))
     assert "peerAllowed" in cfg, "the CFG write path must consult the gate"
+
+
+# ---------------------------------------------------------------------------
+# WS-419c - boot-time bind window
+# ---------------------------------------------------------------------------
+#
+# Holding key 1 while powering on opens a 2 minute window where a NEW host may
+# claim the binding. Outside it the WS-419b gate must stay exactly as strict,
+# and an unresolved identity must never count as a takeover (that is CASE=C).
+
+def _claim(binary, bound, window, identity_null, identity_matches):
+    return _run(binary, "claim %d %d %d %d" % (bound, window, identity_null,
+                                               identity_matches))[0]
+
+
+def test_no_window_means_no_takeover(policy):
+    """Without the boot gesture a stranger is still just a stranger."""
+    assert _claim(policy, 1, 0, 0, 0)["claim"] == "none"
+
+
+def test_window_lets_a_new_host_take_over(policy):
+    assert _claim(policy, 1, 1, 0, 0)["claim"] == "takeover"
+
+
+def test_window_with_the_current_host_only_closes_it(policy):
+    assert _claim(policy, 1, 1, 0, 1)["claim"] == "keep"
+
+
+def test_window_never_hands_the_deck_to_an_unresolved_identity(policy):
+    assert _claim(policy, 1, 1, 1, 0)["claim"] == "none"
+
+
+def test_unbound_deck_uses_the_first_bind_path_not_the_window(policy):
+    assert _claim(policy, 0, 1, 0, 0)["claim"] == "none"
+    assert _claim(policy, 0, 0, 0, 0)["claim"] == "none"
+
+
+def test_firmware_opens_and_expires_the_window(policy):
+    src = _read(FIRMWARE)
+    assert "classifyBindClaim" in src, "firmware must use the tested classifier"
+    assert "openBindWindow" in src and "bind window expired" in src, \
+        "the window must be opened and expired explicitly"
+    main = _read(MAIN_CPP)
+    assert "openBindWindow(120000)" in main, \
+        "the boot gesture must open a 2 minute window"
