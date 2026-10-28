@@ -26,6 +26,7 @@ pywebview.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -48,6 +49,10 @@ STATE = {
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
+
+# WS-457: 端口 8788 被另一个实例占着时，用户看到的是这句话，而不是
+# "WinError 10048"。提权实例接管端口失败时也用它。
+PORT_BUSY_HINT = "已有普通权限实例在运行，请先退出"
 
 _quit_callback = None
 
@@ -76,6 +81,85 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.6)
         return s.connect_ex((host, port)) == 0
+
+
+def port_busy_message(port: int | None = None) -> str:
+    """Readable text for "the port is taken by another instance"."""
+    msg = PORT_BUSY_HINT
+    if port:
+        msg += f"（端口 {port} 已被占用）"
+    return msg
+
+
+def port_bind_error(exc: BaseException, port: int | None = None) -> str:
+    """Translate a failed bind into something a user can act on.
+
+    ``WinError 10048`` ("only one usage of each socket address") tells the
+    user nothing; ``PORT_BUSY_HINT`` tells them what to do.
+    """
+    code = getattr(exc, "errno", None)
+    if code == errno.EADDRINUSE or code == 10048 or "10048" in str(exc):
+        return port_busy_message(port)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def make_flask_server(flask_app, port: int):
+    """Bind *port* for the Flask app.
+
+    Returns ``(server, error)``: *server* is ``None`` when the port could not
+    be bound and *error* holds a readable reason.  A taken port must not
+    surface as a bare ``WinError 10048`` - the user needs to know that another
+    instance is in the way.
+
+    Werkzeug's ``make_server`` calls ``sys.exit(1)`` on ``EADDRINUSE`` instead
+    of raising, so that case is caught here as well.
+    """
+    from werkzeug.serving import make_server
+
+    try:
+        return make_server("127.0.0.1", port, flask_app, threaded=True), ""
+    except OSError as e:
+        return None, port_bind_error(e, port)
+    except SystemExit:
+        return None, port_busy_message(port)
+
+
+def is_port_busy_error(error: str) -> bool:
+    """Whether *error* says "the port is taken by another instance"."""
+    return bool(error) and error.startswith(PORT_BUSY_HINT)
+
+
+def wait_port_free(port: int, timeout: float = 25.0, host: str = "127.0.0.1") -> bool:
+    """Wait until *port* is free.
+
+    Used by the elevated instance: the instance it replaces is still shutting
+    down (and still holding 8788) for a moment after the UAC prompt.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not port_in_use(port, host):
+            return True
+        time.sleep(0.25)
+    return not port_in_use(port, host)
+
+
+def report_port_busy(url: str, message: str) -> bool:
+    """Tell the instance that holds the port why we could not take it.
+
+    The other instance is the one serving the web UI, so this is how the
+    user learns about the conflict (its desktop hint shows the message).
+    """
+    try:
+        payload = json.dumps({"message": message}).encode("utf-8")
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/desktop/port-busy",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 - the peer may be gone already
+        return False
 
 
 def wait_until_ready(url: str, timeout: float = 5.0) -> bool:
@@ -383,13 +467,11 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
         return 0
 
     if server is None:
-        from werkzeug.serving import make_server
-        try:
-            server = make_server("127.0.0.1", port, flask_app, threaded=True)
-        except OSError as e:
-            STATE["error"] = str(e)
+        server, error = make_flask_server(flask_app, port)
+        if server is None:
+            STATE["error"] = error
             show_console()
-            print("[desktop] cannot bind port:", e)
+            print("[desktop] cannot bind port:", error)
             return 1
 
     icon = None
@@ -561,7 +643,7 @@ def make_on_closing(state, close_ref, use_tray, url, window_ref):
 
 def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
                 use_tray: bool = True, log_path: str = "",
-                close_ref: dict | None = None) -> int:
+                close_ref: dict | None = None, elevated: bool = False) -> int:
     """Serve Flask behind a native pywebview window — the real desktop app.
 
     Unlike ``run_desktop`` (tray + browser), this renders the existing Web UI
@@ -576,6 +658,10 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     effect immediately without restarting the app.  When omitted it defaults
     to a local ``{"behavior": "minimize"}`` dict (static minimize-to-tray).
 
+    ``elevated`` marks the instance that took over the port from the
+    normal-permission one: it must not fall back to "open the browser" when
+    the port is still taken, but report the conflict instead (WS-457).
+
     When pywebview or its GUI backend is unavailable (headless Linux, or
     Windows without pythonnet) it falls back to ``_serve_headless`` so
     ``python app.py --desktop`` keeps working without a console crash.
@@ -586,6 +672,12 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         setup_stdio(log_path)
 
     if port_in_use(port):
+        if elevated:
+            message = port_busy_message(port)
+            STATE["error"] = message
+            print("[webview] " + message)
+            report_port_busy(url, message)
+            return 1
         # Second double-click: the running instance is already up.  We cannot
         # raise another process's window, so just open the URL in a browser.
         print(f"[webview] already running at {url}, opening browser")
@@ -593,12 +685,13 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         return 0
 
     # 1. Start Flask in a background thread so the window can load the page.
-    from werkzeug.serving import make_server
-    try:
-        server = make_server("127.0.0.1", port, flask_app, threaded=True)
-    except OSError as e:
-        STATE["error"] = str(e)
-        print("[webview] cannot bind port:", e)
+    server, error = make_flask_server(flask_app, port)
+    if server is None:
+        STATE["error"] = error
+        print("[webview] cannot bind port:", error)
+        if is_port_busy_error(error):
+            # 让占着端口的实例在它的日志与 desktopHint 里显示同样的话。
+            report_port_busy(url, error)
         return 1
 
     flask_thread = threading.Thread(target=server.serve_forever, name="flask", daemon=True)

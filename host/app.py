@@ -100,6 +100,10 @@ DATA_DIR = _data_dir()
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 PORT = int(os.environ.get("BINDDECKLITE_PORT", "8788"))
 
+# How long the elevated instance waits for the running one to release the
+# port before it gives up and reports the conflict (WS-457).
+ELEVATED_PORT_WAIT = 25.0
+
 # Same vendor service as the firmware's ble_config.cpp (shared protocol).
 CONTROL_SERVICE = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
 
@@ -135,6 +139,7 @@ _config = {"devices": {}, "settings": {
     "udp_fallback": True,
     "start_minimized": True,
     "close_button_behavior": "minimize",
+    "admin_autostart": False,
     "recent_paths": [],
 }}
 
@@ -3601,6 +3606,9 @@ def desktop_payload() -> dict:
 def api_desktop():
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
+        with _lock:
+            minimized = bool(_config["settings"].get("start_minimized", True))
+            admin_pref = bool(_config["settings"].get("admin_autostart", False))
         if "start_minimized" in data:
             value = bool(data["start_minimized"])
             with _lock:
@@ -3608,7 +3616,7 @@ def api_desktop():
             save_config()
             # Keep the login entry in sync when autostart is already enabled.
             if autostart.status().get("enabled"):
-                result = autostart.enable(minimized=value)
+                result = autostart.enable(minimized=value, admin=admin_pref)
                 if not result.get("ok"):
                     add_event("desktop", "重写自启动条目失败: " + str(result.get("error", "?")),
                               level="warn")
@@ -3625,14 +3633,121 @@ def api_desktop():
                       level="ok")
         if "autostart" in data:
             want = bool(data["autostart"])
-            with _lock:
-                minimized = bool(_config["settings"].get("start_minimized", True))
-            result = autostart.enable(minimized) if want else autostart.disable()
+            result = autostart.enable(minimized, admin=admin_pref) if want else autostart.disable()
             if not result.get("ok"):
-                return jsonify({"ok": False, "error": result.get("error", "设置失败"),
-                                **desktop_payload()}), 500
+                reason = str(result.get("error", "设置失败"))
+                add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
+                return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
             add_event("desktop", "已开启开机自启动" if want else "已关闭开机自启动", level="ok")
+        elif "admin_autostart" in data:
+            # 提权模式变了：注册表 Run 值与计划任务互斥，重写一次。
+            want_admin = bool(data["admin_autostart"])
+            # 自启动本来就是关的、又只是「关掉提权」时，不去写 Run 值 -—
+            # 否则「取消开机自启动」会被这一下顺手打开。
+            if want_admin or autostart.status().get("enabled"):
+                result = autostart.enable(minimized, admin=want_admin)
+                if not result.get("ok"):
+                    reason = str(result.get("error", "设置失败"))
+                    add_event("desktop", "重写自启动条目失败: " + reason, level="warn")
+                    return jsonify({"ok": False, "error": reason, **desktop_payload()}), 500
+                add_event("desktop", "已开启管理员自启动" if want_admin else "已改为普通权限自启动",
+                          level="ok")
+            with _lock:
+                _config["settings"]["admin_autostart"] = want_admin
+            save_config()
     return jsonify({"ok": True, **desktop_payload()})
+
+
+@app.route("/api/desktop/port-busy", methods=["POST"])
+def api_desktop_port_busy():
+    """Tell *this* instance that another instance could not take the port.
+
+    The elevated instance cannot serve the web UI when 8788 is still held by
+    a normal-permission instance, so it reports the conflict here: the running
+    instance shows it in its event log and in ``desktopHint``.
+    """
+    data = request.get_json(silent=True) or {}
+    message = str(data.get("message") or desktop.PORT_BUSY_HINT)
+    desktop.STATE["error"] = message
+    add_event("desktop", message, level="warn")
+    return jsonify({"ok": True})
+
+
+def _elevated_argv() -> list[str]:
+    """Arguments for the elevated twin of this process.
+
+    The executable itself is passed to ``ShellExecuteW`` separately, so only
+    the arguments are built here.  Running from source the script path has to
+    be part of them (``sys.executable`` is the interpreter then).
+    """
+    args: list[str] = []
+    if not desktop.is_frozen():
+        args.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"))
+    if desktop.STATE.get("desktop"):
+        args.append("--desktop")
+    # Marker for the elevated instance: it takes over the port instead of
+    # treating the running instance as a second copy.
+    args.append("--elevated")
+    return args
+
+
+# The browser-mode (no tray, no native window) server, so the elevated
+# restart can hand the port over.
+_web_server = {"server": None}
+
+
+def _exit_for_restart() -> bool:
+    """Leave the current instance so the elevated twin can take the port.
+
+    Desktop/tray mode goes through the regular quit path (``/api/quit``);
+    browser mode shuts its own server down.  Never ``os._exit`` - the window
+    and the tray have to be cleaned up.
+    """
+    if desktop.request_quit():
+        return True
+    server = _web_server.get("server")
+    if server is None:
+        return False
+
+    def _run():
+        time.sleep(0.4)  # let the HTTP response reach the browser first
+        server.shutdown()
+
+    threading.Thread(target=_run, name="quit", daemon=True).start()
+    return True
+
+
+@app.route("/api/desktop/restart-admin", methods=["POST"])
+def api_desktop_restart_admin():
+    """Restart the host with administrator rights (Windows only).
+
+    The elevated instance is started through ``ShellExecuteW("runas")``, which
+    shows the UAC prompt.  Afterwards this instance leaves through the regular
+    quit path so the elevated one can take over the port.
+    """
+    if not sys.platform.startswith("win"):
+        return jsonify({"ok": False, "error": "仅 Windows 支持以管理员身份运行"}), 409
+    try:
+        import ctypes
+    except Exception as e:  # noqa: BLE001 - ctypes is always available on Windows
+        return jsonify({"ok": False, "error": f"无法调用系统提权接口：{e}"}), 500
+    args = _elevated_argv()
+    params = subprocess.list2cmdline(args)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": f"提权启动失败：{type(e).__name__}: {e}"}), 500
+    if rc is None or rc <= 32:
+        # <= 32: the UAC prompt was declined (or the launch failed).
+        add_event("desktop", "已取消提权，未能启动管理员实例", level="warn")
+        return jsonify({"ok": False, "error": "已取消提权"}), 409
+    add_event("desktop", "已启动管理员实例，正在退出当前实例", level="ok")
+    # Leave through the existing exit path (server shutdown + window close),
+    # never os._exit, so the elevated instance can bind the port.
+    if not _exit_for_restart():
+        return jsonify({"ok": False, "error": "当前实例无法自动退出，请手动关闭后重试"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/api/browse", methods=["POST"])
@@ -3702,6 +3817,7 @@ def _parse_args(argv):
     parser.add_argument("--no-tray", dest="no_tray", action="store_true",
                         help="桌面模式但不创建托盘图标")
     parser.add_argument("--file-dialog", choices=("file", "dir"), help=argparse.SUPPRESS)
+    parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -3717,7 +3833,24 @@ def main(argv=None):
     url = f"http://127.0.0.1:{PORT}"
     desktop_mode = (args.desktop or desktop.is_frozen()
                     or os.environ.get("BINDDECKLITE_DESKTOP") == "1")
-    if desktop_mode and desktop.port_in_use(PORT):
+    if args.elevated:
+        # 提权实例接管端口：等当前实例退出、释放 8788。等不到就明确报错，
+        # 而不是只抛一个 WinError 10048。
+        if not desktop.wait_port_free(PORT, timeout=ELEVATED_PORT_WAIT):
+            message = desktop.port_busy_message(PORT)
+            print("[app] " + message)
+            add_event("desktop", message, level="warn")
+            # 让占着端口的那个实例在它的日志与 desktopHint 里显示同样的话。
+            desktop.report_port_busy(url, message)
+            return 1
+    elif desktop_mode and desktop.port_in_use(PORT):
+        if autostart.is_elevated():
+            # 手动以管理员身份启动，但端口被普通权限实例占着：明确说清楚，
+            # 不要只留一个 WinError 10048（WS-457）。
+            message = desktop.port_busy_message(PORT)
+            print("[app] " + message)
+            desktop.report_port_busy(url, message)
+            return 1
         # Second double-click: focus the running instance instead of failing.
         print(f"[app] already running at {url}, opening browser")
         desktop.open_url(url)
@@ -3736,11 +3869,27 @@ def main(argv=None):
                                    start_minimized=bool(args.minimized),
                                    use_tray=not args.no_tray,
                                    close_ref=_close_behavior_ref,
-                                   log_path=os.path.join(DATA_DIR, "host.log"))
+                                   log_path=os.path.join(DATA_DIR, "host.log"),
+                                   elevated=bool(args.elevated))
 
     if os.environ.get("BINDDECKLITE_NO_BROWSER") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+    # 用 make_server 而不是 app.run：这样「立即以管理员身份重启」能让当前实例
+    # 优雅退出、把端口让给提权实例（桌面/托盘模式走 desktop.request_quit）。
+    server, error = desktop.make_flask_server(app, PORT)
+    if server is None:
+        print("[app] cannot bind port:", error)
+        if desktop.is_port_busy_error(error):
+            desktop.report_port_busy(url, error)
+        return 1
+
+    _web_server["server"] = server
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _web_server["server"] = None
     return 0
 
 
