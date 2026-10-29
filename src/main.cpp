@@ -269,6 +269,12 @@ static bool isValidButtonPin(int pin) {
 #ifdef TARGET_ESP32C3
   if (pin < 0 || pin > 21) return false;
   if (pin >= 11 && pin <= 17) return false;   // embedded flash
+  // GPIO18/19 are the C3's USB D-/D+ pair and this build runs USB-CDC on them
+  // (ARDUINO_USB_CDC_ON_BOOT=1), so they are never free for a button: wiring
+  // one there kills the serial log. README and the host already say "avoid
+  // 11-17 and 18/19"; the whitelist has to agree or the portal will happily
+  // accept a pin that silently breaks the console.
+  if (pin >= 18 && pin <= 19) return false;
   // Do NOT apply the classic-ESP32 exclusions here: GPIO6..GPIO8 are ordinary
   // pins on the C3 and buttons 7..9 of this board sit on them. Applying the
   // classic rule made every pin set invalid on the C3, so CFG:PINS: and the
@@ -301,8 +307,9 @@ static String pinRejectReason(int idx, int pin) {
   if (pin < 0 || pin > 39) return btn + " 必须填 0-39 的整数";
   String who = btn + " 的 GPIO " + String(pin);
 #ifdef TARGET_ESP32C3
-  if (pin > 21) return who + " 在 C3 上不存在（C3 只有 GPIO0-10、20、21）";
+  if (pin > 21) return who + " 在 C3 上不存在（C3 可用 GPIO0-10、20-21）";
   if (pin >= 11 && pin <= 17) return who + " 在 C3 上是内部 Flash 引脚，不能用作按键";
+  if (pin >= 18 && pin <= 19) return who + " 在 C3 上是 USB D-/D+ 引脚（USB-CDC 串口占用），不能用作按键";
 #else
   if (pin >= 6 && pin <= 11) return who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键";
   if (pin >= 34) return who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键";
@@ -591,7 +598,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
     ".bad input{border:2px solid #d93025;background:#fff5f5}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
-    h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
+    h += F("<div class='err' role='alert' id='cfgerr'><b>保存失败，未写入设备：</b><ul>");
     for (const String& e : form->errors) {
       h += "<li>";
       h += e;
@@ -624,9 +631,18 @@ static String cfgPage(const KeysForm* form = nullptr) {
   for (int i = 0; i < NUM_BUTTONS; i++) {
     bool bad = form && form->bad[i];
     h += bad ? "<tr class='bad'>" : "<tr>";
+    // type='text' + inputmode='numeric' (WS-419): a non-numeric value echoed
+    // into type='number' is wiped by the browser, so a rejected save left the
+    // user staring at an empty box instead of their own "abc". inputmode keeps
+    // the numeric keypad on phones; validation is the firmware's job anyway.
     h += "<td>按键" + String(i + 1) + " GPIO</td><td><input name='pin" + String(i) +
-         "' type='number' min='0' max='39'";
-    if (bad) h += " aria-invalid='true'";
+         "' type='text' inputmode='numeric'";
+    if (bad) {
+      h += " aria-invalid='true'";
+      // WS-419: name the reason list so a screen reader announces why the row
+      // is invalid instead of just "invalid entry".
+      if (!form->errors.empty()) h += " aria-describedby='cfgerr'";
+    }
     h += " value='";
     h += htmlEsc(form ? form->pins[i] : String(buttonPins[i]));
     h += "'></td></tr>";
@@ -760,6 +776,14 @@ static void setupProvisioning() {
                      "<meta charset='utf-8'><meta http-equiv='refresh' content='1;url=/'>"
                      "<p>已保存。</p>");
     } else {
+      // WS-419: pinRejectReason() above and isValidPinSet() below are two
+      // copies of the same whitelist. They agree today, but if one is changed
+      // alone the save is rejected here with no message collected, and the
+      // portal would render a 400 page with no error bar at all. Never send an
+      // empty explanation.
+      if (form.errors.empty()) {
+        form.errors.push_back("引脚配置无效，请检查是否与保留引脚或编码器引脚冲突");
+      }
       cfgServer.send(400, "text/html; charset=utf-8", cfgPage(&form));
     }
   });
