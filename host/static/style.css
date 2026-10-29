@@ -412,6 +412,19 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
 .pin { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--muted); }
 .pin input { text-align: center; }
 
+/* ---------- pin validation (WS-476) ---------- */
+/* 错误行：红边 + 下方红字。文案在 92 px 起步的窄列里换行，不挤压 9 列网格，
+   390 px 宽时也不产生横向滚动。 */
+.pin.bad input { border-color: var(--danger); box-shadow: 0 0 0 1px var(--danger); }
+.pin-error { color: var(--danger); font-size: 11px; line-height: 1.35; overflow-wrap: anywhere; }
+.pin-error[hidden] { display: none; }
+.pin-error-count {
+  margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+  background: rgba(255, 107, 107, 0.14); border: 1px solid rgba(255, 107, 107, 0.45);
+  color: var(--danger); font-size: 11px; font-weight: 600;
+}
+.pin-error-count[hidden] { display: none; }
+
 .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; color: var(--text); font-size: 13px; }
 .row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
 input.short { width: 80px; }
@@ -657,5 +670,7 @@ body.modal-open { overflow: hidden; }
   .layout { flex-direction: column; }
   .sidebar { width: auto; border-right: none; border-bottom: 1px solid var(--line); }
   .topbar { flex-wrap: wrap; }
+  /* WS-476：窄屏（含 390 px 验收）下右侧状态/按钮换行，整页不出现横向滚动。 */
+  .topbar-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; }
   .main { padding: 18px; }
 }
