@@ -461,3 +461,32 @@ def test_bind_window_gesture_is_encoder_plus_key1(policy):
     assert "encLow && key1Low" in main, \
         "the gesture must require the encoder AND key 1"
     assert "bothLowMs >= 200" in main, "the combo needs the same 200 ms debounce"
+
+
+# ---------------------------------------------------------------------------
+# WS-419d - clearing the binding also drops the old host's link
+# ---------------------------------------------------------------------------
+#
+# Field report: after clearing the binding, the old PC kept working because its
+# link was still up (WS-411 #4 kept it alive on purpose). "Clear binding" has to
+# mean "stop accepting this host", so the link is cut and the bond is removed
+# once every central is gone.
+
+def test_clear_binding_drops_the_host_link(policy):
+    src = _read(FIRMWARE)
+    assert "requestDropHostLink" in src, \
+        "clearHostBinding() must arm the link drop"
+    assert "s_pendingDropHost" in src and "conn=0x%04X" in src, \
+        "the drop must be drained on the loop task, not from the NimBLE callback"
+    # the drop must happen BEFORE the early return that guards the bond delete
+    drop_at = src.index("if (s_pendingDropHost)")
+    ret_at = src.index("if (!s_pendingDeleteBond) return;")
+    assert drop_at < ret_at, \
+        "the link drop must not be skipped when no bond delete is pending"
+
+
+def test_clear_binding_still_defers_the_unpair(policy):
+    """Dropping the link first and unpairing after it is gone keeps WS-411 intact."""
+    src = _read(FIRMWARE)
+    assert "s_deleteBondOnDisconnect = true;" in src
+    assert "bond removed after disconnect" in src

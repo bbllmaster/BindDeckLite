@@ -125,4 +125,7 @@ private:
 // loop() (Arduino task) drains them via processPendingBleWork().
 void requestDeleteBond(const NimBLEAddress& addr);
 void requestClearHostBinding();
+// WS-419d: drop the link of the central that currently owns HID. Deferred to
+// the Arduino loop task, like the bond writes above.
+void requestDropHostLink();
 void processPendingBleWork();
