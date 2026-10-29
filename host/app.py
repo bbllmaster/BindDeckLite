@@ -184,32 +184,88 @@ def pin_chip(chip: str) -> str:
     return "C3" if "C3" in (chip or "").upper() else "ESP32"
 
 
+def _pin_span_text(spans, sep="、") -> str:
+    """``[[0, 4], [12, 17], [20, 20]]`` -> ``0-4、12-17、20``."""
+    return sep.join(str(lo) if lo == hi else "%d-%d" % (lo, hi) for lo, hi in spans)
+
+
+def _pin_free_spans(rules: dict) -> list:
+    """The GPIO ranges a button may actually use, derived from ``rules`` itself.
+
+    Everything here comes out of the same fields ``validate_pins()`` reads —
+    the range limit, ``blocked`` and the encoder pins — plus ``avoid`` for pins
+    that are legal but not worth spending (C3 18/19 are USB-CDC).  Deriving
+    instead of writing a second list keeps the hint from drifting away from
+    the rule again (WS-481).
+    """
+    occupied = set()
+    for lo, hi in rules["blocked"]:
+        occupied.update(range(lo, hi + 1))
+    occupied.update(rules["encoder"].values())
+    occupied.update(rules.get("avoid", ()))
+    spans = []
+    for pin in range(rules["min"], rules["max"] + 1):
+        if pin in occupied:
+            continue
+        if spans and pin == spans[-1][1] + 1:
+            spans[-1][1] = pin
+        else:
+            spans.append([pin, pin])
+    return spans
+
+
+def _reserved_pin_text(reserved) -> str:
+    """``[[6, 11, "SPI Flash"]]`` -> ``6-11 SPI Flash``; several joined by 与."""
+    return " 与 ".join(
+        "%s %s" % (_pin_span_text([[lo, hi]]), label) for lo, hi, label in reserved
+    )
+
+
 def pin_rules(chip: str = "") -> dict:
     """The pin constraints for one chip, in the shape the UI renders.
 
     Descriptive only — ``validate_pins()`` is the single authority on whether
-    a value is accepted; this just states the same limits as a hint.
+    a value is accepted; this just states the same limits as a hint.  The hint
+    text is built from these fields, never from a second hand-written list.
     """
     prof = pin_chip(chip)
     if prof == "C3":
-        return {
+        reserved = [[11, 17, "内部 Flash"]]
+        rules = {
             "chip": "C3",
             "count": PIN_COUNT,
             "min": 0,
             "max": 21,
-            "blocked": [[11, 17]],
+            "blocked": [[lo, hi] for lo, hi, _ in reserved],
+            "avoid": [18, 19],   # legal, but USB-CDC — not worth spending
             "encoder": dict(ENCODER_PINS["C3"]),
-            "hint": "C3：按键可用 GPIO0-10、20、21（避开 11-17 内部 Flash）；编码器 A/B/按压 = 20/21/10；18/19 是 USB-CDC，不建议占用。",
         }
-    return {
+        rules["hint"] = (
+            "C3：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s；%s 是 USB-CDC，不建议占用。"
+            % (
+                _pin_span_text(_pin_free_spans(rules)),
+                _reserved_pin_text(reserved),
+                _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
+                _pin_span_text([[p, p] for p in rules["avoid"]], "/"),
+            )
+        )
+        return rules
+
+    reserved = [[6, 11, "SPI Flash"], [34, 39, "仅输入脚"]]
+    rules = {
         "chip": "ESP32",
         "count": PIN_COUNT,
         "min": 0,
         "max": 39,
-        "blocked": [[6, 11], [34, 39]],
+        "blocked": [[lo, hi] for lo, hi, _ in reserved],
         "encoder": dict(ENCODER_PINS["ESP32"]),
-        "hint": "经典 ESP32：按键可用 GPIO0-39（避开 6-11 SPI Flash 与 34-39 仅输入脚）；编码器 A/B/按压 = 18/19/5。",
     }
+    rules["hint"] = "经典 ESP32：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s。" % (
+        _pin_span_text(_pin_free_spans(rules)),
+        _reserved_pin_text(reserved),
+        _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
+    )
+    return rules
 
 
 def _pin_int(value):
