@@ -31,6 +31,7 @@ Run::
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -317,3 +318,55 @@ def test_defaults_rules_match_validate_pins():
     c3 = client.get("/api/defaults?chip=C3").get_json()["pinRules"]
     assert (c3["min"], c3["max"]) == (0, 21)
     assert c3["blocked"] == [[11, 17]]
+
+
+# --- WS-481: the hint text must not drift from the rule -------------------
+
+def _hint_pins(hint):
+    """Expand 「按键可用 GPIO0-4、12-17、20-33」 from a hint into its pin list.
+
+    Reads the production hint string, so a hint that advertises a reserved,
+    encoder or non-existent pin fails here instead of on the user's device.
+    """
+    match = re.search(r"按键可用 GPIO([0-9、\-]+)", hint)
+    assert match, hint
+    pins = []
+    for part in match.group(1).split("、"):
+        lo, _, hi = part.partition("-")
+        pins.extend(range(int(lo), int(hi or lo) + 1))
+    return pins
+
+
+def test_pin_hint_only_advertises_pins_the_validator_accepts():
+    """WS-481: 照提示填不能被判错 —— 提示里的每个脚都要过真实的校验 gate."""
+    for chip in ("C3", "ESP32"):
+        rules = app.pin_rules(chip)
+        prof = app.pin_chip(chip)
+        pins = _hint_pins(rules["hint"])
+        assert pins, rules["hint"]
+        for pin in pins:
+            assert app._pin_reject_reason(prof, "按键 1", pin) == ("", ""), (chip, pin)
+
+
+def test_pin_hint_excludes_reserved_and_encoder_pins():
+    """The hint may only list pins that are neither reserved nor an encoder pin."""
+    for chip in ("C3", "ESP32"):
+        rules = app.pin_rules(chip)
+        advertised = set(_hint_pins(rules["hint"]))
+        reserved = set()
+        for lo, hi in rules["blocked"]:
+            reserved.update(range(lo, hi + 1))
+        assert advertised.isdisjoint(reserved), chip
+        assert advertised.isdisjoint(set(rules["encoder"].values())), chip
+
+
+def test_c3_hint_no_longer_offers_the_encoder_pins_as_buttons():
+    """WS-481: 「GPIO0-10、20、21」 contradicted the encoder line right below it."""
+    hint = app.pin_rules("C3")["hint"]
+    assert "GPIO0-9（避开 11-17" in hint
+    assert "18/19" in hint   # still mentioned, but only as "不建议占用"
+
+
+def test_esp32_hint_lists_the_real_ranges():
+    hint = app.pin_rules("ESP32")["hint"]
+    assert "GPIO0-4、12-17、20-33" in hint
