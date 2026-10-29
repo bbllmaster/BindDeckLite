@@ -1879,7 +1879,10 @@ static void processCommand(String data) {
     g_bootReq = BOOT_REBOOT;
   } else if (data.startsWith("CMD:CLEARBOND")) {
     // WS-321: drop the persisted host binding so a new central can become the
-    // HID primary. The CFG channel stays usable on this same connection.
+    // HID primary. WS-419d: the link of the host that owned it is dropped too -
+    // "clear binding" should stop the old host receiving keys, not wait for it
+    // to disconnect by itself. The CFG channel on the caller's own connection
+    // is unaffected unless the caller *was* that host.
     bleKeyboard.clearHostBinding();
     sendToHost("ACK:CMD:CLEARBOND");
     log_e("[ble] host binding cleared by CMD:CLEARBOND");

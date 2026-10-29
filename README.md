@@ -132,7 +132,7 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 
 查询绑定状态用 `CMD:GET_BOND`，设备返回 `BOND_STATUS:bound,<脱敏地址>` 或 `BOND_STATUS:unbound`。地址只保留前两字节，完整 BLE 地址不会离开设备。
 
-清除是立即生效的：旧的已连接主机不会被强行断开（避免操作过程中键盘失效），但下一台发来 HID 订阅的主机会直接接管并成为新的绑定主机，不需要给设备重新上电。
+清除是立即生效的：**设备的绑定被清空，同时旧主机的连接会被主动断开**（`CONN_TERM_LOCAL`），之后第一台发来 HID 订阅的主机会接管并成为新的绑定主机，不需要给设备重新上电。
 
 ### 串口协议
 

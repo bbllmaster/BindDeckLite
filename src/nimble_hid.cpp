@@ -102,6 +102,10 @@ static NimBLEAddress   s_pendingDeleteAddr;
 static bool            s_pendingDeleteBond = false;
 // WS-410: CASE=A reset — armed from onDisconnect, drained by loop().
 static bool            s_pendingClearBinding = false;
+// WS-419d: a cleared binding must also cut the link of the host that owned it,
+// otherwise "clear binding" leaves the old PC receiving every key until it
+// happens to disconnect on its own. Drained by processPendingBleWork().
+static volatile bool   s_pendingDropHost = false;
 // WS-411 #4: a CLEARBOND issued while a link is up must not tear that link
 // down. Remember the old host address and unpair it only after every central
 // has gone.
@@ -1068,7 +1072,13 @@ void BleKeyboard::clearHostBinding() {
     if (s_connected) {
       s_deferredBondAddr = s_hostAddrObj;
       s_deleteBondOnDisconnect = true;
-      ESP_LOGE("BIND", "[ble] CLEARBOND: link active -> bond will be removed after disconnect");
+      // WS-419d: also drop the link. "Clear binding" means "stop accepting this
+      // host", and leaving the old PC receiving keys until it wanders off is
+      // the opposite of what the user asked for. The bond itself is still
+      // removed from onDisconnect (WS-411 #4) so the unpair never races the
+      // link teardown.
+      requestDropHostLink();
+      ESP_LOGE("BIND", "[ble] CLEARBOND: dropping the HID host link, bond removed after disconnect");
     } else {
       requestDeleteBond(s_hostAddrObj);
     }
@@ -1104,6 +1114,10 @@ void requestClearHostBinding() {
   s_pendingClearBinding = true;
 }
 
+void requestDropHostLink() {
+  s_pendingDropHost = true;
+}
+
 void processPendingBleWork() {
   // WS-429: lift the stale-peer advertising backoff when its deadline
   // expires. Runs on the Arduino loop task, so the radio is only touched from
@@ -1124,6 +1138,20 @@ void processPendingBleWork() {
     s_pendingClearBinding = false;
     ::clearHostBinding();
     ESP_LOGE("BIND", "[ble] SELF-HEAL(A): app binding cleared -> host will re-pair");
+  }
+
+  // WS-419d: cut the link of the host whose binding was just cleared. Runs on
+  // the Arduino loop task; ble_gap_terminate is safe here.
+  if (s_pendingDropHost) {
+    s_pendingDropHost = false;
+    if (s_hid_conn != BLE_HS_CONN_HANDLE_NONE) {
+      const uint16_t conn = s_hid_conn;
+      s_hid_conn = BLE_HS_CONN_HANDLE_NONE;
+      if (NimBLEServer* srv = NimBLEDevice::getServer()) {
+        srv->disconnect(conn, BLE_ERR_CONN_TERM_LOCAL);
+        ESP_LOGE("BIND", "[ble] CLEARBOND: dropped host link conn=0x%04X", conn);
+      }
+    }
   }
 
   if (!s_pendingDeleteBond) return;

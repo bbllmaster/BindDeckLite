@@ -907,7 +907,7 @@ function renderDeviceMeta() {
       ` <span class="muted small">· 配对 ${bond.peer_sec} 个 · NimBLE 绑定 ${bond.nimble_bond ? "正常" : "缺失"}</span>`;
     bondEl.innerHTML = `<span class="dot ok"></span>已绑定 <b>${escapeHtml(bond.addr || "—")}</b>${diag}`;
     clearBtn.hidden = false;
-    $("#bondHint").textContent = "只有已绑定的主机能发送 HID 按键；清除后任何主机均可接入。";
+    $("#bondHint").textContent = "只有已绑定的主机能发送 HID 按键；清除会同时断开它的连接，之后任何主机均可接入。";
   } else {
     bondEl.innerHTML = `<span class="dot warn"></span>未绑定`;
     clearBtn.hidden = true;
