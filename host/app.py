@@ -155,6 +155,182 @@ DEFAULT_PINS = {
 DEFAULT_KEYS = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9]
 DEFAULT_LABELS = ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22"]
 
+# --- WS-476: pin rules (the host keeps exactly one copy) -------------------
+# Mirrors isValidButtonPin() / isValidPinSet() in src/main.cpp. The device page
+# used to accept any number, then a cleared box reached CFG:PINS as "None" and
+# apply_device() died on int(None) (HTTP 500). The rule lives here and is
+# published through /api/defaults so the JavaScript never re-implements it.
+PIN_COUNT = 9
+
+# Encoder CLK / DT / SW per chip (main.cpp ENCODER_CLK/DT/SW).
+ENCODER_PINS = {
+    "C3": {"CLK": 20, "DT": 21, "SW": 10},
+    "ESP32": {"CLK": 18, "DT": 19, "SW": 5},
+}
+_ENCODER_ROLE_TEXT = {
+    "CLK": "编码器 A 相脚（CLK）",
+    "DT": "编码器 B 相脚（DT）",
+    "SW": "编码器按压脚",
+}
+
+
+def pin_chip(chip: str) -> str:
+    """Normalise a firmware chip string to one of the two pin profiles.
+
+    Firmware sends ``C3`` or ``ESP32`` (main.cpp FW_CHIP); older configs may
+    carry ``ESP32C3`` or an empty string, which falls back to the classic map
+    exactly like ``new_device_cfg()`` does.
+    """
+    return "C3" if "C3" in (chip or "").upper() else "ESP32"
+
+
+def pin_rules(chip: str = "") -> dict:
+    """The pin constraints for one chip, in the shape the UI renders.
+
+    Descriptive only — ``validate_pins()`` is the single authority on whether
+    a value is accepted; this just states the same limits as a hint.
+    """
+    prof = pin_chip(chip)
+    if prof == "C3":
+        return {
+            "chip": "C3",
+            "count": PIN_COUNT,
+            "min": 0,
+            "max": 21,
+            "blocked": [[11, 17]],
+            "encoder": dict(ENCODER_PINS["C3"]),
+            "hint": "C3：按键可用 GPIO0-10、20、21（避开 11-17 内部 Flash）；编码器 A/B/按压 = 20/21/10；18/19 是 USB-CDC，不建议占用。",
+        }
+    return {
+        "chip": "ESP32",
+        "count": PIN_COUNT,
+        "min": 0,
+        "max": 39,
+        "blocked": [[6, 11], [34, 39]],
+        "encoder": dict(ENCODER_PINS["ESP32"]),
+        "hint": "经典 ESP32：按键可用 GPIO0-39（避开 6-11 SPI Flash 与 34-39 仅输入脚）；编码器 A/B/按压 = 18/19/5。",
+    }
+
+
+def _pin_int(value):
+    """Strictly parse one candidate pin. Returns ``(ok, pin)``.
+
+    Unlike ``int()`` this never accepts ``None``/``""``/``"abc"``/``6.5``;
+    booleans are rejected too, because ``True`` would otherwise pass as GPIO1.
+    """
+    if isinstance(value, bool):
+        return False, 0
+    if isinstance(value, int):
+        return True, value
+    if isinstance(value, float):
+        return (True, int(value)) if value.is_integer() else (False, 0)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return False, 0
+        try:
+            return True, int(text, 10)
+        except ValueError:
+            return False, 0
+    return False, 0
+
+
+def _pin_reject_reason(prof: str, btn: str, pin: int):
+    """Why ``pin`` cannot be a button pin on ``prof``. ``("", "")`` = accepted.
+
+    Returns ``(code, message)`` so the caller can tag the row without parsing
+    the text back apart.
+    """
+    who = "%s 的 GPIO %d" % (btn, pin)
+    if prof == "C3":
+        if pin > 21:
+            return "out_of_range", who + " 在 C3 上不存在（C3 只有 GPIO0-10、20、21）"
+        if 11 <= pin <= 17:
+            return "reserved", who + " 在 C3 上是内部 Flash 引脚，不能用作按键"
+    else:
+        if 6 <= pin <= 11:
+            return "reserved", who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键"
+        if pin >= 34:
+            return "reserved", who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键"
+    for role, encoder_pin in ENCODER_PINS[prof].items():
+        if pin == encoder_pin:
+            return "encoder", who + " 与" + _ENCODER_ROLE_TEXT[role] + "冲突"
+    return "", ""
+
+
+def validate_pins(pins, chip: str = "") -> list:
+    """Return one ``{index, code, message}`` per offending button row.
+
+    ``[]`` means the pin set is acceptable — the same set the firmware would
+    accept, so ``CFG:PINS`` is only sent when the deck can actually take it.
+    Every message starts with 「按键 N」so the device page can show it under
+    that row instead of framing all nine inputs (the old behaviour).
+
+    Rules (src/main.cpp:228-285): non-empty, integer 0-39, unique, and on top
+    of that the per-chip reserved ranges plus the encoder pins.
+    """
+    prof = pin_chip(chip)
+    values = list(pins) if isinstance(pins, (list, tuple)) else []
+    errors = []
+    accepted = {}   # pin -> [row indices], used for the duplicate report
+
+    for i in range(PIN_COUNT):
+        btn = "按键 %d" % (i + 1)
+        raw = values[i] if i < len(values) else None
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            errors.append({"index": i, "code": "empty", "message": btn + " 不能为空"})
+            continue
+        ok, pin = _pin_int(raw)
+        if not ok:
+            errors.append({"index": i, "code": "not_integer",
+                           "message": btn + " 必须是 0-39 的整数"})
+            continue
+        if pin < 0 or pin > 39:
+            errors.append({"index": i, "code": "out_of_range",
+                           "message": btn + " 必须填 0-39 的整数"})
+            continue
+        reason_code, reason = _pin_reject_reason(prof, btn, pin)
+        if reason:
+            errors.append({"index": i, "code": reason_code, "message": reason})
+            continue
+        accepted.setdefault(pin, []).append(i)
+
+    # Duplicates: every row that shares a pin is flagged, so fixing either one
+    # clears both at once.
+    for pin, rows in accepted.items():
+        if len(rows) < 2:
+            continue
+        names = ["按键 %d" % (i + 1) for i in rows]
+        text = ("%s 与%s" % (names[0], names[1]) if len(names) == 2
+                else "、".join(names))
+        for i in rows:
+            errors.append({"index": i, "code": "duplicate",
+                           "message": "%s 都使用了 GPIO %d" % (text, pin)})
+
+    errors.sort(key=lambda e: e["index"])
+    return errors
+
+
+def parse_pins_query(raw: str) -> list:
+    """Turn ``?pins=0,1,,3`` into values for ``validate_pins``.
+
+    An empty token stays ``None`` (「不能为空」); anything non-numeric is kept
+    verbatim so the error can still name the row. Missing trailing tokens are
+    handled by ``validate_pins`` itself.
+    """
+    out = []
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if not token:
+            out.append(None)
+            continue
+        try:
+            out.append(int(token, 10))
+        except ValueError:
+            out.append(token)
+    return out
+
+
 KEY_CODES = [
     ("F13", 0xF0), ("F14", 0xF1), ("F15", 0xF2), ("F16", 0xF3),
     ("F17", 0xF4), ("F18", 0xF5), ("F19", 0xF6), ("F20", 0xF7),
@@ -1174,6 +1350,15 @@ def send(dev_id: str, cmd: str) -> dict:
 
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
+
+    # WS-476: refuse an invalid pin set before anything touches the link. The
+    # old code built the line first, so a cleared box (None) blew up on
+    # int(None) and the user only saw "500 INTERNAL SERVER ERROR".
+    pin_errors = validate_pins(cfg.get("pins"), cfg.get("chip", ""))
+    if pin_errors:
+        add_event("cfg", "未下发：" + pin_errors[0]["message"], dev_id, "warn")
+        return {"ok": False, "invalid": True, "pin_errors": pin_errors,
+                "error": pin_errors[0]["message"]}
 
     # Build the values we are going to send — this snapshot is what the
     # readback is compared against, so a rejected field shows the user what
@@ -2917,7 +3102,20 @@ def api_status():
 
 @app.route("/api/defaults")
 def api_defaults():
-    return jsonify(new_device_cfg("ESP32", ""))
+    """Default config, plus the pin rule the device page renders (WS-476).
+
+    Read-only and side-effect free, so the form also sends its current values
+    here (``?chip=C3&pins=0,1,,3``) to get per-row errors back. That keeps the
+    validation rule in one place — the firmware-equivalent ``validate_pins()``
+    — instead of a second copy in JavaScript.
+    """
+    chip = request.args.get("chip", "ESP32")
+    payload = new_device_cfg(chip, "")
+    payload["pinRules"] = pin_rules(chip)
+    if "pins" in request.args:
+        payload["pinErrors"] = validate_pins(
+            parse_pins_query(request.args.get("pins", "")), chip)
+    return jsonify(payload)
 
 
 @app.route("/api/scan")
@@ -2943,7 +3141,9 @@ def api_config(dev_id):
 
 @app.route("/api/apply/<dev_id>", methods=["POST"])
 def api_apply(dev_id):
-    return jsonify(apply_device(dev_id))
+    result = apply_device(dev_id)
+    # WS-476: an invalid pin set is a client-side problem, not a server crash.
+    return jsonify(result), (400 if result.get("invalid") else 200)
 
 
 @app.route("/api/action/test/<dev_id>/<int:idx>", methods=["POST"])

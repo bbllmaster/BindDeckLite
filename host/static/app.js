@@ -33,6 +33,13 @@ const MACRO_KEY_HINT =
   "Left Right Up Down LCtrl RCtrl LShift RShift LAlt RAlt LWin RWin " +
   "F1-F12、单个字母/数字；组合键用 + 连接（ctrl+alt+t）";
 
+// WS-476：按键引脚校验。判定规则只有一份，在 host/app.py 的 validate_pins()
+// 里（与固件 isValidButtonPin / isValidPinSet 对齐）。这里只负责把当前 9 个
+// 值交给只读的 /api/defaults 取回逐行错误，不在 JS 里再抄一遍规则。
+const PIN_COUNT = 9;
+// 停止输入 300 ms 后才校验：13 改成 1 会先经过空串，不能每敲一个字符就飘红。
+const PIN_VALIDATE_DEBOUNCE_MS = 300;
+
 const state = {
   devices: [],
   selected: null,
@@ -54,6 +61,10 @@ const state = {
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段（WS-409）
   sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status（WS-445）
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
+  pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors（WS-476）
+  pinRules: null,     // 当前 chip 的引脚规则/提示，来源 /api/defaults 的 pinRules（WS-476）
+  pinValidateSeq: 0,  // 每次校验自增，丢弃过期响应（防抖 / 快速切换设备时乱序）
+  pinValidateTimer: null,
 };
 
 async function api(path, opts = {}) {
@@ -61,7 +72,18 @@ async function api(path, opts = {}) {
     headers: { "Content-Type": "application/json" },
     ...opts,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    // WS-476: 后端 400 会带 {ok:false,error:"按键 3 不能为空"}，把它显示出来，
+    // 别再让用户只看到 "400 BAD REQUEST"。
+    let detail = "";
+    try {
+      const body = await res.json();
+      if (body && body.error) detail = body.error;
+    } catch (_) {
+      /* 不是 JSON：退回状态码文案 */
+    }
+    throw new Error(detail || `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 
@@ -914,10 +936,9 @@ function renderDeviceMeta() {
     $("#bondHint").textContent = "首次 HID 订阅的主机会被绑定；按住编码器 5 秒也可清除。";
   }
 
-  const hint = chip === "C3" || chip === "ESP32C3"
-    ? "C3 预设：按键 GPIO0-8、编码器按压 GPIO10、编码器 A/B=GPIO20/21；避开 11-17（Flash）与 18/19（USB）。"
-    : "经典 ESP32：避开 6-11（Flash）与 34-39（仅输入）。编码器固定 18/19/5。";
-  $("#pinHint").textContent = hint;
+  // 引脚提示文案也来自后端规则（/api/defaults 的 pinRules），避免 JS 里再写一份
+  // 与固件可能漂移的引脚限制。
+  renderPinHint();
   // WS-409: 设备页的「上次读取」状态行。
   renderReadStatus();
   // WS-445: 运行状态卡片（采样请求由 selectDevice / 重连 / 刷新 / 打开设备页触发）。
@@ -928,23 +949,139 @@ function renderPins() {
   const box = $("#pinGrid");
   box.innerHTML = "";
   if (!state.cfg) return;
-  const pins = state.cfg.pins || [];
-  for (let i = 0; i < 9; i++) {
+  // 旧 config.json 可能缺项 / 是 null / 甚至不是数组：照原样渲染，由校验标红，
+  // 不在这里替用户补默认值（WS-476 要求不改写用户的值）。
+  const pins = Array.isArray(state.cfg.pins) ? state.cfg.pins : [];
+  for (let i = 0; i < PIN_COUNT; i++) {
     const wrap = document.createElement("label");
     wrap.className = "pin";
-    wrap.innerHTML = `<span>按键 ${i + 1}</span>`;
+    const name = document.createElement("span");
+    name.textContent = `按键 ${i + 1}`;
     const input = document.createElement("input");
     input.type = "number";
     input.min = "0";
     input.max = "39";
-    input.value = pins[i] ?? "";
+    input.value = pins[i] === null || pins[i] === undefined ? "" : pins[i];
+    input.dataset.pinIndex = String(i);
     input.oninput = () => {
-      state.cfg.pins[i] = parseInt(input.value, 10);
+      const raw = input.value.trim();
+      state.cfg.pins = Array.isArray(state.cfg.pins) ? state.cfg.pins : [];
+      // 空串就是「空」，不能像以前那样写 parseInt("") = NaN —— JSON.stringify
+      // 会把 NaN 变成 null，旧后端在 int(None) 上直接 500。
+      state.cfg.pins[i] = raw === "" ? null
+        : (Number.isFinite(Number(raw)) ? Number(raw) : raw);
       markDirty();
+      schedulePinValidation();
     };
-    wrap.appendChild(input);
+    // 失焦立刻校验，不必等防抖计时器。
+    input.onblur = () => validatePins();
+    const err = document.createElement("small");
+    err.className = "pin-error";
+    err.setAttribute("aria-live", "polite");
+    err.hidden = true;
+    wrap.append(name, input, err);
     box.appendChild(wrap);
   }
+  // 每次重绘都先清掉上一轮的结论，再按当前值重算，避免旧红框挂在新值上。
+  applyPinErrors([]);
+  validatePins();
+}
+
+/** 防抖：停止输入 300 ms 后校验整张引脚表。 */
+function schedulePinValidation() {
+  clearTimeout(state.pinValidateTimer);
+  state.pinValidateTimer = setTimeout(() => {
+    state.pinValidateTimer = null;
+    validatePins();
+  }, PIN_VALIDATE_DEBOUNCE_MS);
+}
+
+/**
+ * 向只读接口要逐行错误并渲染。
+ *
+ * 规则来自后端：把 chip 和 9 个原始值原样传过去，服务端用 validate_pins()
+ * 判定。返回 [{index, code, message}]，空数组 = 全部合法。
+ */
+async function validatePins() {
+  clearTimeout(state.pinValidateTimer);
+  state.pinValidateTimer = null;
+  if (!state.cfg) {
+    applyPinErrors([]);
+    return [];
+  }
+  const pins = Array.isArray(state.cfg.pins) ? state.cfg.pins : [];
+  const tokens = [];
+  for (let i = 0; i < PIN_COUNT; i++) {
+    const v = pins[i];
+    tokens.push(v === null || v === undefined ? "" : String(v));
+  }
+  const seq = ++state.pinValidateSeq;
+  const query = `?chip=${encodeURIComponent(state.cfg.chip || "ESP32")}`
+    + `&pins=${encodeURIComponent(tokens.join(","))}`;
+  let errors;
+  try {
+    const r = await api("/api/defaults" + query);
+    errors = Array.isArray(r.pinErrors) ? r.pinErrors : [];
+    if (r.pinRules) {
+      state.pinRules = r.pinRules;
+      renderPinHint();
+    }
+  } catch (_) {
+    // 上位机后端暂时取不到：保留上一次结论，绝不假装全部合法。
+    return state.pinErrors || [];
+  }
+  if (seq !== state.pinValidateSeq) return state.pinErrors || [];  // 有更新的请求
+  applyPinErrors(errors);
+  return errors;
+}
+
+/** 把错误列表画到对应行：红边 + 输入框下方红字 + 标题旁计数。 */
+function applyPinErrors(errors) {
+  state.pinErrors = Array.isArray(errors) ? errors : [];
+  const byIndex = {};
+  state.pinErrors.forEach((e) => {
+    if (e && typeof e.index === "number") byIndex[e.index] = e.message || "";
+  });
+  $$("#pinGrid .pin").forEach((row, i) => {
+    const msg = byIndex[i] || "";
+    const input = row.querySelector("input");
+    const slot = row.querySelector(".pin-error");
+    row.classList.toggle("bad", !!msg);
+    if (slot) {
+      slot.textContent = msg;
+      slot.hidden = !msg;
+    }
+    if (input) {
+      if (msg) input.setAttribute("aria-invalid", "true");
+      else input.removeAttribute("aria-invalid");
+    }
+  });
+  renderPinErrorCount();
+}
+
+/** 引脚卡片下方的说明文字：来自后端 pinRules，和 validate_pins 同一份规则。 */
+function renderPinHint() {
+  const el = $("#pinHint");
+  if (el && state.pinRules) el.textContent = state.pinRules.hint || "";
+}
+
+function renderPinErrorCount() {
+  const el = $("#pinErrorCount");
+  if (!el) return;
+  const n = state.pinErrors.length;
+  el.textContent = n ? `${n} 处需要修正` : "";
+  el.hidden = !n;
+}
+
+/** 滚动并聚焦第一处错误行（非平滑滚动，避免长时间动画）。 */
+function focusFirstPinError(errors) {
+  const first = (errors || [])[0];
+  if (!first) return;
+  const row = $$("#pinGrid .pin")[first.index];
+  if (!row) return;
+  row.scrollIntoView({ block: "center" });
+  const input = row.querySelector("input");
+  if (input) input.focus();
 }
 
 /* ---------------- desktop shell ---------------- */
@@ -1073,6 +1210,14 @@ async function applyConfig() {
   }
   if (!state.selected) {
     toast("未连接设备，当前只是默认配置预览", "bad");
+    return;
+  }
+  // WS-476：先校验。有错误就一条 CFG: 都不发，直接把用户带到第一处错误行。
+  // 顺序放在「未连接设备」之后：预览/离线仍只提示未连接，不叠加两套 toast。
+  const pinErrors = await validatePins();
+  if (pinErrors.length) {
+    toast(`按键引脚有 ${pinErrors.length} 处错误`, "bad");
+    focusFirstPinError(pinErrors);
     return;
   }
   await saveConfig();

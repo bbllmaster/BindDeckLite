@@ -1,5 +1,33 @@
 # Changelog
 
+## 设备页引脚逐行校验 + 应用阻断 + `/api/apply` 不再 500 — 2026-10-29（WS-476）
+
+设备页的 9 个引脚框只是 `parseInt` 后写进配置：清空一格得到 `NaN`，
+`JSON.stringify` 落成 `null`，`apply_device()` 在 `int(None)` 上抛 `TypeError`，
+用户只看到右上角一个 500；引脚约束（Flash / 仅输入 / 编码器脚 / 重复）只有设备侧
+知道，被拒后只能整块黄框。
+
+- 后端一份规则：`host/app.py` 新增 `validate_pins(pins, chip)`，与 `src/main.cpp`
+  的 `isValidButtonPin` / `isValidPinSet` 对齐（非空、`0-39` 整数、9 值不重复；C3
+  排除 11-17 与编码器 20/21/10，经典排除 6-11、34-39 与编码器 18/19/5），逐行返回
+  `{index, code, message}`。
+- `/api/apply` 在拼 `CFG:PINS` 之前先校验：非法时返回 `400 {"ok":false,"error":"按键 3 不能为空"}`，
+  一条 `CFG:` 都不发，不再 500。
+- `/api/defaults` 同时是只读的规则/校验入口：`?chip=&pins=` 回 `pinErrors` 与
+  `pinRules`（规则 + 提示文案），不带参数时行为不变；前端不再抄一份判定。
+- 设备页：每行预留 `small.pin-error`（`aria-live`），停止输入 300 ms 或失焦后校验；
+  错误行红边 + `aria-invalid` + 行内文案，标题旁「N 处需要修正」；「应用配置」有错时
+  不下发、toast「按键引脚有 N 处错误」、滚动并聚焦第一处错误行；切换设备 / 读取设备
+  配置重绘后按当前值重算，不残留上一轮。
+- 旧配置里的 `null` / 非数值 / 不足 9 项打开设备页即标红，不改写用户的值。
+- 窄屏：顶栏右侧状态与按钮换行，390 px 无横向滚动；错误文案在输入框下方换行。
+- 回归：`cd host && python -m pytest test_pin_validation.py -q`（修复前：函数不存在 /
+  `POST /api/apply` 500；修复后 24 passed）。
+
+```bash
+cd host && python -m pytest test_pin_validation.py -q     # 24 passed
+```
+
 ## 移除 `esp32c3_2mb` 环境与发布产物 — 2026-10-28（WS-460）
 
 2 MB Flash 的 C3 模块不再维护：4 MB 分区表在 2 MB 芯片上会被 bootloader 判为
