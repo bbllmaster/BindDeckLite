@@ -1675,6 +1675,144 @@ def _truncate(s, n: int = 80) -> str:
     return s if len(s) <= n else s[:n] + "..."
 
 
+# --- macro summary (WS-484) ------------------------------------------------
+# A macro body may hold a password (``paste:`` / ``text:`` lines).  The event
+# log is copyable row by row and is served verbatim by ``GET /api/log``, so
+# the log must never carry the macro body — only a summary of its steps.
+MACRO_SUMMARY_MAX = 120
+
+
+def _redact_url_userinfo(url: str) -> str:
+    """Replace the ``user:pass@`` part of a URL with ``***``.
+
+    Only the userinfo section of the authority is touched: the host, the
+    path and the query string stay exactly as they were.  A string that is
+    not a ``scheme://`` URL, or that carries no userinfo, is returned
+    unchanged.
+    """
+    text = str(url or "")
+    marker = text.find("://")
+    if marker <= 0:
+        return text
+    scheme = text[:marker]
+    if not scheme[0].isalpha() or not scheme.isascii():
+        return text
+    rest = text[marker + 3:]
+    # The authority ends at the first "/", "?" or "#" — anything after it
+    # is path / query / fragment and must not be touched.
+    end = len(rest)
+    for ch in "/?#":
+        pos = rest.find(ch)
+        if pos != -1 and pos < end:
+            end = pos
+    authority = rest[:end]
+    at = authority.rfind("@")
+    if at < 0:
+        return text
+    # Only the userinfo part (before the "@") is replaced; the host stays.
+    return text[:marker + 3] + "***@" + authority[at + 1:] + rest[end:]
+
+
+def _macro_text_delay_ms(step):
+    """The explicit ``text!<ms>:`` delay of a macro step, if it has one.
+
+    ``None`` means "no explicit delay" (a plain ``text:`` step) — the
+    summary then shows ``text(N 字符)`` without a delay.  ``0`` is a real
+    value (``text!0:`` means "type as fast as possible").
+    """
+    raw = (step or {}).get("delay")
+    if raw is None or raw == "":
+        return None
+    try:
+        ms = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if ms < 0:
+        return None
+    return int(ms)
+
+
+# The UI stores a ``wait:`` step as type "delay" — the log names it the way
+# the user wrote it.
+MACRO_STEP_LABELS = {"delay": "wait"}
+
+
+def _macro_step_text(step) -> str:
+    """One macro step, rendered for the log without its body."""
+    step = step if isinstance(step, dict) else {}
+    stype = str(step.get("type") or "")
+    value = step.get("value", "")
+    if stype == "text":
+        count = len(str(value or ""))
+        delay = _macro_text_delay_ms(step)
+        if delay is not None:
+            return f"text({delay}ms, {count} 字符)"
+        return f"text({count} 字符)"
+    if stype == "paste":
+        return f"paste({len(str(value or ''))} 字符)"
+    if stype == "delay":
+        return f"wait:{_truncate(str(value or 0))}"
+    if stype == "url":
+        return f"url:{_truncate(_redact_url_userinfo(value))}"
+    if not stype:
+        return _truncate(value)
+    return f"{stype}:{_truncate(value)}"
+
+
+def macro_summary(action: dict) -> str:
+    """Log-safe summary of a macro action.
+
+    ``text:`` / ``paste:`` steps show their character count only — their
+    body may be a credential and the log is copyable.  The result is a
+    single line and never echoes ``action["value"]`` (the raw macro text
+    the UI keeps for the edit box).
+    """
+    action = action or {}
+    steps = action.get("macro")
+    if not isinstance(steps, list) or not steps:
+        return "0 步"
+    total = len(steps)
+    parts = [_macro_step_text(step) for step in steps]
+    head = f"{total} 步："
+    summary = head + " → ".join(parts)
+    if len(summary) > MACRO_SUMMARY_MAX:
+        # Keep whole steps only — a half-printed step ("text(13 字") would
+        # be misleading.  The tail carries the real step count.
+        tail = f"…（共 {total} 步）"
+        budget = MACRO_SUMMARY_MAX - len(head) - len(tail)
+        kept = []
+        used = 0
+        for part in parts:
+            extra = len(part) + (3 if kept else 0)
+            if kept and used + extra > budget:
+                break
+            kept.append(part)
+            used += extra
+        summary = head + " → ".join(kept)
+        if len(summary) > MACRO_SUMMARY_MAX:
+            summary = summary[:MACRO_SUMMARY_MAX].rstrip()
+        summary += tail
+    # A step value may contain newlines — the log row stays one line.
+    return summary.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _action_display_target(action: dict) -> str:
+    """The ``target`` shown in the log / toast for one action.
+
+    Macros are summarised (never their body) and URL credentials are
+    masked, so nothing secret ends up in a copyable log row.
+    """
+    action = action or {}
+    kind = action.get("type", "none")
+    value = action.get("value", "")
+    if kind == "macro":
+        return macro_summary(action)
+    if kind == "url" or (kind == "launch"
+                         and str(value).startswith(("http://", "https://"))):
+        return _truncate(_redact_url_userinfo(value))
+    return _truncate(value)
+
+
 # --- macro browser selection ----------------------------------------------
 # A ``browser:<name>`` macro step picks the browser that following ``url:``
 # steps open with. Users write the canonical names; the aliases cover the
@@ -2620,7 +2758,9 @@ def run_action(action: dict, dev_id: str = "") -> dict:
     action = action or {}
     kind = action.get("type", "none")
     value = action.get("value", "")
-    target = _truncate(value)
+    # WS-484: a macro target is a summary of its steps, never its body —
+    # the body may be a password and the log is copyable.
+    target = _action_display_target(action)
 
     if kind == "none":
         return {"ok": True, "error": "", "action_type": "none", "target": target}
@@ -2663,14 +2803,19 @@ def run_action(action: dict, dev_id: str = "") -> dict:
         if kb is None:
             return {"ok": False, "error": "宏需要 keyboard 库: pip install keyboard",
                     "action_type": kind, "target": target}
+        # WS-484: remember which step failed so the log row can point at it
+        # without echoing the macro body.
+        current_step = 0
+        current_type = ""
         try:
             # ``browser:`` steps choose the target for later ``url:`` steps;
             # None means "system default browser". Reset on a failed open so a
             # broken target does not break every following url.
             browser_target = None
             browser_used = "default"
-            for step in action.get("macro", []):
+            for current_step, step in enumerate(action.get("macro", []), 1):
                 st = step.get("type")
+                current_type = st or ""
                 if st == "key":
                     # 宏里可以写界面上的键名（PageUp / RCtrl / Tab ...），
                     # 这里统一换成 keyboard 库认识的写法。
@@ -2768,20 +2913,23 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                     url_val = step.get("value", "")
                     if url_val:
                         open_err = _open_url_with(browser_target, url_val)
+                        # WS-484: the log is copyable — never write URL
+                        # credentials into it.
+                        url_log = _redact_url_userinfo(url_val)
                         if open_err:
                             add_event(
                                 "error",
-                                f"未能用 {browser_used} 打开 {url_val}"
+                                f"未能用 {browser_used} 打开 {url_log}"
                                 f"（{open_err}），已回退默认浏览器",
                                 level="error")
                             browser_target = None
                             browser_used = "default"
                         elif browser_used == "default":
-                            add_event("action", f"已用默认浏览器打开 {url_val}",
+                            add_event("action", f"已用默认浏览器打开 {url_log}",
                                       level="ok")
                         else:
                             add_event("action",
-                                      f"已用 {browser_used} 打开 {url_val}",
+                                      f"已用 {browser_used} 打开 {url_log}",
                                       level="ok")
                         # Keep the freshly opened window in front, otherwise
                         # the next text:/paste: steps land in the old window.
@@ -2791,7 +2939,8 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                     "target": target, "browser_used": browser_used}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
-                    "action_type": kind, "target": target}
+                    "action_type": kind, "target": target,
+                    "step": current_step, "step_type": current_type}
 
     if kind == "media":
         kb = _load_keyboard()
@@ -2822,6 +2971,10 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
 
     ``label`` overrides the default input label (used by WS-389 for encoder
     directions, which are not one of the 10 button indices).
+
+    WS-484: a macro failure points at the step that failed ("宏第 3/6 步
+    key 失败") instead of echoing the macro body.  The body may hold a
+    password and the log is copyable row by row.
     """
     if not label:
         label = _action_label(idx)
@@ -2829,10 +2982,22 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
     target = result.get("target", "")
     if result["ok"]:
         add_event("action", f"动作成功: {label} · {atype} · {target}", dev_id, "ok")
-    else:
+        return
+    if atype == "macro" and "step" in result:
+        steps = (action or {}).get("macro") or []
+        total = len(steps) if isinstance(steps, list) else 0
+        step_type = MACRO_STEP_LABELS.get(result.get("step_type", ""),
+                                          result.get("step_type", ""))
+        where = f"宏第 {result.get('step', 0)}/{total} 步"
+        if step_type:
+            where += f" {step_type}"
         add_event("action",
-                  f"动作失败: {label} · {atype} · {target} · {result['error']}",
+                  f"动作失败: {label} · {where} 失败：{result['error']}",
                   dev_id, "error")
+        return
+    add_event("action",
+              f"动作失败: {label} · {atype} · {target} · {result['error']}",
+              dev_id, "error")
 
 
 def _prune_stuck_actions(now: float | None = None):
@@ -3228,7 +3393,7 @@ def api_action_test(dev_id, idx):
         except Exception as e:  # noqa: BLE001
             result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "action_type": action.get("type", ""),
-                              "target": _truncate(action.get("value", ""))})
+                              "target": _action_display_target(action)})
         finally:
             # A macro longer than the 5 s wait keeps running in the background;
             # the worker owns the claim then, so the card stays in "执行中".
@@ -3292,7 +3457,7 @@ def api_encoder_action_test(dev_id, direction):
         except Exception as e:  # noqa: BLE001
             result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "action_type": action.get("type", ""),
-                              "target": _truncate(action.get("value", ""))})
+                              "target": _action_display_target(action)})
         finally:
             _end_encoder_action(dev_id, direction, token)
 
