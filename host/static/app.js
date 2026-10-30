@@ -1661,7 +1661,7 @@ async function pollLog() {
       copyBtn.type = "button";
       copyBtn.className = "log-copy";
       copyBtn.textContent = "复制";
-      copyBtn.title = "复制这一行日志";
+      copyBtn.title = "复制这一行（宏正文已隐藏）";
       copyBtn.onclick = () => copyLogLine(`${e.time} [${e.kind}] ${e.text}`, copyBtn);
       row.appendChild(copyBtn);
 
