@@ -122,7 +122,7 @@ _lock = threading.RLock()
 _events = deque(maxlen=400)
 _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
-_action_running = {}      # (dev_id, idx) -> {"started", "token", "thread"}; WS-359/360
+_action_running = {}      # (dev_id, idx) -> {"started", "token", "thread", "cancel"}; WS-359/360, WS-495
 _action_token_seq = 0     # bumped under _lock, one token per claim
 # WS-389: encoder rotation actions share the same preemption model as keys, but
 # are keyed by (dev_id, "CW"|"CCW") because each direction has its own action.
@@ -2746,13 +2746,40 @@ def _wait_url_foreground(timeout: float | None = None) -> bool:
         time.sleep(0.1)
 
 
-def run_action(action: dict, dev_id: str = "") -> dict:
+def _macro_cancelled(action: dict, step: int, total: int,
+                     step_type: str) -> dict:
+    """Result object for a macro stopped by the user (WS-495).
+
+    Cancelling is not a failure of the action: the result carries
+    ``cancelled: True`` so the UI can show a neutral "已停止" instead of a red
+    error toast, and so ``_record_action_result`` writes a ``warn`` row that
+    names the step but never its body (WS-484 rule).
+    """
+    label = MACRO_STEP_LABELS.get(step_type, step_type) or "未知步骤"
+    return {"ok": False,
+            "cancelled": True,
+            "error": f"已停止（第 {step}/{total} 步，{label}）",
+            "action_type": "macro",
+            "target": _action_display_target(action),
+            "step": step,
+            "step_type": step_type,
+            "total_steps": total}
+
+
+def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     """Execute one host-side action and return a structured result.
 
     Returns ``{ok: bool, error: str, action_type: str, target: str}`` where
     ``error`` is a human-readable failure reason (empty when ``ok`` is True).
     ``dev_id`` only tags inner log rows (clipboard/paste warnings) with the
     device they came from.
+
+    ``cancel`` is an optional ``threading.Event`` (WS-495).  A ``macro`` stops
+    at the next step boundary when it is set; ``wait:`` steps are sliced into
+    50 ms pieces so a stop does not have to wait out the whole delay.  The
+    step in flight is never retracted — the keystrokes it already sent cannot
+    be recalled.
+
     Never raises: every code path produces a result object.
     """
     action = action or {}
@@ -2807,15 +2834,23 @@ def run_action(action: dict, dev_id: str = "") -> dict:
         # without echoing the macro body.
         current_step = 0
         current_type = ""
+        macro_steps = action.get("macro", []) or []
+        total_steps = len(macro_steps)
         try:
             # ``browser:`` steps choose the target for later ``url:`` steps;
             # None means "system default browser". Reset on a failed open so a
             # broken target does not break every following url.
             browser_target = None
             browser_used = "default"
-            for current_step, step in enumerate(action.get("macro", []), 1):
+            for current_step, step in enumerate(macro_steps, 1):
                 st = step.get("type")
                 current_type = st or ""
+                # WS-495: stop *between* steps.  The step that is already
+                # typing keeps going (its keys are out), but nothing after
+                # it runs.
+                if cancel is not None and cancel.is_set():
+                    return _macro_cancelled(action, current_step, total_steps,
+                                            current_type)
                 if st == "key":
                     # 宏里可以写界面上的键名（PageUp / RCtrl / Tab ...），
                     # 这里统一换成 keyboard 库认识的写法。
@@ -2833,7 +2868,22 @@ def run_action(action: dict, dev_id: str = "") -> dict:
                         kb.write(step.get("value", ""),
                                  delay=MACRO_TEXT_DEFAULT_DELAY)
                 elif st == "delay":
-                    time.sleep(max(0, int(step.get("value", 0))) / 1000.0)
+                    wait_s = max(0, int(step.get("value", 0))) / 1000.0
+                    if cancel is None:
+                        time.sleep(wait_s)
+                    else:
+                        # WS-495: sleep in <=50 ms slices so a stop request
+                        # takes effect almost immediately instead of after a
+                        # whole wait:5000.  The remainder is the last slice.
+                        remaining = wait_s
+                        while remaining > 0:
+                            if cancel.is_set():
+                                return _macro_cancelled(
+                                    action, current_step, total_steps,
+                                    current_type)
+                            slice_s = min(0.05, remaining)
+                            time.sleep(slice_s)
+                            remaining -= slice_s
                 elif st == "app":
                     # Launch a desktop application, then wait for its window to
                     # take the foreground so the following text:/key:/paste:
@@ -2980,6 +3030,20 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
         label = _action_label(idx)
     atype = result.get("action_type", (action or {}).get("type", "unknown"))
     target = result.get("target", "")
+    # WS-495: a user-requested stop is not a failure — one neutral warn row
+    # naming the step, and (WS-484) never the step body.
+    if result.get("cancelled"):
+        steps = (action or {}).get("macro") or []
+        total = result.get("total_steps")
+        if not isinstance(total, int) or total <= 0:
+            total = len(steps) if isinstance(steps, list) else 0
+        step_type = MACRO_STEP_LABELS.get(result.get("step_type", ""),
+                                          result.get("step_type", ""))
+        where = f"第 {result.get('step', 0)}/{total} 步"
+        if step_type:
+            where += f"（{step_type}）"
+        add_event("action", f"动作已停止：{label} · {where}", dev_id, "warn")
+        return
     if result["ok"]:
         add_event("action", f"动作成功: {label} · {atype} · {target}", dev_id, "ok")
         return
@@ -3051,8 +3115,42 @@ def _begin_action(dev_id: str, idx: int):
             return None, now - entry["started"]
         _action_token_seq += 1
         token = _action_token_seq
-        _action_running[(dev_id, idx)] = {"started": now, "token": token, "thread": None}
+        _action_running[(dev_id, idx)] = {
+            "started": now, "token": token, "thread": None,
+            # WS-495: set by /api/action/cancel, polled by the macro loop.
+            "cancel": threading.Event(),
+        }
         return token, None
+
+
+def _action_cancel_event(dev_id: str, idx: int):
+    """The cancel flag of the live claim on ``(dev_id, idx)``, or ``None``.
+
+    Read right after ``_begin_action`` succeeded: the claim is exclusive, so
+    the event belongs to this run and is safe to hand to ``run_action``.
+    """
+    with _lock:
+        entry = _action_running.get((dev_id, idx))
+        return entry.get("cancel") if entry else None
+
+
+def _cancel_action(dev_id: str, idx: int) -> bool:
+    """Request a stop for the action running on ``(dev_id, idx)`` (WS-495).
+
+    Returns True only when this call actually flipped the flag; every other
+    case (no claim, already finished, already asked) returns False so the
+    route can answer ``already_done`` without logging an error or writing a
+    second "已停止" row.
+    """
+    with _lock:
+        entry = _action_running.get((dev_id, idx))
+        if entry is None:
+            return False
+        event = entry.get("cancel")
+        if event is None or event.is_set():
+            return False
+        event.set()
+        return True
 
 
 def _bind_action_thread(dev_id: str, idx: int, token: int, thread):
@@ -3118,9 +3216,12 @@ def _run_action_for(dev_id: str, idx: int):
                   dev_id, "warn")
         return
 
+    # WS-495: a physical key press is stoppable through the same route.
+    cancel = _action_cancel_event(dev_id, idx)
+
     def _do():
         try:
-            result = run_action(action, dev_id)
+            result = run_action(action, dev_id, cancel=cancel)
             _record_action_result(dev_id, idx, action, result)
         finally:
             # Release even when run_action raised; otherwise the card would
@@ -3386,14 +3487,22 @@ def api_action_test(dev_id, idx):
 
     # Execute synchronously (5 s cap) so the caller gets the real result.
     result_queue: "queue.Queue" = queue.Queue()
+    # WS-495: so the card's "停止" works during the 5 s window too.
+    cancel = _action_cancel_event(dev_id, idx)
 
     def _worker():
         try:
-            result_queue.put(run_action(action, dev_id))
-        except Exception as e:  # noqa: BLE001
-            result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
-                              "action_type": action.get("type", ""),
-                              "target": _action_display_target(action)})
+            try:
+                result = run_action(action, dev_id, cancel=cancel)
+            except Exception as e:  # noqa: BLE001
+                result = {"ok": False, "error": f"{type(e).__name__}: {e}",
+                          "action_type": action.get("type", ""),
+                          "target": _action_display_target(action)}
+            result_queue.put(result)
+            # WS-495: record here, not in the route.  A macro that outlived
+            # the 5 s window used to finish with no log row at all, so a
+            # stop after that window left no "动作已停止" trace.
+            _record_action_result(dev_id, idx, action, result)
         finally:
             # A macro longer than the 5 s wait keeps running in the background;
             # the worker owns the claim then, so the card stays in "执行中".
@@ -3413,9 +3522,24 @@ def api_action_test(dev_id, idx):
         return jsonify({"ok": False, "error": "仍在执行", "running": True}), 200
 
     _end_action(dev_id, idx, token)
-    _record_action_result(dev_id, idx, action, result)
     return jsonify({"ok": result["ok"], "error": result["error"],
+                    # WS-495: additive — a stop is not a failure.
+                    "cancelled": bool(result.get("cancelled")),
                     "browser_used": result.get("browser_used", "")})
+
+
+@app.route("/api/action/cancel/<dev_id>/<int:idx>", methods=["POST"])
+def api_action_cancel(dev_id, idx):
+    """Stop the action running on one input at the next step boundary (WS-495).
+
+    Always 200: "there was nothing to stop" is a normal answer, not an error
+    (the macro may have finished between the click and the request, or the
+    deck may have disconnected with a stale claim).  ``already_done`` tells
+    the UI to leave its neutral state alone instead of showing a failure.
+    """
+    if _cancel_action(dev_id, idx):
+        return jsonify({"ok": True, "cancelling": True})
+    return jsonify({"ok": True, "already_done": True})
 
 
 @app.route("/api/encoder/action/test/<dev_id>/<direction>", methods=["POST"])

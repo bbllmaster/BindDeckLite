@@ -109,6 +109,7 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; bor
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.primary.dirty { box-shadow: 0 0 0 2px rgba(53, 224, 194, 0.25); }
 .btn.danger { color: var(--danger); border-color: rgba(255, 107, 107, 0.35); }
+.btn.danger:hover { border-color: rgba(255, 107, 107, 0.7); background: rgba(255, 107, 107, 0.08); }
 .btn.tiny { padding: 5px 10px; font-size: 11px; border-radius: 8px; }
 .small-btn { padding: 6px 12px; font-size: 12px; }
 
