@@ -56,6 +56,7 @@ const state = {
   ota: null,           // {status, sent, total, percent, error, filename}
   otaFile: null,       // File object chosen by the user
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
+  stopping: {},        // dev_id -> {"<idx>": true}，已发出停止请求、等状态确认（WS-495）
   scan: null,          // 最近一次扫描的结论，来源 /api/status（WS-395）
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status（WS-389）
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段（WS-409）
@@ -328,18 +329,22 @@ function renderKeys() {
     renderActionInput(holder, item, card);
 
     $(".test", card).onclick = async () => {
+      const devId = state.selected;
       if (card.classList.contains("running")) {
-        // 按钮此时本应 disabled，兜底防止键盘触发第二次宏。
-        toast("该按键的动作仍在执行", "warn");
+        // 执行中：这颗按钮就是止损入口（WS-495），不是重入。
+        stopAction(devId, i);
         return;
       }
-      const devId = state.selected;
       const noAction = !item.action || (item.action.type || "none") === "none";
-      // /api/action/test 最多阻塞 5 秒才返回；先本地点亮执行中态，
-      // 否则点击后到下一次轮询之间用户看不到任何反馈。
+      // /api/action/test 最多阻塞 5 秒才返回，先本地点亮执行中态；但 300 ms
+      // 内就结束的动作不该让按钮闪一下「停止」，所以延迟点亮，快速返回时
+      // 定时器直接清掉（WS-495 验收：5 秒内正常结束不出现「停止」）。
+      let armTimer = null;
       if (devId && !noAction) {
-        markRunning(devId, i);
-        applyRunningState();
+        armTimer = setTimeout(() => {
+          markRunning(devId, i);
+          applyRunningState();
+        }, 300);
       }
       let r = null;
       try {
@@ -349,6 +354,9 @@ function renderKeys() {
           // the system default is visible instead of surprising.
           const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
           toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type) + used, "ok");
+        } else if (r.cancelled) {
+          // WS-495: 用户按下了「停止」，不是失败 —— 中性提示。
+          toast("已停止", "");
         } else if (r.running) {
           // 仍在执行（重入被拒绝，或宏总时长超过 5 秒）：保持执行中态。
           if (devId) markRunning(devId, i, r.elapsed || 0);
@@ -360,6 +368,7 @@ function renderKeys() {
       } catch (e) {
         toast(e.message, "bad");
       } finally {
+        clearTimeout(armTimer);
         if (!(r && r.running)) {
           if (devId) clearRunning(devId, i);
           applyRunningState();
@@ -370,9 +379,16 @@ function renderKeys() {
   applyRunningState();
 }
 
-/* ---------- 执行中态（WS-359） ----------
+/* ---------- 执行中态（WS-359）+ 停止入口（WS-495） ----------
  * 服务端 /api/status 的 running 字段是唯一权威来源；这里只在点击测试的
- * 5 秒等待窗口内先本地标记，随后由轮询结果覆盖。 */
+ * 5 秒等待窗口内先本地标记，随后由轮询结果覆盖。
+ *
+ * 执行期间按钮不再是灰掉的「执行中…」，而是「停止」：点它就请求服务端在
+ * 下一步边界退出。已经发出的按键收不回来，所以文案必须写明这一点。 */
+
+// 执行中（可点）与已请求停止（不可点）两态的提示。
+const STOP_BTN_TITLE = "在当前步骤结束后停止，已经发出的按键不会被撤回";
+const STOPPING_BTN_TITLE = "已发出停止请求，当前步骤结束后退出";
 
 function runningFor(devId) {
   return (state.running && state.running[devId]) || {};
@@ -389,24 +405,101 @@ function clearRunning(devId, idx) {
   delete map[String(idx)];
 }
 
-function setCardRunning(card, secs) {
+function stoppingFor(devId) {
+  return (state.stopping && state.stopping[devId]) || {};
+}
+
+function markStopping(devId, idx) {
+  state.stopping = state.stopping || {};
+  const map = state.stopping[devId] || (state.stopping[devId] = {});
+  map[String(idx)] = true;
+}
+
+function clearStopping(devId, idx) {
+  delete stoppingFor(devId)[String(idx)];
+}
+
+function isStopping(devId, idx) {
+  return !!stoppingFor(devId)[String(idx)];
+}
+
+/** 停止后补两次状态快照：轮询间隔 1.2 秒，撑不到「1 秒内恢复」的验收。 */
+function nudgeStatus() {
+  setTimeout(pollStatus, 250);
+  setTimeout(pollStatus, 750);
+}
+
+/**
+ * 请求停止一条正在执行的动作（WS-495）。
+ *
+ * 成功（含 already_done）后不立刻假装已结束：服务端在下一步边界才退出，
+ * 这里保持「正在停止…」，由 /api/status 不再报 running 时自动回到
+ * 「测试动作」，所以卡片不会先跳回「停止」再跳一次。
+ */
+async function stopAction(devId, idx) {
+  if (!devId || isStopping(devId, idx)) return;   // 连点兜底：按钮已 disabled
+  markStopping(devId, idx);
+  applyRunningState();
+  let r = null;
+  try {
+    r = await api(`/api/action/cancel/${encodeURIComponent(devId)}/${idx}`, { method: "POST" });
+  } catch (e) {
+    r = null;
+  }
+  if (!r || r.ok === false) {
+    // 网络异常：退回「停止」，让用户还能再点一次；不写「停止失败」日志。
+    clearStopping(devId, idx);
+    applyRunningState();
+    toast("停止请求没有送达，请再试一次", "warn");
+    return;
+  }
+  if (r.already_done) {
+    // 服务端没有在跑的 claim（宏刚好结束）：直接回空闲态。
+    clearRunning(devId, idx);
+    clearStopping(devId, idx);
+  }
+  applyRunningState();
+  toast("已停止", "");        // 中性提示：停止不是失败
+  nudgeStatus();
+}
+
+function setCardRunning(card, secs, stopping) {
   const live = secs !== undefined && secs !== null;
   card.classList.toggle("running", live);
   const btn = $(".test", card);
   if (!btn) return;
-  btn.disabled = live;
-  btn.textContent = live ? "执行中…" : "测试动作";
-  btn.title = live
-    ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
-    : TEST_BTN_IDLE_TITLE;
+  if (live && stopping) {
+    // 已请求停止：防连点，等状态轮询确认退出。
+    btn.disabled = true;
+    btn.textContent = "正在停止…";
+    btn.classList.add("danger");
+    btn.title = STOPPING_BTN_TITLE;
+    return;
+  }
+  if (live) {
+    // 执行中：按钮可点，就是止损入口。
+    btn.disabled = false;
+    btn.textContent = "停止";
+    btn.classList.add("danger");
+    btn.title = STOP_BTN_TITLE;
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = "测试动作";
+  btn.classList.remove("danger");
+  btn.title = TEST_BTN_IDLE_TITLE;
+  // 动作结束后顺手清掉残留的停止标记，避免下次执行还显示「正在停止…」。
+  const idx = card.dataset.idx;
+  if (idx !== undefined && state.selected) clearStopping(state.selected, idx);
 }
 
 function applyRunningState() {
   // 预览 / 无选中设备时没有任何运行项；status 缺少该项即按未运行渲染。
   const running = state.preview || !state.selected ? {} : runningFor(state.selected);
+  const stopping = state.preview || !state.selected ? {} : stoppingFor(state.selected);
   $$(".keycard").forEach((card) => {
     const idx = String(parseInt(card.dataset.idx, 10));
-    setCardRunning(card, running[idx]);
+    setCardRunning(card, running[idx], stopping[idx]);
   });
 }
 

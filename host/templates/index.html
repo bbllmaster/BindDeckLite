@@ -334,7 +334,7 @@ key:enter</pre>
       <h3>常见错误排查</h3>
       <ul>
         <li><b>报错 <code>key:xxx is not mapped to any known key</code></b>：键名不在上面的对照表里。核对拼写（对照表已不区分大小写），组合键用 <code>+</code> 连接。</li>
-        <li><b>按了没反应，但卡片在呼吸</b>：这条动作还在执行（卡片边框变亮、「测试动作」显示为「执行中…」），期间重复按下会被忽略，日志里只有一条「动作跳过」。宏结束时会自动恢复；上位机不会中断已经发出的按键，要提前结束只能等宏自己跑完。</li>
+        <li><b>按了没反应，但卡片在呼吸</b>：这条动作还在执行（卡片边框变亮、「测试动作」变成红色的「停止」），期间重复按下会被忽略，日志里只有一条「动作跳过」。宏结束时会自动恢复；执行期间可点卡片上的「停止」，会在当前步骤结束后退出；<b>已经发出的按键不会撤回</b>。</li>
         <li><b>宏完全没反应</b>：宏需要 <code>keyboard</code> 库（<code>pip install keyboard</code>，Windows 打包版已内置）；确认右上角「上位机动作」已开启，动作类型选的是「宏」且点过「应用配置」。</li>
         <li><b>组合键不生效</b>：用 <code>+</code> 连接，<code>key:ctrl+shift+t</code>；不要写成 <code>key:ctrl shift t</code> 或 <code>key:ctrl+alt t</code>。</li>
         <li><b>输入跑到了别的位置</b>：页面还没加载完，把 <code>wait:</code> 调大（如 <code>wait:2000</code>）。</li>
