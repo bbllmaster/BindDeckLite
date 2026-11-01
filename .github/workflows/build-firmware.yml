@@ -11,6 +11,22 @@ on:
 # mask the others; the matrix result is the single source of truth for "did the
 # firmware compile".
 jobs:
+  # Source-level guards that do not need a toolchain: the portal self-check
+  # wiring (WS-504) and its inline page script. Cheap enough to run before the
+  # matrix so a broken guard fails fast instead of after six minutes of builds.
+  guards:
+    name: checks / source guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Portal key self-check wiring
+        run: python tools/check_key_selfcheck.py
+
+      - name: Portal key self-check page script
+        run: node --test host/test_portal_selfcheck.mjs
+
   firmware:
     name: firmware / ${{ matrix.env }}
     runs-on: ubuntu-latest

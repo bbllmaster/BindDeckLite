@@ -148,6 +148,29 @@ static inline int inputPin(int idx) {
   return (idx == 10) ? ENCODER_CLK : ENCODER_DT;
 }
 
+// === Portal key self-check (WS-504) =======================================
+// The portal is the only place where wiring gets typed in, and BLE is off
+// while it runs - so the host app cannot show which key was just pressed.
+// The existing debounced scan below records the most recent press here and
+// GET /keys/state exposes it; the portal page polls that and highlights the
+// matching row. Read-only: nothing is persisted, nothing is sent as HID, and
+// nothing is added to the CFG:/CMD: line protocol.
+struct RecentInput {
+  uint32_t seq;   // monotonic press counter - the page polls for "seq grew"
+  int      index; // input index that was pressed (0..11), -1 = never
+  int      gpio;  // GPIO that input sat on at press time, -1 = never
+};
+static RecentInput g_recentInput = {0, -1, -1};
+
+// Called from the button scan only, so presses are already debounced: one
+// call per physical press, no repeats while the key stays down.
+static void recordInputPress(int idx) {
+  if (idx < 0 || idx >= inputCount()) return;  // inputs outside the layout
+  g_recentInput.seq++;
+  g_recentInput.index = idx;
+  g_recentInput.gpio = inputPin(idx);
+}
+
 static String g_devId;    // "A1B2"
 static String g_bleName;  // "BindDeckLite-A1B2"
 
@@ -688,6 +711,16 @@ static String cfgPage(const KeysForm* form = nullptr) {
     "border-radius:6px;margin:0 0 12px;font-size:14px;word-break:break-word}"
     ".err ul{margin:6px 0 0;padding-left:18px}"
     ".bad input{border:2px solid #d93025;background:#fff5f5}"
+    // WS-504: self-check box + row highlight. The highlight is an inset shadow
+    // and a background tint only - no border/padding change, so the table does
+    // not shift while a key is held down.
+    "#chk{border:1px solid #dadce0;border-radius:6px;padding:8px 10px;margin:0 0 10px}"
+    "#chk .last{font-size:15px;word-break:break-word}"
+    "#chk .hint,#chk .note{font-size:12px;color:#5f6368;margin-top:2px}"
+    "#chk .note{color:#8a6d3b}"
+    "tr.hit{background:#e8f5e9}"
+    "tr.hit td:first-child{box-shadow:inset 3px 0 0 0 #188038}"
+    "td.tag{width:1%;white-space:nowrap;font-size:12px;color:#188038}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
     h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
@@ -722,6 +755,14 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // WS-499: the layout switch lives in the same form as the pin rows, but its
   // own value is only written when the POST actually carries it (see /keys).
   bool selLayoutEnc = form ? form->encOn : encOn;
+  // WS-504: self-check panel above the wiring table. The firmware records the
+  // last debounced press and the script at the end of the page polls it, so a
+  // key can be identified here without leaving the portal.
+  h += F("<hr><h3>按键自检</h3>"
+         "<div id='chk'><div class='last' id='chkLast' aria-live='polite'>"
+         "按下任意按键开始自检</div>"
+         "<div class='hint'>用于确认按键接在哪个 GPIO，不需要连电脑</div>"
+         "<div class='note' id='chkNote' hidden></div></div>");
   h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys'>"
          "<p><b>按键布局</b><br><select name='layout'>");
   h += "<option value='1'";
@@ -732,13 +773,17 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += F(">12 键（无编码器，A/B/按压 三脚各接一键）</option></select></p><table>");
   for (int i = 0; i < NUM_BUTTONS; i++) {
     bool bad = form && form->bad[i];
-    h += bad ? "<tr class='bad'>" : "<tr>";
+    // WS-504: the row carries an id and a trailing tag cell so the script can
+    // mark "this one fired" without moving anything around.
+    h += "<tr id='row" + String(i) + "'";
+    if (bad) h += " class='bad'";
+    h += ">";
     h += "<td>按键" + String(i + 1) + " GPIO</td><td><input name='pin" + String(i) +
          "' type='number' min='0' max='39'";
     if (bad) h += " aria-invalid='true'";
     h += " value='";
     h += htmlEsc(form ? form->pins[i] : String(buttonPins[i]));
-    h += "'></td></tr>";
+    h += "'></td><td class='tag'><span id='tag" + String(i) + "'></span></td></tr>";
   }
   // The three extra inputs of the 12-key layout sit on fixed pins (same wires
   // as the encoder), so they are shown read-only instead of being editable.
@@ -776,8 +821,56 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
          "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
          "——编码器布局下是编码器按压，12 键布局下是第 10 键；或上位机点“进入配网模式”）。"
-         "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。</p>"
-         "</body></html>");
+         "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。</p>");
+  // WS-504: self-check poller. Inline on purpose - the portal stays a single
+  // response with no external resource. Kept inside the marked <script> block
+  // so host/test_portal_selfcheck.mjs can extract and exercise this exact code.
+  h += F("<script id='selfcheck'>"
+         "(function(){"
+         "var seq=0,primed=false,fails=0,sawHttp=false,stop=false,hitTimer=null;"
+         "var elLast=document.getElementById('chkLast'),elNote=document.getElementById('chkNote');"
+         "function note(t){if(!elNote)return;elNote.textContent=t||'';elNote.hidden=!t;}"
+         "function pinOf(i){var n=document.querySelector('input[name=pin'+i+']');"
+         "return n?String(n.value).trim():'';}"
+         "function nameOf(i){return i<9?'按键 '+(i+1):'第 '+(i+1)+' 键';}"
+         "function gpioOf(i,g){var v=pinOf(i);return v===''?String(g):v;}"
+         "function clearHit(){for(var i=0;i<9;i++){var r=document.getElementById('row'+i),"
+         "t=document.getElementById('tag'+i);if(r)r.classList.remove('hit');if(t)t.textContent='';}}"
+         "function onHit(i,g){var gv=gpioOf(i,g);"
+         "if(elLast)elLast.textContent='最近触发：'+nameOf(i)+'（GPIO '+gv+'）';"
+         "clearHit();"
+         "if(i>=0&&i<9){var r=document.getElementById('row'+i),t=document.getElementById('tag'+i);"
+         "if(r)r.classList.add('hit');if(t)t.textContent='已触发 · GPIO '+gv;}"
+         "if(hitTimer)clearTimeout(hitTimer);hitTimer=setTimeout(clearHit,1500);}"
+         "function later(ms){if(!stop)setTimeout(poll,ms);}"
+         "function poll(){"
+         "var opt={cache:'no-store'},ctrl=null,timer=null;"
+         "if(typeof AbortController!=='undefined'){ctrl=new AbortController();opt.signal=ctrl.signal;"
+         "timer=setTimeout(function(){ctrl.abort();},2000);}"
+         "fetch('/keys/state',opt).then(function(r){"
+         "if(timer)clearTimeout(timer);"
+         "if(r.status===404){var e=new Error('unsupported');e.unsupported=1;throw e;}"
+         "if(!r.ok){var e2=new Error('http');e2.http=1;throw e2;}"
+         "var ct=(r.headers&&r.headers.get)?String(r.headers.get('content-type')||''):'';"
+         "if(ct.indexOf('json')<0){var e3=new Error('unsupported');e3.unsupported=1;throw e3;}"
+         "return r.json();"
+         "}).then(function(s){"
+         "fails=0;sawHttp=false;note('');"
+         "if(!s||typeof s.seq!=='number')return;"
+         "if(!primed||s.seq<seq){primed=true;seq=s.seq;return;}"
+         "if(s.seq>seq){seq=s.seq;onHit(s.index,s.gpio);}"
+         "}).catch(function(e){"
+         "if(timer)clearTimeout(timer);"
+         "if(e&&e.unsupported){stop=true;note('当前固件不支持按键自检');return;}"
+         "if(e&&e.http)sawHttp=true;"
+         "fails++;"
+         "if(fails>=3)note(sawHttp?'设备忙，稍后自动重试':'配网已退出，请重新进入');"
+         "}).then(function(){later(fails>=3?2000:400);});"
+         "}"
+         "poll();"
+         "})();"
+         "</script>");
+  h += F("</body></html>");
   return h;
 }
 
@@ -900,6 +993,20 @@ static void setupProvisioning() {
     } else {
       cfgServer.send(400, "text/html; charset=utf-8", cfgPage(&form));
     }
+  });
+
+  // --- WS-504: read-only self-check feed for the portal page ---
+  // Registered only while the portal runs, so in normal (BLE) mode the path is
+  // not routed at all. The page polls it every 400 ms; Connection: close keeps
+  // the single-client WebServer from parking the next poll behind a keep-alive
+  // socket. JSON only - no CFG:/CMD: traffic, no NVS write, no HID.
+  cfgServer.on("/keys/state", HTTP_GET, []() {
+    String j = "{\"seq\":" + String((unsigned long)g_recentInput.seq) +
+               ",\"index\":" + String(g_recentInput.index) +
+               ",\"gpio\":" + String(g_recentInput.gpio) + "}";
+    cfgServer.sendHeader("Cache-Control", "no-store");
+    cfgServer.sendHeader("Connection", "close");
+    cfgServer.send(200, "application/json", j);
   });
 
   // --- OTA (config mode only) ---
@@ -2587,7 +2694,13 @@ void loop() {
     loopWiFi();
     static unsigned long exitHold = 0;
     if (digitalRead(ENCODER_SW) == LOW) {
-      if (exitHold == 0) exitHold = millis();
+      if (exitHold == 0) {
+        exitHold = millis();
+        // WS-504: on a 12-key deck this line is a plain button ("第 10 键"), so
+        // report it to the self-check. In the encoder layout it is the encoder
+        // push, which belongs to the exit gesture and is out of scope.
+        if (!encOn) recordInputPress(9);
+      }
       else if (millis() - exitHold >= CONFIG_EXIT_MS) {
         log_e("[cfg] exit -> BLE mode");
         WiFi.mode(WIFI_OFF);
@@ -2622,6 +2735,9 @@ void loop() {
     switches[i].update();
     if (switches[i].pressed()) {
       g_lastActivity = millis();
+      // WS-504: feed the portal self-check. Same debounced edge as the HID
+      // send below, so the portal sees exactly the presses the host app would.
+      recordInputPress(i);
       // WS-429: the user is at the deck -> do not make them wait out a
       // stale-peer advertising backoff.
       bleKeyboard.notifyUserActivity();
