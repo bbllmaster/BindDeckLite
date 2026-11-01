@@ -152,8 +152,79 @@ DEFAULT_PINS = {
     "ESP32": [13, 12, 14, 27, 32, 33, 25, 26, 4],
     "C3": [0, 1, 2, 3, 4, 5, 6, 7, 8],
 }
-DEFAULT_KEYS = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9]
-DEFAULT_LABELS = ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22"]
+# WS-499: the tail two codes only exist in the 12-key layout (the EC11 A/B
+# lines used as plain buttons). Keeping them in the table costs nothing in the
+# encoder layout — input_count() simply never shows them.
+DEFAULT_KEYS = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9,
+                0xFA, 0xFB]
+DEFAULT_LABELS = ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21",
+                  "F22", "F23", "F24"]
+
+# --- WS-499: input layout ------------------------------------------------
+# The firmware reports its layout as ``LAYOUT:<0|1>`` and accepts
+# ``CFG:LAYOUT:<0|1>``. 1 = encoder layout (9 buttons + EC11 = 10 inputs),
+# 0 = 12-key layout (the EC11 SW/A/B lines carry three more buttons = 12).
+LAYOUT_ENCODER = 1
+LAYOUT_12KEY = 0
+INPUT_COUNT_ENCODER = 10
+INPUT_COUNT_12KEY = 12
+
+
+def layout_of(cfg) -> int:
+    """The layout stored for one device (unknown -> encoder, i.e. 10 inputs).
+
+    Old firmware never replies to ``CFG:LAYOUT`` and old configs have no
+    ``layout`` field; both must keep behaving exactly like today.
+    """
+    try:
+        value = int((cfg or {}).get("layout", LAYOUT_ENCODER))
+    except (TypeError, ValueError):
+        return LAYOUT_ENCODER
+    return LAYOUT_12KEY if value == LAYOUT_12KEY else LAYOUT_ENCODER
+
+
+def input_count(cfg) -> int:
+    """How many input cards this device has: 10 (encoder) or 12 (12-key)."""
+    return INPUT_COUNT_12KEY if layout_of(cfg) == LAYOUT_12KEY else INPUT_COUNT_ENCODER
+
+
+def _input_label(cfg, idx: int) -> str:
+    """Display name of one input for the log / event feed (WS-499)."""
+    twelve = layout_of(cfg) == LAYOUT_12KEY
+    if idx == 9:
+        return "按键 10（配网键）" if twelve else "编码器按压"
+    if 0 <= idx < 9:
+        return "按键 %d" % (idx + 1)
+    if twelve and idx < INPUT_COUNT_12KEY:
+        return "按键 %d（扩展）" % (idx + 1)
+    return "按键 %d" % (idx + 1)
+
+
+def default_key_item(i: int) -> dict:
+    """One ``keys[i]`` entry with the shipped default code and label."""
+    code = DEFAULT_KEYS[i] if i < len(DEFAULT_KEYS) else 0
+    label = DEFAULT_LABELS[i] if i < len(DEFAULT_LABELS) else str(code)
+    return {"code": code, "label": label,
+            "action": {"type": "none", "value": "", "macro": []}}
+
+
+def ensure_key_items(cfg: dict) -> list:
+    """Grow ``cfg["keys"]`` to the full 12-entry table, in place (WS-499/WS-503).
+
+    v1.3.6 stored only 10 entries (the last was the encoder-push code). A deck
+    switched to the 12-key layout reports 12 codes, so ``apply_device()`` would
+    send 10 and compare them against the 12 that came back — a permanent
+    "keys: rejected" the user could never clear, because the read-back used to
+    be discarded when it differed. Padding here is idempotent and keeps the
+    sent snapshot, the read-back and the 12 input cards on one list.
+    """
+    keys = cfg.get("keys")
+    if not isinstance(keys, list):
+        keys = cfg["keys"] = []
+    while len(keys) < INPUT_COUNT_12KEY:
+        keys.append(default_key_item(len(keys)))
+    return keys
+
 
 # --- WS-476: pin rules (the host keeps exactly one copy) -------------------
 # Mirrors isValidButtonPin() / isValidPinSet() in src/main.cpp. The device page
@@ -193,15 +264,19 @@ def _pin_free_spans(rules: dict) -> list:
     """The GPIO ranges a button may actually use, derived from ``rules`` itself.
 
     Everything here comes out of the same fields ``validate_pins()`` reads —
-    the range limit, ``blocked`` and the encoder pins — plus ``avoid`` for pins
-    that are legal but not worth spending (C3 18/19 are USB-CDC).  Deriving
-    instead of writing a second list keeps the hint from drifting away from
-    the rule again (WS-481).
+    the range limit, ``blocked``, the encoder pins and the fixed pins of the
+    12-key layout (``extended``) — plus ``avoid`` for pins that are legal but
+    not worth spending (C3 18/19 are USB-CDC).  Deriving instead of writing a
+    second list keeps the hint from drifting away from the rule again (WS-481).
     """
     occupied = set()
     for lo, hi in rules["blocked"]:
         occupied.update(range(lo, hi + 1))
     occupied.update(rules["encoder"].values())
+    # WS-503: inputs 9..11 own the three EC11 lines in the 12-key layout, so
+    # the hint must not offer them as free button pins (validate_pins rejects
+    # them as duplicates).
+    occupied.update(rules.get("extended", ()))
     occupied.update(rules.get("avoid", ()))
     spans = []
     for pin in range(rules["min"], rules["max"] + 1):
@@ -221,14 +296,25 @@ def _reserved_pin_text(reserved) -> str:
     )
 
 
-def pin_rules(chip: str = "") -> dict:
+def _extended_pin_text(prof: str) -> str:
+    """``GPIO10/20/21 = 第 10/11/12 键`` for the 12-key layout (WS-499)."""
+    enc = ENCODER_PINS[prof]
+    return "GPIO%s = 第 10/11/12 键" % _pin_span_text(
+        [[enc["SW"], enc["SW"]], [enc["CLK"], enc["CLK"]], [enc["DT"], enc["DT"]]], "/")
+
+
+def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
     """The pin constraints for one chip, in the shape the UI renders.
 
     Descriptive only — ``validate_pins()`` is the single authority on whether
     a value is accepted; this just states the same limits as a hint.  The hint
     text is built from these fields, never from a second hand-written list.
+
+    ``layout`` (WS-499) decides whether the three EC11 pins are off limits
+    (encoder layout) or already owned by inputs 9..11 (12-key layout).
     """
     prof = pin_chip(chip)
+    twelve = layout_of({"layout": layout}) == LAYOUT_12KEY
     if prof == "C3":
         reserved = [[11, 17, "内部 Flash"]]
         rules = {
@@ -238,17 +324,35 @@ def pin_rules(chip: str = "") -> dict:
             "max": 21,
             "blocked": [[lo, hi] for lo, hi, _ in reserved],
             "avoid": [18, 19],   # legal, but USB-CDC — not worth spending
-            "encoder": dict(ENCODER_PINS["C3"]),
+            "encoder": {} if twelve else dict(ENCODER_PINS["C3"]),
+            # Fixed pins of inputs 9..11 (the EC11 lines). Published in both
+            # layouts so the UI can label the rows without a second copy of
+            # the chip map (WS-499).
+            "extended": [ENCODER_PINS["C3"]["SW"],
+                         ENCODER_PINS["C3"]["CLK"],
+                         ENCODER_PINS["C3"]["DT"]],
+            "layout": LAYOUT_12KEY if twelve else LAYOUT_ENCODER,
         }
-        rules["hint"] = (
-            "C3：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s；%s 是 USB-CDC，不建议占用。"
-            % (
-                _pin_span_text(_pin_free_spans(rules)),
-                _reserved_pin_text(reserved),
-                _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
-                _pin_span_text([[p, p] for p in rules["avoid"]], "/"),
+        if twelve:
+            rules["hint"] = (
+                "C3：按键可用 GPIO%s（避开 %s）。%s；%s 是 USB-CDC，不建议占用。"
+                % (
+                    _pin_span_text(_pin_free_spans(rules)),
+                    _reserved_pin_text(reserved),
+                    _extended_pin_text(prof),
+                    _pin_span_text([[p, p] for p in rules["avoid"]], "/"),
+                )
             )
-        )
+        else:
+            rules["hint"] = (
+                "C3：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s；%s 是 USB-CDC，不建议占用。"
+                % (
+                    _pin_span_text(_pin_free_spans(rules)),
+                    _reserved_pin_text(reserved),
+                    _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
+                    _pin_span_text([[p, p] for p in rules["avoid"]], "/"),
+                )
+            )
         return rules
 
     reserved = [[6, 11, "SPI Flash"], [34, 39, "仅输入脚"]]
@@ -258,13 +362,27 @@ def pin_rules(chip: str = "") -> dict:
         "min": 0,
         "max": 39,
         "blocked": [[lo, hi] for lo, hi, _ in reserved],
-        "encoder": dict(ENCODER_PINS["ESP32"]),
+        "encoder": {} if twelve else dict(ENCODER_PINS["ESP32"]),
+        "extended": [ENCODER_PINS["ESP32"]["SW"],
+                     ENCODER_PINS["ESP32"]["CLK"],
+                     ENCODER_PINS["ESP32"]["DT"]],
+        "layout": LAYOUT_12KEY if twelve else LAYOUT_ENCODER,
     }
-    rules["hint"] = "经典 ESP32：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s。" % (
-        _pin_span_text(_pin_free_spans(rules)),
-        _reserved_pin_text(reserved),
-        _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
-    )
+    if twelve:
+        rules["hint"] = (
+            "经典 ESP32（12 键布局）：按键可用 GPIO%s（避开 %s）。%s。"
+            % (
+                _pin_span_text(_pin_free_spans(rules)),
+                _reserved_pin_text(reserved),
+                _extended_pin_text(prof),
+            )
+        )
+    else:
+        rules["hint"] = "经典 ESP32：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s。" % (
+            _pin_span_text(_pin_free_spans(rules)),
+            _reserved_pin_text(reserved),
+            _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
+        )
     return rules
 
 
@@ -291,11 +409,14 @@ def _pin_int(value):
     return False, 0
 
 
-def _pin_reject_reason(prof: str, btn: str, pin: int):
+def _pin_reject_reason(prof: str, btn: str, pin: int,
+                       layout: int = LAYOUT_ENCODER):
     """Why ``pin`` cannot be a button pin on ``prof``. ``("", "")`` = accepted.
 
     Returns ``(code, message)`` so the caller can tag the row without parsing
-    the text back apart.
+    the text back apart. In the 12-key layout (WS-499) the EC11 SW/A/B pins
+    are inputs 9..11 rather than an encoder, so using them again is a
+    duplicate — the firmware words it the same way.
     """
     who = "%s 的 GPIO %d" % (btn, pin)
     if prof == "C3":
@@ -308,13 +429,19 @@ def _pin_reject_reason(prof: str, btn: str, pin: int):
             return "reserved", who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键"
         if pin >= 34:
             return "reserved", who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键"
+    if layout_of({"layout": layout}) == LAYOUT_12KEY:
+        for idx, role in ((9, "SW"), (10, "CLK"), (11, "DT")):
+            if pin == ENCODER_PINS[prof][role]:
+                return "extended", who + (" 该脚在 12 键模式下是第 %d 键，不能重复分配"
+                                          % (idx + 1))
+        return "", ""
     for role, encoder_pin in ENCODER_PINS[prof].items():
         if pin == encoder_pin:
             return "encoder", who + " 与" + _ENCODER_ROLE_TEXT[role] + "冲突"
     return "", ""
 
 
-def validate_pins(pins, chip: str = "") -> list:
+def validate_pins(pins, chip: str = "", layout: int = LAYOUT_ENCODER) -> list:
     """Return one ``{index, code, message}`` per offending button row.
 
     ``[]`` means the pin set is acceptable — the same set the firmware would
@@ -323,7 +450,8 @@ def validate_pins(pins, chip: str = "") -> list:
     that row instead of framing all nine inputs (the old behaviour).
 
     Rules (src/main.cpp:228-285): non-empty, integer 0-39, unique, and on top
-    of that the per-chip reserved ranges plus the encoder pins.
+    of that the per-chip reserved ranges plus the encoder pins — or, in the
+    12-key layout (WS-499), those three pins as inputs 9..11.
     """
     prof = pin_chip(chip)
     values = list(pins) if isinstance(pins, (list, tuple)) else []
@@ -345,7 +473,7 @@ def validate_pins(pins, chip: str = "") -> list:
             errors.append({"index": i, "code": "out_of_range",
                            "message": btn + " 必须填 0-39 的整数"})
             continue
-        reason_code, reason = _pin_reject_reason(prof, btn, pin)
+        reason_code, reason = _pin_reject_reason(prof, btn, pin, layout)
         if reason:
             errors.append({"index": i, "code": reason_code, "message": reason})
             continue
@@ -491,6 +619,12 @@ _ota_lock = threading.RLock()
 _read_windows: dict = {}
 _read_lock = threading.RLock()
 
+# WS-499: one pending CFG:LAYOUT probe per device. The probe tells "this deck
+# speaks the layout command" apart from "old firmware that stays silent", which
+# is what stops the host from pretending a 12-key apply succeeded.
+_layout_windows: dict = {}
+_layout_lock = threading.RLock()
+
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
 # device config so a failed read leaves the stored config untouched.
@@ -556,6 +690,15 @@ _CFG_READBACK_FIELDS = [
     ("tz", "TZ", "时区"),
 ]
 
+# WS-499: the layout line is *optional*. A deck older than this feature never
+# sends CFG_LAYOUT / LAYOUT, so requiring it would make every apply look
+# half-failed on hardware that works fine. It is merged when it arrives and
+# compared by apply_device() only when that device actually reported it.
+_CFG_OPTIONAL_FIELDS = [
+    ("layout", "LAYOUT", "按键布局"),
+]
+_ALL_CFG_FIELDS = _CFG_READBACK_FIELDS + _CFG_OPTIONAL_FIELDS
+
 
 class ApplyWindow:
     """Per-device apply operation state.
@@ -570,8 +713,10 @@ class ApplyWindow:
     def __init__(self, dev_id: str, snapshot: dict):
         self.dev_id = dev_id
         self.snapshot = snapshot  # {field: value_string we tried to send}
-        self._ack_ok = {f: False for f, _, _ in _CFG_READBACK_FIELDS}
-        self._ack_events = {f: threading.Event() for f, _, _ in _CFG_READBACK_FIELDS}
+        # Optional fields (layout) get an ACK slot too, but they never gate
+        # completeness — an old deck simply never answers them.
+        self._ack_ok = {f: False for f, _, _ in _ALL_CFG_FIELDS}
+        self._ack_events = {f: threading.Event() for f, _, _ in _ALL_CFG_FIELDS}
         self.readback = {}        # {field: value_string from CMD:GET_CFG}
         self._rb_lock = threading.Lock()
         self._rb_count = 0
@@ -587,7 +732,10 @@ class ApplyWindow:
         with self._rb_lock:
             self.readback[field] = value
             self._rb_count += 1
-        if self._rb_count >= len(_CFG_READBACK_FIELDS):
+            # Completeness is decided by the *required* fields only; the
+            # optional layout line must not keep the window waiting.
+            complete = all(f in self.readback for f, _, _ in _CFG_READBACK_FIELDS)
+        if complete:
             self._done.set()
 
     def wait_ack(self, field: str, timeout: float) -> bool:
@@ -746,11 +894,14 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
             codes = [int(v.strip()) for v in vals]
         except ValueError:
             return False
-        for i, code in enumerate(codes[:10]):
-            if i >= len(cfg.get("keys", [])):
-                break
-            cfg["keys"][i]["code"] = code
-            cfg["keys"][i]["label"] = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
+        keys = cfg.setdefault("keys", [])
+        # WS-499: a 12-key deck reports 12 codes; grow the stored list instead
+        # of dropping the last two (a 10-code answer still fills 0..9 only).
+        for i in range(len(keys), min(len(codes), INPUT_COUNT_12KEY)):
+            keys.append(default_key_item(i))
+        for i, code in enumerate(codes[:INPUT_COUNT_12KEY]):
+            keys[i]["code"] = code
+            keys[i]["label"] = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
         return True
     if field == "pins":
         vals = [v for v in raw.split(",") if v.strip()]
@@ -768,6 +919,15 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
         except ValueError:
             return False
         cfg.setdefault("encoder", {})["mode"] = mode
+        return True
+    if field == "layout":
+        # WS-499: the device answered CFG:LAYOUT, so it speaks the command.
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            return False
+        cfg["layout"] = LAYOUT_12KEY if value == LAYOUT_12KEY else LAYOUT_ENCODER
+        cfg["layout_supported"] = True
         return True
     if field == "sleep":
         payload = raw.split(",")
@@ -791,7 +951,7 @@ def _split_cfg_line(line: str):
     ones (pins / keys / enc / sleep) decide whether the answer is complete;
     ``tz`` is captured as well but never waited for.
     """
-    for field, prefix, _ in _CFG_READBACK_FIELDS:
+    for field, prefix, _ in _ALL_CFG_FIELDS:
         if line.startswith("CFG_" + prefix + ":"):
             return field, line[len("CFG_") + len(prefix) + 1:]
     return None, ""
@@ -845,6 +1005,12 @@ def load_config():
                 "devices": data.get("devices", {}) or {},
                 "settings": {**_config["settings"], **(data.get("settings", {}) or {})},
             }
+            # WS-503: configs written before the 12-key layout carry 10 key
+            # entries; repair them on load so an upgraded deck cannot get
+            # stuck on "keys: rejected" (see ensure_key_items).
+            for cfg in _config["devices"].values():
+                if isinstance(cfg, dict):
+                    ensure_key_items(cfg)
     except FileNotFoundError:
         pass
     except Exception as e:  # noqa: BLE001
@@ -866,12 +1032,13 @@ def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
     return {
         "name": name,
         "chip": chip,
+        # WS-499: a new deck is an encoder deck (10 inputs) until it says
+        # otherwise, so the shipped card count does not change.
+        "layout": LAYOUT_ENCODER,
         "pins": list(DEFAULT_PINS.get(chip, DEFAULT_PINS["ESP32"])),
-        "keys": [
-            {"code": DEFAULT_KEYS[i], "label": DEFAULT_LABELS[i],
-             "action": {"type": "none", "value": "", "macro": []}}
-            for i in range(10)
-        ],
+        # 12 entries are kept so a layout switch to 12 keys has codes ready;
+        # input_count() decides how many the UI shows.
+        "keys": [default_key_item(i) for i in range(INPUT_COUNT_12KEY)],
         # WS-389: rotation actions are host-side (never sent to the device), so they
 # live next to the device-side encoder mode. Default = 未配置 (仅 HID).
 # Keys are the raw ENC: direction ("CW"|"CCW"), not lowercase.
@@ -896,6 +1063,9 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
                 cfg["chip"] = chip
             if name:
                 cfg["name"] = name
+        # WS-503: historical devices only have 10 key entries (v1.3.6). Pad on
+        # every access so apply/read-back/UI all see the same 12-entry list.
+        ensure_key_items(cfg)
         return cfg
 
 
@@ -1168,8 +1338,31 @@ def _on_line(dev_id: str, line: str):
                 idx = -1
         with _lock:
             _last_press[dev_id] = (idx, time.time())
-        add_event("key", f"按键 {idx + 1 if 0 <= idx < 9 else '编码器按压'}", dev_id)
+        with _lock:
+            cfg_now = _config["devices"].get(dev_id)
+        add_event("key", _input_label(cfg_now, idx), dev_id)
         _run_action_for(dev_id, idx)
+        return
+    if line.startswith("LAYOUT:"):
+        # WS-499: answer to CFG:LAYOUT (and the layout probe). A deck that
+        # sends this line supports the 12-key layout; one that stays silent
+        # does not, and apply_device() refuses to pretend otherwise.
+        raw = line[len("LAYOUT:"):].strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = LAYOUT_ENCODER
+        cfg = device_cfg(dev_id)
+        with _lock:
+            cfg["layout"] = LAYOUT_12KEY if value == LAYOUT_12KEY else LAYOUT_ENCODER
+            cfg["layout_supported"] = True
+            save_config()
+        with _layout_lock:
+            pending = _layout_windows.get(dev_id)
+        if pending is not None:
+            event, box = pending
+            box["value"] = cfg["layout"]
+            event.set()
         return
     if line.startswith("ENC:"):
         parts = line.split(":")
@@ -1188,7 +1381,14 @@ def _on_line(dev_id: str, line: str):
         chip = fields[2] if len(fields) > 2 else ""
         cfg = device_cfg(dev_id, chip=chip)
         with _lock:
-            cfg["fw"] = {"version": fields[0] if fields else "",
+            new_version = fields[0] if fields else ""
+            old_version = (cfg.get("fw") or {}).get("version", "")
+            if new_version != old_version:
+                # A different firmware may or may not speak CFG:LAYOUT; drop
+                # the cached verdict (unknown) so the next 12-key apply probes
+                # again instead of inheriting the old answer.
+                cfg["layout_supported"] = None
+            cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
                          "build": fields[3] if len(fields) > 3 else "",
@@ -1204,7 +1404,7 @@ def _on_line(dev_id: str, line: str):
     # Firmware echoes ACK:CFG:PINS:... — strip "ACK:" then match "CFG:" + prefix + ":".
     if line.startswith("ACK:") and window and window.phase == "sending":
         body = line[4:]  # strip "ACK:" → body = "CFG:PINS:..."
-        for field, prefix, _ in _CFG_READBACK_FIELDS:
+        for field, prefix, _ in _ALL_CFG_FIELDS:
             if body.startswith("CFG:" + prefix + ":"):
                 window.on_ack(field)
                 break
@@ -1215,7 +1415,7 @@ def _on_line(dev_id: str, line: str):
     # the local config — the user must explicitly accept device values.
     # Firmware responds to CMD:GET_CFG with CFG_PINS:... (underscore).
     if window and window.phase == "readback":
-        for field, prefix, _ in _CFG_READBACK_FIELDS:
+        for field, prefix, _ in _ALL_CFG_FIELDS:
             if line.startswith("CFG_" + prefix + ":"):
                 raw = line[len("CFG_") + len(prefix) + 1:]
                 window.on_readback(field, raw)
@@ -1404,23 +1604,66 @@ def send(dev_id: str, cmd: str) -> dict:
     return {"sent": bool(via), "via": via}
 
 
+def probe_layout(dev_id: str, timeout: float = 1.5) -> dict:
+    """Ask one deck for its layout.
+
+    Returns ``{"sent", "answered", "layout"}``. ``sent`` False means the link
+    was down (unknown, not "unsupported"); ``answered`` False with ``sent``
+    True means old firmware that predates ``CFG:LAYOUT``. That difference is
+    what lets the UI say 「固件不支持 12 键布局」 without ever claiming it about
+    a deck that simply is not connected.
+    """
+    event = threading.Event()
+    box = {"value": None}
+    with _layout_lock:
+        _layout_windows[dev_id] = (event, box)
+    try:
+        result = send(dev_id, "CFG:LAYOUT")
+        sent = bool((result or {}).get("sent"))
+        if sent:
+            event.wait(timeout)
+    finally:
+        with _layout_lock:
+            _layout_windows.pop(dev_id, None)
+    return {"sent": sent,
+            "answered": box["value"] is not None,
+            "layout": box["value"]}
+
+
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
+    target_layout = layout_of(cfg)
 
     # WS-476: refuse an invalid pin set before anything touches the link. The
     # old code built the line first, so a cleared box (None) blew up on
     # int(None) and the user only saw "500 INTERNAL SERVER ERROR".
-    pin_errors = validate_pins(cfg.get("pins"), cfg.get("chip", ""))
+    pin_errors = validate_pins(cfg.get("pins"), cfg.get("chip", ""), target_layout)
     if pin_errors:
         add_event("cfg", "未下发：" + pin_errors[0]["message"], dev_id, "warn")
         return {"ok": False, "invalid": True, "pin_errors": pin_errors,
                 "error": pin_errors[0]["message"]}
 
+    # WS-499: a 12-key config needs firmware that understands CFG:LAYOUT.
+    # Say so instead of sending 12 key codes that the deck silently rejects.
+    if target_layout == LAYOUT_12KEY and not cfg.get("layout_supported"):
+        probe = probe_layout(dev_id)
+        if probe["sent"] and not probe["answered"]:
+            # Cache the negative verdict so every later apply does not pay
+            # another 1.5 s probe; a firmware version change clears it.
+            with _lock:
+                cfg["layout_supported"] = False
+                save_config()
+            message = ("当前固件不支持 12 键布局（需要 v1.3.7 及以上），"
+                       "请先在配网页面或通过 OTA 升级固件")
+            add_event("cfg", "未下发：" + message, dev_id, "warn")
+            return {"ok": False, "unsupported_layout": True, "error": message}
+
+    count = input_count(cfg)
     # Build the values we are going to send — this snapshot is what the
     # readback is compared against, so a rejected field shows the user what
     # they tried to set vs what the device actually kept.
     pins = ",".join(str(int(p)) for p in cfg.get("pins", [])[:9])
-    keys = ",".join(str(int(k["code"])) for k in cfg.get("keys", [])[:10])
+    keys = ",".join(str(int(k["code"])) for k in cfg.get("keys", [])[:count])
     enc_val = str(int(cfg["encoder"].get("mode", 0)))
     sleep = cfg.get("sleep", {})
     sleep_val = "%d,%d" % (
@@ -1435,6 +1678,7 @@ def apply_device(dev_id: str) -> dict:
         "enc": enc_val,
         "sleep": sleep_val,
         "tz": tz_val,
+        "layout": str(target_layout),
     }
 
     # Create the per-device apply window before sending anything.
@@ -1445,6 +1689,8 @@ def apply_device(dev_id: str) -> dict:
     try:
         results = []
         commands = [
+            # Layout first: the key count the deck expects depends on it.
+            ("layout", "CFG:LAYOUT:%d" % target_layout),
             ("pins", "CFG:PINS:" + pins),
             ("keys", "CFG:KEYS:" + keys),
             ("enc", "CFG:ENC:" + enc_val),
@@ -1509,6 +1755,22 @@ def apply_device(dev_id: str) -> dict:
                 "actual": actual,
                 "reason": reason,
             })
+
+        # WS-499: the layout is compared only when the deck reported it back —
+        # old firmware has no layout line and must not look half-failed.
+        if "layout" in window.readback:
+            actual_layout = window.readback["layout"].strip()
+            ok_layout = actual_layout == snapshot["layout"]
+            items.append({
+                "field": "layout",
+                "label": "按键布局",
+                "status": "ok" if ok_layout else "rejected",
+                "expected": snapshot["layout"],
+                "actual": actual_layout,
+                "reason": "" if ok_layout else "设备拒绝（布局仍是原来的）",
+            })
+            if not ok_layout:
+                add_event("cfg", "布局未生效：设备回报 " + actual_layout, dev_id, "warn")
 
         return {
             "ok": all(i["status"] == "ok" for i in items),
@@ -1642,7 +1904,7 @@ def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
     with _lock:
         cfg = device_cfg(dev_id)
         merged = copy.deepcopy(cfg)
-        for field, _prefix, _label in _CFG_READBACK_FIELDS:
+        for field, _prefix, _label in _ALL_CFG_FIELDS:
             if field in values and not _apply_cfg_field(merged, field, values[field]):
                 return {"ok": False, "cfg": None, "fields": fields, "at": at,
                         "reason": "设备回报的配置无法解析"}
@@ -3007,8 +3269,18 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     return {"ok": True, "error": "", "action_type": kind, "target": target}
 
 
-def _action_label(idx: int) -> str:
-    """Human-readable input label for an index (0-8 = 按键 1-9, 9 = 编码器按压)."""
+def _action_label(idx: int, dev_id: str = "") -> str:
+    """Human-readable input label for an index.
+
+    0-8 = 按键 1-9, 9 = 编码器按压 — or, in the 12-key layout, 按键 10/11/12
+    (WS-499). Without a device the encoder wording is kept, which is what the
+    pre-layout log lines said.
+    """
+    if dev_id:
+        with _lock:
+            cfg = _config["devices"].get(dev_id)
+        if cfg is not None:
+            return _input_label(cfg, idx)
     return f"按键 {idx + 1}" if 0 <= idx < 9 else "编码器按压"
 
 
@@ -3027,7 +3299,7 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
     password and the log is copyable row by row.
     """
     if not label:
-        label = _action_label(idx)
+        label = _action_label(idx, dev_id)
     atype = result.get("action_type", (action or {}).get("type", "unknown"))
     target = result.get("target", "")
     # WS-495: a user-requested stop is not a failure — one neutral warn row
@@ -3089,7 +3361,7 @@ def _prune_stuck_actions(now: float | None = None):
             stuck.append((key, now - entry["started"]))
     for (dev_id, idx), elapsed in stuck:
         add_event("action",
-                  f"动作超时释放: {_action_label(idx)} · 已运行 {elapsed:.1f} 秒，"
+                  f"动作超时释放: {_action_label(idx, dev_id)} · 已运行 {elapsed:.1f} 秒，"
                   f"强制解除执行中状态",
                   dev_id, "warn")
 
@@ -3211,7 +3483,7 @@ def _run_action_for(dev_id: str, idx: int):
         # Re-entry: the previous macro is still typing into the focused window,
         # so a second one would interleave characters. Drop it silently.
         add_event("action",
-                  f"动作跳过: {_action_label(idx)} · 上一次动作仍在执行"
+                  f"动作跳过: {_action_label(idx, dev_id)} · 上一次动作仍在执行"
                   f"（已运行 {busy_for:.1f} 秒）",
                   dev_id, "warn")
         return
@@ -3432,11 +3704,17 @@ def api_defaults():
     — instead of a second copy in JavaScript.
     """
     chip = request.args.get("chip", "ESP32")
+    try:
+        layout = int(request.args.get("layout", LAYOUT_ENCODER))
+    except ValueError:
+        layout = LAYOUT_ENCODER
+    layout = LAYOUT_12KEY if layout == LAYOUT_12KEY else LAYOUT_ENCODER
     payload = new_device_cfg(chip, "")
-    payload["pinRules"] = pin_rules(chip)
+    payload["layout"] = layout
+    payload["pinRules"] = pin_rules(chip, layout)
     if "pins" in request.args:
         payload["pinErrors"] = validate_pins(
-            parse_pins_query(request.args.get("pins", "")), chip)
+            parse_pins_query(request.args.get("pins", "")), chip, layout)
     return jsonify(payload)
 
 
@@ -3454,7 +3732,7 @@ def api_config(dev_id):
     data = request.get_json(silent=True) or {}
     cfg = device_cfg(dev_id)
     with _lock:
-        for field in ("pins", "keys", "encoder", "sleep", "tz", "name"):
+        for field in ("pins", "keys", "encoder", "sleep", "tz", "name", "layout"):
             if field in data:
                 cfg[field] = data[field]
         save_config()
@@ -3639,6 +3917,33 @@ def api_device_sysinfo(dev_id):
     and forget.
     """
     return jsonify(read_sysinfo(dev_id))
+
+
+@app.route("/api/device/<dev_id>/layout", methods=["POST"])
+def api_device_layout(dev_id):
+    """WS-499: ask the deck which layout it runs.
+
+    The UI uses this to hide/disable the 12-key choice on firmware that
+    predates ``CFG:LAYOUT`` (「固件不支持」) instead of letting the user pick
+    something the apply step would have to refuse. ``supported: None`` means
+    "the link was down, verdict unknown".
+    """
+    cfg = device_cfg(dev_id)
+    probe = probe_layout(dev_id)
+    with _lock:
+        if probe["sent"] and not probe["answered"]:
+            cfg["layout_supported"] = False
+            save_config()
+        elif probe["answered"]:
+            cfg["layout_supported"] = True
+            save_config()
+        supported = cfg.get("layout_supported")
+        payload = {"dev_id": dev_id,
+                   "supported": None if supported is None and not probe["sent"]
+                                else bool(supported),
+                   "layout": layout_of(cfg),
+                   "sent": probe["sent"]}
+    return jsonify(payload)
 
 
 # --- OTA (host-driven firmware push) --------------------------------------

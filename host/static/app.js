@@ -37,6 +37,34 @@ const MACRO_KEY_HINT =
 // 里（与固件 isValidButtonPin / isValidPinSet 对齐）。这里只负责把当前 9 个
 // 值交给只读的 /api/defaults 取回逐行错误，不在 JS 里再抄一遍规则。
 const PIN_COUNT = 9;
+
+/* ---------------- WS-499: 按键布局 ----------------
+ * 固件回报 LAYOUT:1（编码器，10 输入）或 LAYOUT:0（12 键，12 输入）。
+ * 旧固件不回这一行 → 配置里没有 layout 字段 → 仍按 10 输入渲染，
+ * 行为与今天完全一致。 */
+const INPUT_COUNT_ENCODER = 10;
+const INPUT_COUNT_12KEY = 12;
+const LAYOUT_ENCODER = 1;
+const LAYOUT_12KEY = 0;
+
+function layoutOf() {
+  return Number((state.cfg || {}).layout) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER;
+}
+
+function is12Key() {
+  return layoutOf() === LAYOUT_12KEY;
+}
+
+function inputCount() {
+  return is12Key() ? INPUT_COUNT_12KEY : INPUT_COUNT_ENCODER;
+}
+
+/** 第 i 个输入的显示名（0 起）；第 10 个在两种布局下含义不同。 */
+function inputTitle(i) {
+  if (i < 9) return "按键 " + (i + 1);
+  if (i === 9) return is12Key() ? "按键 10（配网键）" : "编码器按压";
+  return is12Key() ? `按键 ${i + 1}（扩展）` : `按键 ${i + 1}`;
+}
 // 停止输入 300 ms 后才校验：13 改成 1 会先经过空串，不能每敲一个字符就飘红。
 const PIN_VALIDATE_DEBOUNCE_MS = 300;
 
@@ -270,6 +298,9 @@ async function selectDevice(devId) {
     setDirty(false);
     // WS-445: 切换设备后按设备各自采样，不与上一台的缓存混用。
     loadSysinfo(devId);
+    // WS-499: 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
+    // 12 键选项直接禁用，而不是让用户选完再被后端拒绝。
+    probeDeviceLayout(devId);
   } catch (e) {
     toast("读取配置失败：" + e.message, "bad");
   }
@@ -287,18 +318,33 @@ function renderKeys() {
   const grid = $("#keyGrid");
   grid.innerHTML = "";
   if (!state.cfg) return;
-  $("#keyHint").textContent = state.preview ? "预览 · 未连接设备" : "共 10 个输入";
-  const keys = state.cfg.keys || [];
-  for (let i = 0; i < 10; i++) {
-    const item = keys[i] || { code: 0, label: "?", action: { type: "none", value: "" } };
+  const total = inputCount();
+  const layoutText = is12Key() ? " · 12 键布局" : "";
+  $("#keyHint").textContent = state.preview
+    ? "预览 · 未连接设备"
+    : `共 ${total} 个输入${layoutText}`;
+  // WS-503: 后端 device_cfg() 已把历史配置的 keys 幂等补齐到 12 条；这里只
+  // 兜住异常数据。补出来的条目必须写进 state.cfg.keys —— 以前每次渲染都新建
+  // 临时对象，第 11/12 张卡上改的键码落在临时对象里，重绘即丢（改完看不见）。
+  if (!Array.isArray(state.cfg.keys)) state.cfg.keys = [];
+  const keys = state.cfg.keys;
+  while (keys.length < total) {
+    keys.push({ code: 0, label: "未配置",
+                action: { type: "none", value: "", macro: [] } });
+  }
+  for (let i = 0; i < total; i++) {
+    const item = keys[i];
     const action = item.action || { type: "none", value: "" };
     const card = document.createElement("div");
-    card.className = "keycard" + (i === 9 ? " encoder-push" : "");
+    // 12 键布局下第 10–12 张是「扩展」输入（原来编码器的按压 / A / B 三脚），
+    // 单独标色，和第 1–9 张普通按键区分开（WS-499 验收）。
+    const extended = is12Key() && i >= 9;
+    card.className = "keycard" + (i === 9 ? " encoder-push" : "") + (extended ? " extended" : "");
     card.dataset.idx = i;
     card.innerHTML = `
       <div class="kc-head">
-        <span class="kc-num">${i === 9 ? "⏻" : i + 1}</span>
-        <span class="kc-title">${i === 9 ? "编码器按压" : "按键 " + (i + 1)}</span>
+        <span class="kc-num">${i === 9 && !is12Key() ? "⏻" : i + 1}</span>
+        <span class="kc-title">${inputTitle(i)}</span>
         <span class="kc-live"></span>
       </div>
       <label class="field-label">HID 键</label>
@@ -690,12 +736,20 @@ function renderEncoder() {
   const grid = $("#encoderModes");
   grid.innerHTML = "";
   if (!state.cfg) return;
+  const disabled = is12Key();
+  const note = $("#encoderDisabledNote");
+  if (note) note.hidden = !disabled;
   const mode = state.cfg.encoder ? state.cfg.encoder.mode : 0;
   ENCODER_MODES.forEach((m) => {
     const el = document.createElement("button");
-    el.className = "mode-card" + (m.id === mode ? " active" : "");
+    el.className = "mode-card" + (m.id === mode ? " active" : "") + (disabled ? " locked" : "");
+    el.disabled = disabled;
     el.innerHTML = `<b>${m.name}</b><span>${m.desc}</span>`;
     el.onclick = () => {
+      if (disabled) {
+        toast("当前为 12 键布局，编码器不可用", "warn");
+        return;
+      }
       state.cfg.encoder = state.cfg.encoder || {};
       state.cfg.encoder.mode = m.id;
       renderEncoder();
@@ -788,7 +842,8 @@ function renderEncoderActions() {
   if (!actions.CW) actions.CW = defaultEncoderAction();
   if (!actions.CCW) actions.CCW = defaultEncoderAction();
   const mode = enc.mode || 0;
-  const editable = mode === 4;
+  // WS-499: 12 键布局没有旋转编码器，旋转动作同样不可用（配置保留，切回后恢复）。
+  const editable = mode === 4 && !is12Key();
 
   const card = document.createElement("div");
   card.className = "enc-action-card" + (editable ? "" : " disabled");
@@ -796,7 +851,9 @@ function renderEncoderActions() {
   const statusEl = document.createElement("p");
   statusEl.className = "enc-action-status";
   const refreshStatus = () => {
-    statusEl.textContent = encoderStatusText(actions, editable);
+    statusEl.textContent = is12Key()
+      ? "当前为 12 键布局，编码器不可用（配置会保留，切回编码器布局后恢复）"
+      : encoderStatusText(actions, editable);
   };
   refreshStatus();
   card.appendChild(statusEl);
@@ -998,6 +1055,66 @@ function renderSysinfo() {
   atEl.textContent = when + stale;
 }
 
+/** WS-499: 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
+async function probeDeviceLayout(devId) {
+  if (!devId) return;
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/layout`, { method: "POST" });
+    if (state.selected !== devId || !state.cfg) return;
+    if (!r.sent) return;            // 设备未连接：结论未知，保持现状
+    state.cfg.layout_supported = r.supported;
+    if (r.layout === LAYOUT_12KEY || r.layout === LAYOUT_ENCODER) {
+      state.cfg.layout = r.layout;  // 以设备为准（配网页可能刚改过）
+    }
+    renderKeys();
+    renderEncoder();
+    renderPins();
+    renderDeviceMeta();
+  } catch (_) {
+    /* 旧后端或链路异常：布局维持本地配置，不影响其他功能 */
+  }
+}
+
+/** WS-499: 设备页「按键布局」卡片的状态与说明。 */
+function renderLayoutCard() {
+  const enc = $("#layoutEncoder");
+  const twelve = $("#layout12Key");
+  const hint = $("#layoutHint");
+  if (!enc || !twelve) return;
+  const supported = (state.cfg || {}).layout_supported;
+  const blocked = supported === false;
+  // 旧固件：12 键选项直接禁用，并说明原因（而不是选了才在应用时失败）。
+  twelve.disabled = blocked;
+  if (blocked && is12Key()) {
+    // 本地配置是 12 键但固件不支持（例如刚降级）：先按设备真实布局显示。
+    state.cfg.layout = LAYOUT_ENCODER;
+    enc.checked = true;
+    twelve.checked = false;
+    renderKeys();
+    renderEncoder();
+  } else {
+    enc.checked = !is12Key();
+    twelve.checked = is12Key();
+  }
+  if (blocked) {
+    hint.textContent = "该设备固件不支持 12 键布局（需 v1.3.7 及以上），请先升级固件。";
+    return;
+  }
+  hint.textContent = is12Key()
+    ? "第 10–12 键固定在原编码器按压 / A / B 三脚上；旋转编码器不可用，第 10 键同时承担配网手势。"
+    : "9 个按键 + EC11：旋转 = 编码器模式，按压 = 第 10 个输入。";
+}
+
+function setLayout(value) {
+  if (!state.cfg) return;
+  state.cfg.layout = value;
+  renderKeys();
+  renderEncoder();
+  renderPins();
+  renderDeviceMeta();
+  markDirty();
+}
+
 function renderDeviceMeta() {
   if (!state.cfg) return;
   const chip = state.cfg.chip || "ESP32";
@@ -1007,7 +1124,9 @@ function renderDeviceMeta() {
     <div><span>设备</span><b>${escapeHtml(state.cfg.name || state.selected || "—")}</b></div>
     <div><span>固件</span><b>${escapeHtml(fw.version || "—")}</b></div>
     <div><span>编译</span><b class="mono">${escapeHtml(fw.build || "—")}</b></div>
-    <div><span>输入</span><b>9 键 + EC11</b></div>`;
+    <div><span>输入</span><b>${is12Key() ? "12 键（无编码器）" : "9 键 + EC11"}</b></div>
+    <div><span>布局</span><b>${is12Key() ? "12 键" : "编码器"}</b></div>`;
+  renderLayoutCard();
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
 
@@ -1075,9 +1194,33 @@ function renderPins() {
     wrap.append(name, input, err);
     box.appendChild(wrap);
   }
+  // WS-499: 12 键布局下第 10–12 键固定在原编码器三脚上，只读展示。
+  renderFixedPins();
   // 每次重绘都先清掉上一轮的结论，再按当前值重算，避免旧红框挂在新值上。
   applyPinErrors([]);
   validatePins();
+}
+
+/** 12 键布局的三行只读引脚（第 10–12 键 = 原编码器 SW / CLK / DT）。 */
+function renderFixedPins() {
+  const box = $("#pinGrid");
+  if (!box) return;
+  $$(".pin-fixed", box).forEach((el) => el.remove());
+  if (!is12Key()) return;
+  const ext = (state.pinRules && state.pinRules.extended) || null;
+  const values = ext || ["?", "?", "?"];
+  values.forEach((pin, i) => {
+    const idx = 9 + i;
+    const wrap = document.createElement("div");
+    wrap.className = "pin pin-fixed";
+    const name = document.createElement("span");
+    name.textContent = `按键 ${idx + 1}（固定）`;
+    const val = document.createElement("span");
+    val.className = "mono";
+    val.textContent = `GPIO ${pin}`;
+    wrap.append(name, val);
+    box.appendChild(wrap);
+  });
 }
 
 /** 防抖：停止输入 300 ms 后校验整张引脚表。 */
@@ -1110,6 +1253,7 @@ async function validatePins() {
   }
   const seq = ++state.pinValidateSeq;
   const query = `?chip=${encodeURIComponent(state.cfg.chip || "ESP32")}`
+    + `&layout=${layoutOf()}`
     + `&pins=${encodeURIComponent(tokens.join(","))}`;
   let errors;
   try {
@@ -1118,6 +1262,7 @@ async function validatePins() {
     if (r.pinRules) {
       state.pinRules = r.pinRules;
       renderPinHint();
+      renderFixedPins();   // WS-499: keep the fixed rows in sync with the rule
     }
   } catch (_) {
     // 上位机后端暂时取不到：保留上一次结论，绝不假装全部合法。
@@ -1316,6 +1461,13 @@ async function applyConfig() {
   await saveConfig();
   try {
     const r = await api(`/api/apply/${encodeURIComponent(state.selected)}`, { method: "POST" });
+
+    // WS-499: 旧固件收到 12 键配置时后端直接拒绝 —— 明确告诉用户原因，
+    // 不要落到下面的「设备未连接？」兜底文案里假装失败得莫名其妙。
+    if (!r.ok && r.error && !r.items) {
+      toast(r.error, "bad");
+      return;
+    }
 
     // New contract: per-item readback results.
     if (r.items && r.items.length) {
@@ -2102,6 +2254,14 @@ async function init() {
       toast(e.message, "bad");
     }
   };
+  // WS-499: 布局切换。只改本地配置，点「应用配置」才下发；
+  // 下发后重新渲染按键卡片与编码器页，切换立刻可见。
+  $$("input[name='layout']").forEach((el) => {
+    el.onchange = () => {
+      if (!el.checked) return;
+      setLayout(Number(el.value) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER);
+    };
+  });
   $("#btnPing").onclick = () => devAction("ping", "已发送 Ping");
   // WS-445: 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
   $("#btnSysRefresh").onclick = async () => {

@@ -12,7 +12,7 @@
     <div class="logo">BD<span>L</span></div>
     <div>
       <h1>BindDeckLite</h1>
-      <p>9 键 + EC11 · 无屏幕精简版</p>
+      <p>9 键 + EC11 / 12 键 · 无屏幕精简版</p>
     </div>
   </div>
 
@@ -75,10 +75,13 @@
           <p>旋转动作由设备直接发送 HID；按压使用上方「编码器按压」按键的映射。</p>
         </div>
       </div>
+      <div class="note" id="encoderDisabledNote" hidden>
+        <b>编码器不可用</b>当前为 12 键布局：旋转编码器已被三个按键取代，切换回「编码器」布局并应用后恢复。
+      </div>
       <div class="mode-grid" id="encoderModes"></div>
       <div id="encoderActions"></div>
       <div class="note">
-        <b>提示</b>1.2 秒内连按两次编码器会重启并进入 WiFi 配网 / OTA 模式（无菜单键时的入口）。
+        <b>提示</b>1.2 秒内连按两次第 10 个输入（编码器按压 / 12 键布局的第 10 键）会重启并进入 WiFi 配网 / OTA 模式（无菜单键时的入口）。
       </div>
     </section>
 
@@ -113,6 +116,19 @@
 </div>
 
       <div class="card">
+        <h3>按键布局 <span class="muted">（WS-499）</span></h3>
+        <label class="row">
+          <input type="radio" name="layout" id="layoutEncoder" value="1">
+          <span>编码器（9 键 + EC11 旋转 + 按压）</span>
+        </label>
+        <label class="row">
+          <input type="radio" name="layout" id="layout12Key" value="0">
+          <span>12 键（无编码器，原 A / B / 按压 三脚各接一键）</span>
+        </label>
+        <p class="muted small" id="layoutHint"></p>
+      </div>
+
+      <div class="card">
         <h3>按键引脚 <span class="muted">（9 个，GPIO 编号）</span><span class="pin-error-count" id="pinErrorCount" hidden></span></h3>
         <div class="pins" id="pinGrid"></div>
         <p class="muted small" id="pinHint"></p>
@@ -129,7 +145,7 @@
           <input type="number" id="sleepMinutes" min="1" max="120" step="1" class="short">
           <span>分钟</span>
         </label>
-        <p class="muted small">ESP32-C3 只能被 GPIO0–5 上的按键唤醒；经典 ESP32 由编码器按压唤醒。</p>
+        <p class="muted small">ESP32-C3 只能被 GPIO0–5 上的按键唤醒；经典 ESP32 由第 10 个输入（编码器按压 / 12 键布局的第 10 键）唤醒。</p>
       </div>
 
       <div class="card">

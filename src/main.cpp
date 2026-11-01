@@ -51,7 +51,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.6"   // WS-433: OTA verified writes + [ota][wt] write probe
+#define FW_VERSION "1.3.7"   // WS-499: CFG:LAYOUT / 12-key layout
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -66,8 +66,18 @@
 // === Hardware =============================================================
 #define NUM_BUTTONS 9
 #define NUM_INPUTS  10          // 9 buttons + encoder push (index 9)
+// WS-499: two physical layouts share one firmware.
+//   encoder layout (default): 9 buttons + EC11 (rotate + push) = 10 inputs
+//   12-key layout           : the EC11 lines carry three plain buttons, so the
+//                             9 buttons + SW + A + B = 12 inputs
+// The editable pin table always has NUM_BUTTONS rows; the extra inputs of the
+// 12-key layout sit on the (otherwise encoder) SW/CLK/DT pins, so index -> pin
+// goes through inputPin() instead of buttonPins[].
+#define NUM_INPUTS_MAX 12       // 12-key layout input count (0..11)
 // Bumped when the default pin map changes, so a board that keeps its NVS across
 // an OTA adopts the corrected wiring instead of the old stored pins.
+// WS-499: the layout switch is stored separately ("encOn") precisely so adding
+// it does NOT have to bump this - a bump would reset every user's pin map.
 #define CFG_SCHEMA  2
 
 #ifdef TARGET_ESP32C3
@@ -93,10 +103,12 @@
   static const int DEFAULT_BUTTON_PINS[NUM_BUTTONS] = {13, 12, 14, 27, 32, 33, 25, 26, 4};
 #endif
 
-// Default HID keys for the 9 buttons and the encoder push (F13..F22).
-static const uint8_t DEFAULT_KEYS[NUM_INPUTS] = {
+// Default HID keys for the nine buttons, the (former) encoder push and the two
+// EC11 rotation lines used as plain buttons in the 12-key layout (F13..F24).
+static const uint8_t DEFAULT_KEYS[NUM_INPUTS_MAX] = {
   KEY_F13, KEY_F14, KEY_F15, KEY_F16, KEY_F17,
-  KEY_F18, KEY_F19, KEY_F20, KEY_F21, KEY_F22
+  KEY_F18, KEY_F19, KEY_F20, KEY_F21, KEY_F22,
+  KEY_F23, KEY_F24
 };
 
 // v1.0.1: the old "hold 5 s to open the portal" gesture was the firmware's only
@@ -114,11 +126,27 @@ BleKeyboard bleKeyboard(FW_NAME_PREFIX, "BindDeckLite", 100);
 Preferences preferences;
 
 int buttonPins[NUM_BUTTONS];
-int buttonKeys[NUM_INPUTS];
+int buttonKeys[NUM_INPUTS_MAX];
 int encMode = 0;
+// WS-499: true = encoder layout (10 inputs), false = 12-key layout.
+// Stored as NVS key "encOn", independent of CFG_SCHEMA (see the note above).
+bool encOn = true;
 bool sleepEnabled = true;
 unsigned long sleepTimeoutMs = 300000;
 char tzString[64] = "CET-1CEST,M3.5.0,M10.5.0/3";
+
+// Active input count for the current layout (10 or 12).
+static inline int inputCount() { return encOn ? NUM_INPUTS : NUM_INPUTS_MAX; }
+
+// GPIO behind one input index. Indices 0..8 are the editable rows, 9 is the
+// encoder push line (a plain button in both layouts, which is why the portal
+// gesture works the same way), 10/11 are the EC11 A/B lines (12-key only).
+static inline int inputPin(int idx) {
+  if (idx < 0 || idx >= NUM_INPUTS_MAX) return -1;
+  if (idx < NUM_BUTTONS) return buttonPins[idx];
+  if (idx == 9) return ENCODER_SW;
+  return (idx == 10) ? ENCODER_CLK : ENCODER_DT;
+}
 
 static String g_devId;    // "A1B2"
 static String g_bleName;  // "BindDeckLite-A1B2"
@@ -264,8 +292,44 @@ static void readEncoder() {
 static esp_timer_handle_t s_encoderTimer = NULL;
 static void encoderTimerCb(void*) { readEncoder(); }
 
+// WS-499: in the 12-key layout the A/B lines are buttons, so the sampler is
+// stopped and no ENC: event is produced. esp_timer_start_periodic()/stop() are
+// documented as thread-safe, so a layout switch can be applied at runtime from
+// the command path without a reboot (no ISR is freed, nothing can race).
+static void encoderTimerSetEnabled(bool on) {
+  if (!on) {
+    if (s_encoderTimer) esp_timer_stop(s_encoderTimer);
+    return;
+  }
+  if (s_encoderTimer == NULL) {
+    esp_timer_create_args_t cfg = {
+      .callback = &encoderTimerCb,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "enc"
+    };
+    if (esp_timer_create(&cfg, &s_encoderTimer) != ESP_OK) {
+      log_e("[enc] timer create failed - encoder disabled");
+      s_encoderTimer = NULL;
+      return;
+    }
+  }
+  esp_timer_stop(s_encoderTimer);          // no-op when it is not running
+  esp_timer_start_periodic(s_encoderTimer, 1000);
+}
+
 // === Pin validation =======================================================
-static bool isValidButtonPin(int pin) {
+// Input index (9..11) that owns `pin` in the 12-key layout, or -1. In the
+// encoder layout those three pins belong to the encoder and are off limits.
+static int extendedInputForPin(int pin, bool encoderLayout) {
+  if (encoderLayout) return -1;
+  if (pin == ENCODER_SW)  return 9;
+  if (pin == ENCODER_CLK) return 10;
+  if (pin == ENCODER_DT)  return 11;
+  return -1;
+}
+
+static bool isValidButtonPin(int pin, bool encoderLayout) {
 #ifdef TARGET_ESP32C3
   if (pin < 0 || pin > 21) return false;
   if (pin >= 11 && pin <= 17) return false;   // embedded flash
@@ -278,13 +342,20 @@ static bool isValidButtonPin(int pin) {
   if (pin >= 6 && pin <= 11) return false;    // classic ESP32 SPI flash
   if (pin >= 34) return false;                // input-only, no pull-up
 #endif
-  if (pin == ENCODER_CLK || pin == ENCODER_DT || pin == ENCODER_SW) return false;
+  // WS-499: the three EC11 lines are never free for an editable row -- in the
+  // encoder layout they belong to the encoder, in the 12-key layout they ARE
+  // inputs 9..11. Rejecting them here is also why isValidPinSet() needs no
+  // second duplicate check against 9..11: a row cannot name those pins at all.
+  if (pin == ENCODER_SW || pin == ENCODER_CLK || pin == ENCODER_DT) return false;
   return true;
 }
 
-static bool isValidPinSet(const int pins[NUM_BUTTONS]) {
+// The nine editable rows must be valid and distinct. In the 12-key layout the
+// pins of inputs 9..11 are rejected outright by isValidButtonPin(), so the
+// duplicate check below stays a plain 9x9 comparison.
+static bool isValidPinSet(const int pins[NUM_BUTTONS], bool encoderLayout) {
   for (int i = 0; i < NUM_BUTTONS; i++) {
-    if (!isValidButtonPin(pins[i])) return false;
+    if (!isValidButtonPin(pins[i], encoderLayout)) return false;
     for (int j = i + 1; j < NUM_BUTTONS; j++) {
       if (pins[i] == pins[j]) return false;
     }
@@ -296,7 +367,7 @@ static bool isValidPinSet(const int pins[NUM_BUTTONS]) {
 // The accept/reject rule is exactly isValidButtonPin() - this only adds a
 // human-readable reason so the portal can name the offending row instead of
 // one generic "invalid or duplicate pin" page (WS-408).
-static String pinRejectReason(int idx, int pin) {
+static String pinRejectReason(int idx, int pin, bool encoderLayout) {
   String btn = "按键 " + String(idx + 1);
   if (pin < 0 || pin > 39) return btn + " 必须填 0-39 的整数";
   String who = btn + " 的 GPIO " + String(pin);
@@ -307,9 +378,16 @@ static String pinRejectReason(int idx, int pin) {
   if (pin >= 6 && pin <= 11) return who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键";
   if (pin >= 34) return who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键";
 #endif
-  if (pin == ENCODER_CLK) return who + " 与编码器 A 相脚（CLK）冲突";
-  if (pin == ENCODER_DT)  return who + " 与编码器 B 相脚（DT）冲突";
-  if (pin == ENCODER_SW)  return who + " 与编码器按压脚冲突";
+  // WS-499: in the 12-key layout the three encoder lines ARE buttons, so the
+  // message names the input that already owns the pin instead of claiming a
+  // conflict with a (nonexistent) encoder.
+  int ext = extendedInputForPin(pin, encoderLayout);
+  if (ext >= 0) {
+    return who + " 该脚在 12 键模式下是第 " + String(ext + 1) + " 键，不能重复分配";
+  }
+  if (pin == ENCODER_CLK) return who + " 该脚在编码器模式下是编码器 A 相脚（CLK），12 键模式下才是第 11 键";
+  if (pin == ENCODER_DT)  return who + " 该脚在编码器模式下是编码器 B 相脚（DT），12 键模式下才是第 12 键";
+  if (pin == ENCODER_SW)  return who + " 该脚在编码器模式下是编码器按压脚（第 10 输入），12 键模式下才是第 10 键";
   return "";
 }
 
@@ -331,11 +409,25 @@ static bool parsePinText(const String& s, int& out) {
 }
 
 // === Buttons ==============================================================
-Bounce2::Button switches[NUM_BUTTONS];
+// One debouncer per input of the widest layout; only the active ones are
+// attached, so a 12-key deck gets 12 objects without ever indexing past the
+// array (WS-499). Index 9 keeps its own gesture/portal handling below and is
+// deliberately NOT driven by a debouncer.
+Bounce2::Button switches[NUM_INPUTS_MAX];
+
+// True when input `idx` is handled by the switches[] loop (0..8 always, 10/11
+// only in the 12-key layout).
+static inline bool inputUsesSwitch(int idx) {
+  if (idx < 0 || idx >= inputCount()) return false;
+  return idx != 9;
+}
 
 static void applyButtonPins() {
-  for (int i = 0; i < NUM_BUTTONS; i++) {
-    switches[i].attach(buttonPins[i], INPUT_PULLUP);
+  for (int i = 0; i < NUM_INPUTS_MAX; i++) {
+    // Inputs outside the active layout keep their (old) attachment but are
+    // never updated, so they cannot report presses; Bounce2 has no detach().
+    if (!inputUsesSwitch(i)) continue;
+    switches[i].attach(inputPin(i), INPUT_PULLUP);
     switches[i].interval(DEBOUNCE_MS);
     switches[i].setPressedState(LOW);
   }
@@ -372,6 +464,8 @@ static void saveConfig() {
   preferences.begin("binddecklite", false);
   preferences.putInt("encMode", encMode);
   preferences.putInt("cfgVer", CFG_SCHEMA);
+  // WS-499: layout flag, stored on its own so adding it never bumps the schema.
+  preferences.putBool("encOn", encOn);
   preferences.putBool("sleepEnabled", sleepEnabled);
   preferences.putULong("sleepTimeoutMs", sleepTimeoutMs);
   preferences.putString("tz", tzString);
@@ -380,7 +474,7 @@ static void saveConfig() {
     snprintf(k, sizeof(k), "pin%d", i);
     preferences.putInt(k, buttonPins[i]);
   }
-  for (int i = 0; i < NUM_INPUTS; i++) {
+  for (int i = 0; i < NUM_INPUTS_MAX; i++) {
     char k[10];
     snprintf(k, sizeof(k), "key%d", i);
     preferences.putInt(k, buttonKeys[i]);
@@ -389,7 +483,7 @@ static void saveConfig() {
 }
 
 static void loadConfig() {
-  for (int i = 0; i < NUM_INPUTS; i++) buttonKeys[i] = DEFAULT_KEYS[i];
+  for (int i = 0; i < NUM_INPUTS_MAX; i++) buttonKeys[i] = DEFAULT_KEYS[i];
   for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = DEFAULT_BUTTON_PINS[i];
 
   // Open read-write so the namespace is created on a blank device; a read-only
@@ -417,6 +511,9 @@ static void loadConfig() {
 
   encMode = preferences.getInt("encMode", 0);
   if (encMode < 0 || encMode > 4) encMode = 0;
+  // WS-499: must be known before the pin set is validated - the three encoder
+  // pins are legal button pins in the 12-key layout only.
+  encOn = preferences.getBool("encOn", true);
   sleepEnabled = preferences.getBool("sleepEnabled", true);
   sleepTimeoutMs = preferences.getULong("sleepTimeoutMs", 300000);
   if (sleepTimeoutMs < 60000) sleepTimeoutMs = 300000;
@@ -438,20 +535,20 @@ static void loadConfig() {
     snprintf(k, sizeof(k), "pin%d", i);
     loaded[i] = staleSchema ? DEFAULT_BUTTON_PINS[i]
                             : preferences.getInt(k, DEFAULT_BUTTON_PINS[i]);
-    if (!isValidButtonPin(loaded[i])) bad = true;
+    if (!isValidButtonPin(loaded[i], encOn)) bad = true;
   }
   if (staleSchema) {
     log_e("[cfg] pin schema v%d -> v%d: using the board defaults%s", schema, CFG_SCHEMA,
           cfgVerPresent ? "" : " (no stored schema)");
   }
-  if (isValidPinSet(loaded)) {
+  if (isValidPinSet(loaded, encOn)) {
     for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = loaded[i];
   } else {
     log_e("[cfg] stored pin set invalid - keeping defaults");
     (void)bad;
   }
 
-  for (int i = 0; i < NUM_INPUTS; i++) {
+  for (int i = 0; i < NUM_INPUTS_MAX; i++) {
     char k[10];
     snprintf(k, sizeof(k), "key%d", i);
     buttonKeys[i] = preferences.getInt(k, DEFAULT_KEYS[i]);
@@ -460,7 +557,8 @@ static void loadConfig() {
   if (staleSchema) {
     saveConfig();   // persist the corrected pin map + new schema version
   }
-  log_e("[cfg] enc=%d sleep=%d/%lums", encMode, (int)sleepEnabled, sleepTimeoutMs);
+  log_e("[cfg] layout=%s enc=%d sleep=%d/%lums", encOn ? "encoder" : "12key",
+        encMode, (int)sleepEnabled, sleepTimeoutMs);
 }
 
 // === Transport to the host ================================================
@@ -483,7 +581,7 @@ static void applyTimezone() { configTzTime(tzString, "pool.ntp.org"); }
 
 // === HID actions ==========================================================
 static void sendKeyForInput(int idx) {
-  if (idx < 0 || idx >= NUM_INPUTS) return;
+  if (idx < 0 || idx >= inputCount()) return;
   if (bleKeyboard.isConnected()) {
     bleKeyboard.press(buttonKeys[idx]);
     delay(8);
@@ -567,10 +665,11 @@ struct KeysForm {
   bool   bad[NUM_BUTTONS];             // mark the row red / aria-invalid
   std::vector<String> errors;          // reasons for the banner, one per line
   int    enc;                          // encoder mode to keep selected
+  bool   encOn;                        // layout to keep selected (WS-499)
   bool   sleepEnabled;
   unsigned long sleepMs;
 
-  KeysForm() : enc(0), sleepEnabled(true), sleepMs(300000) {
+  KeysForm() : enc(0), encOn(true), sleepEnabled(true), sleepMs(300000) {
     for (int i = 0; i < NUM_BUTTONS; i++) bad[i] = false;
   }
 };
@@ -620,7 +719,17 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += htmlEsc(pwd);
   h += F("'><p><button style='padding:10px 20px'>保存并连接</button></p></form>");
 
-  h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys'><table>");
+  // WS-499: the layout switch lives in the same form as the pin rows, but its
+  // own value is only written when the POST actually carries it (see /keys).
+  bool selLayoutEnc = form ? form->encOn : encOn;
+  h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys'>"
+         "<p><b>按键布局</b><br><select name='layout'>");
+  h += "<option value='1'";
+  if (selLayoutEnc) h += " selected";
+  h += F(">编码器（9 键 + EC11 旋转）</option>");
+  h += "<option value='0'";
+  if (!selLayoutEnc) h += " selected";
+  h += F(">12 键（无编码器，A/B/按压 三脚各接一键）</option></select></p><table>");
   for (int i = 0; i < NUM_BUTTONS; i++) {
     bool bad = form && form->bad[i];
     h += bad ? "<tr class='bad'>" : "<tr>";
@@ -631,9 +740,23 @@ static String cfgPage(const KeysForm* form = nullptr) {
     h += htmlEsc(form ? form->pins[i] : String(buttonPins[i]));
     h += "'></td></tr>";
   }
+  // The three extra inputs of the 12-key layout sit on fixed pins (same wires
+  // as the encoder), so they are shown read-only instead of being editable.
+  if (!selLayoutEnc) {
+    h += F("<tr><td>第 10–12 键<br><span style='color:#888;font-size:12px'>固定，不可改</span></td><td>"
+           "GPIO ");
+    h += String(ENCODER_SW) + " / " + String(ENCODER_CLK) + " / " + String(ENCODER_DT);
+    h += F("</td></tr>");
+  }
   int selEnc = form ? form->enc : encMode;
   if (selEnc < 0 || selEnc > 4) selEnc = 0;
-  h += F("</table><p><b>编码器模式</b><br><select name='enc'>");
+  h += F("</table>");
+  if (!selLayoutEnc) {
+    h += F("<p style='color:#888;font-size:12px'>12 键布局下编码器旋转不可用，"
+           "「编码器模式」仍会保存但不生效；第 10 键（原编码器按压那一路）"
+           "同时承担配网手势。</p>");
+  }
+  h += F("<p><b>编码器模式</b><br><select name='enc'>");
   for (int m = 0; m < 5; m++) {
     h += "<option value='" + String(m) + "'";
     if (m == selEnc) h += " selected";
@@ -651,8 +774,9 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += F("' style='width:80px'></p><button style='padding:10px 20px'>保存按键配置</button></form>");
 
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
-         "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住编码器上电，"
-         "或上位机点“进入配网模式”）。离开配网：长按编码器约 1 秒，或等 5 分钟自动退出。</p>"
+         "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
+         "——编码器布局下是编码器按压，12 键布局下是第 10 键；或上位机点“进入配网模式”）。"
+         "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。</p>"
          "</body></html>");
   return h;
 }
@@ -705,6 +829,13 @@ static void setupProvisioning() {
     KeysForm form;
     bool ok = true;
 
+    // WS-499 / WS-408: the layout is only written when the form actually
+    // carried a "layout" field. A page (or an old client) that omits it must
+    // not silently fall back to the encoder layout.
+    form.encOn = cfgServer.hasArg("layout")
+                     ? (cfgServer.arg("layout").toInt() != 0)
+                     : encOn;
+
     // Echo back what was submitted (including the encoder/sleep choices) so a
     // rejected save never loses the user's work.
     form.enc = cfgServer.hasArg("enc") ? cfgServer.arg("enc").toInt() : encMode;
@@ -714,6 +845,8 @@ static void setupProvisioning() {
     if (mins < 1) mins = 5;
     form.sleepMs = (unsigned long)mins * 60000UL;
 
+    // Validate against the layout being *submitted*, not the one running now:
+    // choosing "12 键" and typing GPIO20 no longer trips the encoder rule.
     for (int i = 0; i < NUM_BUTTONS; i++) {
       form.pins[i] = cfgServer.arg("pin" + String(i));
       form.pins[i].trim();
@@ -725,7 +858,7 @@ static void setupProvisioning() {
         ok = false;
         continue;
       }
-      String why = pinRejectReason(i, pins[i]);
+      String why = pinRejectReason(i, pins[i], form.encOn);
       if (why.length()) {
         form.bad[i] = true;
         form.errors.push_back(why);
@@ -744,8 +877,13 @@ static void setupProvisioning() {
       }
     }
 
-    if (ok && isValidPinSet(pins)) {
+    if (ok && isValidPinSet(pins, form.encOn)) {
       for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = pins[i];
+      if (form.encOn != encOn) {
+        encOn = form.encOn;
+        encoderTimerSetEnabled(encOn);
+        log_e("[cfg] portal layout -> %s", encOn ? "encoder" : "12key");
+      }
       applyButtonPins();
       // Only touch encMode when the form actually carried it: a field the page
       // did not submit must not silently reset the mode to "0 音量" (WS-408).
@@ -1752,7 +1890,7 @@ static void processCommand(String data) {
       if (comma == -1) break;
       payload = payload.substring(comma + 1);
     }
-    if (n == NUM_BUTTONS && isValidPinSet(pins)) {
+    if (n == NUM_BUTTONS && isValidPinSet(pins, encOn)) {
       for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = pins[i];
       applyButtonPins();
       saveConfig();
@@ -1761,11 +1899,14 @@ static void processCommand(String data) {
       log_e("[cfg] pins REJECTED");
     }
   } else if (data.startsWith("CFG:KEYS:")) {
-    // CFG:KEYS:<9 button codes>,<encoder push code>
+    // CFG:KEYS:<codes...>: 10 values (buttons + encoder push) in the encoder
+    // layout, 12 values in the 12-key layout (WS-499). The old 10-value form
+    // stays valid in the 12-key layout too - the two missing tail codes then
+    // take their defaults (F23/F24), so an old host cannot truncate the map.
     String payload = data.substring(9);
-    int keys[NUM_INPUTS];
+    int keys[NUM_INPUTS_MAX];
     int n = 0;
-    while (n < NUM_INPUTS && payload.length() > 0) {
+    while (n < NUM_INPUTS_MAX && payload.length() > 0) {
       int comma = payload.indexOf(',');
       String tok = (comma == -1) ? payload : payload.substring(0, comma);
       tok.trim();
@@ -1773,17 +1914,41 @@ static void processCommand(String data) {
       if (comma == -1) break;
       payload = payload.substring(comma + 1);
     }
-    if (n == NUM_INPUTS) {
-      for (int i = 0; i < NUM_INPUTS; i++) buttonKeys[i] = keys[i];
+    const int need = inputCount();
+    if (n == need || (n == NUM_INPUTS && need > NUM_INPUTS)) {
+      for (int i = 0; i < n; i++) buttonKeys[i] = keys[i];
+      for (int i = n; i < need; i++) buttonKeys[i] = DEFAULT_KEYS[i];
       saveConfig();
-      log_e("[cfg] keys applied");
+      log_e("[cfg] keys applied (%d values)", n);
     } else {
-      log_e("[cfg] keys REJECTED (need %d values)", NUM_INPUTS);
+      log_e("[cfg] keys REJECTED (need %d values, layout=%s)", need,
+            encOn ? "encoder" : "12key");
     }
+  } else if (data.startsWith("CFG:LAYOUT:")) {
+    // WS-499: 1 = encoder layout (10 inputs), 0 = 12-key layout (12 inputs).
+    // Applied live; the A/B sampler is stopped/started through esp_timer,
+    // which is safe from the BLE/UDP callback (no reboot needed).
+    String v = data.substring(11);
+    v.trim();
+    bool want = (v.toInt() != 0);
+    if (want != encOn) {
+      encOn = want;
+      encoderTimerSetEnabled(encOn);
+      applyButtonPins();
+      saveConfig();
+      log_e("[cfg] layout -> %s (%d inputs)", encOn ? "encoder" : "12key", inputCount());
+    }
+  } else if (data == "CFG:LAYOUT") {
+    // Read-back: LAYOUT:<0|1>. Old hosts ignore the unknown line, new hosts
+    // use it to decide between 10 and 12 input cards.
+    sendToHost("LAYOUT:" + String(encOn ? 1 : 0));
   } else if (data.startsWith("CFG:ENC:")) {
     encMode = data.substring(8).toInt();
     if (encMode < 0 || encMode > 4) encMode = 0;
     saveConfig();
+    // WS-499: stored either way, but rotations do not exist in the 12-key
+    // layout. Say so in the log instead of dropping the value silently.
+    if (!encOn) log_e("[cfg] enc=%d stored (12-key layout: rotations inactive)", encMode);
   } else if (data.startsWith("CFG:SLEEP:")) {
     String p = data.substring(10);
     int comma = p.indexOf(',');
@@ -1824,7 +1989,9 @@ static void processCommand(String data) {
                + "," + FW_BUILD + "," + String(ESP.getFlashChipSize() / 1024));
   } else if (data.startsWith("CMD:GET_CFG")) {
     String keys;
-    for (int i = 0; i < NUM_INPUTS; i++) { if (i) keys += ","; keys += String(buttonKeys[i]); }
+    // WS-499: report only the inputs the current layout actually has, so an
+    // old host still sees exactly 10 codes on an encoder deck.
+    for (int i = 0; i < inputCount(); i++) { if (i) keys += ","; keys += String(buttonKeys[i]); }
     String pins;
     for (int i = 0; i < NUM_BUTTONS; i++) { if (i) pins += ","; pins += String(buttonPins[i]); }
     // WS-336: one compact console line with the five values that go out, so a
@@ -1839,6 +2006,9 @@ static void processCommand(String data) {
     sendToHost("CFG_ENC:" + String(encMode));
     sendToHost("CFG_SLEEP:" + String(sleepEnabled ? 1 : 0) + "," + String(sleepTimeoutMs / 60000));
     sendToHost("CFG_TZ:" + String(tzString));
+    // WS-499: appended last so the five existing lines keep their order and an
+    // old host that stops reading after CFG_TZ is unaffected.
+    sendToHost("CFG_LAYOUT:" + String(encOn ? 1 : 0));
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {
@@ -2114,6 +2284,7 @@ void setup() {
   otaTestOnBoot();
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
+  // WS-499: this is input 9 in both layouts (encoder push / "button 10").
   // WS-321: a 5 s hold is a *separate* gesture that clears the host binding
   // without entering the portal. It takes priority over the 200 ms hold so a
   // user who really wants the portal can release before 5 s.
@@ -2244,20 +2415,16 @@ void setup() {
     log_e("[cfg] normal mode - BLE only, WiFi off");
   }
 
-  // Encoder + buttons
-  pinMode(ENCODER_CLK, INPUT_PULLUP);
-  pinMode(ENCODER_DT, INPUT_PULLUP);
+  // Encoder + buttons. WS-499: in the 12-key layout the A/B lines are plain
+  // buttons, so they are pulled up by applyButtonPins() like any other input;
+  // only the push line keeps an unconditional pull-up (it is input 9 in both
+  // layouts and the boot/portal gesture reads it directly).
   pinMode(ENCODER_SW, INPUT_PULLUP);
-  if (s_encoderTimer == NULL) {
-    esp_timer_create_args_t cfg = {
-      .callback = &encoderTimerCb,
-      .arg = NULL,
-      .dispatch_method = ESP_TIMER_TASK,
-      .name = "enc"
-    };
-    esp_timer_create(&cfg, &s_encoderTimer);
-    esp_timer_start_periodic(s_encoderTimer, 1000);
+  if (encOn) {
+    pinMode(ENCODER_CLK, INPUT_PULLUP);
+    pinMode(ENCODER_DT, INPUT_PULLUP);
   }
+  encoderTimerSetEnabled(encOn);
   applyButtonPins();
   g_lastActivity = millis();
 
@@ -2448,7 +2615,10 @@ void loop() {
   }
 
   // ---- buttons -----------------------------------------------------------
-  for (int i = 0; i < NUM_BUTTONS; i++) {
+  // WS-499: 0..8 always, plus 10/11 in the 12-key layout. Index 9 has its own
+  // debouncer below because it also carries the portal gesture.
+  for (int i = 0; i < inputCount(); i++) {
+    if (!inputUsesSwitch(i)) continue;
     switches[i].update();
     if (switches[i].pressed()) {
       g_lastActivity = millis();
@@ -2461,7 +2631,10 @@ void loop() {
     }
   }
 
-  // ---- encoder push: key + portal gesture --------------------------------
+  // ---- encoder push (input 9): key + portal gesture ----------------------
+  // WS-499: index 9 is the same physical line in both layouts (encoder push,
+  // or "button 10" on a 12-key deck), so this block - and therefore the whole
+  // portal gesture - is shared unchanged.
   // The portal gesture is a DOUBLE-CLICK. It is armed only after the pin has
   // been seen idle (HIGH) at least once, so a permanently-LOW pin can never
   // reboot the device in a loop.
@@ -2489,15 +2662,15 @@ void loop() {
         lastPressAt = now;
         g_lastActivity = now;
         bleKeyboard.notifyUserActivity();   // WS-429: user present -> resume advertising
-        log_e("[btn] encoder push");
-        sendKeyForInput(NUM_INPUTS - 1);
-        sendToHost("BTN:" + g_devId + ":" + String(NUM_INPUTS - 1));
+        log_e("[btn] input 9%s", encOn ? " (encoder push)" : " (button 10)");
+        sendKeyForInput(9);
+        sendToHost("BTN:" + g_devId + ":9");
       }
     }
   }
 
-  // ---- encoder rotation --------------------------------------------------
-  {
+  // ---- encoder rotation (encoder layout only) ----------------------------
+  if (encOn) {
     static int lastSteps = 0;
     int cur = encoderSteps;
     if (cur / 4 != lastSteps / 4) {
@@ -2530,11 +2703,17 @@ void loop() {
   if (!g_configMode && sleepEnabled && (millis() - g_lastActivity >= sleepTimeoutMs)) {
     log_e("[sleep] idle %lums -> deep sleep", sleepTimeoutMs);
     delay(100);
+    // WS-499: wake sources are per layout so inputs 9..11 are covered where the
+    // chip allows it. On the C3 only GPIO0-5 can wake from deep sleep, so the
+    // EC11 lines (10/20/21) never qualify there. On the classic ESP32 the ext0
+    // call on ENCODER_SW is unchanged from before this change; note GPIO5 is
+    // not an RTC GPIO (RTC domain is 0/2/4/12-15/25-27/32-39), so that path is
+    // a pre-existing gap, not something the 12-key layout introduced.
 #ifdef TARGET_ESP32C3
     uint64_t mask = 0;
-    if (ENCODER_SW <= 5) mask |= (1ULL << ENCODER_SW);
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-      if (buttonPins[i] >= 0 && buttonPins[i] <= 5) mask |= (1ULL << buttonPins[i]);
+    for (int i = 0; i < inputCount(); i++) {
+      int pin = inputPin(i);
+      if (pin >= 0 && pin <= 5) mask |= (1ULL << pin);
     }
     if (mask) esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
 #else
