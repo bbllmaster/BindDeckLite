@@ -188,10 +188,6 @@ def input_count(cfg) -> int:
     return INPUT_COUNT_12KEY if layout_of(cfg) == LAYOUT_12KEY else INPUT_COUNT_ENCODER
 
 
-def layout_name(cfg) -> str:
-    return "12 键（无编码器）" if layout_of(cfg) == LAYOUT_12KEY else "编码器（9 键 + EC11）"
-
-
 def _input_label(cfg, idx: int) -> str:
     """Display name of one input for the log / event feed (WS-499)."""
     twelve = layout_of(cfg) == LAYOUT_12KEY
