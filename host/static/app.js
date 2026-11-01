@@ -328,8 +328,9 @@ function renderKeys() {
     const item = keys[i] || { code: 0, label: "?", action: { type: "none", value: "" } };
     const action = item.action || { type: "none", value: "" };
     const card = document.createElement("div");
-    // 12 键布局下第 11、12 张是「扩展」输入（原编码器 A/B 相），单独标色。
-    const extended = is12Key() && i >= 10;
+    // 12 键布局下第 10–12 张是「扩展」输入（原来编码器的按压 / A / B 三脚），
+    // 单独标色，和第 1–9 张普通按键区分开（WS-499 验收）。
+    const extended = is12Key() && i >= 9;
     card.className = "keycard" + (i === 9 ? " encoder-push" : "") + (extended ? " extended" : "");
     card.dataset.idx = i;
     card.innerHTML = `

@@ -3241,8 +3241,18 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     return {"ok": True, "error": "", "action_type": kind, "target": target}
 
 
-def _action_label(idx: int) -> str:
-    """Human-readable input label for an index (0-8 = 按键 1-9, 9 = 编码器按压)."""
+def _action_label(idx: int, dev_id: str = "") -> str:
+    """Human-readable input label for an index.
+
+    0-8 = 按键 1-9, 9 = 编码器按压 — or, in the 12-key layout, 按键 10/11/12
+    (WS-499). Without a device the encoder wording is kept, which is what the
+    pre-layout log lines said.
+    """
+    if dev_id:
+        with _lock:
+            cfg = _config["devices"].get(dev_id)
+        if cfg is not None:
+            return _input_label(cfg, idx)
     return f"按键 {idx + 1}" if 0 <= idx < 9 else "编码器按压"
 
 
@@ -3261,7 +3271,7 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
     password and the log is copyable row by row.
     """
     if not label:
-        label = _action_label(idx)
+        label = _action_label(idx, dev_id)
     atype = result.get("action_type", (action or {}).get("type", "unknown"))
     target = result.get("target", "")
     # WS-495: a user-requested stop is not a failure — one neutral warn row
@@ -3323,7 +3333,7 @@ def _prune_stuck_actions(now: float | None = None):
             stuck.append((key, now - entry["started"]))
     for (dev_id, idx), elapsed in stuck:
         add_event("action",
-                  f"动作超时释放: {_action_label(idx)} · 已运行 {elapsed:.1f} 秒，"
+                  f"动作超时释放: {_action_label(idx, dev_id)} · 已运行 {elapsed:.1f} 秒，"
                   f"强制解除执行中状态",
                   dev_id, "warn")
 
@@ -3445,7 +3455,7 @@ def _run_action_for(dev_id: str, idx: int):
         # Re-entry: the previous macro is still typing into the focused window,
         # so a second one would interleave characters. Drop it silently.
         add_event("action",
-                  f"动作跳过: {_action_label(idx)} · 上一次动作仍在执行"
+                  f"动作跳过: {_action_label(idx, dev_id)} · 上一次动作仍在执行"
                   f"（已运行 {busy_for:.1f} 秒）",
                   dev_id, "warn")
         return
