@@ -323,9 +323,17 @@ function renderKeys() {
   $("#keyHint").textContent = state.preview
     ? "预览 · 未连接设备"
     : `共 ${total} 个输入${layoutText}`;
-  const keys = state.cfg.keys || [];
+  // WS-503: 后端 device_cfg() 已把历史配置的 keys 幂等补齐到 12 条；这里只
+  // 兜住异常数据。补出来的条目必须写进 state.cfg.keys —— 以前每次渲染都新建
+  // 临时对象，第 11/12 张卡上改的键码落在临时对象里，重绘即丢（改完看不见）。
+  if (!Array.isArray(state.cfg.keys)) state.cfg.keys = [];
+  const keys = state.cfg.keys;
+  while (keys.length < total) {
+    keys.push({ code: 0, label: "未配置",
+                action: { type: "none", value: "", macro: [] } });
+  }
   for (let i = 0; i < total; i++) {
-    const item = keys[i] || { code: 0, label: "?", action: { type: "none", value: "" } };
+    const item = keys[i];
     const action = item.action || { type: "none", value: "" };
     const card = document.createElement("div");
     // 12 键布局下第 10–12 张是「扩展」输入（原来编码器的按压 / A / B 三脚），

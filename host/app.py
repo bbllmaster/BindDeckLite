@@ -207,6 +207,25 @@ def default_key_item(i: int) -> dict:
     return {"code": code, "label": label,
             "action": {"type": "none", "value": "", "macro": []}}
 
+
+def ensure_key_items(cfg: dict) -> list:
+    """Grow ``cfg["keys"]`` to the full 12-entry table, in place (WS-499/WS-503).
+
+    v1.3.6 stored only 10 entries (the last was the encoder-push code). A deck
+    switched to the 12-key layout reports 12 codes, so ``apply_device()`` would
+    send 10 and compare them against the 12 that came back — a permanent
+    "keys: rejected" the user could never clear, because the read-back used to
+    be discarded when it differed. Padding here is idempotent and keeps the
+    sent snapshot, the read-back and the 12 input cards on one list.
+    """
+    keys = cfg.get("keys")
+    if not isinstance(keys, list):
+        keys = cfg["keys"] = []
+    while len(keys) < INPUT_COUNT_12KEY:
+        keys.append(default_key_item(len(keys)))
+    return keys
+
+
 # --- WS-476: pin rules (the host keeps exactly one copy) -------------------
 # Mirrors isValidButtonPin() / isValidPinSet() in src/main.cpp. The device page
 # used to accept any number, then a cleared box reached CFG:PINS as "None" and
@@ -245,15 +264,19 @@ def _pin_free_spans(rules: dict) -> list:
     """The GPIO ranges a button may actually use, derived from ``rules`` itself.
 
     Everything here comes out of the same fields ``validate_pins()`` reads —
-    the range limit, ``blocked`` and the encoder pins — plus ``avoid`` for pins
-    that are legal but not worth spending (C3 18/19 are USB-CDC).  Deriving
-    instead of writing a second list keeps the hint from drifting away from
-    the rule again (WS-481).
+    the range limit, ``blocked``, the encoder pins and the fixed pins of the
+    12-key layout (``extended``) — plus ``avoid`` for pins that are legal but
+    not worth spending (C3 18/19 are USB-CDC).  Deriving instead of writing a
+    second list keeps the hint from drifting away from the rule again (WS-481).
     """
     occupied = set()
     for lo, hi in rules["blocked"]:
         occupied.update(range(lo, hi + 1))
     occupied.update(rules["encoder"].values())
+    # WS-503: inputs 9..11 own the three EC11 lines in the 12-key layout, so
+    # the hint must not offer them as free button pins (validate_pins rejects
+    # them as duplicates).
+    occupied.update(rules.get("extended", ()))
     occupied.update(rules.get("avoid", ()))
     spans = []
     for pin in range(rules["min"], rules["max"] + 1):
@@ -312,7 +335,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
         }
         if twelve:
             rules["hint"] = (
-                "C3：按键可用 GPIO%s（避开 %s 与 12 键布局固定的 %s）；%s 是 USB-CDC，不建议占用。"
+                "C3：按键可用 GPIO%s（避开 %s）。%s；%s 是 USB-CDC，不建议占用。"
                 % (
                     _pin_span_text(_pin_free_spans(rules)),
                     _reserved_pin_text(reserved),
@@ -347,7 +370,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
     }
     if twelve:
         rules["hint"] = (
-            "经典 ESP32（12 键布局）：按键可用 GPIO%s（避开 %s 与固定的 %s）。"
+            "经典 ESP32（12 键布局）：按键可用 GPIO%s（避开 %s）。%s。"
             % (
                 _pin_span_text(_pin_free_spans(rules)),
                 _reserved_pin_text(reserved),
@@ -982,6 +1005,12 @@ def load_config():
                 "devices": data.get("devices", {}) or {},
                 "settings": {**_config["settings"], **(data.get("settings", {}) or {})},
             }
+            # WS-503: configs written before the 12-key layout carry 10 key
+            # entries; repair them on load so an upgraded deck cannot get
+            # stuck on "keys: rejected" (see ensure_key_items).
+            for cfg in _config["devices"].values():
+                if isinstance(cfg, dict):
+                    ensure_key_items(cfg)
     except FileNotFoundError:
         pass
     except Exception as e:  # noqa: BLE001
@@ -1034,6 +1063,9 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
                 cfg["chip"] = chip
             if name:
                 cfg["name"] = name
+        # WS-503: historical devices only have 10 key entries (v1.3.6). Pad on
+        # every access so apply/read-back/UI all see the same 12-entry list.
+        ensure_key_items(cfg)
         return cfg
 
 

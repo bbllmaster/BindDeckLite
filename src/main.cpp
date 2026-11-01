@@ -342,15 +342,17 @@ static bool isValidButtonPin(int pin, bool encoderLayout) {
   if (pin >= 6 && pin <= 11) return false;    // classic ESP32 SPI flash
   if (pin >= 34) return false;                // input-only, no pull-up
 #endif
-  // WS-499: in the 12-key layout the SW/CLK/DT lines are ordinary buttons, so
-  // they are only rejected when the encoder actually owns them.
-  if (extendedInputForPin(pin, encoderLayout) >= 0) return false;
-  if (encoderLayout && (pin == ENCODER_CLK || pin == ENCODER_DT || pin == ENCODER_SW)) return false;
+  // WS-499: the three EC11 lines are never free for an editable row -- in the
+  // encoder layout they belong to the encoder, in the 12-key layout they ARE
+  // inputs 9..11. Rejecting them here is also why isValidPinSet() needs no
+  // second duplicate check against 9..11: a row cannot name those pins at all.
+  if (pin == ENCODER_SW || pin == ENCODER_CLK || pin == ENCODER_DT) return false;
   return true;
 }
 
 // The nine editable rows must be valid and distinct. In the 12-key layout the
-// duplicate check also has to cover inputs 9..11, which sit on fixed pins.
+// pins of inputs 9..11 are rejected outright by isValidButtonPin(), so the
+// duplicate check below stays a plain 9x9 comparison.
 static bool isValidPinSet(const int pins[NUM_BUTTONS], bool encoderLayout) {
   for (int i = 0; i < NUM_BUTTONS; i++) {
     if (!isValidButtonPin(pins[i], encoderLayout)) return false;
@@ -2701,11 +2703,12 @@ void loop() {
   if (!g_configMode && sleepEnabled && (millis() - g_lastActivity >= sleepTimeoutMs)) {
     log_e("[sleep] idle %lums -> deep sleep", sleepTimeoutMs);
     delay(100);
-    // WS-499: wake sources cover every input of the active layout (9..11
-    // included), limited to what the chip can actually wake on. On the C3 only
-    // GPIO0-5 can be deep-sleep wake pins, so the encoder lines (10/20/21)
-    // never qualify there; on the classic ESP32 only RTC GPIOs can, and the
-    // encoder lines 18/19 are not RTC-capable -- index 9 (GPIO5) still is.
+    // WS-499: wake sources are per layout so inputs 9..11 are covered where the
+    // chip allows it. On the C3 only GPIO0-5 can wake from deep sleep, so the
+    // EC11 lines (10/20/21) never qualify there. On the classic ESP32 the ext0
+    // call on ENCODER_SW is unchanged from before this change; note GPIO5 is
+    // not an RTC GPIO (RTC domain is 0/2/4/12-15/25-27/32-39), so that path is
+    // a pre-existing gap, not something the 12-key layout introduced.
 #ifdef TARGET_ESP32C3
     uint64_t mask = 0;
     for (int i = 0; i < inputCount(); i++) {

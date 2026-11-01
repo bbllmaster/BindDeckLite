@@ -159,6 +159,21 @@ def test_encoder_pins_are_still_reserved_in_the_encoder_layout():
     assert errors[0]["code"] == "encoder"
 
 
+def test_twelve_key_hint_never_offers_the_fixed_pins():
+    """WS-503 S1: the hint is derived from the same fields validate_pins() uses.
+
+    It used to advertise GPIO10/20/21 as free while the same sentence called
+    them the fixed pins of inputs 9..11, and validate_pins() rejected them.
+    """
+    for chip in ("C3", "ESP32"):
+        rules = app.pin_rules(chip, app.LAYOUT_12KEY)
+        free = {pin for lo, hi in app._pin_free_spans(rules)
+                for pin in range(lo, hi + 1)}
+        assert not free & set(rules["extended"]), (chip, sorted(free))
+        # The three fixed pins are still named, so the user knows why.
+        assert "第 10/11/12 键" in rules["hint"], (chip, rules["hint"])
+
+
 # --- apply ---------------------------------------------------------------
 
 def test_apply_sends_layout_first_and_twelve_key_codes(monkeypatch):
@@ -203,6 +218,30 @@ def test_apply_in_encoder_layout_is_unchanged(monkeypatch):
     assert result["ok"], result
     keys_cmd = next(c for c in sent if c.startswith("CFG:KEYS:"))
     assert keys_cmd == "CFG:KEYS:" + ",".join(str(c) for c in app.DEFAULT_KEYS[:10])
+
+
+def test_apply_upgrades_a_ten_entry_config_to_twelve_keys(monkeypatch):
+    """WS-503 M1: v1.3.6 config.json holds 10 key entries.
+
+    Switching that deck to the 12-key layout used to send 10 codes while the
+    deck answered with 12, so every apply reported ``keys: rejected`` and the
+    stored list never grew -- the user could not get out of the loop.
+    """
+    cfg = _device(layout=app.LAYOUT_12KEY, layout_supported=True)
+    del cfg["keys"][10:]                 # exactly what an old config.json holds
+    sent = []
+    monkeypatch.setattr(app, "send", _fake_send(sent, layout_line=True, layout="0"))
+
+    result = app.apply_device(DEV)
+
+    keys_cmd = next(c for c in sent if c.startswith("CFG:KEYS:"))
+    assert keys_cmd == "CFG:KEYS:" + KEYS_12
+    keys_item = next(i for i in result["items"] if i["field"] == "keys")
+    assert keys_item["status"] == "ok", keys_item
+    assert result["ok"], result
+    # And the padding is persisted, so the next apply starts from 12 as well.
+    assert len(app._config["devices"][DEV]["keys"]) == 12
+    assert app.apply_device(DEV)["ok"]
 
 
 # --- the probe route the UI uses to hide the 12-key option ---------------

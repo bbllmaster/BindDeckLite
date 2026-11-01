@@ -27,13 +27,16 @@
 - **休眠唤醒**：唤醒源按当前布局覆盖输入 9–11 中芯片实际支持唤醒的引脚。
 - **文档**：`docs/protocol.md` 补 `CFG:LAYOUT` / `LAYOUT:` / `CFG_LAYOUT:` 与 `BTN:0–11`，
   README 补 12 键硬件形态、输入编号与配网手势。
-- **回归**：`cd host && python -m pytest test_layout.py -q`（修复前 13 failed：函数/字段
-  不存在；修复后 13 passed）——直接 import `app.input_count` / `app._on_line` /
-  `app.apply_device` / `app.validate_pins`，覆盖 `LAYOUT:1` / `LAYOUT:0` / 缺该行三种情况的
-  输入数量（10/12/10）、12 项键码表与 F23/F24、旧固件降级与拒绝下发。
+- **回归**：`cd host && python -m pytest test_layout.py -q`（本文件 18 条用例在 `main` 上
+  18 failed：函数/字段不存在；合入后 18 passed）——直接 import `app.input_count` /
+  `app._on_line` / `app.apply_device` / `app.validate_pins`，覆盖 `LAYOUT:1` / `LAYOUT:0` /
+  缺该行三种情况的输入数量（10/12/10）、12 项键码表与 F23/F24、旧固件降级与拒绝下发。
+- **旧配置升级（WS-503）**：v1.3.6 的 `config.json` 只有 10 条 `keys`，切到 12 键布局后
+  `device_cfg()` / `load_config()` 会幂等补齐到 12 条（第 11/12 条取默认 F23/F24），
+  不再每次下发都报「按键被拒」；引脚提示也不再把这固定三脚列成「可用」。
 
 ```bash
-cd host && python -m pytest test_layout.py -q      # 13 passed
+cd host && python -m pytest test_layout.py -q      # 18 passed
 pio run -e esp32dev -e esp32c3 -e esp32c3_16mb     # 3 environments green
 ```
 
