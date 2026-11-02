@@ -17,6 +17,7 @@
 - **降级**：旧固件（≤1.3.7）收到 0 会多发一帧全 0 报告，OS 不会据此输入字符；
   完全静默需 v1.3.8 起。旧上位机读到 0 时显示第一项 `F13`，底层值仍是 0。
 - **文档**：README 键码说明、`docs/protocol.md` HID 键码表、帮助浮层。
+- **版本**：`FW_VERSION` 1.3.7 → **1.3.8**（`VERSION:` 首字段）。
 - **回归**：`cd host && python -m pytest test_keycode_none.py -q`（import `KEY_CODES`、
   `apply_device`、`_apply_cfg_field` 生产函数）。
 

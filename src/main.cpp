@@ -51,7 +51,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.7"   // WS-499: CFG:LAYOUT / 12-key layout
+#define FW_VERSION "1.3.8"   // WS-508: 键码 0 = 不发键（此前为 WS-499 CFG:LAYOUT）
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
