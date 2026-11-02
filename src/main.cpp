@@ -605,6 +605,10 @@ static void applyTimezone() { configTzTime(tzString, "pool.ntp.org"); }
 // === HID actions ==========================================================
 static void sendKeyForInput(int idx) {
   if (idx < 0 || idx >= inputCount()) return;
+  // WS-508: 键码 0 = 「不发键」—— 这个键只跑上位机动作。直接返回，连一帧
+  // 全 0 报告都不发；BLE 连接判断、BTN: 事件与其它输入都不受影响（BTN: 由
+  // 调用方单独发送，不经过这里）。
+  if (buttonKeys[idx] <= 0) return;
   if (bleKeyboard.isConnected()) {
     bleKeyboard.press(buttonKeys[idx]);
     delay(8);

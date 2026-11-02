@@ -309,9 +309,18 @@ async function selectDevice(devId) {
 /* ---------------- keys ---------------- */
 
 function keyOptions(selected) {
-  return state.keycodes
-    .map((k) => `<option value="${k.code}" ${k.code === selected ? "selected" : ""}>${k.label}</option>`)
-    .join("");
+  // WS-508: 键码 0 = 「不发键」，单独收进「特殊」分组，普通键码的顺序不变。
+  // 第一项仍然是 F13 —— selected 找不到时浏览器默认选第一项，0 若排第一会
+  // 把每个未知键码都显示成「不发键」。
+  const opt = (k) =>
+    `<option value="${k.code}" ${k.code === selected ? "selected" : ""}>${k.label}</option>`;
+  const normal = state.keycodes.filter((k) => k.code !== 0);
+  const special = state.keycodes.filter((k) => k.code === 0);
+  let html = normal.map(opt).join("");
+  if (special.length) {
+    html += `<optgroup label="特殊">${special.map(opt).join("")}</optgroup>`;
+  }
+  return html;
 }
 
 function renderKeys() {
@@ -365,6 +374,12 @@ function renderKeys() {
       const code = parseInt(selKey.value, 10);
       item.code = code;
       item.label = (state.keycodes.find((k) => k.code === code) || {}).label || String(code);
+      // WS-508: 动作为「无」时卡片只有一行提示，文字取决于键码是否为 0；
+      // 重绘是安全的（这一支没有任何用户输入）。动作不是「无」时不重绘，
+      // 否则会清掉还没保存的宏 / 路径输入框。
+      if (!item.action || item.action.type === "none") {
+        renderActionInput(holder, item, card);
+      }
       markDirty();
     };
     selAct.onchange = () => {
@@ -553,7 +568,11 @@ function renderActionInput(holder, item, card) {
   const action = item.action || { type: "none", value: "" };
   holder.innerHTML = "";
   if (action.type === "none") {
-    holder.innerHTML = `<p class="muted small">只发送上面的 HID 键。</p>`;
+    // WS-508: 键码 0 = 不发键。没有上位机动作时这个键按下去什么都不会发生，
+    // 必须说清楚，否则用户只会看到一个「没反应」的死键。
+    holder.innerHTML = item.code === 0
+      ? `<p class="muted small">该键不会发送任何输入</p>`
+      : `<p class="muted small">只发送上面的 HID 键。</p>`;
     return;
   }
   if (action.type === "media") {

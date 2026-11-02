@@ -172,6 +172,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 
 固件沿用 BindDeck / t-vk 的键码编码：
 
+- `0`：不发键（该输入只跑上位机动作）；v1.3.8 起完全静默，更早的固件会发一帧全 0 报告
 - `0x80`–`0x87`：修饰键（LCtrl, LShift, LAlt, LWin, RCtrl, RShift, RAlt, RWin）
 - `0xC2`–`0xCD`：F1–F12（HID usage + 0x88）
 - `0xD1`–`0xDA`：Insert/Home/PgUp/Delete/End/PgDn/Right/Left/Up/Down

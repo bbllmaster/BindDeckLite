@@ -531,6 +531,11 @@ KEY_CODES = [
 ]
 KEY_CODES += [(chr(c), c) for c in range(ord("A"), ord("Z") + 1)]
 KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
+# WS-508: sentinel code 0 = 「不发键」—— 这个键只跑上位机动作，设备不发 HID
+# （固件 v1.3.8 起直接跳过；更早的固件会发一帧全 0 报告，OS 不产生字符）。
+# 必须留在列表末尾：``keyOptions(selected)`` 找不到 selected 时退回第一项，
+# 0 排第一会让每个未知键码都显示成「不发键」。
+KEY_CODES += [("不发键（仅上位机动作）", 0)]
 
 # --- macro key names ------------------------------------------------------
 # ``key:`` macro steps are written with the names the UI shows in the HID key
