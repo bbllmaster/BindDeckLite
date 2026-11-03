@@ -17,6 +17,11 @@
   </div>
 
   <div class="topbar-right">
+    <label class="switch" title="按下按键时执行上位机动作（宏/启动程序等）">
+      <input type="checkbox" id="actionsToggle">
+      <span class="slider"></span>
+      <span class="switch-label">上位机动作</span>
+    </label>
     <div class="status" id="status">
       <span class="dot" id="statusDot"></span>
       <div>
@@ -24,9 +29,7 @@
         <div class="status-sub" id="statusSub">BLE</div>
       </div>
     </div>
-    <span class="last-apply" id="lastApplyInfo" hidden></span>
-    <button class="pending-badge" id="pendingBadge" type="button" hidden></button>
-    <button class="btn ghost" id="btnHelp" title="宏语法、键名对照与常见错误">帮助</button>
+    <button class="btn" id="btnHelp" title="宏语法、键名对照与常见错误">帮助</button>
     <button class="btn primary" id="btnApply">应用配置</button>
   </div>
 </header>
@@ -35,9 +38,9 @@
   <aside class="sidebar">
     <div class="side-head">
       <span>设备</span>
-      <button class="icon-btn" id="btnScan" title="重新扫描" aria-label="重新扫描设备">⟳</button>
+      <button class="icon-btn" id="btnScan" title="重新扫描">⟳</button>
     </div>
-    <ul class="device-list" id="deviceList" role="listbox" aria-label="设备列表"></ul>
+    <ul class="device-list" id="deviceList"></ul>
     <div class="side-note">
       <p>设备名 <code>BindDeckLite-XXXX</code></p>
       <p>配置通过 BLE 私有服务下发，无需 WiFi。</p>
@@ -45,15 +48,15 @@
   </aside>
 
   <main class="main">
-    <nav class="tabs" id="tabs" role="tablist" aria-label="功能页签">
-      <button class="tab active" id="tabbtn-keys" data-tab="keys" role="tab" aria-selected="true" aria-controls="tab-keys" tabindex="0">按键</button>
-      <button class="tab" id="tabbtn-encoder" data-tab="encoder" role="tab" aria-selected="false" aria-controls="tab-encoder" tabindex="-1">编码器</button>
-      <button class="tab" id="tabbtn-device" data-tab="device" role="tab" aria-selected="false" aria-controls="tab-device" tabindex="-1">设备</button>
-      <button class="tab" id="tabbtn-log" data-tab="log" role="tab" aria-selected="false" aria-controls="tab-log" tabindex="-1">日志</button>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-tab="keys">按键</button>
+      <button class="tab" data-tab="encoder">编码器</button>
+      <button class="tab" data-tab="device">设备</button>
+      <button class="tab" data-tab="log">日志</button>
     </nav>
 
     <!-- ================= KEYS ================= -->
-    <section class="panel active" id="tab-keys" role="tabpanel" aria-labelledby="tabbtn-keys">
+    <section class="panel active" id="tab-keys">
       <div class="panel-head">
         <div>
           <h2>按键映射</h2>
@@ -61,25 +64,11 @@
         </div>
         <span class="hint" id="keyHint">共 10 个输入</span>
       </div>
-      <div class="status-line" id="keysActionsHint" role="status">上位机动作状态读取中…</div>
-      <div class="keys-layout">
-        <div class="key-grid" id="keyGrid"></div>
-        <aside class="key-drawer" id="keyDrawer" aria-labelledby="keyDrawerTitle">
-          <div class="drawer-head">
-            <h3 id="keyDrawerTitle">按键编辑</h3>
-            <button class="icon-btn" id="btnKeyDrawerClose" type="button"
-                    title="关闭（Esc）" aria-label="关闭按键编辑">✕</button>
-          </div>
-          <div class="drawer-body" id="keyDrawerBody">
-            <p class="muted small">选择左侧的按键开始编辑。修改会按设备自动保存，点顶栏「应用配置」后下发。</p>
-          </div>
-        </aside>
-      </div>
+      <div class="key-grid" id="keyGrid"></div>
     </section>
-    <div class="drawer-backdrop" id="keyDrawerBackdrop" hidden></div>
 
     <!-- ================= ENCODER ================= -->
-    <section class="panel" id="tab-encoder" role="tabpanel" aria-labelledby="tabbtn-encoder">
+    <section class="panel" id="tab-encoder">
       <div class="panel-head">
         <div>
           <h2>EC11 编码器</h2>
@@ -97,7 +86,7 @@
     </section>
 
     <!-- ================= DEVICE ================= -->
-    <section class="panel" id="tab-device" role="tabpanel" aria-labelledby="tabbtn-device">
+    <section class="panel" id="tab-device">
       <div class="panel-head">
         <div>
           <h2>设备</h2>
@@ -106,143 +95,113 @@
         <div class="chip-badge" id="chipBadge">—</div>
       </div>
 
-      <!-- 概览：只保留 4 格关键信息 -->
-      <section class="dev-section" aria-labelledby="devOverviewTitle">
-        <div class="section-head">
-          <h3 id="devOverviewTitle">概览</h3>
-          <button class="btn primary small-btn" id="btnOta" title="打开 OTA 升级向导">OTA 升级</button>
+      <div class="device-meta" id="deviceMeta"></div>
+
+      <div class="card" id="sysCard">
+        <div class="card-head">
+          <h3>运行状态 <span class="muted">（WS-445）</span></h3>
+          <button class="btn small-btn" id="btnSysRefresh">刷新</button>
         </div>
-        <div class="device-meta" id="deviceMeta"></div>
-      </section>
+        <div class="sys-grid" id="sysInfo"><span class="muted">读取中…</span></div>
+        <p class="muted small" id="sysSampleAt"></p>
+      </div>
 
-      <!-- 硬件与行为 -->
-      <section class="dev-section" aria-labelledby="devHardwareTitle">
-        <div class="section-head"><h3 id="devHardwareTitle">硬件与行为</h3></div>
-        <div class="card-grid">
-          <div class="card">
-            <h3>按键布局</h3>
-            <label class="row">
-              <input type="radio" name="layout" id="layoutEncoder" value="1">
-              <span>编码器（9 键 + EC11 旋转 + 按压）</span>
-            </label>
-            <label class="row">
-              <input type="radio" name="layout" id="layout12Key" value="0">
-              <span>12 键（无编码器，原 A / B / 按压 三脚各接一键）</span>
-            </label>
-            <p class="muted small" id="layoutHint"></p>
-          </div>
+<div class="card">
+  <h3>主机绑定 <span class="muted">（WS-321）</span></h3>
+  <div id="bondStatus"><span class="muted">读取中…</span></div>
+  <div class="btn-row">
+    <button class="btn danger small-btn" id="btnClearBond" hidden>清除主机绑定</button>
+    <span class="muted small" id="bondHint"></span>
+  </div>
+</div>
 
-          <div class="card">
-            <h3>自动休眠</h3>
-            <label class="row">
-              <input type="checkbox" id="sleepEnabled">
-              <span>空闲后进入深度睡眠</span>
-            </label>
-            <label class="row">
-              <span>延时</span>
-              <input type="number" id="sleepMinutes" min="1" max="120" step="1" class="short">
-              <span>分钟</span>
-            </label>
-            <p class="muted small">ESP32-C3 只能被 GPIO0–5 上的按键唤醒；经典 ESP32 由第 10 个输入（编码器按压 / 12 键布局的第 10 键）唤醒。</p>
-          </div>
+      <div class="card">
+        <h3>按键布局 <span class="muted">（WS-499）</span></h3>
+        <label class="row">
+          <input type="radio" name="layout" id="layoutEncoder" value="1">
+          <span>编码器（9 键 + EC11 旋转 + 按压）</span>
+        </label>
+        <label class="row">
+          <input type="radio" name="layout" id="layout12Key" value="0">
+          <span>12 键（无编码器，原 A / B / 按压 三脚各接一键）</span>
+        </label>
+        <p class="muted small" id="layoutHint"></p>
+      </div>
 
-          <div class="card span-2">
-            <h3>按键引脚 <span class="muted">（9 个，GPIO 编号）</span><span class="pin-error-count" id="pinErrorCount" hidden></span></h3>
-            <div class="pins" id="pinGrid"></div>
-            <p class="muted small" id="pinHint"></p>
-          </div>
+      <div class="card">
+        <h3>按键引脚 <span class="muted">（9 个，GPIO 编号）</span><span class="pin-error-count" id="pinErrorCount" hidden></span></h3>
+        <div class="pins" id="pinGrid"></div>
+        <p class="muted small" id="pinHint"></p>
+      </div>
+
+      <div class="card">
+        <h3>自动休眠</h3>
+        <label class="row">
+          <input type="checkbox" id="sleepEnabled">
+          <span>空闲后进入深度睡眠</span>
+        </label>
+        <label class="row">
+          <span>延时</span>
+          <input type="number" id="sleepMinutes" min="1" max="120" step="1" class="short">
+          <span>分钟</span>
+        </label>
+        <p class="muted small">ESP32-C3 只能被 GPIO0–5 上的按键唤醒；经典 ESP32 由第 10 个输入（编码器按压 / 12 键布局的第 10 键）唤醒。</p>
+      </div>
+
+      <div class="card">
+        <h3>桌面应用 <span class="desk-badge" id="desktopMode">—</span></h3>
+        <label class="row">
+          <input type="checkbox" id="autostartToggle">
+          <span>开机自启动</span>
+        </label>
+        <label class="row" id="adminAutostartRow">
+          <input type="checkbox" id="adminAutostartToggle">
+          <span>以管理员身份运行（开机自启动时）</span>
+        </label>
+        <label class="row">
+          <input type="checkbox" id="minimizedToggle">
+          <span>开机启动时最小化到托盘</span>
+        </label>
+        <label class="row">
+          <input type="checkbox" id="closeMinimizeToggle">
+          <span>关闭窗口时最小化到托盘</span>
+        </label>
+        <p class="muted small" id="desktopHint">读取中…</p>
+        <div class="btn-row">
+          <button class="btn small-btn" id="btnShowWindow" hidden>显示窗口</button>
+          <button class="btn small-btn" id="btnRestartAdmin" hidden>立即以管理员身份重启</button>
+          <button class="btn danger small-btn" id="btnQuitHost" hidden>退出上位机</button>
         </div>
-      </section>
+      </div>
 
-      <!-- 上位机与系统 -->
-      <section class="dev-section" aria-labelledby="devHostTitle">
-        <div class="section-head"><h3 id="devHostTitle">上位机与系统</h3></div>
-        <div class="card-grid">
-          <div class="card">
-            <div class="card-head">
-              <h3>上位机动作</h3>
-              <label class="switch" title="按下按键时执行上位机动作（宏 / 启动程序 / 命令）">
-                <input type="checkbox" id="actionsToggle">
-                <span class="slider"></span>
-                <span class="switch-label">启用</span>
-              </label>
-            </div>
-            <p class="muted small" id="actionsStateHint">读取中…</p>
-          </div>
-
-          <div class="card" id="sysCard">
-            <div class="card-head">
-              <h3>运行状态</h3>
-              <button class="btn secondary small-btn" id="btnSysRefresh">刷新</button>
-            </div>
-            <div class="sys-grid" id="sysInfo"><span class="muted">读取中…</span></div>
-            <p class="muted small" id="sysSampleAt"></p>
-          </div>
-
-          <div class="card">
-            <h3>通信与配置</h3>
-            <div class="btn-row">
-              <button class="btn secondary" id="btnPing">Ping</button>
-              <button class="btn secondary" id="btnRefresh">读取设备配置</button>
-            </div>
-            <p class="muted small" id="cfgReadStatus">尚未读取设备配置</p>
-            <p class="muted small">读取会以设备当前值为准覆盖上方表单；有未下发修改时会先确认。</p>
-          </div>
-
-          <div class="card">
-            <h3>桌面应用 <span class="desk-badge" id="desktopMode">—</span></h3>
-            <label class="row">
-              <input type="checkbox" id="autostartToggle">
-              <span>开机自启动</span>
-            </label>
-            <label class="row" id="adminAutostartRow">
-              <input type="checkbox" id="adminAutostartToggle">
-              <span>以管理员身份运行（开机自启动时）</span>
-            </label>
-            <label class="row">
-              <input type="checkbox" id="minimizedToggle">
-              <span>开机启动时最小化到托盘</span>
-            </label>
-            <label class="row">
-              <input type="checkbox" id="closeMinimizeToggle">
-              <span>关闭窗口时最小化到托盘</span>
-            </label>
-            <p class="muted small" id="desktopHint">读取中…</p>
-            <div class="btn-row">
-              <button class="btn secondary small-btn" id="btnShowWindow" hidden>显示窗口</button>
-              <button class="btn secondary small-btn" id="btnRestartAdmin" hidden>立即以管理员身份重启</button>
-              <button class="btn danger small-btn" id="btnQuitHost" hidden>退出上位机</button>
-            </div>
-          </div>
+      <div class="card">
+        <h3>操作</h3>
+        <div class="btn-row">
+          <button class="btn" id="btnPing">Ping</button>
+          <button class="btn" id="btnRefresh">读取设备配置</button>
+          <button class="btn" id="btnPortal">进入配网模式</button>
+          <button class="btn danger" id="btnReboot">重启设备</button>
+          <button class="btn primary" id="btnOta">OTA 升级</button>
         </div>
-      </section>
+        <p class="muted small" id="cfgReadStatus">尚未读取设备配置</p>
+        <p class="muted small">配网模式会开热点 <code>BindDeckLite-XXXX</code>，浏览器打开 <code>http://192.168.4.1</code> 可配 WiFi / OTA。长按编码器 1 秒退出。</p>
+      </div>
 
-      <!-- 高级操作：默认折叠 -->
-      <details class="advanced" id="advancedOps">
-        <summary>高级操作</summary>
-        <div class="advanced-body">
-          <div class="card">
-            <h3>主机绑定</h3>
-            <div id="bondStatus"><span class="muted">读取中…</span></div>
-            <div class="btn-row">
-              <button class="btn danger small-btn" id="btnClearBond" hidden>清除主机绑定</button>
-              <span class="muted small" id="bondHint"></span>
-            </div>
-          </div>
-          <div class="card">
-            <h3>危险设备操作</h3>
-            <div class="btn-row">
-              <button class="btn danger" id="btnPortal">进入配网模式</button>
-              <button class="btn danger" id="btnReboot">重启设备</button>
-            </div>
-            <p class="muted small">配网模式会开热点 <code>BindDeckLite-XXXX</code>，浏览器打开 <code>http://192.168.4.1</code> 可配 WiFi / OTA。长按编码器约 1 秒退出；此操作可逆。</p>
-          </div>
+      <!-- OTA progress card (hidden until an OTA starts) -->
+      <div class="card" id="otaCard" hidden>
+        <h3>OTA 升级 <span class="muted small" id="otaStatusText">就绪</span></h3>
+        <div id="otaFileLine" class="muted small"></div>
+        <div class="progress"><div class="progress-bar" id="otaProgressBar" style="width:0%"></div></div>
+        <div class="btn-row">
+          <button class="btn primary" id="btnOtaStart" hidden>开始升级</button>
+          <button class="btn" id="btnOtaCancel">取消</button>
         </div>
-      </details>
+        <p class="muted small" id="otaHint"></p>
+      </div>
     </section>
 
     <!-- ================= LOG ================= -->
-    <section class="panel" id="tab-log" role="tabpanel" aria-labelledby="tabbtn-log">
+    <section class="panel" id="tab-log">
       <div class="panel-head">
         <div>
           <h2>实时日志</h2>
@@ -253,38 +212,8 @@
           <button class="btn small-btn" id="btnClearLog">清空</button>
         </div>
       </div>
-      <div class="log-filters" role="search" aria-label="日志过滤">
-        <label class="log-filter-label" for="logKind">类型</label>
-        <select id="logKind" class="log-select" aria-label="按日志类型过滤">
-          <option value="">全部类型</option>
-          <option value="cfg">配置 cfg</option>
-          <option value="key">按键 key</option>
-          <option value="enc">编码器 enc</option>
-          <option value="action">动作 action</option>
-          <option value="device">设备 device</option>
-          <option value="ble">蓝牙 ble</option>
-          <option value="ota">升级 ota</option>
-          <option value="desktop">桌面 desktop</option>
-          <option value="tx">下发 tx</option>
-          <option value="ack">确认 ack</option>
-          <option value="pong">响应 pong</option>
-          <option value="line">原始 line</option>
-          <option value="warn">警告 warn</option>
-          <option value="error">错误 error</option>
-        </select>
-        <div class="log-level-chips" id="logLevelChips" role="group" aria-label="按日志级别过滤">
-          <button type="button" class="log-chip active" data-level="" aria-pressed="true">全部</button>
-          <button type="button" class="log-chip" data-level="info" aria-pressed="false">信息</button>
-          <button type="button" class="log-chip" data-level="ok" aria-pressed="false">成功</button>
-          <button type="button" class="log-chip" data-level="warn" aria-pressed="false">警告</button>
-          <button type="button" class="log-chip" data-level="error" aria-pressed="false">错误</button>
-        </div>
-        <input type="search" id="logSearch" class="log-search" placeholder="搜索日志内容…" aria-label="搜索日志内容">
-        <button type="button" class="btn tiny" id="btnLogFilterReset" hidden>清除过滤</button>
-      </div>
       <div class="log-wrap">
         <div class="log" id="logList"></div>
-        <p class="log-empty" id="logEmpty" hidden>没有匹配的日志</p>
         <!-- 暂停跟随时浮在底部的胶囊：N 为暂停后新到达的行数 -->
         <div class="log-new" id="logNew" hidden>
           <button type="button" class="log-new-btn" id="btnLogJump">
@@ -422,7 +351,7 @@ key:enter</pre>
       <ul>
         <li><b>报错 <code>key:xxx is not mapped to any known key</code></b>：键名不在上面的对照表里。核对拼写（对照表已不区分大小写），组合键用 <code>+</code> 连接。</li>
         <li><b>按了没反应，但卡片在呼吸</b>：这条动作还在执行（卡片边框变亮、「测试动作」变成红色的「停止」），期间重复按下会被忽略，日志里只有一条「动作跳过」。宏结束时会自动恢复；执行期间可点卡片上的「停止」，会在当前步骤结束后退出；<b>已经发出的按键不会撤回</b>。</li>
-        <li><b>宏完全没反应</b>：宏需要 <code>keyboard</code> 库（<code>pip install keyboard</code>，Windows 打包版已内置）；确认「设备 → 上位机与系统 → 上位机动作」已开启，动作类型选的是「宏」且点过「应用配置」。</li>
+        <li><b>宏完全没反应</b>：宏需要 <code>keyboard</code> 库（<code>pip install keyboard</code>，Windows 打包版已内置）；确认右上角「上位机动作」已开启，动作类型选的是「宏」且点过「应用配置」。</li>
         <li><b>组合键不生效</b>：用 <code>+</code> 连接，<code>key:ctrl+shift+t</code>；不要写成 <code>key:ctrl shift t</code> 或 <code>key:ctrl+alt t</code>。</li>
         <li><b>输入跑到了别的位置</b>：页面还没加载完，把 <code>wait:</code> 调大（如 <code>wait:2000</code>）。</li>
         <li><b>目标程序收不到按键</b>：目标程序以管理员身份运行时，上位机也要以管理员身份运行。</li>
@@ -439,86 +368,8 @@ key:enter</pre>
   </div>
 </div>
 
-<!-- ================= OTA WIZARD ================= -->
-<div class="modal" id="otaModal" hidden>
-  <div class="modal-card ota-modal" role="dialog" aria-modal="true" aria-labelledby="otaTitle">
-    <div class="modal-head">
-      <h2 id="otaTitle">OTA 升级</h2>
-      <button class="icon-btn" id="btnOtaClose" title="关闭（Esc）" aria-label="关闭">✕</button>
-    </div>
-    <div class="ota-steps" aria-hidden="true">
-      <span class="ota-step-dot" data-step="pick"><i>1</i>选择文件</span>
-      <span class="ota-step-dot" data-step="check"><i>2</i>校验</span>
-      <span class="ota-step-dot" data-step="confirm"><i>3</i>确认</span>
-      <span class="ota-step-dot" data-step="upload"><i>4</i>升级</span>
-    </div>
-    <div class="modal-body ota-body" id="otaCard">
-      <div class="ota-pane" data-pane="pick">
-        <p>选择 app-only 固件（文件名 <code>ota_*.bin</code>）。整片 merged 包请用 USB 或配网页面刷写。</p>
-        <div class="btn-row">
-          <button class="btn primary" id="btnOtaPick">选择固件文件</button>
-        </div>
-        <p class="muted small" id="otaPickHint"></p>
-      </div>
-
-      <div class="ota-pane" data-pane="check" hidden>
-        <div class="ota-rows">
-          <span class="k">文件名</span><span class="v" id="otaCheckName">—</span>
-          <span class="k">大小</span><span class="v" id="otaCheckSize">—</span>
-          <span class="k">SHA256</span><span class="v mono" id="otaCheckSha">计算中…</span>
-        </div>
-        <p class="ota-check-state" id="otaCheckState"></p>
-        <p class="ota-error" id="otaCheckError" hidden></p>
-        <div class="btn-row">
-          <button class="btn secondary" id="btnOtaRepick">重新选择</button>
-          <button class="btn primary" id="btnOtaNext" disabled>下一步</button>
-        </div>
-      </div>
-
-      <div class="ota-pane" data-pane="confirm" hidden>
-        <div class="ota-rows">
-          <span class="k">目标设备</span><span class="v" id="otaConfirmDevice">—</span>
-          <span class="k">固件版本</span><span class="v" id="otaConfirmVersions">—</span>
-          <span class="k">文件</span><span class="v" id="otaConfirmFile">—</span>
-          <span class="k">SHA256</span><span class="v mono" id="otaConfirmSha">—</span>
-        </div>
-        <div class="ota-warning" role="alert">
-          <b>升级期间请勿断电或拔线。</b>上传中断可能让设备停在 bootloader；确认设备已连接稳定电源后再开始。
-        </div>
-        <div class="btn-row">
-          <button class="btn secondary" id="btnOtaBack">上一步</button>
-          <button class="btn primary" id="btnOtaStart">开始升级</button>
-        </div>
-      </div>
-
-      <div class="ota-pane" data-pane="upload" hidden>
-        <div class="ota-upload-head">
-          <b id="otaStatusText">准备中</b>
-          <span class="muted small" id="otaFileLine"></span>
-        </div>
-        <div class="progress"><div class="progress-bar" id="otaProgressBar" style="width:0%"></div></div>
-        <p class="muted small" id="otaHint"></p>
-        <div class="btn-row">
-          <button class="btn secondary" id="btnOtaCancel">取消升级</button>
-        </div>
-      </div>
-
-      <div class="ota-pane" data-pane="result" hidden>
-        <p class="ota-result-title" id="otaResultTitle">—</p>
-        <p class="muted small" id="otaResultDetail"></p>
-        <p class="muted small" id="otaResultHint"></p>
-        <div class="btn-row">
-          <button class="btn primary" id="btnOtaRetry" hidden>重试升级</button>
-          <button class="btn secondary" id="btnOtaDone">完成</button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="notice-center" id="noticeCenter" role="status" aria-live="polite" aria-relevant="additions"></div>
+<div class="toast" id="toast"></div>
 <script src="/static/log_follow.js"></script>
-<script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
