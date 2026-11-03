@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 
@@ -75,6 +76,62 @@ def open_url(url: str) -> None:
         webbrowser.open(url)
     except Exception as e:  # noqa: BLE001
         STATE["error"] = f"{type(e).__name__}: {e}"
+
+
+def focus_running_instance(url: str, timeout: float = 5.0) -> bool:
+    """Ask an already-running instance to show/raise its native window.
+
+    A second double-click must not fall back to opening the default browser:
+    the running instance owns the pywebview window and ``/api/show-window``
+    calls ``Window.show()``, which also activates the window on WinForms.
+
+    Retries for a few seconds: a double-click right after startup can reach the
+    peer before it has created its window (``/api/show-window`` answers 409),
+    and that must not be reported as "cannot focus".  The last failure reason
+    is written to host.log so a real failure can be diagnosed.
+    """
+    deadline = time.time() + timeout
+    reason = "no attempt"
+    while True:
+        try:
+            req = urllib.request.Request(
+                url.rstrip("/") + "/api/show-window",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    return True
+                reason = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                body = ""
+            reason = f"HTTP {e.code}: {body}"
+        except Exception as e:  # noqa: BLE001 - peer may be gone or busy
+            reason = f"{type(e).__name__}: {e}"
+        if time.time() >= deadline:
+            print(f"[desktop] cannot focus the running instance: {reason}")
+            return False
+        time.sleep(0.4)
+
+
+def show_error_dialog(title: str, message: str) -> None:
+    """Show a native error box in the windowed exe and write it to host.log.
+
+    A PyInstaller windowed build has no console; a startup failure must be
+    visible and must never degrade into a browser tab.
+    """
+    STATE["error"] = message
+    print(f"[desktop] {message}")
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # MB_ICONERROR
+    except Exception as e:  # noqa: BLE001
+        print("[desktop] error dialog failed:", e)
 
 
 def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -275,7 +332,10 @@ def show_window() -> bool:
         win.show()
         STATE["window_hidden"] = False
         return True
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        # Keep the reason in host.log: a silent False made a failed
+        # "focus the running instance" impossible to diagnose.
+        print(f"[desktop] show window failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -436,8 +496,12 @@ def _build_tray(url: str, on_quit, window=None):
                 window.show()
                 STATE["window_hidden"] = False
                 return
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                print("[desktop] tray show window failed:", e)
+        if is_frozen():
+            # A desktop exe must never degrade into a browser tab.
+            print("[desktop] no native window to show; not opening a browser")
+            return
         open_url(url)
 
     def quit_app(_icon=None, _item=None):
@@ -636,6 +700,11 @@ def make_on_closing(state, close_ref, use_tray, url, window_ref):
             state["force_quit"], close_ref["behavior"], use_tray
         )
         if not allow_close and hide_window:
+            if is_frozen() and not STATE.get("tray_active"):
+                # Frozen desktop app without a tray: hiding would leave no
+                # native way back, and a browser tab is not a desktop UI.
+                # Close instead.
+                return True
             try:
                 window_ref[0].hide()
             except Exception:
@@ -690,11 +759,18 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
             print("[webview] " + message)
             report_port_busy(url, message)
             return 1
-        # Second double-click: the running instance is already up.  We cannot
-        # raise another process's window, so just open the URL in a browser.
-        print(f"[webview] already running at {url}, opening browser")
-        open_url(url)
-        return 0
+        # Second double-click: raise the running instance's native window.
+        # Never open a browser from the desktop exe.
+        if focus_running_instance(url):
+            print(f"[webview] already running at {url}, focused existing window")
+            return 0
+        message = ("BindDeckLite 已在运行，但无法唤起它的窗口。"
+                   "请从任务栏或托盘打开已有窗口；若确实没有窗口，"
+                   "请先结束已有的 BindDeckLite 进程再重新启动。")
+        STATE["error"] = message
+        print("[webview] " + message)
+        show_error_dialog("BindDeckLite", message)
+        return 1
 
     # 1. Start Flask in a background thread so the window can load the page.
     server, error = make_flask_server(flask_app, port)
@@ -720,15 +796,18 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
             return
         state["stopped"] = True
         state["force_quit"] = True
+        started = time.time()
         try:
             if window_ref[0] is not None:
                 window_ref[0].destroy()
-        except Exception:
-            pass
+                print(f"[webview] window destroyed in {time.time() - started:.1f}s")
+        except Exception as e:  # noqa: BLE001
+            print("[webview] window.destroy failed:", e)
         try:
             server.shutdown()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            print("[webview] server.shutdown failed:", e)
+        print(f"[webview] shutdown finished in {time.time() - started:.1f}s")
 
     set_quit_callback(stop_all)
 
@@ -751,10 +830,17 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     except Exception as e:  # noqa: BLE001
         STATE["error"] = f"pywebview 不可用: {type(e).__name__}: {e}"
         print("[webview] native window unavailable, falling back to tray-only:", e)
+        if is_frozen():
+            # A windowed exe must not degrade silently: say why and where to look.
+            show_error_dialog(
+                "BindDeckLite",
+                STATE["error"] + "\n\n请确认已安装 Microsoft Edge WebView2 Runtime。"
+                "详细错误已写入 host.log。")
         return _serve_headless(server, flask_thread, url, use_tray)
 
     window_ref[0] = window
     _window_ref[0] = window
+    print(f"[webview] native window created: BindDeckLite ({url})")
 
     # Window starts hidden (start_minimized) without a tray icon: mark it so the
     # web UI offers "显示窗口" immediately instead of assuming the window is
@@ -785,8 +871,12 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     # 5. Block on the native GUI loop until the window closes.  A missing GUI
     #    backend (headless Linux) falls back to serving headlessly instead of
     #    crashing; a normal close stops the server and tray below.
+    def _log_renderer():
+        # Evidence in host.log that the bundled WebView2 backend really loaded.
+        print(f"[webview] renderer={getattr(webview, 'renderer', 'unknown')}")
+
     try:
-        webview.start()
+        webview.start(_log_renderer)
     except Exception as e:  # noqa: BLE001
         STATE["error"] = f"pywebview GUI 不可用: {type(e).__name__}: {e}"
         print("[webview] GUI backend unavailable, serving headless:", e)
@@ -794,6 +884,11 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         # cleanly instead of touching a dead GUI object (WS-374 review #5).
         _window_ref[0] = None
         STATE["window_hidden"] = False
+        if is_frozen():
+            show_error_dialog(
+                "BindDeckLite",
+                STATE["error"] + "\n\n请确认已安装 Microsoft Edge WebView2 Runtime。"
+                "详细错误已写入 host.log。")
         return _serve_headless(server, flask_thread, url, use_tray)
 
     stop_all()

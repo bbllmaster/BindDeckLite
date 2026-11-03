@@ -4733,10 +4733,17 @@ def main(argv=None):
             print("[app] " + message)
             desktop.report_port_busy(url, message)
             return 1
-        # Second double-click: focus the running instance instead of failing.
-        print(f"[app] already running at {url}, opening browser")
-        desktop.open_url(url)
-        return 0
+        # Second double-click: raise the running instance's native window.
+        # A desktop exe must never fall back to a browser tab.
+        if desktop.focus_running_instance(url):
+            print(f"[app] already running at {url}, focused existing window")
+            return 0
+        message = ("BindDeckLite 已在运行，但无法唤起它的窗口。"
+                   "请从任务栏或托盘打开已有窗口；若确实没有窗口，"
+                   "请先结束已有的 BindDeckLite 进程再重新启动。")
+        print("[app] " + message)
+        desktop.show_error_dialog("BindDeckLite", message)
+        return 1
 
     load_config()
     started = ble.start()

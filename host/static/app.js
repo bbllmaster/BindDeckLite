@@ -23,7 +23,7 @@ const ACTION_TYPES = [
 const MEDIA_KEYS = ["volume up", "volume down", "volume mute", "play/pause", "next track", "previous track"];
 
 // 测试按钮空闲态的固定提示。执行中临时换成「仍在执行」，结束后恢复成这一句，
-// 而不是把 title 清空（WS-360 评审 nit）。
+// 而不是把 title 清空。
 const TEST_BTN_IDLE_TITLE = "立即执行这条上位机动作（不会发送 HID 键）";
 
 // 宏输入框 placeholder 里展示的键名列表（映射规则见 host/app.py 的
@@ -33,12 +33,12 @@ const MACRO_KEY_HINT =
   "Left Right Up Down LCtrl RCtrl LShift RShift LAlt RAlt LWin RWin " +
   "F1-F12、单个字母/数字；组合键用 + 连接（ctrl+alt+t）";
 
-// WS-476：按键引脚校验。判定规则只有一份，在 host/app.py 的 validate_pins()
+// 按键引脚校验。判定规则只有一份，在 host/app.py 的 validate_pins()
 // 里（与固件 isValidButtonPin / isValidPinSet 对齐）。这里只负责把当前 9 个
 // 值交给只读的 /api/defaults 取回逐行错误，不在 JS 里再抄一遍规则。
 const PIN_COUNT = 9;
 
-/* ---------------- WS-499: 按键布局 ----------------
+/* ---------------- 按键布局 ----------------
  * 固件回报 LAYOUT:1（编码器，10 输入）或 LAYOUT:0（12 键，12 输入）。
  * 旧固件不回这一行 → 配置里没有 layout 字段 → 仍按 10 输入渲染，
  * 行为与今天完全一致。 */
@@ -71,27 +71,36 @@ const PIN_VALIDATE_DEBOUNCE_MS = 300;
 const state = {
   devices: [],
   selected: null,
+  deviceRows: new Map(), // dev_id -> <li>，增量渲染用，避免轮询时清空重建
+  // dev_id -> { cfg, applied, lastResult, lastApply, ota, otaFile, otaStep }
+  // 每台设备各自保存草稿、待下发基线与上次下发结果，切换设备不丢。
+  buckets: new Map(),
   selectedConnected: false,
   cfg: null,
   keycodes: [],
   logSeq: 0,
-  logFollow: true,     // 日志是否跟随最新行（WS-470）；上滚即暂停
+  logFollow: true,     // 日志是否跟随最新行；上滚即暂停
   logPending: 0,       // 暂停期间新到达、尚未查看的行数
+  logFilter: { kind: "", level: "", q: "" }, // 日志页的客户端过滤（不影响轮询与 seq）
   dirty: false,
   saveTimer: null,
   preview: false,
   desktop: null,
-  ota: null,           // {status, sent, total, percent, error, filename}
+  ota: null,           // {status, sent, acked, total, percent, error, filename, sha256, version}
   otaFile: null,       // File object chosen by the user
+  otaStep: null,       // pick / check / confirm / upload / result
+  editingKey: null,    // 抽屉里正在编辑的按键下标；null = 未打开
+  keyDrawerReturn: null, // 关闭抽屉后要还焦点的卡片按钮
+  macroView: null,     // 宏编辑器上次用的视图：steps / text
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
-  stopping: {},        // dev_id -> {"<idx>": true}，已发出停止请求、等状态确认（WS-495）
-  scan: null,          // 最近一次扫描的结论，来源 /api/status（WS-395）
-  encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status（WS-389）
-  readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段（WS-409）
-  sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status（WS-445）
+  stopping: {},        // dev_id -> {"<idx>": true}，已发出停止请求、等状态确认
+  scan: null,          // 最近一次扫描的结论，来源 /api/status
+  encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status
+  readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段
+  sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
-  pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors（WS-476）
-  pinRules: null,     // 当前 chip 的引脚规则/提示，来源 /api/defaults 的 pinRules（WS-476）
+  pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors
+  pinRules: null,     // 当前 chip 的引脚规则/提示，来源 /api/defaults 的 pinRules
   pinValidateSeq: 0,  // 每次校验自增，丢弃过期响应（防抖 / 快速切换设备时乱序）
   pinValidateTimer: null,
 };
@@ -102,7 +111,7 @@ async function api(path, opts = {}) {
     ...opts,
   });
   if (!res.ok) {
-    // WS-476: 后端 400 会带 {ok:false,error:"按键 3 不能为空"}，把它显示出来，
+    // 后端 400 会带 {ok:false,error:"按键 3 不能为空"}，把它显示出来，
     // 别再让用户只看到 "400 BAD REQUEST"。
     let detail = "";
     try {
@@ -116,12 +125,216 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+/* ---------------- 按设备分桶 ---------------- */
+function bucketFor(devId) {
+  let b = state.buckets.get(devId);
+  if (!b) {
+    b = {
+      cfg: null,
+      applied: null,      // 已下发到设备的快照，用来算「待下发 N 项」
+      lastResult: null,   // 上一次下发的逐项结果（失败时用于常驻浮层）
+      lastApply: null,    // { at, failed }
+      ota: null,
+      otaFile: null,
+      otaStep: null,
+    };
+    state.buckets.set(devId, b);
+  }
+  return b;
+}
+
+function snapshotCfg(cfg) {
+  return JSON.parse(JSON.stringify(cfg || {}));
+}
+
+/** 离开当前设备前，把活动状态写回它的桶。 */
+function saveCurrentBucket() {
+  if (!state.selected) return;
+  const b = bucketFor(state.selected);
+  b.cfg = state.cfg;
+  b.ota = state.ota;
+  b.otaFile = state.otaFile;
+  b.otaStep = state.otaStep;
+}
+
+function sameJson(a, b) {
+  return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+}
+
+function cfgLayout(cfg) {
+  return Number((cfg || {}).layout) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER;
+}
+
+function firstChangedIndex(next, prev) {
+  const a = Array.isArray(next) ? next : [];
+  const b = Array.isArray(prev) ? prev : [];
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (!sameJson(a[i], b[i])) return i;
+  }
+  return 0;
+}
+
+/** 当前设备相对「已下发快照」的改动；返回空数组表示没有待下发项。 */
+function collectPending() {
+  const b = state.selected ? bucketFor(state.selected) : null;
+  if (!b || !b.applied || !state.cfg) return [];
+  const cfg = state.cfg;
+  const base = b.applied;
+  const out = [];
+  if (!sameJson(cfg.keys, base.keys)) {
+    out.push({ field: "keys", label: "按键映射", tab: "keys", index: firstChangedIndex(cfg.keys, base.keys) });
+  }
+  if (cfgLayout(cfg) !== cfgLayout(base)) {
+    out.push({ field: "layout", label: "按键布局", tab: "device" });
+  }
+  if (!sameJson(cfg.pins, base.pins)) {
+    out.push({ field: "pins", label: "按键引脚", tab: "device", index: firstChangedIndex(cfg.pins, base.pins) });
+  }
+  if (!sameJson(cfg.sleep, base.sleep)) {
+    out.push({ field: "sleep", label: "自动休眠", tab: "device" });
+  }
+  if (!sameJson(cfg.enc, base.enc)) {
+    out.push({ field: "enc", label: "编码器设置", tab: "encoder" });
+  }
+  return out;
+}
+
+function updatePendingUi() {
+  const items = collectPending();
+  const badge = $("#pendingBadge");
+  if (badge) {
+    badge.hidden = !items.length;
+    badge.textContent = items.length ? `待下发 ${items.length} 项` : "";
+    badge.title = items.length ? `点击跳到第一处改动：${items[0].label}` : "";
+  }
+  const apply = $("#btnApply");
+  if (apply) {
+    apply.textContent = "应用配置";
+    apply.classList.toggle("dirty", !!items.length);
+  }
+  state.dirty = !!items.length;
+  renderLastApply();
+}
+
+function renderLastApply() {
+  const el = $("#lastApplyInfo");
+  if (!el) return;
+  const b = state.selected ? state.buckets.get(state.selected) : null;
+  const la = b && b.lastApply;
+  if (!la) {
+    el.hidden = true;
+    el.textContent = "";
+    el.title = "";
+    el.onclick = null;
+    el.classList.remove("bad");
+    return;
+  }
+  el.hidden = false;
+  el.textContent = `上次下发 ${fmtClock(la.at)} · ${la.failed ? `${la.failed} 项未生效` : "全部生效"}`;
+  el.classList.toggle("bad", !!la.failed);
+  el.title = la.failed ? "点击查看未生效项" : "本次配置已全部生效";
+  el.onclick = la.failed && b.lastResult ? () => renderApplyResults(b.lastResult) : null;
+}
+
+function renderActionsState() {
+  const on = !!state.actionsEnabled;
+  const toggle = $("#actionsToggle");
+  if (toggle) toggle.checked = on;
+  const keysHint = $("#keysActionsHint");
+  if (keysHint) {
+    keysHint.textContent = on
+      ? "上位机动作已开启：按键会执行宏 / 启动程序等动作。可在「设备 → 上位机与系统」中关闭。"
+      : "上位机动作已关闭：按键只发送设备 HID，宏 / 启动程序不会执行。可在「设备 → 上位机与系统」中开启。";
+    keysHint.classList.toggle("off", !on);
+  }
+  const devHint = $("#actionsStateHint");
+  if (devHint) {
+    devHint.textContent = on
+      ? "已开启：按下按键时执行配置的宏 / 启动程序 / 命令。"
+      : "已关闭：仅发送设备自身的 HID 按键，上位机动作不执行。";
+  }
+}
+
+/** 点击「待下发 N 项」：切到对应页签并聚焦第一处改动。 */
+function focusPendingItem() {
+  const item = collectPending()[0];
+  if (!item) return;
+  const tab = document.querySelector(`.tab[data-tab="${item.tab}"]`);
+  if (tab && !tab.classList.contains("active")) tab.click();
+  setTimeout(() => {
+    if (item.field === "keys") {
+      // 按键改动落到摘要卡上，真正的编辑入口是抽屉：直接打开并聚焦 HID。
+      openKeyDrawer(item.index || 0);
+      return;
+    }
+    let target = null;
+    if (item.field === "pins") {
+      target = $$("#pinGrid .pin input")[item.index || 0] || null;
+    } else if (item.field === "enc") {
+      target = document.querySelector(".mode-card");
+    } else if (item.field === "sleep") {
+      target = $("#sleepEnabled");
+    } else if (item.field === "layout") {
+      target = $("#layoutEncoder");
+    }
+    if (!target) return;
+    target.scrollIntoView({ block: "center" });
+    const focusable = target.matches("input, select, textarea, button")
+      ? target : target.querySelector("input, select, textarea, button");
+    if (focusable) focusable.focus({ preventScroll: true });
+  }, 0);
+}
+
+/* ---------------- notices ---------------- */
+const NOTICE_AUTO_DISMISS_MS = 3000;
+const NOTICE_MAX = 5;
+
+function removeNotice(item) {
+  if (!item || !item.parentNode) return;
+  clearTimeout(item._timer);
+  item.classList.add("leaving");
+  setTimeout(() => item.remove(), 160);
+}
+
+function showNotice(msg, kind) {
+  const center = $("#noticeCenter");
+  if (!center) return;
+
+  const item = document.createElement("div");
+  item.className = "notice" + (kind ? " " + kind : "");
+
+  const text = document.createElement("span");
+  text.className = "notice-text";
+  text.textContent = msg;
+  item.appendChild(text);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "notice-close";
+  close.setAttribute("aria-label", "关闭提示");
+  close.textContent = "×";
+  close.onclick = () => removeNotice(item);
+  item.appendChild(close);
+
+  center.appendChild(item);
+
+  // 超出上限时优先丢弃最早的非错误通知；错误留给用户手动关闭。
+  while (center.children.length > NOTICE_MAX) {
+    const oldest = center.querySelector(".notice:not(.bad)") || center.firstElementChild;
+    clearTimeout(oldest._timer);
+    oldest.remove();
+  }
+
+  // 成功/提示 3 秒消退；错误常驻，避免长文案没读完就消失。
+  if (kind !== "bad") {
+    item._timer = setTimeout(() => removeNotice(item), NOTICE_AUTO_DISMISS_MS);
+  }
+}
+
+/** 兼容旧调用点：toast(msg) / toast(msg, "ok") / toast(msg, "bad")。 */
 function toast(msg, kind = "") {
-  const el = $("#toast");
-  el.textContent = msg;
-  el.className = "toast show " + kind;
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => (el.className = "toast"), 2400);
+  showNotice(msg, kind === "bad" ? "bad" : kind === "ok" ? "ok" : "");
 }
 
 /* ---------------- devices ---------------- */
@@ -132,20 +345,20 @@ async function pollStatus() {
     state.devices = s.devices || [];
     state.actionsEnabled = !!s.actions_enabled;
     state.running = s.running || {};
-    // WS-395: 最近一次扫描的结论（为什么没找到设备）。
+    // 最近一次扫描的结论（为什么没找到设备）。
     state.scan = s.scan || null;
-    // WS-389: additive field — old front-ends simply ignore it.
+    // additive field — old front-ends simply ignore it.
     state.encRunning = s.encoder_running || {};
-    // WS-409: the server remembers the last read-back per device, so the
+    // the server remembers the last read-back per device, so the
     // device page keeps showing "上次读取" across a page reload.
     state.devices.forEach((d) => {
       if (d.read) state.readStatus[d.dev_id] = d.read;
     });
-    // WS-445: 运行状态采样只存在服务端内存里，页面刷新后靠这个字段恢复；
+    // 运行状态采样只存在服务端内存里，页面刷新后靠这个字段恢复；
     // 断开时卡片显示的就是这份「上次采样」。
     state.sysinfo = Object.assign({}, state.sysinfo, s.sysinfo || {});
     renderReadStatus();
-    $("#actionsToggle").checked = state.actionsEnabled;
+    renderActionsState();
 
     if (!state.selected || !state.devices.some((d) => d.dev_id === state.selected)) {
       const preferred =
@@ -167,6 +380,7 @@ async function pollStatus() {
           }
         }
         renderDevices();
+        updatePendingUi();
       }
     } else {
       renderDevices();
@@ -177,7 +391,7 @@ async function pollStatus() {
     const nowConnected = !!(sel && sel.connected);
     const wasConnected = state.selectedConnected;
     if (wasConnected && !nowConnected) clearApplyResults();
-    // WS-445: 重新连上时立刻补一次运行状态（断开期间卡片保留旧值）。
+    // 重新连上时立刻补一次运行状态（断开期间卡片保留旧值）。
     if (state.selected && !wasConnected && nowConnected) {
       loadSysinfo(state.selected);
     }
@@ -192,7 +406,7 @@ async function pollStatus() {
       $("#statusDot").className = "dot bad";
       $("#statusText").textContent = "未发现设备";
     }
-    // WS-395: 副标题按优先级说明「为什么连不上」（蓝牙不可用 > 单设备失败
+    // 副标题按优先级说明「为什么连不上」（蓝牙不可用 > 单设备失败
     // 原因 > 扫描结论），而不是一律显示「请给设备上电」。
     let sub;
     if (s.ble_ok === false) {
@@ -208,6 +422,7 @@ async function pollStatus() {
       sub = `${sel.name} · ${fw}`;
     }
     $("#statusSub").textContent = sub;
+    $("#statusSub").title = sub;
     highlightKeys(s.last_press || {});
     applyRunningState();
     applyEncoderRunningState();
@@ -215,11 +430,12 @@ async function pollStatus() {
     $("#statusDot").className = "dot bad";
     $("#statusText").textContent = "上位机未就绪";
     $("#statusSub").textContent = String(e.message || e);
+    $("#statusSub").title = String(e.message || e);
   }
 }
 
 /**
- * 扫描诊断文案（WS-395）。
+ * 扫描诊断文案。
  *
  * - 没有 scan 字段 = 旧后端：返回 null，界面保持原样。
  * - at 为 null = 还没扫完：显示「扫描中…」，不要显示「0 个 BLE 设备」。
@@ -239,66 +455,170 @@ function fmtClock(ts) {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/**
+ * 设备列表按 dev_id 复用 <li>：轮询只更新文本与状态类，
+ * 不清空重建，避免 1.2 秒一次的 hover / focus 丢失。
+ */
 function renderDevices() {
   const ul = $("#deviceList");
-  ul.innerHTML = "";
+
   if (!state.devices.length) {
-    const li = document.createElement("li");
+    state.deviceRows.forEach((li) => li.remove());
+    state.deviceRows.clear();
+    renderDeviceEmpty(ul);
+    return;
+  }
+
+  const empty = ul.querySelector(".device-empty");
+  if (empty) empty.remove();
+
+  const seen = new Set();
+  state.devices.forEach((d) => {
+    seen.add(d.dev_id);
+    let li = state.deviceRows.get(d.dev_id);
+    if (!li) {
+      li = document.createElement("li");
+      li.className = "device";
+      // 设备列表是单选列表：键盘 Tab 进入，Enter / 空格选中。
+      li.setAttribute("role", "option");
+      li.tabIndex = 0;
+      li.innerHTML = '<span class="dot"></span><span class="dev-main"><b></b><small></small></span>';
+      li.onclick = () => selectDevice(d.dev_id);
+      li.onkeydown = (e) => {
+        if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+        e.preventDefault();
+        selectDevice(d.dev_id);
+      };
+      li._dot = li.querySelector(".dot");
+      li._name = li.querySelector("b");
+      li._sub = li.querySelector("small");
+      state.deviceRows.set(d.dev_id, li);
+    }
+
+    const active = d.dev_id === state.selected;
+    if (li.classList.contains("active") !== active) li.classList.toggle("active", active);
+    li.setAttribute("aria-selected", active ? "true" : "false");
+
+    // 未连接且已知失败原因时，用原因摘要代替地址，圆点变琥珀色。
+    const reason = !d.connected && d.last_error ? d.last_error.text : "";
+    const dotClass = "dot" + (d.connected ? " ok" : (reason ? " warn" : ""));
+    if (li._dot.className !== dotClass) li._dot.className = dotClass;
+
+    const name = d.name || d.dev_id || "BindDeckLite";
+    if (li._name.textContent !== name) li._name.textContent = name;
+    const label = `${name}（${d.connected ? "已连接" : "未连接"}）`;
+    if (li.getAttribute("aria-label") !== label) li.setAttribute("aria-label", label);
+
+    const sub = reason || d.address || "";
+    if (li._sub.textContent !== sub) li._sub.textContent = sub;
+    const subClass = reason ? "reason" : "";
+    if (li._sub.className !== subClass) li._sub.className = subClass;
+    if (li._sub.title !== reason) li._sub.title = reason;
+  });
+
+  // 扫描后设备可能消失：移除对应的行。
+  state.deviceRows.forEach((li, id) => {
+    if (seen.has(id)) return;
+    li.remove();
+    state.deviceRows.delete(id);
+  });
+
+  // 设备顺序可能变化：按顺序移动节点，不重建。
+  state.devices.forEach((d, i) => {
+    const li = state.deviceRows.get(d.dev_id);
+    if (li && ul.children[i] !== li) ul.insertBefore(li, ul.children[i] || null);
+  });
+}
+
+/** 空列表引导只在首次创建，后续只更新「最后扫描」一行。 */
+function renderDeviceEmpty(ul) {
+  let li = ul.querySelector(".device-empty");
+  if (!li) {
+    li = document.createElement("li");
     li.className = "device-empty";
-    // WS-395: 没找到设备时给出下一步该做什么，而不是只丢一句「未发现」。
-    const scan = state.scan;
-    const parts = [
+    li.innerHTML = [
       "<b>未发现 BindDeckLite 设备</b>",
       "<span>① 系统蓝牙已开启</span>",
       "<span>② 设备已上电且在 1 米内</span>",
       "<span>③ 刚进过配网模式的话，长按编码器约 1 秒退出</span>",
-    ];
-    if (scan && scan.at !== null && scan.at !== undefined) {
-      const tail = scan.reason ? ` · ${escapeHtml(scan.reason)}` : "";
-      parts.push(`<span class="dev-scan">最后扫描 ${fmtClock(scan.at)}${tail}</span>`);
-    }
-    li.innerHTML = parts.join("");
+      '<span class="dev-scan" hidden></span>',
+    ].join("");
+    li._scan = li.querySelector(".dev-scan");
     ul.appendChild(li);
+  }
+
+  const scan = state.scan;
+  if (!scan || scan.at === null || scan.at === undefined) {
+    li._scan.hidden = true;
     return;
   }
-  state.devices.forEach((d) => {
-    const li = document.createElement("li");
-    li.className = "device" + (d.dev_id === state.selected ? " active" : "");
-    // WS-395: 未连接且已知失败原因时，用原因摘要代替地址，点变琥珀色。
-    const reason = !d.connected && d.last_error ? d.last_error.text : "";
-    const dot = d.connected ? "ok" : (reason ? "warn" : "");
-    const sub = reason
-      ? `<small class="reason" title="${escapeHtml(d.last_error.text)}">${escapeHtml(reason)}</small>`
-      : `<small>${escapeHtml(d.address || "")}</small>`;
-    li.innerHTML = `
-      <span class="dot ${dot}"></span>
-      <span class="dev-main">
-        <b>${escapeHtml(d.name || d.dev_id || "BindDeckLite")}</b>
-        ${sub}
-      </span>`;
-    li.onclick = () => selectDevice(d.dev_id);
-    ul.appendChild(li);
-  });
+  const tail = scan.reason ? ` · ${scan.reason}` : "";
+  const text = `最后扫描 ${fmtClock(scan.at)}${tail}`;
+  if (li._scan.textContent !== text) li._scan.textContent = text;
+  li._scan.hidden = false;
 }
 
 async function selectDevice(devId) {
-  // 切换设备：上一台设备的结果浮层不再适用。
+  if (state.selected === devId) {
+    renderDevices();
+    return;
+  }
+
+  // 切换设备：先保存上一台的草稿 / 待下发基线 / 下发结果 / OTA 状态。
+  saveCurrentBucket();
   clearApplyResults();
+  closeOtaWizard();
+  // 抽屉绑定的是上一台设备的 key 下标；切设备时直接收起，不还焦点
+  // （焦点要落在新设备的 DOM 上，由后续渲染决定）。
+  if (typeof closeKeyDrawer === "function") closeKeyDrawer(false);
   state.selected = devId;
   state.preview = false;
   localStorage.setItem("binddecklite.device", devId);
   renderDevices();
-  try {
-    state.cfg = await api(`/api/config/${encodeURIComponent(devId)}`);
+
+  const b = bucketFor(devId);
+  state.ota = b.ota;
+  state.otaFile = b.otaFile;
+  state.otaStep = b.otaStep;
+
+  // 有草稿就直接恢复，不重新请求，避免覆盖用户尚未下发的修改。
+  if (b.cfg) {
+    state.cfg = b.cfg;
     renderKeys();
     renderEncoder();
     renderPins();
     renderDeviceMeta();
-    state.dirty = false;
-    setDirty(false);
-    // WS-445: 切换设备后按设备各自采样，不与上一台的缓存混用。
+    if (!b.applied) b.applied = snapshotCfg(state.cfg);
+    updatePendingUi();
+    renderOta();
+    if (b.lastResult) renderApplyResults(b.lastResult);
     loadSysinfo(devId);
-    // WS-499: 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
+    probeDeviceLayout(devId);
+    return;
+  }
+
+  try {
+    const cfg = await api(`/api/config/${encodeURIComponent(devId)}`);
+    const bucket = bucketFor(devId);
+    if (state.selected !== devId) {
+      // 请求期间用户又切走了：结果只写回它自己的桶，不渲染到别的设备。
+      bucket.cfg = cfg;
+      if (!bucket.applied) bucket.applied = snapshotCfg(cfg);
+      return;
+    }
+    state.cfg = cfg;
+    renderKeys();
+    renderEncoder();
+    renderPins();
+    renderDeviceMeta();
+    bucket.cfg = state.cfg;
+    bucket.applied = snapshotCfg(state.cfg);
+    bucket.lastResult = null;
+    setDirty(false);
+    renderOta();
+    // 切换设备后按设备各自采样，不与上一台的缓存混用。
+    loadSysinfo(devId);
+    // 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
     // 12 键选项直接禁用，而不是让用户选完再被后端拒绝。
     probeDeviceLayout(devId);
   } catch (e) {
@@ -308,21 +628,6 @@ async function selectDevice(devId) {
 
 /* ---------------- keys ---------------- */
 
-function keyOptions(selected) {
-  // WS-508: 键码 0 = 「不发键」，单独收进「特殊」分组，普通键码的顺序不变。
-  // 第一项仍然是 F13 —— selected 找不到时浏览器默认选第一项，0 若排第一会
-  // 把每个未知键码都显示成「不发键」。
-  const opt = (k) =>
-    `<option value="${k.code}" ${k.code === selected ? "selected" : ""}>${k.label}</option>`;
-  const normal = state.keycodes.filter((k) => k.code !== 0);
-  const special = state.keycodes.filter((k) => k.code === 0);
-  let html = normal.map(opt).join("");
-  if (special.length) {
-    html += `<optgroup label="特殊">${special.map(opt).join("")}</optgroup>`;
-  }
-  return html;
-}
-
 function renderKeys() {
   const grid = $("#keyGrid");
   grid.innerHTML = "";
@@ -331,8 +636,8 @@ function renderKeys() {
   const layoutText = is12Key() ? " · 12 键布局" : "";
   $("#keyHint").textContent = state.preview
     ? "预览 · 未连接设备"
-    : `共 ${total} 个输入${layoutText}`;
-  // WS-503: 后端 device_cfg() 已把历史配置的 keys 幂等补齐到 12 条；这里只
+    : `共 ${total} 个输入${layoutText} · 摘要卡点「编辑」可改映射与动作`;
+  // 后端 device_cfg() 已把历史配置的 keys 幂等补齐到 12 条；这里只
   // 兜住异常数据。补出来的条目必须写进 state.cfg.keys —— 以前每次渲染都新建
   // 临时对象，第 11/12 张卡上改的键码落在临时对象里，重绘即丢（改完看不见）。
   if (!Array.isArray(state.cfg.keys)) state.cfg.keys = [];
@@ -343,10 +648,9 @@ function renderKeys() {
   }
   for (let i = 0; i < total; i++) {
     const item = keys[i];
-    const action = item.action || { type: "none", value: "" };
     const card = document.createElement("div");
     // 12 键布局下第 10–12 张是「扩展」输入（原来编码器的按压 / A / B 三脚），
-    // 单独标色，和第 1–9 张普通按键区分开（WS-499 验收）。
+    // 单独标色，和第 1–9 张普通按键区分开。
     const extended = is12Key() && i >= 9;
     card.className = "keycard" + (i === 9 ? " encoder-push" : "") + (extended ? " extended" : "");
     card.dataset.idx = i;
@@ -356,91 +660,29 @@ function renderKeys() {
         <span class="kc-title">${inputTitle(i)}</span>
         <span class="kc-live"></span>
       </div>
-      <label class="field-label">HID 键</label>
-      <select class="sel-key">${keyOptions(item.code)}</select>
-      <label class="field-label">上位机动作</label>
-      <select class="sel-act">
-        ${ACTION_TYPES.map((a) => `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${a.name}</option>`).join("")}
-      </select>
-      <div class="act-input"></div>
-      <button class="btn tiny test">测试动作</button>`;
+      <div class="kc-sum">
+        <div class="kc-line"><span class="kc-tag">HID</span><b class="kc-hid"></b></div>
+        <div class="kc-line"><span class="kc-tag">动作</span><b class="kc-act"></b></div>
+      </div>
+      <div class="kc-actions">
+        <button type="button" class="btn tiny edit">编辑</button>
+        <button type="button" class="btn tiny test">测试</button>
+      </div>`;
     grid.appendChild(card);
 
-    const selKey = $(".sel-key", card);
-    const selAct = $(".sel-act", card);
-    const holder = $(".act-input", card);
-
-    selKey.onchange = () => {
-      const code = parseInt(selKey.value, 10);
-      item.code = code;
-      item.label = (state.keycodes.find((k) => k.code === code) || {}).label || String(code);
-      // WS-508: 动作为「无」时卡片只有一行提示，文字取决于键码是否为 0；
-      // 重绘是安全的（这一支没有任何用户输入）。动作不是「无」时不重绘，
-      // 否则会清掉还没保存的宏 / 路径输入框。
-      if (!item.action || item.action.type === "none") {
-        renderActionInput(holder, item, card);
-      }
-      markDirty();
-    };
-    selAct.onchange = () => {
-      item.action = { type: selAct.value, value: "", macro: [] };
-      renderActionInput(holder, item, card);
-      markDirty();
-    };
-    renderActionInput(holder, item, card);
-
-    $(".test", card).onclick = async () => {
-      const devId = state.selected;
-      if (card.classList.contains("running")) {
-        // 执行中：这颗按钮就是止损入口（WS-495），不是重入。
-        stopAction(devId, i);
-        return;
-      }
-      const noAction = !item.action || (item.action.type || "none") === "none";
-      // /api/action/test 最多阻塞 5 秒才返回，先本地点亮执行中态；但 300 ms
-      // 内就结束的动作不该让按钮闪一下「停止」，所以延迟点亮，快速返回时
-      // 定时器直接清掉（WS-495 验收：5 秒内正常结束不出现「停止」）。
-      let armTimer = null;
-      if (devId && !noAction) {
-        armTimer = setTimeout(() => {
-          markRunning(devId, i);
-          applyRunningState();
-        }, 300);
-      }
-      let r = null;
-      try {
-        r = await api(`/api/action/test/${encodeURIComponent(devId)}/${i}`, { method: "POST" });
-        if (r.ok) {
-          // Show which browser a macro actually used, so a silent fallback to
-          // the system default is visible instead of surprising.
-          const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
-          toast("动作执行成功：" + (item.action.type === "none" ? "无上位机动作" : item.action.type) + used, "ok");
-        } else if (r.cancelled) {
-          // WS-495: 用户按下了「停止」，不是失败 —— 中性提示。
-          toast("已停止", "");
-        } else if (r.running) {
-          // 仍在执行（重入被拒绝，或宏总时长超过 5 秒）：保持执行中态。
-          if (devId) markRunning(devId, i, r.elapsed || 0);
-          applyRunningState();
-          toast(r.error || "该按键的动作仍在执行", "warn");
-        } else {
-          toast("动作执行失败：" + (r.error || "未知错误"), "bad");
-        }
-      } catch (e) {
-        toast(e.message, "bad");
-      } finally {
-        clearTimeout(armTimer);
-        if (!(r && r.running)) {
-          if (devId) clearRunning(devId, i);
-          applyRunningState();
-        }
-      }
-    };
+    // 摘要文本、测试按钮的可用态都由 keys.js 统一刷新。
+    refreshKeyCard(i);
+    $(".edit", card).onclick = () => openKeyDrawer(i);
+    $(".test", card).onclick = () => testKeyAction(item, i, card);
+  }
+  // 布局从 12 键切回 10 键时，抽屉可能停在不存在的下标上。
+  if (state.editingKey !== null && state.editingKey >= total && typeof closeKeyDrawer === "function") {
+    closeKeyDrawer(false);
   }
   applyRunningState();
 }
 
-/* ---------- 执行中态（WS-359）+ 停止入口（WS-495） ----------
+/* ---------- 执行中态 + 停止入口 ----------
  * 服务端 /api/status 的 running 字段是唯一权威来源；这里只在点击测试的
  * 5 秒等待窗口内先本地标记，随后由轮询结果覆盖。
  *
@@ -491,7 +733,7 @@ function nudgeStatus() {
 }
 
 /**
- * 请求停止一条正在执行的动作（WS-495）。
+ * 请求停止一条正在执行的动作。
  *
  * 成功（含 already_done）后不立刻假装已结束：服务端在下一步边界才退出，
  * 这里保持「正在停止…」，由 /api/status 不再报 running 时自动回到
@@ -545,10 +787,13 @@ function setCardRunning(card, secs, stopping) {
     btn.title = STOP_BTN_TITLE;
     return;
   }
-  btn.disabled = false;
+  // 「仅 HID」的按键没有上位机动作可测；按钮置灰并给出原因，
+  // 不再允许点出一句「动作执行成功：无上位机动作」的假成功。
+  const noAction = card.dataset.noaction === "1";
+  btn.disabled = noAction;
   btn.textContent = "测试动作";
   btn.classList.remove("danger");
-  btn.title = TEST_BTN_IDLE_TITLE;
+  btn.title = noAction ? "仅 HID：没有上位机动作可测试" : TEST_BTN_IDLE_TITLE;
   // 动作结束后顺手清掉残留的停止标记，避免下次执行还显示「正在停止…」。
   const idx = card.dataset.idx;
   if (idx !== undefined && state.selected) clearStopping(state.selected, idx);
@@ -562,13 +807,17 @@ function applyRunningState() {
     const idx = String(parseInt(card.dataset.idx, 10));
     setCardRunning(card, running[idx], stopping[idx]);
   });
+  // 抽屉里也有一个测试按钮，状态必须跟卡片同步。
+  if (state.editingKey !== null && typeof syncKeyDrawerRunning === "function") {
+    syncKeyDrawerRunning();
+  }
 }
 
 function renderActionInput(holder, item, card) {
   const action = item.action || { type: "none", value: "" };
   holder.innerHTML = "";
   if (action.type === "none") {
-    // WS-508: 键码 0 = 不发键。没有上位机动作时这个键按下去什么都不会发生，
+    // 键码 0 = 不发键。没有上位机动作时这个键按下去什么都不会发生，
     // 必须说清楚，否则用户只会看到一个「没反应」的死键。
     holder.innerHTML = item.code === 0
       ? `<p class="muted small">该键不会发送任何输入</p>`
@@ -593,6 +842,12 @@ function renderActionInput(holder, item, card) {
     return;
   }
   if (action.type === "macro") {
+    if (holder.dataset && holder.dataset.macroEditor === "1") {
+      // 按键抽屉：结构化步骤 + 纯文本双视图（keys.js）。
+      // 编码器那一行太窄，仍使用下面的 DSL 文本框。
+      mountMacroEditor(holder, action);
+      return;
+    }
     const ta = document.createElement("textarea");
     ta.className = "in-val macro";
     ta.rows = 3;
@@ -672,74 +927,6 @@ function renderActionInput(holder, item, card) {
   holder.appendChild(row);
 }
 
-function formatMacro(steps) {
-  return steps
-    .map((s) => {
-      if (s.type === "delay") return "wait:" + (s.value || 0);
-      if (s.type === "text") {
-        // 只有显式写了延迟才输出 text!<ms>:；默认 20ms 由主机端套用，
-        // 这样旧宏序列化回来仍是 text:xxx（往返一致）。
-        // 注意 delay: 0 是「关闭延迟」（主机端 _text_delay() 返回 0），
-        // 不是「使用默认值」，因此照原样序列化为 text!0:；默认值只在
-        // delay 字段缺失 / 非法时生效。
-        const d = typeof s.delay === "number" && isFinite(s.delay) ? s.delay : null;
-        return (d === null ? "text:" : "text!" + d + ":") + (s.value || "");
-      }
-      if (s.type === "paste") return "paste:" + (s.value || "");
-      if (s.type === "url") return "url:" + (s.value || "");
-      if (s.type === "browser") return "browser:" + (s.value || "");
-      if (s.type === "app") return "app:" + (s.value || "");
-      return "key:" + (s.value || "");
-    })
-    .join("\n");
-}
-
-function parseMacro(text) {
-  return text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const i = line.indexOf(":");
-      if (i < 0) return { type: "key", value: line };
-      let kind = line.slice(0, i).trim().toLowerCase();
-      const value = line.slice(i + 1).trim();
-      // text!<延迟毫秒>:<文本> 覆盖默认的 20ms 逐字符延迟，如 text!80:pass
-      let textDelay = null;
-      const m = /^text!(\d+)$/.exec(kind);
-      if (m) {
-        textDelay = parseInt(m[1], 10);
-        kind = "text";
-      }
-      if (kind === "wait" || kind === "delay") return { type: "delay", value: parseInt(value, 10) || 0 };
-      if (kind === "text") {
-        // 没写延迟就不带 delay 字段，主机端用默认 20ms，旧宏行为不变。
-        return textDelay === null
-          ? { type: "text", value }
-          : { type: "text", value, delay: textDelay };
-      }
-      if (kind === "paste") return { type: "paste", value };
-      if (kind === "url") return { type: "url", value };
-      if (kind === "browser") {
-        // 名字统一小写；主机端按 chrome/firefox/edge/safari/default 解析，
-        // 其余值回退默认浏览器。
-        return { type: "browser", value: value.toLowerCase() };
-      }
-      if (kind === "key") {
-        // 只存键名本身；旧版本曾把整行（含 key: 前缀）写进 value，这里把
-        // 累积的前缀去掉，否则重启后会变成 key:key:tab。
-        return { type: "key", value: value.replace(/^(?:key:)+/i, "") };
-      }
-      if (kind === "app") {
-        // 启动桌面应用程序：可执行文件路径，可带参数（引号包裹含空格的路径）。
-        // 主机端 _parse_app_cmd 拆出 (exe, args)：第一个 token 作为 exe 交给
-        // _resolve_exe 解析，其余为参数，原样传给 Popen。
-        return { type: "app", value };
-      }
-      return { type: "key", value: line };
-    });
-}
-
 function highlightKeys(lastPress) {
   const p = lastPress[state.selected];
   const idx = p ? p.index : -1;
@@ -776,12 +963,12 @@ function renderEncoder() {
     };
     grid.appendChild(el);
   });
-  // WS-389: the rotation-action card depends on the active mode, so redraw it
+  // the rotation-action card depends on the active mode, so redraw it
   // whenever the mode grid is (re)rendered.
   renderEncoderActions();
 }
 
-/* ---------------- encoder rotation actions (WS-389) ---------------- */
+/* ---------------- encoder rotation actions ---------------- */
 
 function defaultEncoderAction() {
   return { type: "none", value: "", macro: [] };
@@ -810,13 +997,16 @@ function setEncRowRunning(row, secs) {
   // 非「上位机动作」模式整卡置灰：测试按钮必须一直保持禁用。
   // 这里不能只写 btn.disabled = live —— 状态轮询每轮都会调用本函数，
   // 会把上面 renderEncoderActions 设的 disabled=true 覆盖掉，
-  // 于是灰卡上的按钮又能点，出现「假成功」（WS-390 评审 #1）。
+  // 于是灰卡上的按钮又能点，出现「假成功」。
   const locked = row.dataset.locked === "1";
-  btn.disabled = live || locked;
+  const noAction = row.dataset.noaction === "1";
+  btn.disabled = live || locked || noAction;
   btn.textContent = live ? "执行中…" : "测试动作";
   btn.title = live
     ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
-    : (locked ? "切到「上位机动作」模式后可配置旋转动作" : TEST_BTN_IDLE_TITLE);
+    : locked ? "切到「上位机动作」模式后可配置旋转动作"
+      : noAction ? "仅 HID：没有上位机动作可测试"
+        : TEST_BTN_IDLE_TITLE;
 }
 
 function applyEncoderRunningState() {
@@ -829,7 +1019,7 @@ function applyEncoderRunningState() {
 
 function encoderStatusText(actions, editable) {
   // 顶部状态说明。必须跟着当前配置走：改完动作类型后要立刻反映出来，
-  // 不能一直显示旧文案（WS-390 评审 #3）。
+  // 不能一直显示旧文案。
   if (!editable) return "切到「上位机动作」模式后可配置";
   const cw = actions.CW || defaultEncoderAction();
   const ccw = actions.CCW || defaultEncoderAction();
@@ -861,7 +1051,7 @@ function renderEncoderActions() {
   if (!actions.CW) actions.CW = defaultEncoderAction();
   if (!actions.CCW) actions.CCW = defaultEncoderAction();
   const mode = enc.mode || 0;
-  // WS-499: 12 键布局没有旋转编码器，旋转动作同样不可用（配置保留，切回后恢复）。
+  // 12 键布局没有旋转编码器，旋转动作同样不可用（配置保留，切回后恢复）。
   const editable = mode === 4 && !is12Key();
 
   const card = document.createElement("div");
@@ -887,8 +1077,10 @@ function renderEncoderActions() {
     row.className = "enc-action-row";
     row.dataset.dir = dir;
     // 其他模式下整卡置灰：记住这个状态，状态轮询刷新执行中态时不能把
-    // 测试按钮重新启用（WS-390 评审 #1）。
+    // 测试按钮重新启用。
     row.dataset.locked = editable ? "0" : "1";
+    // 「仅 HID」同样没有上位机动作；轮询刷新执行中态时不能把它重新点亮。
+    row.dataset.noaction = (!action || (action.type || "none") === "none") ? "1" : "0";
     row.innerHTML = `
       <span class="enc-dir-label">${label}</span>
       <select class="sel-enc-act">
@@ -905,8 +1097,10 @@ function renderEncoderActions() {
 
     sel.onchange = () => {
       actions[dir] = { type: sel.value, value: "", macro: [] };
+      row.dataset.noaction = (!actions[dir] || (actions[dir].type || "none") === "none") ? "1" : "0";
       renderActionInput(holder, { action: actions[dir] },
                        { dataset: { idx: "enc-" + dir } });
+      applyEncoderRunningState();
       refreshStatus();
       markDirty();
     };
@@ -939,10 +1133,13 @@ function renderEncoderActions() {
         return;
       }
       const noAction = !actions[dir] || (actions[dir].type || "none") === "none";
-      if (!noAction) {
-        markEncRunning(devId, dir);
-        applyEncoderRunningState();
+      if (noAction) {
+        // 按钮本应 disabled；这里兜住键盘触发，不给假成功。
+        toast("仅 HID：没有上位机动作可测试", "warn");
+        return;
       }
+      markEncRunning(devId, dir);
+      applyEncoderRunningState();
       let r = null;
       try {
         r = await api(`/api/encoder/action/test/${encodeURIComponent(devId)}/${dir}`,
@@ -950,8 +1147,7 @@ function renderEncoderActions() {
         if (r.ok) {
           const used = r.browser_used && r.browser_used !== "default"
             ? ` · ${r.browser_used}` : "";
-          toast("动作执行成功：" + (actions[dir].type === "none"
-            ? "无上位机动作" : actions[dir].type) + used, "ok");
+          toast("动作执行成功：" + actions[dir].type + used, "ok");
         } else if (r.running) {
           if (devId) markEncRunning(devId, dir, r.elapsed || 0);
           applyEncoderRunningState();
@@ -976,7 +1172,7 @@ function renderEncoderActions() {
 
 /* ---------------- device ---------------- */
 
-/* 运行状态（WS-445）：固件只回报事实，文案与着色都在这里。
+/* 运行状态：固件只回报事实，文案与着色都在这里。
    采样值保存在服务端内存（/api/status 的 sysinfo 字段），断开时继续显示
    上一次的值并标注「已断开，非实时」，绝不把旧值当实时值渲染。 */
 function sysinfoFor(devId) {
@@ -1074,7 +1270,7 @@ function renderSysinfo() {
   atEl.textContent = when + stale;
 }
 
-/** WS-499: 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
+/** 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
 async function probeDeviceLayout(devId) {
   if (!devId) return;
   try {
@@ -1089,12 +1285,21 @@ async function probeDeviceLayout(devId) {
     renderEncoder();
     renderPins();
     renderDeviceMeta();
+    // 布局是设备自报的，不应被算成「待下发」；只有用户已经改过其他字段时才保留差异。
+    if (!state.dirty) {
+      const b = bucketFor(devId);
+      if (b.applied) {
+        b.applied.layout = state.cfg.layout;
+        b.applied.layout_supported = state.cfg.layout_supported;
+      }
+    }
+    updatePendingUi();
   } catch (_) {
     /* 旧后端或链路异常：布局维持本地配置，不影响其他功能 */
   }
 }
 
-/** WS-499: 设备页「按键布局」卡片的状态与说明。 */
+/** 设备页「按键布局」卡片的状态与说明。 */
 function renderLayoutCard() {
   const enc = $("#layoutEncoder");
   const twelve = $("#layout12Key");
@@ -1138,23 +1343,25 @@ function renderDeviceMeta() {
   if (!state.cfg) return;
   const chip = state.cfg.chip || "ESP32";
   const fw = state.cfg.fw || {};
-  $("#chipBadge").textContent = chip;
+  const badge = $("#chipBadge");
+  if (badge) badge.textContent = chip;
+  // 概览只留 4 格：把「输入」和「布局」合并成一条可读的布局说明。
+  const layoutText = is12Key() ? "12 键（无编码器）" : "编码器（9 键 + EC11）";
   $("#deviceMeta").innerHTML = `
-    <div><span>设备</span><b>${escapeHtml(state.cfg.name || state.selected || "—")}</b></div>
-    <div><span>固件</span><b>${escapeHtml(fw.version || "—")}</b></div>
-    <div><span>编译</span><b class="mono">${escapeHtml(fw.build || "—")}</b></div>
-    <div><span>输入</span><b>${is12Key() ? "12 键（无编码器）" : "9 键 + EC11"}</b></div>
-    <div><span>布局</span><b>${is12Key() ? "12 键" : "编码器"}</b></div>`;
+    <div><span>设备名</span><b>${escapeHtml(state.cfg.name || state.selected || "—")}</b></div>
+    <div><span>固件版本</span><b>${escapeHtml(fw.version || "—")}</b></div>
+    <div><span>编译 / 芯片</span><b class="mono">${escapeHtml(fw.build || "—")} · ${escapeHtml(chip)}</b></div>
+    <div><span>布局</span><b>${layoutText}</b></div>`;
   renderLayoutCard();
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
 
-  // WS-321: host binding status
+  // host binding status
   const bond = state.cfg.bond || { bound: false, addr: "" };
   const bondEl = $("#bondStatus");
   const clearBtn = $("#btnClearBond");
   if (bond.bound) {
-    // WS-423: the live NimBLE bond state now arrives on BOND_DIAG (separate
+    // the live NimBLE bond state now arrives on BOND_DIAG (separate
     // from BOND_STATUS), so the address stays clean. Show it next to the addr.
     const diag = bond.peer_sec === undefined ? "" :
       ` <span class="muted small">· 配对 ${bond.peer_sec} 个 · NimBLE 绑定 ${bond.nimble_bond ? "正常" : "缺失"}</span>`;
@@ -1170,9 +1377,9 @@ function renderDeviceMeta() {
   // 引脚提示文案也来自后端规则（/api/defaults 的 pinRules），避免 JS 里再写一份
   // 与固件可能漂移的引脚限制。
   renderPinHint();
-  // WS-409: 设备页的「上次读取」状态行。
+  // 设备页的「上次读取」状态行。
   renderReadStatus();
-  // WS-445: 运行状态卡片（采样请求由 selectDevice / 重连 / 刷新 / 打开设备页触发）。
+  // 运行状态卡片（采样请求由 selectDevice / 重连 / 刷新 / 打开设备页触发）。
   renderSysinfo();
 }
 
@@ -1181,7 +1388,7 @@ function renderPins() {
   box.innerHTML = "";
   if (!state.cfg) return;
   // 旧 config.json 可能缺项 / 是 null / 甚至不是数组：照原样渲染，由校验标红，
-  // 不在这里替用户补默认值（WS-476 要求不改写用户的值）。
+  // 不在这里替用户补默认值。
   const pins = Array.isArray(state.cfg.pins) ? state.cfg.pins : [];
   for (let i = 0; i < PIN_COUNT; i++) {
     const wrap = document.createElement("label");
@@ -1213,7 +1420,7 @@ function renderPins() {
     wrap.append(name, input, err);
     box.appendChild(wrap);
   }
-  // WS-499: 12 键布局下第 10–12 键固定在原编码器三脚上，只读展示。
+  // 12 键布局下第 10–12 键固定在原编码器三脚上，只读展示。
   renderFixedPins();
   // 每次重绘都先清掉上一轮的结论，再按当前值重算，避免旧红框挂在新值上。
   applyPinErrors([]);
@@ -1281,7 +1488,7 @@ async function validatePins() {
     if (r.pinRules) {
       state.pinRules = r.pinRules;
       renderPinHint();
-      renderFixedPins();   // WS-499: keep the fixed rows in sync with the rule
+      renderFixedPins();   // keep the fixed rows in sync with the rule
     }
   } catch (_) {
     // 上位机后端暂时取不到：保留上一次结论，绝不假装全部合法。
@@ -1435,25 +1642,26 @@ function cancelPendingSave() {
   }
 }
 
-/** 重新挂起自动保存。 */
+/** 重新挂起自动保存。把编辑时的设备与配置快照带进闭包，切换设备不会串档。 */
 function armPendingSave() {
   cancelPendingSave();
-  state.saveTimer = setTimeout(saveConfig, 500);
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return;
+  state.saveTimer = setTimeout(() => saveConfigFor(devId, cfg), 500);
 }
 
 function setDirty(dirty) {
-  state.dirty = dirty;
-  const btn = $("#btnApply");
-  btn.textContent = dirty ? "应用配置 •" : "应用配置";
-  btn.classList.toggle("dirty", dirty);
+  state.dirty = !!dirty;
+  updatePendingUi();
 }
 
-async function saveConfig() {
-  if (!state.selected || !state.cfg) return;
+async function saveConfigFor(devId, cfg) {
+  if (!devId || !cfg) return;
   try {
-    await api(`/api/config/${encodeURIComponent(state.selected)}`, {
+    await api(`/api/config/${encodeURIComponent(devId)}`, {
       method: "POST",
-      body: JSON.stringify(state.cfg),
+      body: JSON.stringify(cfg),
     });
   } catch (e) {
     toast("保存失败：" + e.message, "bad");
@@ -1469,19 +1677,24 @@ async function applyConfig() {
     toast("未连接设备，当前只是默认配置预览", "bad");
     return;
   }
-  // WS-476：先校验。有错误就一条 CFG: 都不发，直接把用户带到第一处错误行。
+  // 固定本次下发的设备与配置快照：等待期间用户切换设备时不要把结果记到别的桶。
+  const devId = state.selected;
+  const cfg = state.cfg;
+  // 先校验。有错误就一条 CFG: 都不发，直接把用户带到第一处错误行。
   // 顺序放在「未连接设备」之后：预览/离线仍只提示未连接，不叠加两套 toast。
   const pinErrors = await validatePins();
+  if (state.selected !== devId) return;
   if (pinErrors.length) {
     toast(`按键引脚有 ${pinErrors.length} 处错误`, "bad");
     focusFirstPinError(pinErrors);
     return;
   }
-  await saveConfig();
+  await saveConfigFor(devId, cfg);
   try {
-    const r = await api(`/api/apply/${encodeURIComponent(state.selected)}`, { method: "POST" });
+    const r = await api(`/api/apply/${encodeURIComponent(devId)}`, { method: "POST" });
+    if (state.selected !== devId) return;
 
-    // WS-499: 旧固件收到 12 键配置时后端直接拒绝 —— 明确告诉用户原因，
+    // 旧固件收到 12 键配置时后端直接拒绝 —— 明确告诉用户原因，
     // 不要落到下面的「设备未连接？」兜底文案里假装失败得莫名其妙。
     if (!r.ok && r.error && !r.items) {
       toast(r.error, "bad");
@@ -1490,21 +1703,20 @@ async function applyConfig() {
 
     // New contract: per-item readback results.
     if (r.items && r.items.length) {
-      renderApplyResults(r.items);
-      if (r.ok) {
+      const allOk = r.ok && r.items.every((i) => i.status === "ok");
+      recordApply(r.items, allOk);
+      if (allOk) {
         toast("配置已生效", "ok");
-        setDirty(false);
       } else {
-        toast("部分配置未生效，请查看右上角结果", "bad");
-        // Keep dirty — the button stays "应用配置 •" until everything is ok.
+        toast("部分配置未生效，请查看「上次下发」结果", "bad");
       }
       return;
     }
 
     // Legacy fallback (old backend that only returns {ok, results}).
     if (r.ok) {
+      recordApply([], true);
       toast(`已下发到设备（${r.results.filter((x) => x.sent).length} 条）`, "ok");
-      setDirty(false);
     } else {
       toast("下发失败：设备未连接？", "bad");
     }
@@ -1515,38 +1727,21 @@ async function applyConfig() {
 
 /* ---------------- apply results overlay ---------------- */
 
-// 全部生效时浮层自动消失的时长；鼠标悬停或键盘聚焦时暂停计时。
-const APPLY_AUTOCLOSE_MS = 5000;
-// 与 style.css 中 .apply-results 的过渡时长保持一致。
-const APPLY_FADE_MS = 200;
-
-// 自动消失计时状态：deadline 为绝对时间戳，remaining 是暂停时刻的剩余毫秒。
-let applyTimer = null;
-let applyDeadline = 0;
-let applyRemaining = 0;
-
-function stopApplyTimer() {
-  if (applyTimer !== null) {
-    clearTimeout(applyTimer);
-    applyTimer = null;
+/** 记录一次下发结果：全部生效写「上次下发」常驻行，失败项保留浮层。 */
+function recordApply(items, allOk) {
+  if (!state.selected) return;
+  const b = bucketFor(state.selected);
+  const failed = (items || []).filter((i) => i.status !== "ok").length;
+  b.lastApply = { at: Math.floor(Date.now() / 1000), failed: allOk ? 0 : Math.max(1, failed) };
+  if (allOk) {
+    b.applied = snapshotCfg(state.cfg);
+    b.lastResult = null;
+    clearApplyResults();
+  } else {
+    b.lastResult = items;
+    renderApplyResults(items);
   }
-}
-
-function startApplyTimer(ms) {
-  stopApplyTimer();
-  if (ms <= 0) return;
-  applyDeadline = Date.now() + ms;
-  applyTimer = setTimeout(dismissApplyResults, ms);
-}
-
-function pauseApplyTimer() {
-  if (applyTimer === null) return;
-  applyRemaining = Math.max(0, applyDeadline - Date.now());
-  stopApplyTimer();
-}
-
-function resumeApplyTimer() {
-  if (applyTimer === null && applyRemaining > 0) startApplyTimer(applyRemaining);
+  updatePendingUi();
 }
 
 function clearFieldHighlights() {
@@ -1554,29 +1749,9 @@ function clearFieldHighlights() {
 }
 
 function clearApplyResults() {
-  stopApplyTimer();
-  applyRemaining = 0;
   const existing = $("#applyResults");
   if (existing) existing.remove();
   clearFieldHighlights();
-}
-
-// 自动消失：先淡出，再移除节点。若期间被新的结果替换或手动关闭，
-// 节点已不在文档中，这里直接放弃，避免清掉新浮层的字段高亮。
-function dismissApplyResults() {
-  stopApplyTimer();
-  applyRemaining = 0;
-  const el = $("#applyResults");
-  if (!el) {
-    clearFieldHighlights();
-    return;
-  }
-  el.classList.add("leaving");
-  setTimeout(() => {
-    if (!el.isConnected) return;
-    el.remove();
-    clearFieldHighlights();
-  }, APPLY_FADE_MS);
 }
 
 // 浮层固定定位，top 跟随顶部栏的实际底边：窄窗口下顶部栏会换行变高，
@@ -1638,7 +1813,7 @@ function renderApplyResults(items) {
     }
 
     const actionBtn = (item.status !== "ok")
-      ? `<button class="btn tiny accept-device-value" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
+      ? `<button class="btn tiny secondary accept-device-value" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
       : "";
 
     row.innerHTML = `
@@ -1651,24 +1826,13 @@ function renderApplyResults(items) {
   // 浮层挂在 body 上并脱离文档流，不占用顶部栏的布局空间。
   document.body.appendChild(container);
   positionApplyResults();
-  // WS-409: 动态生成的「以设备为准」按钮也要服从 OTA 锁。
+  // 动态生成的「以设备为准」按钮也要服从 OTA 锁。
   applyOtaLock();
 
   // Highlight the form fields whose value was rejected.
   items.forEach((item) => {
     if (item.status === "rejected") highlightFormField(item.field);
   });
-
-  // 全部生效 → 5 秒后自动淡出，悬停 / 聚焦期间暂停；有未生效项 → 常驻，
-  // 由用户点 × 或按 Esc 关闭。
-  if (allOk) {
-    applyRemaining = APPLY_AUTOCLOSE_MS;
-    startApplyTimer(APPLY_AUTOCLOSE_MS);
-    container.addEventListener("mouseenter", pauseApplyTimer);
-    container.addEventListener("mouseleave", resumeApplyTimer);
-    container.addEventListener("focusin", pauseApplyTimer);
-    container.addEventListener("focusout", resumeApplyTimer);
-  }
 }
 
 function highlightFormField(field) {
@@ -1691,7 +1855,7 @@ function highlightFormField(field) {
   }
 }
 
-/* ---------------- 读取设备配置（WS-409） ---------------- */
+/* ---------------- 读取设备配置 ---------------- */
 
 // 设备回报的配置分组（与服务端 app.py 的 _CFG_READ_FIELDS 一致）。
 // 这四组全部回来才算一次完整的回读；缺任何一组都按「设备未回报」处理。
@@ -1730,7 +1894,7 @@ async function readDeviceConfig(devId) {
     if (!window.confirm("有修改尚未下发到设备，读取设备配置会丢弃它们")) return null;
   }
   // 挂起的自动保存必须先停掉：它会把前端旧副本写回服务端，把刚读回来的
-  // 设备真值覆盖掉（WS-409）。
+  // 设备真值覆盖掉。
   const wasDirty = state.dirty;
   cancelPendingSave();
   try {
@@ -1758,6 +1922,12 @@ async function readDeviceConfig(devId) {
 function applyReadback(r) {
   if (!r || !r.cfg) return;
   state.cfg = r.cfg;
+  if (state.selected) {
+    const b = bucketFor(state.selected);
+    b.cfg = state.cfg;
+    b.applied = snapshotCfg(state.cfg);
+    b.lastResult = null;
+  }
   setDirty(false);
   renderKeys();
   renderEncoder();
@@ -1804,7 +1974,7 @@ async function acceptDeviceValue(field) {
 
 /* ---------------- log ---------------- */
 
-// WS-470：日志「跟随 / 暂停」。判据只有一条 —— 用户是否停在底部（≤ 24 px）。
+// 日志「跟随 / 暂停」。判据只有一条 —— 用户是否停在底部（≤ 24 px）。
 // 纯逻辑在 log_follow.js（同样的代码 Node 测试直接 import）。
 const LOG_FOLLOW_THRESHOLD = window.LogFollow.DEFAULT_THRESHOLD;
 
@@ -1875,6 +2045,95 @@ function syncLogFollowUi(opts = {}) {
   }
 }
 
+/* ---------------- 日志页过滤（纯客户端，不影响轮询与 seq） ---------------- */
+
+function logFilterActive() {
+  const f = state.logFilter;
+  return !!(f.kind || f.level || f.q);
+}
+
+function logRowMatches(row) {
+  const f = state.logFilter;
+  if (f.kind && (row.dataset.kind || "") !== f.kind) return false;
+  if (f.level && (row.dataset.level || "info") !== f.level) return false;
+  if (f.q && !(row.textContent || "").toLowerCase().includes(f.q)) return false;
+  return true;
+}
+
+function applyLogRowVisibility(row) {
+  // 用 hidden + CSS（.log-row[hidden]{display:none}）过滤，不动行节点，
+  // 轮询追加与 log_follow 的裁剪补偿逻辑保持原样。
+  row.hidden = logFilterActive() && !logRowMatches(row);
+}
+
+/** 只有过滤生效且有内容但全被隐藏时，才显示「没有匹配的日志」。 */
+function syncLogFilterChrome() {
+  const list = $("#logList");
+  const empty = $("#logEmpty");
+  if (empty && list) {
+    const anyVisible = Array.from(list.children).some((row) => !row.hidden);
+    empty.hidden = !(logFilterActive() && list.children.length > 0 && !anyVisible);
+  }
+  const reset = $("#btnLogFilterReset");
+  if (reset) reset.hidden = !logFilterActive();
+}
+
+function applyLogFilter() {
+  const list = $("#logList");
+  if (!list) return;
+  Array.from(list.children).forEach(applyLogRowVisibility);
+  syncLogFilterChrome();
+  if (state.logFollow) stickLogToBottom(list);
+}
+
+function bindLogFilters() {
+  const kind = $("#logKind");
+  const search = $("#logSearch");
+  const chips = $("#logLevelChips");
+  const reset = $("#btnLogFilterReset");
+
+  if (kind) {
+    kind.onchange = () => {
+      state.logFilter.kind = kind.value;
+      applyLogFilter();
+    };
+  }
+  if (search) {
+    search.oninput = () => {
+      state.logFilter.q = search.value.trim().toLowerCase();
+      applyLogFilter();
+    };
+  }
+  if (chips) {
+    chips.onclick = (e) => {
+      const btn = e.target.closest(".log-chip");
+      if (!btn) return;
+      state.logFilter.level = btn.dataset.level || "";
+      $$(".log-chip", chips).forEach((b) => {
+        const on = b === btn;
+        b.classList.toggle("active", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      applyLogFilter();
+    };
+  }
+  if (reset) {
+    reset.onclick = () => {
+      state.logFilter = { kind: "", level: "", q: "" };
+      if (kind) kind.value = "";
+      if (search) search.value = "";
+      if (chips) {
+        $$(".log-chip", chips).forEach((b) => {
+          const on = !b.dataset.level;
+          b.classList.toggle("active", on);
+          b.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+      }
+      applyLogFilter();
+    };
+  }
+}
+
 // 上滚 / 回底只改这两个状态值，然后重绘按钮与标签。
 function bindLogFollow() {
   const list = $("#logList");
@@ -1914,9 +2173,13 @@ async function pollLog() {
     // 暂停态先记住可视首行，裁剪后用它校验补偿。
     const anchor = state.logFollow ? null : captureLogAnchor(list);
 
+    let visibleNew = 0;
     r.events.forEach((e) => {
       const row = document.createElement("div");
       row.className = "log-row " + (e.level || "info");
+      // 过滤用的原始字段，不占视觉空间：kind / level 直接来自后端事件。
+      row.dataset.kind = e.kind || "";
+      row.dataset.level = e.level || "info";
       row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
 
       // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
@@ -1929,6 +2192,8 @@ async function pollLog() {
       copyBtn.onclick = () => copyLogLine(`${e.time} [${e.kind}] ${e.text}`, copyBtn);
       row.appendChild(copyBtn);
 
+      applyLogRowVisibility(row);
+      if (!row.hidden) visibleNew++;
       list.appendChild(row);
       // Physical-button action failures arrive through the log stream;
       // surface them as a toast so the user sees them immediately.
@@ -1942,8 +2207,8 @@ async function pollLog() {
     while (list.children.length > 300) list.removeChild(list.firstChild);
     const removedHeight = Math.max(0, heightBeforeTrim - list.scrollHeight);
 
-    // 计数按实际新增行数累加（裁剪前统计），不按批次 +1。
-    state.logPending = window.LogFollow.pendingAfterAppend(state.logPending, r.events.length, state.logFollow);
+    // 计数按实际新增、且过滤后可见的行数累加（裁剪前统计），不按批次 +1。
+    state.logPending = window.LogFollow.pendingAfterAppend(state.logPending, visibleNew, state.logFollow);
 
     if (state.logFollow) {
       stickLogToBottom(list);
@@ -1951,6 +2216,7 @@ async function pollLog() {
       list.scrollTop = window.LogFollow.compensateTrim(list.scrollTop, removedHeight);
       realignLogAnchor(list, anchor);
     }
+    syncLogFilterChrome();
     syncLogFollowUi();
   } catch (_) {
     /* 轮询失败：不追加、不滚底、不重置暂停状态与计数 */
@@ -2030,24 +2296,64 @@ function escapeHtml(s) {
 }
 
 function bindTabs() {
-  $$(".tab").forEach((tab) => {
-    tab.onclick = () => {
-      $$(".tab").forEach((t) => t.classList.remove("active"));
-      $$(".panel").forEach((p) => p.classList.remove("active"));
-      tab.classList.add("active");
-      $("#tab-" + tab.dataset.tab).classList.add("active");
-      if (tab.dataset.tab === "device") {
-        renderDeviceMeta();
-        // WS-445: 打开设备页采样一次运行状态。
-        loadSysinfo(state.selected);
-      }
-      // 日志页隐藏期间容器量不出高度，切回来时补一次贴底 / 胶囊重绘。
-      if (tab.dataset.tab === "log") syncLogFollowUi({ stick: true });
+  const tabs = $$(".tab");
+
+  const activate = (tab) => {
+    tabs.forEach((t) => {
+      const on = t === tab;
+      t.classList.toggle("active", on);
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+    });
+    $$(".panel").forEach((p) => p.classList.remove("active"));
+    $("#tab-" + tab.dataset.tab).classList.add("active");
+    if (tab.dataset.tab === "device") {
+      renderDeviceMeta();
+      // 打开设备页采样一次运行状态。
+      loadSysinfo(state.selected);
+    }
+    // 日志页隐藏期间容器量不出高度，切回来时补一次贴底 / 胶囊重绘。
+    if (tab.dataset.tab === "log") syncLogFollowUi({ stick: true });
+  };
+
+  tabs.forEach((tab, i) => {
+    tab.onclick = () => activate(tab);
+    tab.onkeydown = (e) => {
+      let next = null;
+      if (e.key === "ArrowRight") next = tabs[(i + 1) % tabs.length];
+      else if (e.key === "ArrowLeft") next = tabs[(i - 1 + tabs.length) % tabs.length];
+      else if (e.key === "Home") next = tabs[0];
+      else if (e.key === "End") next = tabs[tabs.length - 1];
+      if (!next) return;
+      e.preventDefault();
+      activate(next);
+      next.focus();
     };
   });
 }
 
 /* ---------------- help ---------------- */
+
+/** 浮层焦点陷阱：Tab 到末尾回到第一个，Shift+Tab 到开头回到最后一个。 */
+function trapFocus(container, e) {
+  const focusables = $$(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    container
+  ).filter((el) => el.getClientRects().length > 0);
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (e.shiftKey) {
+    if (active === first || !container.contains(active)) {
+      e.preventDefault();
+      last.focus();
+    }
+  } else if (active === last || !container.contains(active)) {
+    e.preventDefault();
+    first.focus();
+  }
+}
 
 /* 帮助浮层：说明宏语法、键名对照、登录示例与常见错误。纯前端开关，
    不请求后端，关掉后页面状态完全不变。 */
@@ -2059,12 +2365,12 @@ function bindHelp() {
 
   const open = () => {
     modal.hidden = false;
-    document.body.classList.add("modal-open");
+    syncModalOpenClass();
     closeBtn.focus();
   };
   const close = () => {
     modal.hidden = true;
-    document.body.classList.remove("modal-open");
+    syncModalOpenClass();
     openBtn.focus();
   };
 
@@ -2075,7 +2381,13 @@ function bindHelp() {
     if (e.target === modal) close();
   };
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape" || modal.hidden) return;
+    if (modal.hidden) return;
+    // 焦点陷阱：Tab / Shift+Tab 在浮层内循环，不跑到背景页面。
+    if (e.key === "Tab") {
+      trapFocus(modal, e);
+      return;
+    }
+    if (e.key !== "Escape") return;
     close();
     // 帮助浮层打开时 Esc 只关它自己：阻止 document 上后续的 Esc 监听
     //（配置结果浮层）在同一事件里继续触发。
@@ -2092,9 +2404,27 @@ function bindApplyResults() {
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape" || !$("#applyResults")) return;
     // 兜底：即使帮助浮层的监听没有阻止冒泡，也不连带关掉结果浮层。
-    const modal = $("#helpModal");
-    if (modal && !modal.hidden) return;
+    const help = $("#helpModal");
+    const ota = $("#otaModal");
+    if ((help && !help.hidden) || (ota && !ota.hidden)) return;
     clearApplyResults();
+  });
+}
+
+/* 三个轮询集中管理，便于窗口不可见时整体暂停。 */
+const pollTimers = { status: null, log: null, ota: null };
+
+function startPolling() {
+  if (pollTimers.status) return;
+  pollTimers.status = setInterval(pollStatus, 1200);
+  pollTimers.log = setInterval(pollLog, 800);
+  pollTimers.ota = setInterval(pollOta, 500);
+}
+
+function stopPolling() {
+  Object.keys(pollTimers).forEach((key) => {
+    clearInterval(pollTimers[key]);
+    pollTimers[key] = null;
   });
 }
 
@@ -2102,6 +2432,9 @@ async function init() {
   bindTabs();
   bindHelp();
   bindApplyResults();
+  bindOtaWizard();
+  bindKeyDrawer();
+  bindLogFilters();
   bindLogFollow();
   syncLogFollowUi();
   try {
@@ -2114,29 +2447,49 @@ async function init() {
   if (remembered) state.selected = remembered;
 
   $("#btnScan").onclick = async () => {
+    const btn = $("#btnScan");
+    // 扫描是同步 6 秒的请求，期间禁止重复触发。
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.classList.add("loading");
+    btn.setAttribute("aria-busy", "true");
     toast("正在扫描…");
     try {
       const r = await api("/api/scan");
-      // WS-395: 说清楚为什么没扫到，而不是只报一个「0 台设备」。
+      // 说清楚为什么没扫到，而不是只报一个「0 台设备」。
       toast(r.reason ? `扫描未发现设备：${r.reason}` : `扫描到 ${r.found ? r.found.length : 0} 台设备`);
     } catch (e) {
       toast("扫描失败：" + e.message, "bad");
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+      btn.removeAttribute("aria-busy");
     }
   };
   $("#btnApply").onclick = applyConfig;
+  $("#pendingBadge").onclick = focusPendingItem;
   $("#btnClearLog").onclick = () => {
     $("#logList").innerHTML = "";
     // 清空后没有可读的旧行，强制回跟随。
     state.logFollow = true;
     state.logPending = 0;
+    syncLogFilterChrome();
     syncLogFollowUi({ stick: true });
   };
   $("#actionsToggle").onchange = async (e) => {
+    const target = e.target;
+    const want = target.checked;
+    target.disabled = true;
     try {
-      await api("/api/settings", { method: "POST", body: JSON.stringify({ actions_enabled: e.target.checked }) });
-      toast(e.target.checked ? "上位机动作已启用" : "上位机动作已关闭");
+      await api("/api/settings", { method: "POST", body: JSON.stringify({ actions_enabled: want }) });
+      state.actionsEnabled = want;
+      renderActionsState();
+      toast(want ? "上位机动作已启用" : "上位机动作已关闭", want ? "ok" : "");
     } catch (err) {
+      target.checked = !want;
       toast(err.message, "bad");
+    } finally {
+      target.disabled = false;
     }
   };
   $("#sleepEnabled").onchange = (e) => {
@@ -2260,12 +2613,13 @@ async function init() {
       target.disabled = false;
     }
   };
-  const devAction = async (act, okText) => {
+  const devAction = async (act, okText, confirmText) => {
     if (!state.selected) return;
     if (otaBusy()) {
       toast("OTA 进行中，设备指令已锁定", "bad");
       return;
     }
+    if (confirmText && !window.confirm(confirmText)) return;
     try {
       const r = await api(`/api/device/${encodeURIComponent(state.selected)}/${act}`, { method: "POST" });
       toast(r.sent === false ? "指令未送出：设备未连接" : okText, r.sent === false ? "bad" : "ok");
@@ -2273,7 +2627,7 @@ async function init() {
       toast(e.message, "bad");
     }
   };
-  // WS-499: 布局切换。只改本地配置，点「应用配置」才下发；
+  // 布局切换。只改本地配置，点「应用配置」才下发；
   // 下发后重新渲染按键卡片与编码器页，切换立刻可见。
   $$("input[name='layout']").forEach((el) => {
     el.onchange = () => {
@@ -2282,7 +2636,7 @@ async function init() {
     };
   });
   $("#btnPing").onclick = () => devAction("ping", "已发送 Ping");
-  // WS-445: 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
+  // 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
   $("#btnSysRefresh").onclick = async () => {
     const btn = $("#btnSysRefresh");
     if (!state.selected) {
@@ -2296,14 +2650,22 @@ async function init() {
       btn.disabled = false;
     }
   };
-  // WS-409: 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
+  // 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
   $("#btnRefresh").onclick = () => readDeviceConfig(state.selected);
-  $("#btnPortal").onclick = () => devAction("portal", "设备将重启进入配网模式");
-  $("#btnReboot").onclick = () => devAction("reboot", "设备重启中");
-  // WS-321: clear the persisted host binding so a new central can take over.
+  $("#btnPortal").onclick = () => devAction(
+    "portal",
+    "设备将重启进入配网模式",
+    "进入配网模式会重启设备并暂时断开蓝牙连接，按键映射与上位机动作在配网期间不可用；可在设备上长按编码器约 1 秒退出。此操作可逆，确定继续？",
+  );
+  $("#btnReboot").onclick = () => devAction(
+    "reboot",
+    "设备重启中",
+    "重启会断开当前蓝牙连接，并中断正在执行的上位机动作；配置和已下发的设置不会丢失，设备会自动重连。此操作可逆，确定重启？",
+  );
+  // clear the persisted host binding so a new central can take over.
   $("#btnClearBond").onclick = async () => {
     if (!state.selected) return;
-    if (!window.confirm("清除主机绑定后，任何主机都能控制键盘。确定要清除吗？")) return;
+    if (!window.confirm("清除主机绑定后，当前连接会断开，任何主机首次连接都会重新绑定；按键映射与配置不会丢失。此操作可逆，确定清除吗？")) return;
     const btn = $("#btnClearBond");
     btn.disabled = true;
     try {
@@ -2323,9 +2685,7 @@ async function init() {
       btn.disabled = false;
     }
   };
-  $("#btnOta").onclick = openOtaPicker;
-  $("#btnOtaStart").onclick = startOta;
-  $("#btnOtaCancel").onclick = cancelOta;
+  // OTA 的入口与向导按钮由 bindOtaWizard() 统一绑定。
 
   const initialTab = new URLSearchParams(location.search).get("tab");
   if (initialTab) {
@@ -2335,137 +2695,233 @@ async function init() {
 
   await refreshDesktop();
   await pollStatus();
-  setInterval(pollStatus, 1200);
-  setInterval(pollLog, 800);
-  setInterval(pollOta, 500);
+  startPolling();
+  // 窗口隐藏（最小化到托盘）时暂停轮询，恢复可见时立刻刷新一次。
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopPolling();
+      return;
+    }
+    pollStatus();
+    pollLog();
+    pollOta();
+    startPolling();
+  });
 }
 
 /* ---------------- OTA ---------------- */
 
+function selectedDevice() {
+  return state.devices.find((d) => d.dev_id === state.selected) || null;
+}
+
+function fmtVersion(v) {
+  if (!v) return "未知";
+  const s = String(v);
+  return /^v/i.test(s) ? s : "v" + s;
+}
+
+function formatBytes(n) {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024) return (v / (1024 * 1024)).toFixed(1) + " MB";
+  if (v >= 1024) return Math.round(v / 1024) + " KB";
+  return v + " B";
+}
+
+/** 从 ota_*.bin 文件名里取版本号，作为镜像描述读取失败时的兜底。 */
+function otaVersionFromName(name) {
+  const base = String(name || "").split(/[\\/]/).pop();
+  const m = /_v([0-9][0-9A-Za-z.\-]*)\.bin$/i.exec(base);
+  return m ? m[1] : "";
+}
+
+/** 读 ESP-IDF app descriptor 里的 version 字段（0x20 + 16，32 字节）。 */
+function parseOtaVersion(buffer) {
+  if (!buffer || buffer.byteLength < 0x50) return "";
+  const raw = new Uint8Array(buffer, 0x30, 32);
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === 0) break;
+    if (raw[i] < 0x20 || raw[i] > 0x7e) return "";
+    out += String.fromCharCode(raw[i]);
+  }
+  return out.trim();
+}
+
+/** 前端预检：与后端 /api/ota 的 app-only 校验保持一致，后端仍是最终裁决。 */
+function localOtaImageError(buffer, size) {
+  if (!buffer) return "无法读取文件内容，请重新选择";
+  if (size < 0x30) return "文件过小，不是完整的 ESP32 固件镜像";
+  const b = new Uint8Array(buffer);
+  if (b[0] !== 0xe9) return "不是 ESP32 固件镜像（缺少 0xE9 文件头）";
+  if (!(b[32] === 0x32 && b[33] === 0x54 && b[34] === 0xcd && b[35] === 0xab)) {
+    return "这是整片 merged 包或其他镜像；OTA 只能刷 app-only 的 ota_*.bin";
+  }
+  return "";
+}
+
+async function sha256Hex(buffer) {
+  if (!(window.crypto && crypto.subtle)) return "";
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function otaPaneStep(ota) {
+  if (!ota) return "pick";
+  if (["starting", "uploading"].includes(ota.status)) return "upload";
+  if (["done", "error", "cancelled"].includes(ota.status)) return "result";
+  return state.otaStep === "confirm" ? "confirm" : "check";
+}
+
+function showOtaPane(step) {
+  $$("#otaModal .ota-pane").forEach((p) => { p.hidden = p.dataset.pane !== step; });
+  const order = ["pick", "check", "confirm", "upload"];
+  const activeIdx = step === "result" ? 3 : Math.max(0, order.indexOf(step));
+  $$("#otaModal .ota-step-dot").forEach((d) => {
+    const i = order.indexOf(d.dataset.step);
+    d.classList.toggle("active", i === activeIdx);
+    d.classList.toggle("done", i < activeIdx);
+  });
+}
+
 function renderOta() {
-  const card = $("#otaCard");
+  const modal = $("#otaModal");
   const ota = state.ota;
   if (!ota) {
-    card.hidden = true;
-    state.otaFile = null;
-    $("#btnOtaStart").hidden = true;
+    // The wizard's first step ("pick") has no OTA session yet.  Closing here
+    // would make openOtaWizard() hide the modal it just opened, so the OTA
+    // button looked dead on a fresh app.
+    if (state.otaStep === "pick" && modal && !modal.hidden) {
+      showOtaPane("pick");
+      applyOtaLock();
+      return;
+    }
+    state.otaStep = null;
+    if (modal && !modal.hidden) closeOtaWizard();
     applyOtaLock();
     return;
   }
-  card.hidden = false;
 
-  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  const step = otaPaneStep(ota);
+  state.otaStep = step;
+  showOtaPane(step);
+
+  const sel = selectedDevice();
   const connected = !!(sel && sel.connected);
 
-  const shaLine = (ota.sha256 && ota.status !== "error")
-    ? ` · SHA256 ${ota.sha256}` : "";
+  /* 1 / 2. 选择文件与校验 */
+  $("#otaCheckName").textContent = ota.filename || "—";
+  $("#otaCheckSize").textContent = formatBytes(ota.total);
+  const checking = ota.status === "checking";
+  $("#otaCheckSha").textContent = ota.sha256
+    || (checking ? "计算中…" : "本机无法计算（将由主机与设备校验）");
+  const bad = ota.status === "invalid";
+  $("#otaCheckState").textContent = bad
+    ? "校验未通过" : checking ? "正在校验…" : "校验通过";
+  $("#otaCheckState").className = "ota-check-state " + (bad ? "bad" : ota.status === "ready" ? "ok" : "");
+  $("#otaCheckError").hidden = !bad;
+  $("#otaCheckError").textContent = ota.imageError || "";
+  $("#btnOtaNext").disabled = ota.status !== "ready";
+
+  /* 3. 确认页：设备名 + 当前版本 → 新版本 + 不可断电提示 */
+  const devName = (state.cfg && state.cfg.name) || (sel && sel.name) || state.selected || "—";
+  $("#otaConfirmDevice").textContent = `${devName}${connected ? " · 已连接" : " · 未连接"}`;
+  const currentVersion = (sel && sel.fw && sel.fw.version)
+    || (state.cfg && state.cfg.fw && state.cfg.fw.version) || "";
+  $("#otaConfirmVersions").textContent =
+    `${fmtVersion(currentVersion)} → ${ota.version ? fmtVersion(ota.version) : "文件名未标注"}`;
+  $("#otaConfirmFile").textContent = `${ota.filename || "—"} · ${formatBytes(ota.total)}`;
+  $("#otaConfirmSha").textContent = ota.sha256 || "—";
+  $("#btnOtaStart").disabled = !connected;
+
+  /* 4. 上传 / 结果 */
+  const shaLine = ota.sha256 ? ` · SHA256 ${ota.sha256}` : "";
   if (ota.status === "done") {
-    $("#otaStatusText").textContent = "升级成功";
-    $("#otaFileLine").innerHTML = `<span class="ok">${escapeHtml(ota.filename || "")} · ${ota.total} bytes</span> · 设备即将重启`;
-    $("#otaProgressBar").style.width = "100%";
-    $("#btnOtaStart").hidden = true;
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "关闭";
-    $("#otaHint").textContent = "升级成功，设备即将重启。重启后将自动重新连接。";
+    $("#otaResultTitle").textContent = "升级成功";
+    $("#otaResultTitle").className = "ota-result-title ok";
+    $("#otaResultDetail").textContent = `${ota.filename || ""} · ${formatBytes(ota.total)} · 设备即将重启`;
+    $("#otaResultHint").textContent = ota.sha256
+      ? `SHA256 ${ota.sha256}。重启后会自动重连；若 60 秒内未恢复，请检查设备电源。`
+      : "重启后会自动重连；若 60 秒内未恢复，请检查设备电源。";
+    $("#btnOtaRetry").hidden = true;
+    $("#btnOtaDone").textContent = "完成";
   } else if (ota.status === "error") {
-    $("#otaStatusText").textContent = "失败";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
-    $("#otaProgressBar").style.width = "0%";
-    $("#btnOtaStart").hidden = true;
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "关闭";
-    $("#otaHint").textContent = (ota.error || "未知错误")
-      + (ota.sha256 ? `（所选文件 SHA256 ${ota.sha256}，请与发布页 WS-279 核对）` : "");
-  } else if (ota.status === "uploading") {
-    $("#otaStatusText").textContent = "上传中";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
-    $("#otaProgressBar").style.width = ota.percent + "%";
-    $("#btnOtaStart").hidden = true;
-    // Cancel sends CMD:OTA_CANCEL so the device aborts and keeps the old image.
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "取消升级";
-    const acked = ota.acked != null ? ota.acked : ota.sent;
-    $("#otaHint").textContent =
-      `${acked} / ${ota.total} bytes (${ota.percent}%) · 已确认字节 · 升级中请勿断电`;
-  } else if (ota.status === "starting") {
-    $("#otaStatusText").textContent = "启动中";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
-    $("#otaProgressBar").style.width = "0%";
-    $("#btnOtaStart").hidden = true;
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "取消升级";
-    $("#otaHint").textContent = "正在进入 OTA 模式…";
+    $("#otaResultTitle").textContent = "升级失败";
+    $("#otaResultTitle").className = "ota-result-title bad";
+    $("#otaResultDetail").textContent = ota.error || "未知错误";
+    $("#otaResultHint").textContent = ota.sha256
+      ? `所选文件 SHA256 ${ota.sha256}，请与固件发布页核对后再重试。`
+      : "请确认设备已连接、固件与设备型号匹配后重试。";
+    $("#btnOtaRetry").hidden = !state.otaFile;
+    $("#btnOtaDone").textContent = "关闭";
   } else if (ota.status === "cancelled") {
-    $("#otaStatusText").textContent = "已取消";
-    $("#otaProgressBar").style.width = "0%";
-    $("#btnOtaStart").hidden = true;
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "关闭";
-    $("#otaHint").textContent = "升级已取消，设备保持原固件。";
-  } else {
-    // idle: file selected, waiting for user to click "开始升级"
-    $("#otaStatusText").textContent = "就绪";
-    $("#otaFileLine").textContent = `${escapeHtml(ota.filename || "")} · ${ota.total} bytes${shaLine}`;
-    $("#otaProgressBar").style.width = "0%";
-    $("#btnOtaStart").hidden = false;
-    $("#btnOtaCancel").hidden = false;
-    $("#btnOtaCancel").textContent = "取消";
-    $("#otaHint").textContent = connected
-      ? (ota.sha256
-          ? `SHA256 ${ota.sha256}（请与发布页 WS-279 核对），点击「开始升级」推送`
-          : "点击「开始升级」推送固件（分块传输，约需 1-3 分钟）")
-      : "设备未连接，无法 OTA";
-    $("#btnOtaStart").disabled = !connected;
+    $("#otaResultTitle").textContent = "已取消";
+    $("#otaResultTitle").className = "ota-result-title";
+    $("#otaResultDetail").textContent = `${ota.filename || ""} · 设备保持原固件`;
+    $("#otaResultHint").textContent = "已发送取消指令；若设备仍在 OTA 模式，会在 30 秒内自动中止。";
+    $("#btnOtaRetry").hidden = !state.otaFile;
+    $("#btnOtaDone").textContent = "关闭";
   }
+
+  const acked = ota.acked != null ? ota.acked : ota.sent != null ? ota.sent : 0;
+  $("#otaStatusText").textContent =
+    ota.status === "starting" ? "启动中" : ota.status === "uploading" ? "上传中" : "准备中";
+  $("#otaFileLine").textContent = `${ota.filename || ""} · ${formatBytes(ota.total)}${shaLine}`;
+  $("#otaProgressBar").style.width = (ota.percent || 0) + "%";
+  $("#otaHint").textContent = ota.status === "starting"
+    ? "正在进入 OTA 模式…"
+    : `${acked} / ${ota.total || 0} bytes（${ota.percent || 0}%）已确认 · 升级中请勿断电`;
+
   applyOtaLock();
 }
 
 /* OTA lock: while firmware is being written the deck's configuration and
    device commands are frozen — a concurrent CFG:/CMD: write would interleave
-   with the binary stream and corrupt the image. */
+   with the binary stream and corrupt the image.
+   入口按钮不锁：关闭向导后仍可用它重新打开查看进度。 */
 function otaBusy() {
   return !!(state.ota && (state.ota.status === "starting" || state.ota.status === "uploading"));
 }
 
 function applyOtaLock() {
   const busy = otaBusy();
-  ["btnApply", "btnOta", "btnPing", "btnRefresh", "btnPortal", "btnReboot", "btnClearBond",
+  ["btnApply", "btnPing", "btnRefresh", "btnPortal", "btnReboot", "btnClearBond",
    "btnSysRefresh"]
     .forEach((id) => {
       const el = $("#" + id);
       if (el) el.disabled = busy;
     });
-  // WS-409: 「以设备为准」按钮是运行时动态生成的，OTA 期间同样要锁住。
+  // 「以设备为准」按钮是运行时动态生成的，OTA 期间同样要锁住。
   $$(".accept-device-value").forEach((el) => {
     el.disabled = busy;
   });
 }
 
 async function pollOta() {
-  if (!state.selected) return;
-  // Terminal (done / error) and idle states do not need polling: the server
-  // pops a finished task on its first read, so polling again would 404 and
-  // wipe the result card the user needs to see.
-  if (!state.ota || ["idle", "done", "error", "cancelled"].includes(state.ota.status)) return;
+  if (!state.selected || !otaBusy()) return;
   try {
     const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/progress`);
     if (!r.ok) {
       // The server no longer has the task (app restarted or device gone).
+      state.ota = Object.assign({}, state.ota, {
+        status: "error",
+        error: "连接中断，请重试",
+      });
+      state.otaStep = "result";
       toast("连接中断，请重试", "bad");
-      state.ota.status = "error";
-      state.ota.error = "连接中断，请重试";
       renderOta();
       return;
     }
-    state.ota = {
+    state.ota = Object.assign({}, state.ota, {
       status: r.status,
       sent: r.sent,
       acked: r.acked != null ? r.acked : r.sent,
       total: r.total,
       percent: r.percent,
       error: r.error,
-      filename: r.filename,
-    };
+      filename: r.filename || state.ota.filename,
+    });
+    state.otaStep = ["done", "error", "cancelled"].includes(r.status) ? "result" : "upload";
     if (r.status === "done") {
       toast("升级成功，设备即将重启", "ok");
     } else if (r.status === "error") {
@@ -2477,68 +2933,186 @@ async function pollOta() {
   }
 }
 
-function openOtaPicker() {
-  if (otaBusy()) {
-    toast("OTA 进行中", "bad");
-    return;
+/* ---------- OTA wizard: 选择 → 校验 → 确认 → 上传 / 结果 ---------- */
+
+async function handleOtaFile(file) {
+  if (!file) return;
+  const otaObj = {
+    status: "checking",
+    sent: 0,
+    acked: 0,
+    total: file.size,
+    percent: 0,
+    error: "",
+    imageError: "",
+    filename: file.name,
+    sha256: "",
+    version: otaVersionFromName(file.name),
+  };
+  state.ota = otaObj;
+  state.otaFile = file;
+  state.otaStep = "check";
+  renderOta();
+
+  let buffer = null;
+  try {
+    buffer = await file.arrayBuffer();
+  } catch (_) {
+    /* 读取失败按校验失败处理 */
   }
-  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  // 用户在这期间换了文件：丢弃这次结果。
+  if (state.ota !== otaObj) return;
+
+  let error = "";
+  if (!/^ota_[^/\\]+\.bin$/i.test(file.name)) {
+    error = "文件名必须以 ota_ 开头、以 .bin 结尾（app-only 固件）";
+  } else {
+    error = localOtaImageError(buffer, file.size);
+  }
+  let sha = "";
+  if (buffer) {
+    try {
+      sha = await sha256Hex(buffer);
+    } catch (_) {
+      /* 环境不支持时由后端与设备校验 */
+    }
+  }
+  if (state.ota !== otaObj) return;
+
+  otaObj.sha256 = sha;
+  otaObj.imageError = error;
+  otaObj.version = parseOtaVersion(buffer) || otaObj.version;
+  otaObj.status = error ? "invalid" : "ready";
+  renderOta();
+}
+
+function syncModalOpenClass() {
+  const help = $("#helpModal");
+  const ota = $("#otaModal");
+  document.body.classList.toggle("modal-open",
+    !!((help && !help.hidden) || (ota && !ota.hidden)));
+}
+
+function closeOtaWizard() {
+  const modal = $("#otaModal");
+  if (!modal || modal.hidden) return;
+  modal.hidden = true;
+  syncModalOpenClass();
+}
+
+function openOtaWizard() {
+  const sel = selectedDevice();
   if (!sel || !sel.connected) {
     toast("设备未连接，无法 OTA", "bad");
     return;
   }
+  if (otaBusy()) {
+    state.otaStep = "upload";
+  } else if (!state.ota) {
+    state.otaStep = "pick";
+  } else if (["done", "error", "cancelled"].includes(state.ota.status)) {
+    state.otaStep = "result";
+  } else if (state.ota.status === "ready" && state.otaStep === "confirm") {
+    state.otaStep = "confirm";
+  } else {
+    state.otaStep = "check";
+  }
+  const modal = $("#otaModal");
+  modal.hidden = false;
+  syncModalOpenClass();
+  renderOta();
+  $("#btnOtaClose").focus();
+}
+
+function resetOta() {
+  state.ota = null;
+  state.otaFile = null;
+  state.otaStep = null;
+  renderOta();
+  closeOtaWizard();
+}
+
+function retryOta() {
+  if (!state.otaFile) {
+    state.ota = null;
+    state.otaStep = "pick";
+    renderOta();
+    return;
+  }
+  state.ota = Object.assign({}, state.ota, {
+    status: "ready",
+    error: "",
+    sent: 0,
+    acked: 0,
+    percent: 0,
+  });
+  state.otaStep = "confirm";
+  renderOta();
+}
+
+function bindOtaWizard() {
+  const modal = $("#otaModal");
+  const closeBtn = $("#btnOtaClose");
+  if (!modal || !closeBtn) return;
+
   const input = document.createElement("input");
   input.type = "file";
   input.accept = ".bin";
-  input.onchange = async () => {
-    const file = input.files[0];
-    if (!file) return;
-    const name = file.name.toLowerCase();
-    // Front-end half of the app-only check; the server repeats it before the
-    // push and the firmware validates the image header again.
-    if (!name.endsWith(".bin") || !name.startsWith("ota_")) {
-      toast("请选择 app-only 固件（ota_*.bin），不要用 merged 整片包", "bad");
-      return;
-    }
-    state.otaFile = file;
-    const otaObj = {
-      status: "idle",
-      sent: 0,
-      total: file.size,
-      percent: 0,
-      error: "",
-      filename: file.name,
-      sha256: "",
-    };
-    state.ota = otaObj;
-    renderOta();
-    // Compute the local SHA256 so the user can compare it against the release
-    // page (WS-279) before pushing — a mismatch here is exactly the "device
-    // verify failed" root cause we now guard against.
-    if (file.arrayBuffer && crypto && crypto.subtle) {
-      file.arrayBuffer().then((buf) => crypto.subtle.digest("SHA-256", buf))
-        .then((h) => {
-          const hex = [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
-          otaObj.sha256 = hex;
-          if (state.ota === otaObj) state.ota.sha256 = hex;
-          renderOta();
-        })
-        .catch(() => {});
-    }
+  input.hidden = true;
+  input.onchange = () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (file) handleOtaFile(file);
   };
-  input.click();
+  document.body.appendChild(input);
+
+  const pick = () => {
+    input.value = "";
+    input.click();
+  };
+
+  $("#btnOta").onclick = openOtaWizard;
+  closeBtn.onclick = () => closeOtaWizard();
+  $("#btnOtaPick").onclick = pick;
+  $("#btnOtaRepick").onclick = pick;
+  $("#btnOtaNext").onclick = () => {
+    if (!state.ota || state.ota.status !== "ready") return;
+    state.otaStep = "confirm";
+    renderOta();
+  };
+  $("#btnOtaBack").onclick = () => {
+    state.otaStep = "check";
+    renderOta();
+  };
+  $("#btnOtaStart").onclick = startOta;
+  $("#btnOtaCancel").onclick = cancelOta;
+  $("#btnOtaRetry").onclick = retryOta;
+  $("#btnOtaDone").onclick = resetOta;
+
+  modal.onclick = (e) => {
+    if (e.target === modal) closeOtaWizard();
+  };
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || modal.hidden) return;
+    closeOtaWizard();
+    e.stopImmediatePropagation();
+  });
 }
 
 async function startOta() {
-  const sel = state.devices.find((d) => d.dev_id === state.selected);
+  const sel = selectedDevice();
   if (!sel || !sel.connected) {
     toast("设备未连接，无法 OTA", "bad");
     return;
   }
-  if (!state.otaFile) {
-    toast("请选择固件文件", "bad");
+  if (!state.ota || state.ota.status !== "ready" || !state.otaFile) {
+    toast("请先完成文件校验", "bad");
     return;
   }
+  const btn = $("#btnOtaStart");
+  btn.disabled = true;
+  btn.classList.add("loading");
+  btn.setAttribute("aria-busy", "true");
   const form = new FormData();
   form.append("file", state.otaFile);
   try {
@@ -2548,41 +3122,48 @@ async function startOta() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) {
-      toast(data.error || "OTA 启动失败", "bad");
-      state.ota = null;
-      state.otaFile = null;
+      const message = data.error || "OTA 启动失败";
+      toast(message, "bad");
+      // 失败留在结果页：保留已选文件，方便直接重试。
+      state.ota = Object.assign({}, state.ota, { status: "error", error: message });
+      state.otaStep = "result";
       renderOta();
       return;
     }
-    state.ota = {
+    state.ota = Object.assign({}, state.ota, {
       status: "starting",
       sent: 0,
+      acked: 0,
       total: data.total,
       percent: 0,
       error: "",
-      filename: data.filename,
-      sha256: data.sha256 || (state.ota && state.ota.sha256) || "",
-    };
+      filename: data.filename || state.ota.filename,
+      sha256: data.sha256 || state.ota.sha256 || "",
+    });
+    state.otaStep = "upload";
     renderOta();
   } catch (e) {
-    toast("OTA 启动失败: " + (e.message || e), "bad");
-    state.ota = null;
-    state.otaFile = null;
+    const message = "OTA 启动失败：" + (e.message || e);
+    toast(message, "bad");
+    state.ota = Object.assign({}, state.ota, { status: "error", error: message });
+    state.otaStep = "result";
     renderOta();
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("loading");
+    btn.removeAttribute("aria-busy");
   }
 }
 
 async function cancelOta() {
-  if (state.ota && ["done", "error", "cancelled"].includes(state.ota.status)) {
-    state.ota = null;
-    state.otaFile = null;
-    renderOta();
+  if (!state.ota || ["done", "error", "cancelled"].includes(state.ota.status)) {
+    resetOta();
     return;
   }
   // In-progress cancel: ask the server to stop the push and tell the device
   // to abort (CMD:OTA_CANCEL), so the device leaves OTA mode immediately
   // instead of waiting for its 30 s inter-chunk timeout.
-  if (state.ota && state.selected && otaBusy()) {
+  if (state.selected && otaBusy()) {
     try {
       const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/cancel`, { method: "POST" });
       if (r.sent === false) {
@@ -2593,10 +3174,12 @@ async function cancelOta() {
     } catch (e) {
       toast("取消失败：" + (e.message || e), "bad");
     }
+    state.ota = Object.assign({}, state.ota, { status: "cancelled" });
+    state.otaStep = "result";
+    renderOta();
+    return;
   }
-  state.ota = null;
-  state.otaFile = null;
-  renderOta();
+  resetOta();
 }
 
 init();
