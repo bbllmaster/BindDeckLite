@@ -1,5 +1,5 @@
 /**
- * 日志面板「跟随 / 暂停」的纯逻辑（WS-470）。
+ * 日志面板「跟随 / 暂停」的纯逻辑。
  *
  * 只放与 DOM 无关的判定与计算，浏览器与 Node 共用：UMD 形态，浏览器挂
  * window.LogFollow，Node 走 module.exports，测试无需 mock DOM。
