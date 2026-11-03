@@ -1037,6 +1037,10 @@ def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
     return {
         "name": name,
         "chip": chip,
+        # WS-512: these are *host defaults*, not what the deck currently holds
+        # — a new archive has never read the device, so the UI must say so
+        # before anything is applied on top of the real configuration.
+        "trusted": False,
         # WS-499: a new deck is an encoder deck (10 inputs) until it says
         # otherwise, so the shipped card count does not change.
         "layout": LAYOUT_ENCODER,
@@ -1068,6 +1072,11 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
                 cfg["chip"] = chip
             if name:
                 cfg["name"] = name
+            # WS-512: an archive written before this field existed was filled
+            # by an explicit read / apply, so it is trusted.  ``setdefault``
+            # only fills the in-memory copy — a legacy config.json must not be
+            # rewritten just because someone opened the page.
+            cfg.setdefault("trusted", True)
         # WS-503: historical devices only have 10 key entries (v1.3.6). Pad on
         # every access so apply/read-back/UI all see the same 12-entry list.
         ensure_key_items(cfg)
@@ -1777,8 +1786,18 @@ def apply_device(dev_id: str) -> dict:
             if not ok_layout:
                 add_event("cfg", "布局未生效：设备回报 " + actual_layout, dev_id, "warn")
 
+        ok_all = all(i["status"] == "ok" for i in items)
+        # WS-512: only an apply whose every field read back with the value we
+        # sent makes the archive trustworthy.  A rejected / unconfirmed /
+        # unverified field (old firmware cannot be verified at all) leaves the
+        # flag exactly as it was.
+        if ok_all:
+            with _lock:
+                cfg["trusted"] = True
+                save_config()
+
         return {
-            "ok": all(i["status"] == "ok" for i in items),
+            "ok": ok_all,
             "results": results,
             "items": items,
         }
@@ -1913,6 +1932,11 @@ def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
             if field in values and not _apply_cfg_field(merged, field, values[field]):
                 return {"ok": False, "cfg": None, "fields": fields, "at": at,
                         "reason": "设备回报的配置无法解析"}
+        # WS-512: every tracked group came back and parsed, so the archive is
+        # what the deck actually runs — the banner can go away.  A partial
+        # answer returned above and keeps the untrusted flag untouched.
+        if fields.get("pins") or fields.get("keys"):
+            merged["trusted"] = True
         cfg.clear()
         cfg.update(merged)
         save_config()
@@ -3737,6 +3761,9 @@ def api_config(dev_id):
     data = request.get_json(silent=True) or {}
     cfg = device_cfg(dev_id)
     with _lock:
+        # WS-512: ``trusted`` is deliberately absent — it is a fact about what
+        # the host has read from the deck, never something the draft-save can
+        # set or clear (an old front-end echoing the whole cfg must not do it).
         for field in ("pins", "keys", "encoder", "sleep", "tz", "name", "layout"):
             if field in data:
                 cfg[field] = data[field]

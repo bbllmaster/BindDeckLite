@@ -97,6 +97,12 @@ const state = {
   scan: null,          // 最近一次扫描的结论，来源 /api/status
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段
+  // WS-512：本机没有存档（cfg.trusted === false）时，用户点了「先忽略」的设备。
+  // 只作用于本次会话，不写 config、不清 trusted、不影响下发确认。
+  untrustedIgnored: {},
+  // WS-512：本次会话里成功从设备读取过的设备。下发确认用它避免重复骚扰；
+  // 它不同于 trusted（trusted 会落盘，会话读取只活在内存）。
+  sessionRead: {},
   sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
   pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors
@@ -375,6 +381,8 @@ async function pollStatus() {
             renderEncoder();
             renderPins();
             renderDeviceMeta();
+            // WS-512：预览模式没有「这台设备」，不显示无存档提示条。
+            renderUntrustedBanner();
           } catch (_) {
             /* ignore */
           }
@@ -396,6 +404,8 @@ async function pollStatus() {
       loadSysinfo(state.selected);
     }
     state.selectedConnected = nowConnected;
+    // WS-512：连接状态变了，「从设备读取」的可用性跟着变。
+    renderUntrustedBanner();
     // 连接状态变化时重绘卡片：断开后必须出现「已断开，非实时」。
     if (state.selected && wasConnected !== nowConnected) renderSysinfo();
     const connected = state.devices.filter((d) => d.connected).length;
@@ -591,6 +601,7 @@ async function selectDevice(devId) {
     if (!b.applied) b.applied = snapshotCfg(state.cfg);
     updatePendingUi();
     renderOta();
+    renderUntrustedBanner();
     if (b.lastResult) renderApplyResults(b.lastResult);
     loadSysinfo(devId);
     probeDeviceLayout(devId);
@@ -616,6 +627,7 @@ async function selectDevice(devId) {
     bucket.lastResult = null;
     setDirty(false);
     renderOta();
+    renderUntrustedBanner();
     // 切换设备后按设备各自采样，不与上一台的缓存混用。
     loadSysinfo(devId);
     // 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
@@ -1294,6 +1306,9 @@ async function probeDeviceLayout(devId) {
       }
     }
     updatePendingUi();
+    // 布局探测只更新布局（绝不置 trusted）；提示条里的「按键布局已从设备读取」
+    // 依赖 layout_supported，所以重绘一次。
+    renderUntrustedBanner();
   } catch (_) {
     /* 旧后端或链路异常：布局维持本地配置，不影响其他功能 */
   }
@@ -1689,6 +1704,15 @@ async function applyConfig() {
     focusFirstPinError(pinErrors);
     return;
   }
+  // WS-512：本机没有这台设备的存档，界面里就是默认值。下发会覆盖设备当前的
+  // 引脚 / 键码 / 编码器模式 / 休眠，所以先确认一次；取消时一条 CFG: 都不发
+  // （在 saveConfigFor / /api/apply 之前 return）。
+  if (cfg.trusted === false && !state.sessionRead[devId]) {
+    const go = window.confirm(
+      "本机没有这台设备的配置存档，界面里的引脚与键码是默认值。" +
+      "继续会覆盖设备当前的引脚、键码、编码器模式与休眠设置。仍要下发吗？");
+    if (!go) return;
+  }
   await saveConfigFor(devId, cfg);
   try {
     const r = await api(`/api/apply/${encodeURIComponent(devId)}`, { method: "POST" });
@@ -1704,6 +1728,12 @@ async function applyConfig() {
     // New contract: per-item readback results.
     if (r.items && r.items.length) {
       const allOk = r.ok && r.items.every((i) => i.status === "ok");
+      if (allOk) {
+        // WS-512：全部字段回读生效 = 本机存档就是设备现状，提示条可以收起了。
+        cfg.trusted = true;
+        state.sessionRead[devId] = true;
+        renderUntrustedBanner();
+      }
       recordApply(r.items, allOk);
       if (allOk) {
         toast("配置已生效", "ok");
@@ -1903,6 +1933,8 @@ async function readDeviceConfig(devId) {
     if (state.selected !== devId) return null;
     state.readStatus[devId] = { at: r.at, fields: r.fields || {}, ok: !!r.ok };
     renderReadStatus();
+    // WS-512：读失败 / 只回部分字段时提示条不动，但可能要把「缺少 xx」写出来。
+    renderUntrustedBanner();
     if (!r.ok) {
       // 表单与本地配置都不动，但用户原本的修改仍要能存下去。
       if (wasDirty) armPendingSave();
@@ -1910,6 +1942,8 @@ async function readDeviceConfig(devId) {
       return r;
     }
     applyReadback(r);
+    // WS-512：本次会话确实从设备读到过配置 → 后面的下发不再重复确认。
+    state.sessionRead[devId] = true;
     return r;
   } catch (e) {
     if (wasDirty) armPendingSave();
@@ -1934,6 +1968,7 @@ function applyReadback(r) {
   renderPins();
   renderDeviceMeta();
   renderReadStatus();
+  renderUntrustedBanner();
   const got = readFieldCount(r.fields);
   toast(`已读取设备配置（${fmtClock(r.at)}）· ${got}/${READ_FIELDS.length} 项`, "ok");
 }
@@ -1957,6 +1992,51 @@ function renderReadStatus() {
     text += " · " + missing.map((k) => `${READ_FIELD_LABELS[k]} 设备未回报`).join("、");
   }
   el.textContent = text;
+}
+
+/**
+ * WS-512：本机没有这台设备的配置存档时，在页签下方常驻一条琥珀色提示。
+ *
+ * 判据只看设备自己的 `trusted` 字段（服务端决定）：新条目为 false，读取成功
+ * 或下发全部生效后才是 true；旧 config.json 没有该字段 → undefined，按可信
+ * 处理，不打扰存量用户。预览模式（未选中设备）不显示。
+ */
+function renderUntrustedBanner() {
+  const el = $("#untrustedBanner");
+  if (!el) return;
+  const devId = state.selected;
+  const cfg = state.cfg || {};
+  const show = !!(devId && !state.preview && cfg.trusted === false &&
+    !state.untrustedIgnored[devId]);
+  el.hidden = !show;
+  if (!show) return;
+
+  // 布局是唯一一项从设备读回来的字段（WS-499 探测）；探测确实回了才这么说，
+  // 不回就老实承认布局也是本机默认值。
+  const note = $("#untrustedLayoutNote");
+  if (note) note.textContent = cfg.layout_supported === true ? "（按键布局已从设备读取）" : "";
+
+  // 旧固件只回部分字段：读取状态里缺哪几组就点名，并说明表单仍是默认值。
+  const st = state.readStatus[devId];
+  const extra = $("#untrustedExtra");
+  const missing = st && st.at ? READ_FIELDS.filter((k) => !(st.fields || {})[k]) : [];
+  if (extra) {
+    const partial = missing.length > 0 && missing.length < READ_FIELDS.length;
+    extra.hidden = !partial;
+    extra.textContent = partial
+      ? "读取不完整：缺少 " + missing.map((k) => READ_FIELD_LABELS[k]).join("、")
+      : "";
+  }
+
+  // 未连接 / OTA 中都不能读；title 说明原因，而不是给一个点了没反应的按钮。
+  const read = $("#btnUntrustedRead");
+  if (read) {
+    const connected = !!state.selectedConnected;
+    read.disabled = !connected || otaBusy();
+    read.title = !connected ? "设备未连接，无法读取"
+      : otaBusy() ? "OTA 进行中，读取已锁定"
+        : "从设备读取引脚 / 键码 / 编码器模式 / 休眠";
+  }
 }
 
 /**
@@ -2652,6 +2732,16 @@ async function init() {
   };
   // 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
   $("#btnRefresh").onclick = () => readDeviceConfig(state.selected);
+  // WS-512：提示条上的「从设备读取」复用同一条回读路径 —— OTA 锁与「有未下发
+  // 修改」的确认都在 readDeviceConfig 里，不另起一套。
+  $("#btnUntrustedRead").onclick = () => readDeviceConfig(state.selected);
+  // 「先忽略」只关掉本次会话的提示条：不写 config、不清 trusted、也不解除
+  // 「应用配置」前的覆盖确认（那条判断看的是 trusted 与 sessionRead）。
+  $("#btnUntrustedIgnore").onclick = () => {
+    if (!state.selected) return;
+    state.untrustedIgnored[state.selected] = true;
+    renderUntrustedBanner();
+  };
   $("#btnPortal").onclick = () => devAction(
     "portal",
     "设备将重启进入配网模式",
@@ -2895,6 +2985,8 @@ function applyOtaLock() {
   $$(".accept-device-value").forEach((el) => {
     el.disabled = busy;
   });
+  // WS-512：提示条的「从设备读取」自己判断连接/OTA，这里只让它重算一次状态。
+  renderUntrustedBanner();
 }
 
 async function pollOta() {
