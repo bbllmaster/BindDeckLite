@@ -192,7 +192,25 @@ function openPage() {
   }
   class FakeFormData {
     constructor(form) {
+      // 浏览器语义（successful controls）：disabled 的表单控件不会被
+      // FormData 收集。WS-522 M1 的根因就是先 fw.disabled=true 再构造
+      // FormData，请求体里于是没有 firmware 字段；这条断言让那个顺序
+      // 在测试里立刻失败，而不是悄悄发一个只有结尾 boundary 的空 body。
+      const fw = document.getElementById("fw");
+      assert.equal(
+        fw.disabled,
+        false,
+        "FormData 必须在禁用控件之前构造，否则请求体里没有 firmware 字段（M1）",
+      );
       this.form = form;
+      this.entries = [];
+      if (!fw.disabled && fw.files && fw.files.length) {
+        this.entries.push(["firmware", fw.files[0]]);
+      }
+    }
+    get(name) {
+      const hit = this.entries.find(([k]) => k === name);
+      return hit ? hit[1] : null;
     }
   }
   const run = new Function(
@@ -454,4 +472,112 @@ test("「重新选择固件」清空 input、隐藏进度与结果并回阶段 1
 test("非 JS 兜底：form 的 method/action/enctype 与字段名保持不变", () => {
   assert.match(SOURCE, /<form method='POST' action='\/update' enctype='multipart\/form-data' id='otaForm'>/);
   assert.match(SOURCE, /name='firmware'/);
+});
+
+// --- WS-522 重做（round 1）------------------------------------------------
+
+test("M1：请求体里带上 firmware 文件字段（FormData 先于禁用构造）", () => {
+  const page = openPage();
+  pickFile(page, "ota_test.bin", 120000);
+  const xhr = submit(page);
+
+  assert.ok(xhr.body, "必须调用 xhr.send");
+  assert.ok(Array.isArray(xhr.body.entries), "send 的参数必须是由表单构造的 FormData");
+  assert.equal(xhr.body.entries.length, 1, "请求体不能是空 body");
+  const file = xhr.body.get("firmware");
+  assert.ok(file, "请求体必须含 name='firmware' 的文件字段");
+  assert.equal(file.name, "ota_test.bin");
+  assert.equal(file.size, 120000);
+  // 文件已经交给 FormData 之后，控件仍然要禁用以防中途换文件。
+  assert.equal(page.el("fw").disabled, true);
+});
+
+test("N3：busy 期间第二次 submit 被丢弃，不会发出第二个 XHR", () => {
+  const page = openPage();
+  pickFile(page);
+  submit(page);
+
+  let prevented = false;
+  page.el("otaForm").fire("submit", {
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(prevented, true);
+  assert.equal(page.xhrs.length, 1, "升级进行中不能再提交一次");
+
+  // 结果出来（busy 复位）后可以正常重来。
+  page.el("otaRetry").fire("click");
+  pickFile(page);
+  submit(page);
+  assert.equal(page.xhrs.length, 2);
+});
+
+test("N1：没有 lengthComputable 时，写入阶段把进度条抬到 100%", () => {
+  const page = openPage();
+  pickFile(page, "ota_c3.bin", 4194304);
+  const xhr = submit(page);
+  // 浏览器没给 total：onprogress 里 lengthComputable=false 直接 return，
+  // 内联宽度停在 0%，只加 indet 类改变不了它。
+  assert.equal(page.el("otaBar").style.width, "0%");
+
+  xhr.finishUpload();
+  assert.equal(page.el("otaBar").classList.contains("indet"), true);
+  assert.equal(page.el("otaBar").style.width, "100%");
+});
+
+test("S1：gate 拒绝（X-Ota-Restart: no）不说「设备重启中」", () => {
+  const page = openPage();
+  pickFile(page);
+  const xhr = submit(page);
+  xhr.finishUpload();
+  xhr.respond({
+    text: "<p>升级未开始：flash_too_small</p><p><a href='/update'>返回</a></p>",
+    headers: {
+      "X-Ota-Result": "failed",
+      "X-Ota-Code": "flash_too_small",
+      "X-Ota-Restart": "no",
+    },
+  });
+
+  assert.equal(page.el("otaResult").classList.contains("bad"), true);
+  assert.equal(page.el("otaTitle").textContent, "升级失败");
+  assert.match(page.el("otaLine1").textContent, /merged 整片包/);
+  assert.match(page.el("otaLine2").textContent, /仍在配网模式/);
+  assert.match(page.el("otaLine2").textContent, /重新选择固件/);
+  assert.match(page.el("otaCode").textContent, /flash_too_small/);
+  assert.equal(visibleText(page).includes("重启中"), false, "设备没重启就不能这么写");
+});
+
+test("S1：设备侧 gate 分支在 send 之前回 X-Ota-Restart: no", () => {
+  const header = SOURCE.indexOf('cfgServer.sendHeader("X-Ota-Restart", "no")');
+  assert.ok(header > 0, "gate 分支必须声明 X-Ota-Restart: no");
+  const firstSend = SOURCE.indexOf('cfgServer.send(200, "text/html; charset=utf-8", msg);');
+  assert.ok(firstSend > header, "响应头必须在 send 之前排好");
+});
+
+test("S2：erase_failed 有中文映射，不再是「未知原因」", () => {
+  const page = openPage();
+  pickFile(page);
+  const xhr = submit(page);
+  xhr.finishUpload();
+  xhr.respond({
+    headers: { "X-Ota-Result": "failed", "X-Ota-Code": "erase_failed" },
+  });
+
+  assert.match(page.el("otaLine1").textContent, /擦除失败/);
+  assert.equal(page.el("otaLine1").textContent.includes("未知原因"), false);
+  assert.match(page.el("otaCode").textContent, /erase_failed/);
+});
+
+test("N2：非 JS 兜底仍能看到「升级中请勿断电」", () => {
+  const note = SOURCE.indexOf("升级中请勿断电");
+  const prog = SOURCE.indexOf("id='otaProg' hidden");
+  assert.ok(note >= 0, "页面必须保留「升级中请勿断电」提示");
+  assert.ok(prog > note, "提示必须在默认 hidden 的 #otaProg 之前，关掉 JS 也能看到");
+  assert.equal(
+    SOURCE.indexOf("升级中请勿断电", prog),
+    -1,
+    "提示不能只写在 #otaProg 里面",
+  );
 });

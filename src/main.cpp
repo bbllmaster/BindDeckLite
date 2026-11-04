@@ -1069,6 +1069,9 @@ static void setupProvisioning() {
         "<input type='file' name='firmware' id='fw' accept='.bin' required>"
         "<div class='meta' id='fwMeta' hidden></div>"
         "<button id='otaGo' type='submit'>开始升级</button></form>"
+        // WS-522 N2: this line is plain HTML on purpose — it must stay visible
+        // when JS never runs, i.e. outside the hidden #otaProg block.
+        "<p class='note'>升级中请勿断电，完成后自动重启并回到蓝牙模式。</p>"
         "<div id='otaProg' hidden>"
         "<div class='track'><div class='fill' id='otaBar'></div></div>"
         "<div class='stat' id='otaStat' aria-live='polite'></div>"
@@ -1100,7 +1103,8 @@ static void setupProvisioning() {
         "read_error:'固件写入后回读不一致',no_space:'目标分区空间不足',"
         "magic_byte:'文件不是有效的固件镜像',no_partition:'目标分区不存在',"
         "flash_too_small:'目标分区放不下，可能是把 merged 整片包当成 app-only 传了',"
-        "erase_error:'分区擦除失败',write_failed:'写入失败',"
+        "erase_error:'分区擦除失败',erase_failed:'分区擦除失败（写入后重擦重写未成功）',"
+        "write_failed:'写入失败',"
         "write_not_verified:'写入后回读校验不通过',"
         "flash_not_written:'写入的字节没有落到分区',bad_size:'固件体积不合法',"
         "stream:'上传数据流中断',md5:'MD5 校验失败',"
@@ -1143,7 +1147,16 @@ static void setupProvisioning() {
         "retry.addEventListener('click',reset);"
         "form.addEventListener('submit',function(ev){"
         "ev.preventDefault();"
+        // WS-522 N3: the controls below get disabled, but a second submit can
+        // still arrive (Enter in a text field, programmatic submit). Drop it.
+        "if(busy)return;"
         "var f=(fw.files&&fw.files.length)?fw.files[0]:null;if(!f)return;"
+        // WS-522 M1: build the body BEFORE disabling the controls. A disabled
+        // control is not a successful control, so new FormData(form) after
+        // fw.disabled=true yields an empty body: the device sees no file, never
+        // runs UPLOAD_FILE_START, still reports success and restarts having
+        // written 0 bytes.
+        "var fd=new FormData(form);"
         "var xhr=new XMLHttpRequest(),wrote=false;"
         "busy=true;fw.disabled=true;go.disabled=true;go.textContent='升级中…';"
         "prog.hidden=false;res.hidden=true;waited=0;"
@@ -1159,22 +1172,32 @@ static void setupProvisioning() {
         // Update.end() and the read-back still run on the device.
         "xhr.upload.onload=function(){"
         "if(wrote)return;wrote=true;stage(3);bar.classList.add('indet');"
+        // WS-522 N1: without lengthComputable the inline width is still 0%,
+        // and an inline width beats .fill.indet{width:100%}. Lift it explicitly
+        // or the bar looks frozen at zero all through the write phase.
+        "bar.style.width='100%';"
         "function tick(){stat.textContent='设备正在写入与校验，约 10–60 秒，"
         "请勿断电 · 已等待 '+waited+' 秒';}"
         "tick();stopWait();"
         "waitTimer=setInterval(function(){waited++;tick();},1000);};"
-        "function finish(){var r=null,c=null;"
+        "function finish(){var r=null,c=null,nr=null;"
         "try{r=xhr.getResponseHeader('X-Ota-Result');"
-        "c=xhr.getResponseHeader('X-Ota-Code');}catch(e){r=null;c=null;}"
+        "c=xhr.getResponseHeader('X-Ota-Code');"
+        "nr=xhr.getResponseHeader('X-Ota-Restart');}catch(e){r=null;c=null;nr=null;}"
         "if(r==='ok'){show('ok','升级完成，设备正在重启',"
         "'约 10 秒；热点会消失，设备随后回到蓝牙模式。','','');return;}"
-        "if(r==='failed'){show('bad','升级失败，设备重启中',reason(c),'',"
-        "c?('错误码：'+c):'');return;}"
+        // WS-522 S1: the gate branch (flash_too_small / no_partition) returns
+        // without restarting, so X-Ota-Restart: no means the device is still
+        // in the portal.
+        "if(r==='failed'){"
+        "if(nr==='no'){show('bad','升级失败',reason(c),"
+        "'设备仍在配网模式，可直接重新选择固件。',c?('错误码：'+c):'');return;}"
+        "show('bad','升级失败，设备重启中',reason(c),'',c?('错误码：'+c):'');return;}"
         "fromBody(xhr.responseText);}"
         "xhr.onload=function(){finish();};"
         "xhr.onerror=lost;xhr.ontimeout=lost;xhr.onabort=lost;"
         "xhr.open('POST','/update');"
-        "xhr.send(new FormData(form));"
+        "xhr.send(fd);"
         "});"
         "if(typeof window!=='undefined'&&window.addEventListener){"
         "window.addEventListener('beforeunload',function(e){"
@@ -1197,6 +1220,9 @@ static void setupProvisioning() {
         // is untouched so a non-JS client sees the page it always did.
         cfgServer.sendHeader("X-Ota-Result", "failed");
         cfgServer.sendHeader("X-Ota-Code", g_portalOtaError);
+        // WS-522 S1: this branch returns without ESP.restart(), so the device
+        // stays reachable in the portal. Tell the page not to claim a restart.
+        cfgServer.sendHeader("X-Ota-Restart", "no");
         g_portalOtaError = nullptr;
         g_portalOtaCode = nullptr;
         cfgServer.send(200, "text/html; charset=utf-8", msg);
