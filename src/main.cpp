@@ -1068,7 +1068,7 @@ static void setupProvisioning() {
         "<form method='POST' action='/update' enctype='multipart/form-data' id='otaForm'>"
         "<input type='file' name='firmware' id='fw' accept='.bin' required>"
         "<div class='meta' id='fwMeta' hidden></div>"
-        "<button id='otaGo' type='submit' disabled>开始升级</button></form>"
+        "<button id='otaGo' type='submit'>开始升级</button></form>"
         "<div id='otaProg' hidden>"
         "<div class='track'><div class='fill' id='otaBar'></div></div>"
         "<div class='stat' id='otaStat' aria-live='polite'></div>"

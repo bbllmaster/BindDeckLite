@@ -245,8 +245,14 @@ test("页面骨架：未选文件时「开始升级」disabled，进度区与结
   assert.equal(page.el("otaResult").hidden, true);
   assert.equal(page.el("st1").classList.contains("on"), true);
   assert.equal(page.el("st2").classList.contains("on"), false);
-  // HTML 里按钮本身就带 disabled（脚本没跑起来也不能点）。
-  assert.match(SOURCE, /id='otaGo' type='submit' disabled/, "otaGo 必须自带 disabled 属性");
+  // 但 HTML 里不能硬写 disabled：脚本没跑起来（关掉 JS）时，
+  // 页面必须还能像本轮之前一样直接 POST。
+  assert.match(SOURCE, /id='otaGo' type='submit'>开始升级/, "otaGo 的初始文案由 HTML 提供");
+  assert.equal(
+    /id='otaGo'[^>]*disabled/.test(SOURCE),
+    false,
+    "HTML 不能硬禁用 otaGo，否则非 JS 兜底无法提交",
+  );
   for (const id of ["fwMeta", "otaProg", "otaResult"]) {
     assert.match(
       SOURCE,
