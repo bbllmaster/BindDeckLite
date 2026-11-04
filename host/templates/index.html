@@ -52,6 +52,20 @@
       <button class="tab" id="tabbtn-log" data-tab="log" role="tab" aria-selected="false" aria-controls="tab-log" tabindex="-1">日志</button>
     </nav>
 
+    <!-- WS-512: 本机没有这台设备的存档时，先声明「显示的是默认值」。
+         静态文档流，位于页签下方、面板上方，切页签不消失。 -->
+    <div class="untrusted-banner" id="untrustedBanner" role="status" aria-live="polite" hidden>
+      <div class="untrusted-copy">
+        <p class="untrusted-title">本机没有这台设备的配置存档 · 现在显示的是默认值<span id="untrustedLayoutNote"></span></p>
+        <p class="untrusted-sub">引脚 / 键码 / 编码器模式 / 休眠以本机默认值显示，直接下发会覆盖设备当前配置。</p>
+        <p class="untrusted-extra" id="untrustedExtra" hidden></p>
+      </div>
+      <div class="untrusted-actions">
+        <button class="btn primary small-btn" id="btnUntrustedRead">从设备读取</button>
+        <button class="btn ghost small-btn" id="btnUntrustedIgnore">先忽略</button>
+      </div>
+    </div>
+
     <!-- ================= KEYS ================= -->
     <section class="panel active" id="tab-keys" role="tabpanel" aria-labelledby="tabbtn-keys">
       <div class="panel-head">

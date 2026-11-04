@@ -553,6 +553,40 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   line-height: 1.7;
 }
 
+/* ---------- 无存档提示条（WS-512） ----------
+   琥珀色描边/浅底，和灰色说明、蓝色 .note 明确区分；静态流，不 fixed，
+   因此不会遮住页签，也不会随页签切换消失。窄屏按钮整行换行。 */
+.untrusted-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--state-warn-bd);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-card);
+  background: var(--state-warn-bg);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+.untrusted-banner[hidden] { display: none; }
+.untrusted-copy { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
+.untrusted-title { font-weight: 600; color: var(--state-warn-fg); }
+.untrusted-sub { margin-top: 2px; color: var(--text); opacity: 0.85; }
+.untrusted-extra { margin-top: 4px; color: var(--state-warn-fg); }
+.untrusted-extra[hidden] { display: none; }
+.untrusted-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+@media (max-width: 520px) {
+  .untrusted-actions { width: 100%; }
+  .untrusted-actions .btn { flex: 1 1 120px; }
+  /* 窄屏下标题与右侧胶囊改为上下排列：.hint 默认 nowrap，遇到「共 12 个输入 ·
+     12 键布局 …」这类长文案会把整页撑出横向滚动条，提示条就跟着被推到屏外。 */
+  .panel-head { flex-wrap: wrap; }
+  .panel-head .hint { white-space: normal; }
+}
+
 /* ---------- encoder rotation actions ---------- */
 .enc-action-card {
   margin-top: var(--sp-4);
