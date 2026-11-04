@@ -3133,6 +3133,13 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
             # broken target does not break every following url.
             browser_target = None
             browser_used = "default"
+            # WS-498: one wording for the step number in the stop log — the
+            # step that was running when the user asked to stop, never the
+            # step that would have come next.  A cancel is only observable
+            # at a step boundary, so ``ran_step`` / ``ran_type`` remember the
+            # step that just ran and the boundary reports *that* one.
+            ran_step = 0
+            ran_type = ""
             for current_step, step in enumerate(macro_steps, 1):
                 st = step.get("type")
                 current_type = st or ""
@@ -3140,8 +3147,14 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                 # typing keeps going (its keys are out), but nothing after
                 # it runs.
                 if cancel is not None and cancel.is_set():
-                    return _macro_cancelled(action, current_step, total_steps,
-                                            current_type)
+                    if ran_step:
+                        # WS-498: the step in flight, not the next one.
+                        return _macro_cancelled(action, ran_step,
+                                                total_steps, ran_type)
+                    # Nothing ran yet: the macro stopped before step 1.
+                    return _macro_cancelled(action, current_step,
+                                            total_steps, current_type)
+                ran_step, ran_type = current_step, current_type
                 if st == "key":
                     # 宏里可以写界面上的键名（PageUp / RCtrl / Tab ...），
                     # 这里统一换成 keyboard 库认识的写法。
@@ -3276,6 +3289,12 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                         # the next text:/paste: steps land in the old window.
                         # Windows only; bounded by MACRO_URL_FOCUS_TIMEOUT.
                         _wait_url_foreground()
+            # WS-498: the stop may have arrived during the *last* step — the
+            # loop ends without another boundary check, so close it here and
+            # name the step that was in flight.
+            if cancel is not None and cancel.is_set() and ran_step:
+                return _macro_cancelled(action, ran_step, total_steps,
+                                        ran_type)
             return {"ok": True, "error": "", "action_type": kind,
                     "target": target, "browser_used": browser_used}
         except Exception as e:  # noqa: BLE001
@@ -3440,8 +3459,12 @@ def _cancel_action(dev_id: str, idx: int) -> bool:
 
     Returns True only when this call actually flipped the flag; every other
     case (no claim, already finished, already asked) returns False so the
-    route can answer ``already_done`` without logging an error or writing a
-    second "已停止" row.
+    caller can tell "I stopped it" from "there was nothing to stop".
+
+    WS-498: the return value alone no longer decides what the HTTP route
+    answers — a live claim that was already flagged is still winding down and
+    must be reported as ``cancelling``.  The route asks
+    ``_action_claim_alive`` for that.
     """
     with _lock:
         entry = _action_running.get((dev_id, idx))
@@ -3452,6 +3475,19 @@ def _cancel_action(dev_id: str, idx: int) -> bool:
             return False
         event.set()
         return True
+
+
+def _action_claim_alive(dev_id: str, idx: int) -> bool:
+    """True while ``(dev_id, idx)`` is still claimed by a running action.
+
+    The claim outlives the stop flag: a macro that was asked to stop keeps
+    running until the step in flight finishes (WS-498).  The route needs
+    this to tell "the macro is still winding down" apart from "there is
+    nothing to stop at all" — answering ``already_done`` for a live claim
+    makes the UI snap back to idle while the macro is still typing.
+    """
+    with _lock:
+        return (dev_id, idx) in _action_running
 
 
 def _bind_action_thread(dev_id: str, idx: int, token: int, thread):
@@ -3846,10 +3882,25 @@ def api_action_cancel(dev_id, idx):
     (the macro may have finished between the click and the request, or the
     deck may have disconnected with a stale claim).  ``already_done`` tells
     the UI to leave its neutral state alone instead of showing a failure.
+
+    WS-498: a claim that is still alive means the macro has not finished —
+    it is winding down after a stop that was already requested (a long
+    ``text:`` / ``app:`` step cannot be interrupted mid-step).  That is still
+    "cancelling", not "already_done": the UI has to keep showing
+    「正在停止…」 instead of dropping back to 「测试动作」 and then jumping to
+    「停止」 again on the next poll.
+
+    The claim is checked *first*: ``already_done`` may only be answered when
+    there is nothing to stop at all.  Asking the claim before flipping the
+    flag also avoids answering "cancelling" for a macro that started between
+    the two calls — a flag that was never set would not stop it.
     """
-    if _cancel_action(dev_id, idx):
-        return jsonify({"ok": True, "cancelling": True})
-    return jsonify({"ok": True, "already_done": True})
+    if not _action_claim_alive(dev_id, idx):
+        return jsonify({"ok": True, "already_done": True})
+    # The claim exists: set the stop flag (a no-op when it is already set)
+    # and report the macro as winding down.
+    _cancel_action(dev_id, idx)
+    return jsonify({"ok": True, "cancelling": True})
 
 
 @app.route("/api/encoder/action/test/<dev_id>/<direction>", methods=["POST"])

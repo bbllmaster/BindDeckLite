@@ -747,9 +747,14 @@ function nudgeStatus() {
 /**
  * 请求停止一条正在执行的动作。
  *
- * 成功（含 already_done）后不立刻假装已结束：服务端在下一步边界才退出，
+ * 服务端在下一步边界才真正退出，所以「请求已受理」不等于「已经停了」：
  * 这里保持「正在停止…」，由 /api/status 不再报 running 时自动回到
  * 「测试动作」，所以卡片不会先跳回「停止」再跳一次。
+ *
+ * WS-498：服务端只在**没有 claim** 时才回 already_done（宏确实结束了）；
+ * claim 还在但停止标记已置位时回的是 cancelling —— 那说明宏还在收尾
+ * （长的 text: / app: 步骤无法中途打断），这里必须继续显示「正在停止…」，
+ * 不能把卡片切回空闲，否则 1.2 秒后的轮询又会把它变成「停止」，按钮来回跳。
  */
 async function stopAction(devId, idx) {
   if (!devId || isStopping(devId, idx)) return;   // 连点兜底：按钮已 disabled
@@ -768,8 +773,11 @@ async function stopAction(devId, idx) {
     toast("停止请求没有送达，请再试一次", "warn");
     return;
   }
-  if (r.already_done) {
-    // 服务端没有在跑的 claim（宏刚好结束）：直接回空闲态。
+  if (r.cancelling) {
+    // 宏还在收尾：保持「正在停止…」，等轮询确认它真的退出。
+    markStopping(devId, idx);
+  } else if (r.already_done) {
+    // 服务端确认没有在跑的 claim（宏刚好结束）：直接回空闲态。
     clearRunning(devId, idx);
     clearStopping(devId, idx);
   }
