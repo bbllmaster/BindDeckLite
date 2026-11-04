@@ -257,6 +257,10 @@ static bool g_otaFirstBlockChecked = false;
 // or a lost first block). The POST completion handler reports it instead of
 // claiming success.
 static const char* g_portalOtaError = nullptr;
+// WS-519: machine-readable short code for a failure that only surfaces in
+// Update.end() (whose error code never reached the page before). Sent to the
+// browser as X-Ota-Code so the result card can explain the cause.
+static const char* g_portalOtaCode = nullptr;
 
 // Defined below the OTA helpers, used by the config portal (which is set up
 // earlier in the file) and by processCommand().
@@ -1014,19 +1018,194 @@ static void setupProvisioning() {
   });
 
   // --- OTA (config mode only) ---
+  // WS-519: the page now shows upload progress and the device-side result.
+  // Everything stays inline (one response, no external resource) and the form
+  // plus POST body contract is unchanged, so a browser without JS sees exactly
+  // the old page. host/test_portal_ota_progress.mjs extracts and runs the
+  // script below verbatim, so keep it inside the marked <script> block.
   cfgServer.on("/update", HTTP_GET, []() {
     cfgServer.send(200, "text/html; charset=utf-8",
       F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>BindDeckLite OTA</title></head><body style='font-family:sans-serif;max-width:440px;"
-        "margin:24px auto;padding:0 16px'><h2>固件 OTA 升级</h2>"
+        "<title>BindDeckLite OTA</title>"
+        "<style>*{box-sizing:border-box}"
+        "body{font-family:sans-serif;max-width:440px;margin:24px auto;padding:0 16px}"
+        "h2{font-size:20px;margin:0 0 12px}"
+        "input[type=file]{width:100%;padding:6px;border:1px solid #dadce0;border-radius:6px}"
+        "button{font:inherit}"
+        "#otaGo{width:100%;margin:10px 0 0;padding:10px 16px;border:0;border-radius:6px;"
+        "background:#1a73e8;color:#fff;font-size:16px}"
+        "#otaGo:disabled{background:#dadce0;color:#80868b}"
+        ".meta{font-size:13px;color:#5f6368;margin:6px 0 0;word-break:break-all}"
+        ".steps{display:flex;gap:4px;margin:0 0 14px;padding:0;list-style:none}"
+        ".steps li{flex:1 1 0;min-width:0;font-size:11px;line-height:1.35;color:#5f6368;"
+        "background:#f1f3f4;border-radius:6px;padding:6px 3px;text-align:center}"
+        ".steps li.on{background:#e8f0fe;color:#174ea6;font-weight:700}"
+        ".track{height:10px;background:#e8eaed;border-radius:5px;overflow:hidden;margin:14px 0 6px}"
+        ".fill{height:100%;width:0;background:#1a73e8;border-radius:5px;transition:width .2s}"
+        ".fill.indet{width:100%;background:repeating-linear-gradient(90deg,"
+        "#1a73e8 0 12px,#8ab4f8 12px 24px)}"
+        ".stat{font-size:13px;color:#3c4043;word-break:break-word}"
+        ".note{font-size:12px;color:#8a6d3b;margin:6px 0 0}"
+        ".card{border-radius:8px;padding:12px;margin:14px 0 0;border:1px solid}"
+        ".card.ok{background:#e6f4ea;border-color:#188038;color:#0d652d}"
+        ".card.bad{background:#fce8e6;border-color:#c5221f;color:#8c1d18}"
+        ".card.warn{background:#fef7e0;border-color:#b06000;color:#7a4f01}"
+        ".card .title{font-weight:700;font-size:16px;margin:0 0 6px}"
+        ".card .line{font-size:13px;margin:2px 0;word-break:break-word}"
+        ".card .code{font-family:monospace;font-size:12px;margin:6px 0 0;word-break:break-all}"
+        ".card button,.card .back{display:block;width:100%;margin:10px 0 0;padding:10px;"
+        "border-radius:6px;text-align:center;font-size:15px;text-decoration:none}"
+        ".card button{background:#1a73e8;color:#fff;border:0}"
+        ".card .back{background:#fff;color:#1a73e8;border:1px solid #1a73e8}"
+        ".foot{font-size:13px;margin:18px 0 0}"
+        "</style></head><body><h2>固件 OTA 升级</h2>"
+        "<ol class='steps' id='otaSteps'>"
+        "<li id='st1' class='on'>1 选择固件</li><li id='st2'>2 上传</li>"
+        "<li id='st3'>3 写入与校验</li><li id='st4'>4 结果</li></ol>"
         "<p>请选择 <b>app-only</b> 固件（<code>update_apponly_*.bin</code>），"
         "不要上传 merged 整片包（OTA 校验会失败）。</p>"
-        "<form method='POST' action='/update' enctype='multipart/form-data'>"
-        "<input type='file' name='firmware' accept='.bin' required><br><br>"
-        "<button style='padding:10px 20px'>开始升级</button></form>"
-        "<p style='color:#888'>升级中请勿断电，完成后自动重启并回到蓝牙模式。</p>"
-        "<p><a href='/'>返回</a></p></body></html>"));
+        "<form method='POST' action='/update' enctype='multipart/form-data' id='otaForm'>"
+        "<input type='file' name='firmware' id='fw' accept='.bin' required>"
+        "<div class='meta' id='fwMeta' hidden></div>"
+        "<button id='otaGo' type='submit'>开始升级</button></form>"
+        // WS-522 N2: this line is plain HTML on purpose — it must stay visible
+        // when JS never runs, i.e. outside the hidden #otaProg block.
+        "<p class='note'>升级中请勿断电，完成后自动重启并回到蓝牙模式。</p>"
+        "<div id='otaProg' hidden>"
+        "<div class='track'><div class='fill' id='otaBar'></div></div>"
+        "<div class='stat' id='otaStat' aria-live='polite'></div>"
+        "<p class='note'>升级期间不要关闭页面、不要断热点、不要拔电。</p></div>"
+        "<div class='card' id='otaResult' hidden>"
+        "<div class='title' id='otaTitle' aria-live='polite'></div>"
+        "<div class='line' id='otaLine1'></div><div class='line' id='otaLine2'></div>"
+        "<div class='code' id='otaCode'></div>"
+        "<button id='otaRetry' type='button'>重新选择固件</button>"
+        "<a class='back' href='/'>返回配置页</a></div>"
+        "<p class='foot'><a href='/'>返回</a></p>"
+        // WS-519 page script. Inline on purpose: the portal stays a single
+        // response with no external resource. The browser sends FormData
+        // itself (no FileReader), so a 3.8 MB image never lands in JS memory.
+        "<script id='ota-progress'>"
+        "(function(){"
+        "var form=document.getElementById('otaForm'),fw=document.getElementById('fw'),"
+        "go=document.getElementById('otaGo'),meta=document.getElementById('fwMeta'),"
+        "prog=document.getElementById('otaProg'),bar=document.getElementById('otaBar'),"
+        "stat=document.getElementById('otaStat'),res=document.getElementById('otaResult'),"
+        "rt=document.getElementById('otaTitle'),rl=document.getElementById('otaLine1'),"
+        "rl2=document.getElementById('otaLine2'),rc=document.getElementById('otaCode'),"
+        "retry=document.getElementById('otaRetry'),"
+        "stageIds=['st1','st2','st3','st4'];"
+        "var waitTimer=null,waited=0,busy=false;"
+        // code -> 中文原因。Covers every short code otaUpdateErrorText() returns
+        // plus the ones the portal gate / verified-write path can produce.
+        "var REASONS={write_error:'固件写入失败',"
+        "read_error:'固件写入后回读不一致',no_space:'目标分区空间不足',"
+        "magic_byte:'文件不是有效的固件镜像',no_partition:'目标分区不存在',"
+        "flash_too_small:'目标分区放不下，可能是把 merged 整片包当成 app-only 传了',"
+        "erase_error:'分区擦除失败',erase_failed:'分区擦除失败（写入后重擦重写未成功）',"
+        "write_failed:'写入失败',"
+        "write_not_verified:'写入后回读校验不通过',"
+        "flash_not_written:'写入的字节没有落到分区',bad_size:'固件体积不合法',"
+        "stream:'上传数据流中断',md5:'MD5 校验失败',"
+        "activate:'新固件无法激活（镜像校验失败）',bad_argument:'参数不合法',"
+        "abort:'升级被中止',decrypt:'固件解密失败'};"
+        "function mb(n){n=n||0;return (n/1048576).toFixed(1);}"
+        "function stage(n){for(var i=0;i<stageIds.length;i++){"
+        "var e=document.getElementById(stageIds[i]);if(!e)continue;"
+        "if(i+1<=n)e.classList.add('on');else e.classList.remove('on');}}"
+        "function stopWait(){if(waitTimer){clearInterval(waitTimer);waitTimer=null;}}"
+        "function reason(c){return (c&&REASONS[c])?REASONS[c]:'未知原因（'+(c||'unknown')+'）';}"
+        "function show(kind,title,l1,l2,code){stopWait();busy=false;prog.hidden=true;"
+        "res.hidden=false;res.classList.remove('ok');res.classList.remove('bad');"
+        "res.classList.remove('warn');res.classList.add(kind);"
+        "rt.textContent=title;rl.textContent=l1||'';rl2.textContent=l2||'';"
+        "rc.textContent=code||'';stage(4);}"
+        "function reset(){stopWait();busy=false;fw.value='';fw.disabled=false;"
+        "go.disabled=true;go.textContent='开始升级';meta.hidden=true;meta.textContent='';"
+        "prog.hidden=true;bar.style.width='0%';bar.classList.remove('indet');"
+        "stat.textContent='';res.hidden=true;res.classList.remove('ok');"
+        "res.classList.remove('bad');res.classList.remove('warn');"
+        "rt.textContent='';rl.textContent='';rl2.textContent='';rc.textContent='';"
+        "stage(1);}"
+        "function syncFile(){var f=(fw.files&&fw.files.length)?fw.files[0]:null;"
+        "if(!f){meta.hidden=true;meta.textContent='';go.disabled=true;return;}"
+        "meta.hidden=false;meta.textContent=f.name+' · '+mb(f.size)+' MB';"
+        "go.disabled=false;}"
+        "function fromBody(txt){var m=/([a-z]+_[a-z_]+)/.exec(txt||'');"
+        "var c=m?m[1]:'';"
+        "if((txt||'').indexOf('升级完成')>=0){"
+        "show('ok','升级完成，设备正在重启',"
+        "'约 10 秒；热点会消失，设备随后回到蓝牙模式。','判定来源：响应正文','');return;}"
+        "show('bad','升级失败，设备重启中',reason(c),'判定来源：响应正文',"
+        "c?('错误码：'+c):'');}"
+        "function lost(){show('warn','结果未知',"
+        "'上传已完成，但没收到设备的结果——设备可能正在重启。',"
+        "'1) 等约 10 秒，重新连接热点后打开 http://192.168.4.1，看设备是否已是新固件；"
+        "2) 若仍是旧固件，重新选择固件再试一次。','');}"
+        "fw.addEventListener('change',syncFile);"
+        "retry.addEventListener('click',reset);"
+        "form.addEventListener('submit',function(ev){"
+        "ev.preventDefault();"
+        // WS-522 N3: the controls below get disabled, but a second submit can
+        // still arrive (Enter in a text field, programmatic submit). Drop it.
+        "if(busy)return;"
+        "var f=(fw.files&&fw.files.length)?fw.files[0]:null;if(!f)return;"
+        // WS-522 M1: build the body BEFORE disabling the controls. A disabled
+        // control is not a successful control, so new FormData(form) after
+        // fw.disabled=true yields an empty body: the device sees no file, never
+        // runs UPLOAD_FILE_START, still reports success and restarts having
+        // written 0 bytes.
+        "var fd=new FormData(form);"
+        "var xhr=new XMLHttpRequest(),wrote=false;"
+        "busy=true;fw.disabled=true;go.disabled=true;go.textContent='升级中…';"
+        "prog.hidden=false;res.hidden=true;waited=0;"
+        "bar.style.width='0%';bar.classList.remove('indet');stage(2);"
+        "stat.textContent='已传 0.0 / '+mb(f.size)+' MB · 0%';"
+        "xhr.timeout=180000;"
+        "xhr.upload.onprogress=function(e){"
+        "if(!e||!e.lengthComputable||!e.total)return;"
+        "var pct=Math.floor(e.loaded*100/e.total);if(pct>100)pct=100;"
+        "bar.style.width=pct+'%';"
+        "stat.textContent='已传 '+mb(e.loaded)+' / '+mb(e.total)+' MB · '+pct+'%';};"
+        // Upload reaching 100% only means the socket swallowed the bytes;
+        // Update.end() and the read-back still run on the device.
+        "xhr.upload.onload=function(){"
+        "if(wrote)return;wrote=true;stage(3);bar.classList.add('indet');"
+        // WS-522 N1: without lengthComputable the inline width is still 0%,
+        // and an inline width beats .fill.indet{width:100%}. Lift it explicitly
+        // or the bar looks frozen at zero all through the write phase.
+        "bar.style.width='100%';"
+        "function tick(){stat.textContent='设备正在写入与校验，约 10–60 秒，"
+        "请勿断电 · 已等待 '+waited+' 秒';}"
+        "tick();stopWait();"
+        "waitTimer=setInterval(function(){waited++;tick();},1000);};"
+        "function finish(){var r=null,c=null,nr=null;"
+        "try{r=xhr.getResponseHeader('X-Ota-Result');"
+        "c=xhr.getResponseHeader('X-Ota-Code');"
+        "nr=xhr.getResponseHeader('X-Ota-Restart');}catch(e){r=null;c=null;nr=null;}"
+        "if(r==='ok'){show('ok','升级完成，设备正在重启',"
+        "'约 10 秒；热点会消失，设备随后回到蓝牙模式。','','');return;}"
+        // WS-522 S1: the gate branch (flash_too_small / no_partition) returns
+        // without restarting, so X-Ota-Restart: no means the device is still
+        // in the portal.
+        "if(r==='failed'){"
+        "if(nr==='no'){show('bad','升级失败',reason(c),"
+        "'设备仍在配网模式，可直接重新选择固件。',c?('错误码：'+c):'');return;}"
+        "show('bad','升级失败，设备重启中',reason(c),'',c?('错误码：'+c):'');return;}"
+        "fromBody(xhr.responseText);}"
+        "xhr.onload=function(){finish();};"
+        "xhr.onerror=lost;xhr.ontimeout=lost;xhr.onabort=lost;"
+        "xhr.open('POST','/update');"
+        "xhr.send(fd);"
+        "});"
+        "if(typeof window!=='undefined'&&window.addEventListener){"
+        "window.addEventListener('beforeunload',function(e){"
+        "if(!busy)return;e.preventDefault();e.returnValue='';});}"
+        "syncFile();stage(1);"
+        "})();"
+        "</script>"
+        "</body></html>"));
   });
   cfgServer.on("/update", HTTP_POST,
     []() {
@@ -1037,12 +1216,24 @@ static void setupProvisioning() {
         msg += F("未开始：");
         msg += g_portalOtaError;
         msg += F("</p><p><a href='/update'>返回</a></p>");
+        // WS-519: result headers must be queued before send(). The body above
+        // is untouched so a non-JS client sees the page it always did.
+        cfgServer.sendHeader("X-Ota-Result", "failed");
+        cfgServer.sendHeader("X-Ota-Code", g_portalOtaError);
+        // WS-522 S1: this branch returns without ESP.restart(), so the device
+        // stays reachable in the portal. Tell the page not to claim a restart.
+        cfgServer.sendHeader("X-Ota-Restart", "no");
         g_portalOtaError = nullptr;
+        g_portalOtaCode = nullptr;
         cfgServer.send(200, "text/html; charset=utf-8", msg);
         return;
       }
-      msg += Update.hasError() ? F("失败") : F("完成");
+      const bool ok = !Update.hasError();
+      msg += ok ? F("完成") : F("失败");
       msg += F("，设备重启中…</p>");
+      cfgServer.sendHeader("X-Ota-Result", ok ? "ok" : "failed");
+      if (!ok && g_portalOtaCode) cfgServer.sendHeader("X-Ota-Code", g_portalOtaCode);
+      g_portalOtaCode = nullptr;
       cfgServer.send(200, "text/html; charset=utf-8", msg);
       delay(500);
       ESP.restart();
@@ -1052,6 +1243,7 @@ static void setupProvisioning() {
       if (up.status == UPLOAD_FILE_START) {
         g_otaProgress = 0;
         g_portalOtaError = nullptr;
+        g_portalOtaCode = nullptr;
         // WS-425: the read-back gate below needs a per-session byte count.
         // Without this reset a second portal OTA in the same power cycle
         // inherits the previous run's bytes and trips the gate early.
@@ -1068,7 +1260,10 @@ static void setupProvisioning() {
           g_portalOtaError = gate;
           return;
         }
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) log_e("[ota] Update.begin failed");
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          g_portalOtaCode = otaUpdateErrorText(Update.getError());
+          log_e("[ota] Update.begin failed");
+        }
       } else if (up.status == UPLOAD_FILE_WRITE) {
         if (g_portalOtaError) return;   // never write an ungated slot
         if (up.totalSize > 0) g_otaProgress = (int)(up.currentSize * 100 / up.totalSize);
@@ -1108,6 +1303,9 @@ static void setupProvisioning() {
           // config-portal channel is diagnosable from CDC logs too.
           int code = Update.getError();
           const char* detail = otaUpdateErrorText(code);
+          // WS-519: this is the one failure the page could never explain -
+          // capture the code so the POST can send it as X-Ota-Code.
+          g_portalOtaCode = detail;
           otaDiagReadback(code);
           log_e("[ota] Update.end failed (end_failed:%s(%d))", detail, code);
         }
