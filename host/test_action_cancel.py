@@ -1,4 +1,4 @@
-"""Unit tests for "stop a running macro" (WS-495 / WS-494).
+"""Unit tests for "stop a running macro" (WS-495 / WS-494 / WS-498).
 
 A macro can type a password into whatever window has focus when the user did
 not expect it.  Before this feature the only way out was to wait for the macro
@@ -10,6 +10,14 @@ physical-key path), ``app.run_action``, ``app._cancel_action`` and the Flask
 test client hitting ``/api/action/test`` + ``/api/action/cancel`` — instead of
 re-implementing the cancel logic, so a change to ``host/app.py`` that reopens
 the hole fails this file.
+
+WS-498 pins two things down:
+
+* the step number in the stop row is the step that was **running** when the
+  user asked to stop — never the step that would have come next;
+* ``/api/action/cancel`` answers ``cancelling`` while the claim is still
+  alive, and only says ``already_done`` when there is nothing left to stop.
+  Otherwise the UI snaps back to idle while the macro is still winding down.
 
 They must stay platform-independent and side-effect free: CI runs them on
 Windows, so no test may pop a browser, send a media key, spawn a shell command
@@ -149,7 +157,9 @@ def test_cancel_during_text_keeps_the_body_out_of_the_log():
 
     text = " ".join(e["text"] for e in host_app._events)
     assert "hunter2" not in text, "macro body leaked into the log"
-    assert "第 2/2 步（key）" in _stopped_rows()[0]["text"]
+    # WS-498: the step that was running when the user asked to stop — the
+    # ``text:`` step (1), not the ``key:`` step that would have come next (2).
+    assert "第 1/2 步（text）" in _stopped_rows()[0]["text"]
 
 
 def test_cancel_then_rerun_starts_a_fresh_action():
@@ -174,30 +184,148 @@ def test_cancel_then_rerun_starts_a_fresh_action():
     assert len(_stopped_rows()) == 1
 
 
+# --- WS-498: the step number in the stop log means one thing only ----------
+
+def test_paste_stop_reports_the_paste_step_not_the_next_one():
+    """paste:xxx -> key:enter, stopped during the paste → step 1 (paste).
+
+    The paste step is atomic — the cancel is only noticed at the next step
+    boundary — but the step number in the log must name the step that was
+    really running (1 / paste), never the step that would have come next
+    (2 / key).  Drives the production ``run_action`` directly.
+    """
+    cancel = threading.Event()
+    action = {"type": "macro", "value": "登录宏",
+              "macro": [{"type": "paste", "value": "xxx"},
+                        {"type": "key", "value": "enter"}]}
+    kb = _StubKeyboard()
+
+    def _paste_then_stop(kb_, text, dev_id=""):
+        # 用户在粘贴过程中点了「停止」：粘贴本身已经发出，取消标记随后生效。
+        cancel.set()
+        return True
+
+    with mock.patch.object(host_app, "_load_keyboard", return_value=kb):
+        with mock.patch.object(host_app, "_paste_text",
+                               side_effect=_paste_then_stop):
+            result = host_app.run_action(action, "t1", cancel=cancel)
+
+    assert result["cancelled"] is True
+    assert result["step"] == 1
+    assert result["step_type"] == "paste"
+    assert result["total_steps"] == 2
+    assert kb.sent == []          # key:enter 从未发出
+
+
+def test_paste_stop_logs_the_paste_step():
+    """End to end: the log row says 「第 1/2 步（paste）」, not 「第 2/2 步（key）」."""
+    _setup({"t1": (3, [{"type": "paste", "value": "xxx"},
+                       {"type": "key", "value": "enter"}])})
+    kb = _StubKeyboard()
+
+    def _paste_then_stop(kb_, text, dev_id=""):
+        # 走生产入口停止正在跑的宏（同一个 claim 上的取消标记）。
+        host_app._cancel_action(dev_id, 3)
+        return True
+
+    with mock.patch.object(host_app, "_load_keyboard", return_value=kb):
+        with mock.patch.object(host_app, "_paste_text",
+                               side_effect=_paste_then_stop):
+            host_app._run_action_for("t1", 3)
+            assert _wait_for(lambda: bool(_stopped_rows())), "no 动作已停止 row"
+
+    assert kb.sent == []
+    row = _stopped_rows()[0]
+    assert row["level"] == "warn"
+    assert "第 1/2 步（paste）" in row["text"]
+    assert "第 2/2 步" not in row["text"]
+
+
+def test_stop_during_the_last_step_is_not_reported_as_success():
+    """A stop in the *last* step must not disappear from the log."""
+    cancel = threading.Event()
+    action = {"type": "macro", "value": "登录宏",
+              "macro": [{"type": "key", "value": "enter"}]}
+
+    class _StopsOnSend(_StubKeyboard):
+        def send(self, keys, *args, **kwargs):
+            super().send(keys, *args, **kwargs)
+            cancel.set()
+
+    kb = _StopsOnSend()
+    with mock.patch.object(host_app, "_load_keyboard", return_value=kb):
+        result = host_app.run_action(action, "t1", cancel=cancel)
+
+    assert kb.sent == ["enter"]
+    assert result["cancelled"] is True
+    assert result["step"] == 1
+    assert result["step_type"] == "key"
+
+
 # --- idempotency -----------------------------------------------------------
 
 def test_repeat_cancel_logs_exactly_one_row():
-    """Clicking stop twice must not write two "已停止" rows."""
-    _setup({"t1": (3, [{"type": "delay", "value": 1500}])})
-    kb = _StubKeyboard()
+    """Clicking stop twice must not write two "已停止" rows.
+
+    WS-498: the macro is still winding down after the first stop (the ``text:``
+    step in flight cannot be interrupted), so every answer is ``cancelling`` —
+    the UI has to keep showing 「正在停止…」 instead of falling back to idle.
+    """
+    _setup({"t1": (3, [{"type": "text", "value": "pw"},
+                       {"type": "key", "value": "enter"}])})
+    kb = _StubKeyboard(write_delay=0.8)
     client = host_app.app.test_client()
 
     with _platform(kb):
         host_app._run_action_for("t1", 3)
-        assert _wait_for(lambda: _claim_exists("t1", 3))
+        # Wait until the text step is really in flight: only then the claim
+        # provably outlives the three requests below.
+        assert _wait_for(lambda: bool(kb.written)), "text step never started"
 
         first = client.post("/api/action/cancel/t1/3").get_json()
         second = client.post("/api/action/cancel/t1/3").get_json()
         third = client.post("/api/action/cancel/t1/3").get_json()
 
         assert first == {"ok": True, "cancelling": True}
-        assert second == {"ok": True, "already_done": True}
-        assert third == {"ok": True, "already_done": True}
+        assert second == {"ok": True, "cancelling": True}
+        assert third == {"ok": True, "cancelling": True}
 
         assert _wait_for(lambda: bool(_stopped_rows()))
         assert _wait_for(lambda: not _claim_exists("t1", 3))
 
     assert len(_stopped_rows()) == 1
+
+
+def test_live_claim_never_answers_already_done():
+    """WS-498: ``already_done`` may only be answered when there is no claim.
+
+    The frontend turns ``already_done`` into 「测试动作」 and drops the
+    「正在停止…」 state, so answering it for a macro that is still winding
+    down makes the card jump back to 「停止」 on the next poll.  This is the
+    contract the UI relies on, stated directly.
+    """
+    _setup({"t1": (3, [{"type": "text", "value": "pw"},
+                       {"type": "key", "value": "enter"}])})
+    kb = _StubKeyboard(write_delay=0.8)
+    client = host_app.app.test_client()
+
+    with _platform(kb):
+        host_app._run_action_for("t1", 3)
+        assert _wait_for(lambda: bool(kb.written)), "text step never started"
+        assert _claim_exists("t1", 3), "claim not taken"
+
+        # First request flips the flag; the second one finds the flag already
+        # set — but the claim is still alive, so both must say "cancelling".
+        assert client.post("/api/action/cancel/t1/3").get_json() == {
+            "ok": True, "cancelling": True}
+        assert _claim_exists("t1", 3), "claim released too early"
+        assert client.post("/api/action/cancel/t1/3").get_json() == {
+            "ok": True, "cancelling": True}
+
+        # Only after the macro really ended does the answer change.
+        assert _wait_for(lambda: not _claim_exists("t1", 3))
+        assert client.post("/api/action/cancel/t1/3").get_json() == {
+            "ok": True, "already_done": True}
 
 
 def test_cancel_after_the_macro_finished_is_already_done():

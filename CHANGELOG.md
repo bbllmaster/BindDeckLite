@@ -1,5 +1,27 @@
 # Changelog
 
+## 宏停止日志的步号统一为「实际所在的那一步」；停止后按钮不再来回跳 — 2026-11-05（WS-498）
+
+宏被停止时，日志里的「第 k/N 步」只有一种含义：**用户按下停止时正在跑的那一步**。
+以前两种口径混在一起：`wait:` 步在 50 ms 分片里被打断，报的是当前步；而 `text:` /
+`paste:` / `app:` 无法中途打断，取消标记要到下一步边界才被看到，于是报成了**下一个**
+步骤。复现：`paste:xxx → key:enter`，在粘贴过程中停止，日志写「第 2/2 步（key）」——
+宏明明停在粘贴（step 1）上。日志是唯一的审计线索，同一件事不能有两种说法。
+
+- **宏循环**：记住刚跑完的那一步（`ran_step` / `ran_type`），步骤边界统一报它；
+  `wait:` 步的既有语义不变（分片里打断仍报当前步）。最后一步执行期间到达的停止
+  也不再被吞掉——循环结束前补一次检查，不再静默记成「动作成功」。
+- **停止接口**：`/api/action/cancel` 先看 claim 是否还活着。只要 claim 在，回的
+  就是 `cancelling`（宏还在收尾），只有**一个 claim 都没有**时才回 `already_done`。
+  以前重复点停止会拿到 `already_done`，前端据此把卡片切回「测试动作」，1.2 秒后
+  轮询又把它翻回「停止」——用户点完停止只看到一个 toast，按钮却还在那里来回跳。
+- **前端**：`cancelling` 保持「正在停止…」直到轮询确认宏退出；`already_done`
+  才回空闲态。
+- **回归**：`cd host && python -m pytest test_action_cancel.py -q`（import 生产
+  `run_action` / `_cancel_action` / `_action_claim_alive` 与
+  `/api/action/cancel` 路由）；前端契约另见 `node --test host/test_stop_button.mjs`
+  （加载生产 `host/static/app.js` 在假 DOM 上真跑 `stopAction`）。
+
 ## 本机没有存档的设备先声明「显示的是默认值」，覆盖前必须确认 — 2026-11-03（WS-512 / WS-513）
 
 `config.json` 在 exe 同目录，换目录 / 换电脑 / 重装系统就等于一份空存档。以前上位机
