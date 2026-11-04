@@ -57,6 +57,15 @@ def cfgfile(tmp_path, monkeypatch):
     app._config = {"devices": {}, "settings": {"actions_enabled": True}}
     app._events.clear()
     app._read_status.clear()
+    # A ``app.save_config = lambda: None`` leaked from an earlier module would
+    # make every ``_on_disk`` assertion below vacuous (nothing is ever
+    # written, and the real failure only shows as FileNotFoundError far from
+    # its cause).  Fail here instead, naming the culprit (WS-516).
+    assert app.save_config.__module__ == app.__name__, (
+        "app.save_config is a stub leaked by an earlier test module: %r — "
+        "stub it via monkeypatch, or let conftest.py restore it (WS-516)"
+        % (app.save_config,)
+    )
     return path
 
 
