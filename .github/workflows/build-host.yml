@@ -65,6 +65,10 @@ jobs:
         run: |
           python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_device_trust.py -v
 
+      - name: Portal OTA progress test (WS-519)
+        working-directory: host
+        run: node --test test_portal_ota_progress.mjs
+
       - uses: actions/upload-artifact@v4
         with:
           name: BindDeckLite-windows
