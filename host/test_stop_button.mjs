@@ -26,6 +26,7 @@ const STATIC_DIR = new URL("./static/", import.meta.url);
 function makeEl(sel = "") {
   const el = {
     _sel: sel,
+    tagName: String(sel || "div").toUpperCase(),
     dataset: {},
     style: {},
     classList: {
@@ -51,6 +52,17 @@ function makeEl(sel = "") {
     addEventListener() {},
     removeEventListener() {},
     appendChild(c) { this.children.push(c); return c; },
+    insertBefore(c, ref) {
+      const i = ref ? this.children.indexOf(ref) : -1;
+      if (i < 0) this.children.push(c); else this.children.splice(i, 0, c);
+      return c;
+    },
+    removeChild(c) {
+      const i = this.children.indexOf(c);
+      if (i >= 0) this.children.splice(i, 1);
+      return c;
+    },
+    get options() { return this.children.filter((c) => c.tagName === "OPTION"); },
     remove() {},
     setAttribute() {},
     removeAttribute() {},
@@ -118,9 +130,11 @@ function loadApp() {
 
   const run = (name) => vm.runInContext(
     readFileSync(new URL(name, STATIC_DIR), "utf8"), sandbox, { filename: name });
-  // log_follow.js 是 UMD（app.js 顶层要读 window.LogFollow）；
+  // log_follow.js / log_device.js 是 UMD（app.js 顶层要读 window.LogFollow，
+  // 轮询追加日志要读 window.LogDevice）；
   // keys.js 提供 bindKeyDrawer / syncKeyDrawerRunning（app.js 的 init() 会调用）。
   run("log_follow.js");
+  run("log_device.js");
   run("keys.js");
 
   // app.js 的顶层绑定是词法作用域，追加一段把它暴露出来（不改生产代码）。

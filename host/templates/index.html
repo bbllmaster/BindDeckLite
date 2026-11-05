@@ -286,6 +286,9 @@
         </div>
       </div>
       <div class="log-filters" role="search" aria-label="日志过滤">
+        <!-- 设备下拉：只有设备并集 ≥ 2 时才出现（单设备时界面与以前一致）。 -->
+        <label class="log-filter-label" id="logDevLabel" for="logDev" hidden>设备</label>
+        <select id="logDev" class="log-select" aria-label="按设备过滤" hidden></select>
         <label class="log-filter-label" for="logKind">类型</label>
         <select id="logKind" class="log-select" aria-label="按日志类型过滤">
           <option value="">全部类型</option>
@@ -616,6 +619,7 @@ key:enter</pre>
 
 <div class="notice-center" id="noticeCenter" role="status" aria-live="polite" aria-relevant="additions"></div>
 <script src="/static/log_follow.js"></script>
+<script src="/static/log_device.js"></script>
 <script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
 </body>

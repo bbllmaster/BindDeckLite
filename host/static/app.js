@@ -81,7 +81,7 @@ const state = {
   logSeq: 0,
   logFollow: true,     // 日志是否跟随最新行；上滚即暂停
   logPending: 0,       // 暂停期间新到达、尚未查看的行数
-  logFilter: { kind: "", level: "", q: "" }, // 日志页的客户端过滤（不影响轮询与 seq）
+  logFilter: { kind: "", level: "", q: "", dev: "" }, // 日志页的客户端过滤（不影响轮询与 seq）
   dirty: false,
   saveTimer: null,
   preview: false,
@@ -359,6 +359,13 @@ async function pollStatus() {
   try {
     const s = await api("/api/status");
     state.devices = s.devices || [];
+    // 设备列表（id / 名字）变化时重算日志设备下拉与行标签；签名没变就跳过，
+    // 免得每 1.2 秒把 300 行都扫一遍。
+    const devSig = state.devices.map((d) => `${d.dev_id}:${d.name || ""}`).join("|");
+    if (devSig !== logDevSig) {
+      logDevSig = devSig;
+      syncLogDeviceUi();
+    }
     state.actionsEnabled = !!s.actions_enabled;
     state.running = s.running || {};
     // 最近一次扫描的结论（为什么没找到设备）。
@@ -2188,11 +2195,12 @@ function syncLogFollowUi(opts = {}) {
 
 function logFilterActive() {
   const f = state.logFilter;
-  return !!(f.kind || f.level || f.q);
+  return !!(f.dev || f.kind || f.level || f.q);
 }
 
 function logRowMatches(row) {
   const f = state.logFilter;
+  if (!window.LogDevice.rowMatchesDev(row.dataset.dev || "", f.dev || "")) return false;
   if (f.kind && (row.dataset.kind || "") !== f.kind) return false;
   if (f.level && (row.dataset.level || "info") !== f.level) return false;
   if (f.q && !(row.textContent || "").toLowerCase().includes(f.q)) return false;
@@ -2203,6 +2211,111 @@ function applyLogRowVisibility(row) {
   // 用 hidden + CSS（.log-row[hidden]{display:none}）过滤，不动行节点，
   // 轮询追加与 log_follow 的裁剪补偿逻辑保持原样。
   row.hidden = logFilterActive() && !logRowMatches(row);
+}
+
+/* ---------------- 日志页设备标注 / 设备筛选 ---------------- */
+
+// 上次同步时的设备签名（id:name|…），pollStatus 用它判断是否要重算下拉与标签。
+let logDevSig = "";
+
+// 设备并集 = 已发现设备 ∪ 日志缓冲里出现过的 dev。≥2 才标注设备，
+// 单设备（以及旧固件 dev 为空）时界面与不标注设备时完全一致。
+function logDeviceUnion() {
+  const ids = state.devices.map((d) => d.dev_id).filter(Boolean);
+  const list = $("#logList");
+  const buffered = list ? Array.from(list.children).map((row) => row.dataset.dev || "") : [];
+  return window.LogDevice.deviceUnion(ids, buffered);
+}
+
+/**
+ * 增量对齐「设备」下拉的选项。
+ *
+ * 已有的 option 节点原地复用（只改文案 / 位置），只有设备真的消失才移除，
+ * 避免每次轮询重建下拉、抢走键盘焦点。
+ */
+function syncLogDevOptions(select, union) {
+  const ids = state.devices.map((d) => d.dev_id).filter(Boolean);
+  const list = $("#logList");
+  const buffered = list ? Array.from(list.children).map((row) => row.dataset.dev || "") : [];
+  const want = window.LogDevice.deviceOptions(ids, buffered, state.devices);
+
+  const existing = new Map();
+  Array.from(select.options).forEach((opt) => existing.set(opt.value, opt));
+  want.forEach((item, i) => {
+    let opt = existing.get(item.value);
+    if (opt) existing.delete(item.value);
+    else {
+      opt = document.createElement("option");
+      opt.value = item.value;
+    }
+    if (opt.textContent !== item.label) opt.textContent = item.label;
+    if (select.options[i] !== opt) select.insertBefore(opt, select.options[i] || null);
+  });
+  existing.forEach((opt) => opt.remove());
+}
+
+/**
+ * 按设备并集同步整页设备标注：容器 5 列模式、下拉显隐与选项、已有行的标签。
+ *
+ * 行节点不重建，只在首行/正文之间补删一个 <span class="log-dev">；并集从
+ * ≥2 掉回 1 时把标签、下拉和残留的设备过滤一起清掉，不留孤儿控件。
+ */
+function syncLogDeviceUi() {
+  const list = $("#logList");
+  if (!list) return;
+  const union = logDeviceUnion();
+  const show = window.LogDevice.showsDeviceTag(union);
+  list.classList.toggle("show-dev", show);
+
+  const select = $("#logDev");
+  const label = $("#logDevLabel");
+  if (label) label.hidden = !show;
+  if (select) select.hidden = !show;
+
+  let changed = false;
+  if (!show) {
+    // 并集掉回 1：下拉连同选项一起清掉，不留孤儿控件，也不留一个永远
+    // 匹配不到任何行的设备过滤。
+    if (select) {
+      while (select.options.length) select.removeChild(select.options[0]);
+      select.value = "";
+    }
+    if (state.logFilter.dev) {
+      state.logFilter.dev = "";
+      changed = true;
+    }
+  } else if (select) {
+    syncLogDevOptions(select, union);
+    // 选项以 state 为准回填下拉；选中的设备若已从选项里消失（关机且历史
+    // 行也被裁掉），连同过滤条件一起复位。
+    const want = state.logFilter.dev || "";
+    if (want && !Array.from(select.options).some((o) => o.value === want)) {
+      state.logFilter.dev = "";
+      changed = true;
+    }
+    if (select.value !== (state.logFilter.dev || "")) select.value = state.logFilter.dev || "";
+  }
+
+  Array.from(list.children).forEach((row) => {
+    const dev = row.dataset.dev || "";
+    let span = row.querySelector(".log-dev");
+    if (!show) {
+      if (span) span.remove();
+      return;
+    }
+    const text = window.LogDevice.rowDeviceLabel(dev, state.devices, union);
+    if (!span) {
+      span = document.createElement("span");
+      span.className = "log-dev";
+      const kind = row.querySelector(".log-kind");
+      row.insertBefore(span, kind ? kind.nextSibling : row.children[2] || null);
+    }
+    if (span.textContent !== text) span.textContent = text;
+    if (span.title !== text) span.title = text;
+  });
+
+  // 设备项被清掉后，之前生效的设备过滤要跟着失效并重算可见性。
+  if (changed) applyLogFilter();
 }
 
 /** 只有过滤生效且有内容但全被隐藏时，才显示「没有匹配的日志」。 */
@@ -2226,11 +2339,18 @@ function applyLogFilter() {
 }
 
 function bindLogFilters() {
+  const dev = $("#logDev");
   const kind = $("#logKind");
   const search = $("#logSearch");
   const chips = $("#logLevelChips");
   const reset = $("#btnLogFilterReset");
 
+  if (dev) {
+    dev.onchange = () => {
+      state.logFilter.dev = dev.value || "";
+      applyLogFilter();
+    };
+  }
   if (kind) {
     kind.onchange = () => {
       state.logFilter.kind = kind.value;
@@ -2258,7 +2378,8 @@ function bindLogFilters() {
   }
   if (reset) {
     reset.onclick = () => {
-      state.logFilter = { kind: "", level: "", q: "" };
+      state.logFilter = { kind: "", level: "", q: "", dev: "" };
+      if (dev) dev.value = "";
       if (kind) kind.value = "";
       if (search) search.value = "";
       if (chips) {
@@ -2271,6 +2392,9 @@ function bindLogFilters() {
       applyLogFilter();
     };
   }
+  // 初始化时按当前设备并集决定「设备」下拉是否出现（日志页刚打开时通常
+  // 还没有行，等 pollLog 追加完会再同步一次）。
+  syncLogDeviceUi();
 }
 
 // 上滚 / 回底只改这两个状态值，然后重绘按钮与标签。
@@ -2313,22 +2437,29 @@ async function pollLog() {
     const anchor = state.logFollow ? null : captureLogAnchor(list);
 
     let visibleNew = 0;
+    // 设备标注只在并集 ≥2 时插列；空 dev 的行也插一个空 span，行与行才对齐。
+    // 这一批里新出现的 dev 可能把并集推到 2，追加完由 syncLogDeviceUi 补标签。
+    const showDev = window.LogDevice.showsDeviceTag(logDeviceUnion());
+    const devSpan = showDev ? '<span class="log-dev"></span>' : "";
     r.events.forEach((e) => {
       const row = document.createElement("div");
       row.className = "log-row " + (e.level || "info");
       // 过滤用的原始字段，不占视觉空间：kind / level 直接来自后端事件。
       row.dataset.kind = e.kind || "";
       row.dataset.level = e.level || "info";
-      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span><span class="log-text">${escapeHtml(e.text)}</span>`;
+      // 设备归属：空串表示上位机自身事件或无后缀旧固件，这类行不加标签、
+      // 也不参与任何设备过滤。
+      row.dataset.dev = e.dev || "";
+      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(e.text)}</span>`;
 
       // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
-      // 放进剪贴板，方便贴到 issue / 聊天里。
+      // 放进剪贴板，方便贴到 issue / 聊天里。有设备归属时带上 [设备名]。
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "log-copy";
       copyBtn.textContent = "复制";
       copyBtn.title = "复制这一行（宏正文已隐藏）";
-      copyBtn.onclick = () => copyLogLine(`${e.time} [${e.kind}] ${e.text}`, copyBtn);
+      copyBtn.onclick = () => copyLogLine(window.LogDevice.logCopyText(e, state.devices), copyBtn);
       row.appendChild(copyBtn);
 
       applyLogRowVisibility(row);
@@ -2340,6 +2471,10 @@ async function pollLog() {
         toast(e.text, "bad");
       }
     });
+
+    // 用最新并集补齐 / 摘掉设备标签与下拉；只动标签节点，不重建行。
+    // 必须放在测量 scrollHeight 之前，行高才是最终值。
+    syncLogDeviceUi();
 
     // 裁剪前后的内容高度差 = 被移除行占掉的高度，暂停态要补回滚动位置。
     const heightBeforeTrim = list.scrollHeight;
@@ -2614,6 +2749,8 @@ async function init() {
     // 清空后没有可读的旧行，强制回跟随。
     state.logFollow = true;
     state.logPending = 0;
+    // 缓冲清空后设备并集只剩在线设备，掉回 1 台时标签与下拉要一起收起。
+    syncLogDeviceUi();
     syncLogFilterChrome();
     syncLogFollowUi({ stick: true });
   };
