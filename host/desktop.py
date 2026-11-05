@@ -38,6 +38,8 @@ import urllib.error
 import urllib.request
 import webbrowser
 
+from i18n import t
+
 STATE = {
     "desktop": False,
     "tray_active": False,
@@ -53,7 +55,13 @@ BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
 
 # WS-457: 端口 8788 被另一个实例占着时，用户看到的是这句话，而不是
 # "WinError 10048"。提权实例接管端口失败时也用它。
-PORT_BUSY_HINT = "已有普通权限实例在运行，请先退出"
+# Looked up per call (not a module constant): importing this module must not
+# freeze the language chosen at that moment.
+
+
+def port_busy_hint() -> str:
+    return t("error.port_busy")
+
 
 _quit_callback = None
 
@@ -142,9 +150,9 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 
 def port_busy_message(port: int | None = None) -> str:
     """Readable text for "the port is taken by another instance"."""
-    msg = PORT_BUSY_HINT
+    msg = port_busy_hint()
     if port:
-        msg += f"（端口 {port} 已被占用）"
+        msg += t("error.port_busy_detail", port=port)
     return msg
 
 
@@ -152,7 +160,7 @@ def port_bind_error(exc: BaseException, port: int | None = None) -> str:
     """Translate a failed bind into something a user can act on.
 
     ``WinError 10048`` ("only one usage of each socket address") tells the
-    user nothing; ``PORT_BUSY_HINT`` tells them what to do.
+    user nothing; ``port_busy_hint()`` tells them what to do.
     """
     code = getattr(exc, "errno", None)
     if code == errno.EADDRINUSE or code == 10048 or "10048" in str(exc):
@@ -183,7 +191,7 @@ def make_flask_server(flask_app, port: int):
 
 def is_port_busy_error(error: str) -> bool:
     """Whether *error* says "the port is taken by another instance"."""
-    return bool(error) and error.startswith(PORT_BUSY_HINT)
+    return bool(error) and error.startswith(port_busy_hint())
 
 
 def clear_port_busy_error() -> None:
@@ -380,7 +388,7 @@ def dialog_main(kind: str) -> int:
         from tkinter import filedialog
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"ok": False, "path": "",
-                          "error": f"当前 Python 未包含 tkinter，无法打开文件对话框：{e}"}))
+                          "error": t("error.file_dialog_no_tk", detail=e)}))
         return 2
 
     root = None
@@ -395,18 +403,18 @@ def dialog_main(kind: str) -> int:
         except Exception:
             pass
         if kind == "dir":
-            path = filedialog.askdirectory(parent=root, title="选择文件夹", mustexist=True)
+            path = filedialog.askdirectory(parent=root, title=t("dialog.choose_dir"), mustexist=True)
         else:
             path = filedialog.askopenfilename(
                 parent=root,
-                title="选择要启动的程序或文件",
+                title=t("dialog.choose_program"),
                 filetypes=[
-                    ("程序 / 快捷方式", "*.exe *.lnk *.bat *.cmd *.com *.msi"),
-                    ("所有文件", "*.*"),
+                    (t("dialog.filter_program"), "*.exe *.lnk *.bat *.cmd *.com *.msi"),
+                    (t("dialog.filter_all"), "*.*"),
                 ],
             )
     except Exception as e:  # noqa: BLE001
-        print(json.dumps({"ok": False, "path": "", "error": f"文件对话框失败：{e}"}))
+        print(json.dumps({"ok": False, "path": "", "error": t("error.file_dialog_failed", detail=e)}))
         return 3
     finally:
         try:
@@ -437,7 +445,7 @@ def browse(kind: str = "file") -> dict:
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "path": "",
-                "error": f"文件对话框 {BROWSE_TIMEOUT} 秒无操作，已取消"}
+                "error": t("error.file_dialog_timeout", seconds=BROWSE_TIMEOUT)}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "path": "", "error": f"{type(e).__name__}: {e}"}
 
@@ -450,13 +458,13 @@ def browse(kind: str = "file") -> dict:
             continue
     if not isinstance(payload, dict):
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        detail = detail[-1] if detail else "无输出"
+        detail = detail[-1] if detail else t("dialog.no_output")
         return {"ok": False, "path": "",
-                "error": f"文件对话框不可用：{detail}（退出码 {proc.returncode}）"}
+                "error": t("error.file_dialog_unavailable", detail=detail, code=proc.returncode)}
     if not payload.get("ok"):
-        err = payload.get("error") or "文件对话框不可用"
+        err = payload.get("error") or t("error.file_dialog_unavailable_short")
         if proc.returncode not in (0, None):
-            err += f"（退出码 {proc.returncode}）"
+            err += t("ui.exit_code_suffix", code=proc.returncode)
         return {"ok": False, "path": "", "error": err}
     return {"ok": True, "path": payload.get("path") or ""}
 
@@ -508,11 +516,11 @@ def _build_tray(url: str, on_quit, window=None):
         on_quit()
 
     menu = pystray.Menu(
-        pystray.MenuItem("显示窗口", show, default=True),
+        pystray.MenuItem(t("tray.show_window"), show, default=True),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("退出 BindDeckLite", quit_app),
+        pystray.MenuItem(t("tray.quit"), quit_app),
     )
-    return pystray.Icon("BindDeckLite", _icon_image(), "BindDeckLite · 控制台", menu)
+    return pystray.Icon("BindDeckLite", _icon_image(), t("tray.tooltip"), menu)
 
 
 def _serve_forever(thread) -> None:
@@ -568,7 +576,7 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
     STATE["tray_available"] = tray_ok
     STATE["tray_available_error"] = tray_error
     if use_tray and not tray_ok:
-        STATE["error"] = "托盘不可用：" + tray_error
+        STATE["error"] = t("error.tray_unavailable", detail=tray_error)
         print("[desktop] pystray/Pillow unavailable, falling back:", tray_error)
     use_tray = use_tray and tray_ok
 
@@ -580,7 +588,7 @@ def run_desktop(flask_app, port: int, url: str, start_minimized: bool = False,
         open_url(url)
 
     if not use_tray:
-        print("[desktop] running without tray; use 退出上位机 in the UI or Ctrl+C")
+        print("[desktop] running without tray; use Quit in the UI or Ctrl+C")
         _serve_forever(thread)
         server.shutdown()
         set_quit_callback(None)
@@ -666,7 +674,7 @@ def _serve_headless(server, flask_thread, url, use_tray):
             print("[webview] tray icon ready")
             icon.run()
         else:
-            print("[webview] running headless; use 退出上位机 in the UI or Ctrl+C")
+            print("[webview] running headless; use Quit in the UI or Ctrl+C")
             _serve_forever(flask_thread)
     except KeyboardInterrupt:
         pass
@@ -764,9 +772,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         if focus_running_instance(url):
             print(f"[webview] already running at {url}, focused existing window")
             return 0
-        message = ("BindDeckLite 已在运行，但无法唤起它的窗口。"
-                   "请从任务栏或托盘打开已有窗口；若确实没有窗口，"
-                   "请先结束已有的 BindDeckLite 进程再重新启动。")
+        message = t("error.already_running")
         STATE["error"] = message
         print("[webview] " + message)
         show_error_dialog("BindDeckLite", message)
@@ -828,14 +834,13 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
             hidden=start_minimized,
         )
     except Exception as e:  # noqa: BLE001
-        STATE["error"] = f"pywebview 不可用: {type(e).__name__}: {e}"
+        STATE["error"] = t("error.webview_unavailable", name=type(e).__name__, message=e)
         print("[webview] native window unavailable, falling back to tray-only:", e)
         if is_frozen():
             # A windowed exe must not degrade silently: say why and where to look.
             show_error_dialog(
                 "BindDeckLite",
-                STATE["error"] + "\n\n请确认已安装 Microsoft Edge WebView2 Runtime。"
-                "详细错误已写入 host.log。")
+                STATE["error"] + "\n\n" + t("error.webview_runtime_hint"))
         return _serve_headless(server, flask_thread, url, use_tray)
 
     window_ref[0] = window
@@ -878,7 +883,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     try:
         webview.start(_log_renderer)
     except Exception as e:  # noqa: BLE001
-        STATE["error"] = f"pywebview GUI 不可用: {type(e).__name__}: {e}"
+        STATE["error"] = t("error.webview_gui_unavailable", name=type(e).__name__, message=e)
         print("[webview] GUI backend unavailable, serving headless:", e)
         # The window is gone; drop the reference so show_window() no-ops
         # cleanly instead of touching a dead GUI object (WS-374 review #5).
@@ -887,8 +892,7 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
         if is_frozen():
             show_error_dialog(
                 "BindDeckLite",
-                STATE["error"] + "\n\n请确认已安装 Microsoft Edge WebView2 Runtime。"
-                "详细错误已写入 host.log。")
+                STATE["error"] + "\n\n" + t("error.webview_runtime_hint"))
         return _serve_headless(server, flask_thread, url, use_tray)
 
     stop_all()

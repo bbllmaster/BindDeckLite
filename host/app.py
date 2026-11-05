@@ -48,6 +48,8 @@ import autostart
 import desktop
 import online_update
 from ble_link import BleLinkManager, scan_reason
+from i18n import (SUPPORTED_LANGS, SYSTEM_PREF, current_lang, messages,
+                  normalize_pref, resolve_lang, set_lang, t)
 
 SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -148,6 +150,8 @@ _config = {"devices": {}, "settings": {
     "skipped_version": "",     # 用户跳过的上位机版本
     "last_update": {},         # {status, from, to, at, result, marker}
     "update_fail_count": 0,    # 连续失败次数，>=2 暂停自动更新
+    # WS-529: 界面语言偏好（system / zh-CN / en-US），与上面三个键同层。
+    "lang": SYSTEM_PREF,
 }
 
 # WS-359: a stuck action thread never reaches its ``finally``, so an entry kept
@@ -199,12 +203,12 @@ def _input_label(cfg, idx: int) -> str:
     """Display name of one input for the log / event feed (WS-499)."""
     twelve = layout_of(cfg) == LAYOUT_12KEY
     if idx == 9:
-        return "按键 10（配网键）" if twelve else "编码器按压"
+        return t("ui.input_button_10_config") if twelve else t("ui.input_encoder_press")
     if 0 <= idx < 9:
-        return "按键 %d" % (idx + 1)
+        return t("ui.input_button_n") % (idx + 1)
     if twelve and idx < INPUT_COUNT_12KEY:
-        return "按键 %d（扩展）" % (idx + 1)
-    return "按键 %d" % (idx + 1)
+        return t("ui.input_button_n_extra") % (idx + 1)
+    return t("ui.input_button_n") % (idx + 1)
 
 
 def default_key_item(i: int) -> dict:
@@ -245,10 +249,12 @@ ENCODER_PINS = {
     "C3": {"CLK": 20, "DT": 21, "SW": 10},
     "ESP32": {"CLK": 18, "DT": 19, "SW": 5},
 }
-_ENCODER_ROLE_TEXT = {
-    "CLK": "编码器 A 相脚（CLK）",
-    "DT": "编码器 B 相脚（DT）",
-    "SW": "编码器按压脚",
+# 存“键”而不是译文：模块导入时才 t() 会把语言冻结在启动那一刻，
+# 之后切换语言这些标签不会跟着变。
+_ENCODER_ROLE_KEYS = {
+    "CLK": "ui.pin_encoder_a",
+    "DT": "ui.pin_encoder_b",
+    "SW": "ui.pin_encoder_press",
 }
 
 
@@ -298,7 +304,7 @@ def _pin_free_spans(rules: dict) -> list:
 
 def _reserved_pin_text(reserved) -> str:
     """``[[6, 11, "SPI Flash"]]`` -> ``6-11 SPI Flash``; several joined by 与."""
-    return " 与 ".join(
+    return t("ui.and_join").join(
         "%s %s" % (_pin_span_text([[lo, hi]]), label) for lo, hi, label in reserved
     )
 
@@ -306,7 +312,7 @@ def _reserved_pin_text(reserved) -> str:
 def _extended_pin_text(prof: str) -> str:
     """``GPIO10/20/21 = 第 10/11/12 键`` for the 12-key layout (WS-499)."""
     enc = ENCODER_PINS[prof]
-    return "GPIO%s = 第 10/11/12 键" % _pin_span_text(
+    return t("ui.pin_gpio_map_ext") % _pin_span_text(
         [[enc["SW"], enc["SW"]], [enc["CLK"], enc["CLK"]], [enc["DT"], enc["DT"]]], "/")
 
 
@@ -323,7 +329,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
     prof = pin_chip(chip)
     twelve = layout_of({"layout": layout}) == LAYOUT_12KEY
     if prof == "C3":
-        reserved = [[11, 17, "内部 Flash"]]
+        reserved = [[11, 17, t("ui.pin_internal_flash")]]
         rules = {
             "chip": "C3",
             "count": PIN_COUNT,
@@ -342,7 +348,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
         }
         if twelve:
             rules["hint"] = (
-                "C3：按键可用 GPIO%s（避开 %s）。%s；%s 是 USB-CDC，不建议占用。"
+                t("ui.pin_avail_c3")
                 % (
                     _pin_span_text(_pin_free_spans(rules)),
                     _reserved_pin_text(reserved),
@@ -352,7 +358,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
             )
         else:
             rules["hint"] = (
-                "C3：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s；%s 是 USB-CDC，不建议占用。"
+                t("ui.pin_avail_c3_enc")
                 % (
                     _pin_span_text(_pin_free_spans(rules)),
                     _reserved_pin_text(reserved),
@@ -362,7 +368,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
             )
         return rules
 
-    reserved = [[6, 11, "SPI Flash"], [34, 39, "仅输入脚"]]
+    reserved = [[6, 11, "SPI Flash"], [34, 39, t("ui.pin_input_only")]]
     rules = {
         "chip": "ESP32",
         "count": PIN_COUNT,
@@ -377,7 +383,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
     }
     if twelve:
         rules["hint"] = (
-            "经典 ESP32（12 键布局）：按键可用 GPIO%s（避开 %s）。%s。"
+            t("ui.pin_avail_esp32_12")
             % (
                 _pin_span_text(_pin_free_spans(rules)),
                 _reserved_pin_text(reserved),
@@ -385,7 +391,7 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
             )
         )
     else:
-        rules["hint"] = "经典 ESP32：按键可用 GPIO%s（避开 %s）；编码器 A/B/按压 = %s。" % (
+        rules["hint"] = t("ui.pin_avail_esp32") % (
             _pin_span_text(_pin_free_spans(rules)),
             _reserved_pin_text(reserved),
             _pin_span_text([[p, p] for p in rules["encoder"].values()], "/"),
@@ -425,26 +431,26 @@ def _pin_reject_reason(prof: str, btn: str, pin: int,
     are inputs 9..11 rather than an encoder, so using them again is a
     duplicate — the firmware words it the same way.
     """
-    who = "%s 的 GPIO %d" % (btn, pin)
+    who = t("error.pin_gpio_on_chip", btn=btn, pin=pin)
     if prof == "C3":
         if pin > 21:
-            return "out_of_range", who + " 在 C3 上不存在（C3 只有 GPIO0-10、20、21）"
+            return "out_of_range", who + t("error.pin_c3_missing")
         if 11 <= pin <= 17:
-            return "reserved", who + " 在 C3 上是内部 Flash 引脚，不能用作按键"
+            return "reserved", who + t("error.pin_c3_flash")
     else:
         if 6 <= pin <= 11:
-            return "reserved", who + " 是 SPI Flash 引脚（GPIO 6-11），不能用作按键"
+            return "reserved", who + t("error.pin_spi_flash")
         if pin >= 34:
-            return "reserved", who + " 是仅输入引脚（GPIO 34-39），没有内部上拉，不能用作按键"
+            return "reserved", who + t("error.pin_input_only")
     if layout_of({"layout": layout}) == LAYOUT_12KEY:
         for idx, role in ((9, "SW"), (10, "CLK"), (11, "DT")):
             if pin == ENCODER_PINS[prof][role]:
-                return "extended", who + (" 该脚在 12 键模式下是第 %d 键，不能重复分配"
+                return "extended", who + (t("error.pin_twelve_key")
                                           % (idx + 1))
         return "", ""
     for role, encoder_pin in ENCODER_PINS[prof].items():
         if pin == encoder_pin:
-            return "encoder", who + " 与" + _ENCODER_ROLE_TEXT[role] + "冲突"
+            return "encoder", t("error.pin_conflict_encoder") % (who, t(_ENCODER_ROLE_KEYS[role]))
     return "", ""
 
 
@@ -466,19 +472,19 @@ def validate_pins(pins, chip: str = "", layout: int = LAYOUT_ENCODER) -> list:
     accepted = {}   # pin -> [row indices], used for the duplicate report
 
     for i in range(PIN_COUNT):
-        btn = "按键 %d" % (i + 1)
+        btn = t("ui.input_button_n") % (i + 1)
         raw = values[i] if i < len(values) else None
         if raw is None or (isinstance(raw, str) and not raw.strip()):
-            errors.append({"index": i, "code": "empty", "message": btn + " 不能为空"})
+            errors.append({"index": i, "code": "empty", "message": btn + t("error.pin_empty")})
             continue
         ok, pin = _pin_int(raw)
         if not ok:
             errors.append({"index": i, "code": "not_integer",
-                           "message": btn + " 必须是 0-39 的整数"})
+                           "message": btn + t("error.pin_not_int")})
             continue
         if pin < 0 or pin > 39:
             errors.append({"index": i, "code": "out_of_range",
-                           "message": btn + " 必须填 0-39 的整数"})
+                           "message": btn + t("error.pin_fill_int")})
             continue
         reason_code, reason = _pin_reject_reason(prof, btn, pin, layout)
         if reason:
@@ -491,12 +497,12 @@ def validate_pins(pins, chip: str = "", layout: int = LAYOUT_ENCODER) -> list:
     for pin, rows in accepted.items():
         if len(rows) < 2:
             continue
-        names = ["按键 %d" % (i + 1) for i in rows]
-        text = ("%s 与%s" % (names[0], names[1]) if len(names) == 2
+        names = [t("ui.input_button_n") % (i + 1) for i in rows]
+        text = (t("error.pin_text_join") % (names[0], names[1]) if len(names) == 2
                 else "、".join(names))
         for i in rows:
             errors.append({"index": i, "code": "duplicate",
-                           "message": "%s 都使用了 GPIO %d" % (text, pin)})
+                           "message": t("error.pin_both_use_gpio") % (text, pin)})
 
     errors.sort(key=lambda e: e["index"])
     return errors
@@ -542,7 +548,7 @@ KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
 # （固件 v1.3.8 起直接跳过；更早的固件会发一帧全 0 报告，OS 不产生字符）。
 # 必须留在列表末尾：``keyOptions(selected)`` 找不到 selected 时退回第一项，
 # 0 排第一会让每个未知键码都显示成「不发键」。
-KEY_CODES += [("不发键（仅上位机动作）", 0)]
+KEY_CODES += [(t("ui.key_none_hint"), 0)]
 
 # --- macro key names ------------------------------------------------------
 # ``key:`` macro steps are written with the names the UI shows in the HID key
@@ -685,21 +691,21 @@ OTA_VERIFY_TIMEOUT = 90.0    # s to wait for the new firmware version after rebo
 # Human-readable labels for the five configurable fields (matches the order
 # the firmware applies them and the order the UI shows them).
 FIELD_LABELS = {
-    "pins": "按键引脚",
-    "keys": "按键码",
-    "enc": "编码器模式",
-    "sleep": "休眠",
-    "tz": "时区",
+    "pins": t("ui.group_pins"),
+    "keys": t("ui.group_keys"),
+    "enc": t("ui.group_enc"),
+    "sleep": t("ui.group_sleep"),
+    "tz": t("ui.group_tz"),
 }
 
 # Ordered (field, CFG prefix, label) tuples for ACK matching and readback
 # comparison. The prefix is the part after "CFG:" — e.g. "PINS" for "CFG:PINS:".
 _CFG_READBACK_FIELDS = [
-    ("pins", "PINS", "按键引脚"),
-    ("keys", "KEYS", "按键码"),
-    ("enc", "ENC", "编码器模式"),
-    ("sleep", "SLEEP", "休眠"),
-    ("tz", "TZ", "时区"),
+    ("pins", "PINS", t("ui.group_pins")),
+    ("keys", "KEYS", t("ui.group_keys")),
+    ("enc", "ENC", t("ui.group_enc")),
+    ("sleep", "SLEEP", t("ui.group_sleep")),
+    ("tz", "TZ", t("ui.group_tz")),
 ]
 
 # WS-499: the layout line is *optional*. A deck older than this feature never
@@ -707,7 +713,7 @@ _CFG_READBACK_FIELDS = [
 # half-failed on hardware that works fine. It is merged when it arrives and
 # compared by apply_device() only when that device actually reported it.
 _CFG_OPTIONAL_FIELDS = [
-    ("layout", "LAYOUT", "按键布局"),
+    ("layout", "LAYOUT", t("ui.layout_label")),
 ]
 _ALL_CFG_FIELDS = _CFG_READBACK_FIELDS + _CFG_OPTIONAL_FIELDS
 
@@ -986,7 +992,7 @@ def _capture_read_window(dev_id: str, field: str, raw: str) -> bool:
     read_window.on_value(field, raw)
     # Log the raw line so the user can cross-check the values that land in
     # the form against what the device actually reported.
-    add_event("cfg", "设备回报 CFG_" + field.upper() + ":" + raw, dev_id)
+    add_event("cfg", t("log.device_cfg_prefix") + field.upper() + ":" + raw, dev_id)
     return True
 
 
@@ -1002,11 +1008,11 @@ def _rejection_reason(field: str, expected: str, actual: str) -> str:
         try:
             pins = [int(x) for x in expected.split(",") if x.strip()]
         except ValueError:
-            return "设备拒绝"
+            return t("error.cfg_rejected")
         if len(pins) != len(set(pins)):
-            return "引脚重复"
-        return "保留脚"
-    return "设备拒绝"
+            return t("error.cfg_dup_pins")
+        return t("error.cfg_reserved_pins")
+    return t("error.cfg_rejected")
 
 
 # --- persistence ----------------------------------------------------------
@@ -1023,6 +1029,9 @@ def load_config():
                 "skipped_version": str(data.get("skipped_version", "") or ""),
                 "last_update": data.get("last_update", {}) or {},
                 "update_fail_count": int(data.get("update_fail_count", 0) or 0),
+                # WS-529: 语言偏好同样在顶层；旧 config 没有这个键时用
+                # system（跟随系统），不因为缺键而改动已有设置。
+                "lang": str(data.get("lang", SYSTEM_PREF) or SYSTEM_PREF),
             }
             # WS-503: configs written before the 12-key layout carry 10 key
             # entries; repair them on load so an upgraded deck cannot get
@@ -1034,6 +1043,9 @@ def load_config():
         pass
     except Exception as e:  # noqa: BLE001
         print("[app] config load failed:", e)
+    # WS-529: 老 config.json 没有 lang，读完后统一补上默认值，
+    # 这样调用方拿到的 _config 一定带这个顶层键。
+    _config.setdefault("lang", SYSTEM_PREF)
 
 
 def save_config():
@@ -1097,6 +1109,22 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
         return cfg
 
 
+def _err(message, **extra) -> dict:
+    """JSON error body that keeps both rendered text and the message key.
+
+    ``error`` stays the rendered sentence (old consumers and the pytest suite
+    read it); ``code`` + ``params`` let the web UI re-translate the same error
+    after a language switch (WS-529).
+    """
+    body = {
+        "error": str(message),
+        "code": getattr(message, "code", ""),
+        "params": getattr(message, "params", {}),
+    }
+    body.update(extra)
+    return body
+
+
 # --- event log ------------------------------------------------------------
 def add_event(kind: str, text: str, dev_id: str = "", level: str = "info"):
     global _event_seq
@@ -1107,7 +1135,12 @@ def add_event(kind: str, text: str, dev_id: str = "", level: str = "info"):
             "ts": time.time(),
             "time": time.strftime("%H:%M:%S"),
             "kind": kind,
-            "text": text,
+            # ``text`` stays the rendered string (SSE consumers and the pytest
+            # suite read it); ``code``/``params`` let the web UI re-translate
+            # the same row after a language switch (WS-529).
+            "text": str(text),
+            "code": getattr(text, "code", ""),
+            "params": getattr(text, "params", {}),
             "dev": dev_id,
             "level": level,
         }
@@ -1174,22 +1207,22 @@ _SYSINFO_FIELDS = ("uptime", "reset", "nvs", "heap", "safe", "boots")
 # esp_reset_reason_t values from ESP-IDF 5.5 (esp_system.h). Codes added by a
 # newer IDF fall through to 「未知(N)」 so they still reach the user verbatim.
 RESET_REASON_TEXT = {
-    0: "未知",
-    1: "上电",
-    2: "外部复位",
-    3: "软件重启",
-    4: "软件崩溃（panic）",
-    5: "中断看门狗",
-    6: "任务看门狗",
-    7: "看门狗",
-    8: "深度睡眠唤醒",
-    9: "掉电（欠压）",
-    10: "SDIO 复位",
-    11: "USB 复位",
-    12: "JTAG 复位",
-    13: "EFUSE 错误",
-    14: "电源毛刺",
-    15: "CPU 锁死",
+    0: t("log.reset_unknown"),
+    1: t("log.reset_poweron"),
+    2: t("log.reset_ext"),
+    3: t("log.reset_sw"),
+    4: t("log.reset_panic"),
+    5: t("log.reset_int_wdt"),
+    6: t("log.reset_task_wdt"),
+    7: t("log.reset_wdt"),
+    8: t("log.reset_deep_sleep"),
+    9: t("log.reset_brownout"),
+    10: t("log.reset_sdio"),
+    11: t("log.reset_usb"),
+    12: t("log.reset_jtag"),
+    13: t("log.reset_efuse"),
+    14: t("log.reset_glitch"),
+    15: t("log.reset_cpu_lockup"),
 }
 
 
@@ -1231,29 +1264,29 @@ def reset_reason_text(code) -> str:
     「未知(12)」 so a user can report it instead of seeing a blank cell.
     """
     if code is None:
-        return "未知"
-    label = RESET_REASON_TEXT.get(code, "未知")
+        return t("log.reset_unknown")
+    label = RESET_REASON_TEXT.get(code, t("log.reset_unknown"))
     return f"{label}({code})"
 
 
 def uptime_text(seconds) -> str:
     """「3 小时 12 分」/「4 分 5 秒」/「42 秒」."""
     if seconds is None:
-        return "未知"
+        return t("log.reset_unknown")
     seconds = max(0, int(seconds))
     hours, rest = divmod(seconds, 3600)
     minutes, secs = divmod(rest, 60)
     if hours:
-        return f"{hours} 小时 {minutes} 分"
+        return t("ui.uptime_hm", hours=hours, minutes=minutes)
     if minutes:
-        return f"{minutes} 分 {secs} 秒"
-    return f"{secs} 秒"
+        return t("ui.uptime_ms", minutes=minutes, seconds=secs)
+    return t("ui.uptime_s", seconds=secs)
 
 
 def heap_text(free_bytes) -> str:
     """「96 KB」— one decimal below 100 KB so a tight heap stays visible."""
     if free_bytes is None:
-        return "未知"
+        return t("log.reset_unknown")
     kb = max(0, int(free_bytes)) / 1024.0
     if kb >= 100 or abs(kb - round(kb)) < 0.05:
         return f"{kb:.0f} KB"
@@ -1263,10 +1296,10 @@ def heap_text(free_bytes) -> str:
 def nvs_text(nvs) -> str:
     """「可用」/「不可用：配置不会保存」."""
     if nvs == 1:
-        return "可用"
+        return t("log.uptime_ok")
     if nvs == 0:
-        return "不可用：配置不会保存"
-    return "未知"
+        return t("log.uptime_no_save")
+    return t("log.reset_unknown")
 
 
 # --- millis() wrap (WS-449) -----------------------------------------------
@@ -1275,8 +1308,16 @@ def nvs_text(nvs) -> str:
 # rebooted.  A card showing 「0 秒」 would read as "the device just restarted",
 # which is exactly wrong.  We remember the last value per device and, when the
 # new one is clearly below it, say "已运行" relative to this connection instead.
-UPTIME_WRAP_TEXT = "本次连接内已运行"
-UPTIME_WRAP_NOTE = "设备计时已回绕"
+
+
+def uptime_wrap_text() -> str:
+    """「本次连接内已运行」— looked up per call, so a language switch applies."""
+    return t("log.uptime_this_session")
+
+
+def uptime_wrap_note() -> str:
+    """「设备计时已回绕」— looked up per call (see ``uptime_wrap_text``)."""
+    return t("log.uptime_wrapped")
 
 
 def uptime_wrapped(dev_id: str, seconds) -> bool:
@@ -1319,13 +1360,13 @@ def sysinfo_view(payload: str, dev_id: str = "") -> dict:
     }
     notes = {}
     if flags["safe"]:
-        notes["safe"] = "安全模式：连续多次启动未稳定，本次跳过配网手势"
+        notes["safe"] = t("log.device_safe_mode")
     if flags["deepsleep"]:
-        notes["deepsleep"] = "设备是睡着了，不是死机"
+        notes["deepsleep"] = t("log.device_asleep")
     if flags["heap_low"]:
-        notes["heap"] = "内存偏低，可能影响 OTA"
+        notes["heap"] = t("log.device_low_memory")
     if wrapped:
-        notes["uptime_wrap"] = UPTIME_WRAP_NOTE
+        notes["uptime_wrap"] = uptime_wrap_note()
     return {
         "sample": sample,
         "display": {
@@ -1333,8 +1374,9 @@ def sysinfo_view(payload: str, dev_id: str = "") -> dict:
             # app.js renders notes.safe/heap/deepsleep only, so the wrap hint
             # is also carried in the value itself; the plain 「5 秒」 is
             # suppressed because it reads as "just rebooted".
-            "uptime": (f"{UPTIME_WRAP_TEXT}（{UPTIME_WRAP_NOTE}）" if wrapped
-                       else uptime_text(sample["uptime"])),
+            "uptime": (t("log.uptime_wrapped_line",
+                         text=uptime_wrap_text(), note=uptime_wrap_note())
+                       if wrapped else uptime_text(sample["uptime"])),
             "nvs": nvs_text(sample["nvs"]),
             "heap": heap_text(sample["heap"]),
         },
@@ -1395,7 +1437,8 @@ def _on_line(dev_id: str, line: str):
     if line.startswith("ENC:"):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
-        add_event("enc", "编码器 " + ("顺时针" if direction == "CW" else "逆时针"), dev_id)
+        add_event("enc", t("ui.input_encoder_cw") if direction == "CW"
+                  else t("ui.input_encoder_ccw"), dev_id)
         # WS-389: mode 4 ("上位机动作") may bind a host-side action to each
         # rotation direction. The device still sends F23/F24 regardless; the
         # host action is opt-in and only runs when configured.
@@ -1424,7 +1467,7 @@ def _on_line(dev_id: str, line: str):
                          # firmware omits it and we fall back to 0 (unknown).
                          "flash": int(fields[4]) if len(fields) > 4 and fields[4].strip().isdigit() else 0}
             save_config()
-        add_event("device", f"固件 {cfg['fw']['version']} ({chip})", dev_id)
+        add_event("device", t("log.firmware_version", version=cfg['fw']['version'], chip=chip), dev_id)
         return
 
     # Apply window: capture ACK during the sending phase so the caller can
@@ -1436,7 +1479,7 @@ def _on_line(dev_id: str, line: str):
             if body.startswith("CFG:" + prefix + ":"):
                 window.on_ack(field)
                 break
-        add_event("ack", "设备确认: " + body[:60], dev_id, "ok")
+        add_event("ack", t("log.device_confirm") + body[:60], dev_id, "ok")
         return
 
     # Apply window: capture CFG_* during the readback phase WITHOUT touching
@@ -1469,7 +1512,7 @@ def _on_line(dev_id: str, line: str):
         with _lock:
             _apply_cfg_field(cfg, "keys", line[len("CFG_KEYS:"):])
             save_config()
-        add_event("cfg", "已读取设备按键配置", dev_id)
+        add_event("cfg", t("log.keys_read"), dev_id)
         return
     if line.startswith("CFG_PINS:"):
         cfg = device_cfg(dev_id)
@@ -1505,7 +1548,7 @@ def _on_line(dev_id: str, line: str):
         add_event("ota", line, dev_id, "ok")
         return
     if line.startswith("ACK:"):
-        add_event("ack", "设备确认: " + line[len("ACK:"):][:60], dev_id, "ok")
+        add_event("ack", t("log.device_confirm") + line[len("ACK:"):][:60], dev_id, "ok")
         return
     # WS-321: host binding status reported by CMD:GET_BOND. The address is
     # already masked by the firmware; we just store and display it.
@@ -1522,7 +1565,7 @@ def _on_line(dev_id: str, line: str):
             cfg["bond"] = bond
             save_config()
         add_event("device",
-                  "主机绑定: " + ("已绑定" if parsed["bound"] else "未绑定"),
+                  t("log.host_binding") + (t("log.bound") if parsed["bound"] else t("log.unbound")),
                   dev_id)
         return
     # WS-423: the firmware reports the live NimBLE bond state on its own line
@@ -1541,7 +1584,7 @@ def _on_line(dev_id: str, line: str):
     if line.startswith("PONG"):
         sent = _ping_sent.pop(dev_id, None)
         rtt = int((time.time() - sent) * 1000) if sent else 0
-        add_event("pong", f"设备响应 {rtt} ms", dev_id, "ok")
+        add_event("pong", t("log.ping_response", ms=rtt), dev_id, "ok")
         return
     # WS-445: the answer to CMD:SYSINFO. Hand it to the request that is
     # waiting; an unsolicited line (a newer deck, a duplicate answer) is
@@ -1667,7 +1710,7 @@ def apply_device(dev_id: str) -> dict:
     # int(None) and the user only saw "500 INTERNAL SERVER ERROR".
     pin_errors = validate_pins(cfg.get("pins"), cfg.get("chip", ""), target_layout)
     if pin_errors:
-        add_event("cfg", "未下发：" + pin_errors[0]["message"], dev_id, "warn")
+        add_event("cfg", t("log.not_sent_prefix") + pin_errors[0]["message"], dev_id, "warn")
         return {"ok": False, "invalid": True, "pin_errors": pin_errors,
                 "error": pin_errors[0]["message"]}
 
@@ -1681,9 +1724,8 @@ def apply_device(dev_id: str) -> dict:
             with _lock:
                 cfg["layout_supported"] = False
                 save_config()
-            message = ("当前固件不支持 12 键布局（需要 v1.3.7 及以上），"
-                       "请先在配网页面或通过 OTA 升级固件")
-            add_event("cfg", "未下发：" + message, dev_id, "warn")
+            message = t("log.layout_unsupported")
+            add_event("cfg", t("log.not_sent_prefix") + message, dev_id, "warn")
             return {"ok": False, "unsupported_layout": True, "error": message}
 
     count = input_count(cfg)
@@ -1758,16 +1800,16 @@ def apply_device(dev_id: str) -> dict:
 
             if not ack_ok:
                 status = "unconfirmed"
-                reason = "设备未连接" if not any_sent else "连接中断"
+                reason = t("log.not_connected") if not any_sent else t("log.connection_lost")
             elif not any_readback:
                 # ACK came back but CMD:GET_CFG produced nothing at all —
                 # old firmware that does not support readback.
                 status = "unverified"
-                reason = "已下发，设备未回报（固件不支持校验）"
+                reason = t("log.sent_no_readback")
             elif field not in window.readback:
                 # Some fields came back but this one is missing.
                 status = "unverified"
-                reason = "设备未回报该字段"
+                reason = t("log.field_not_reported")
             elif actual == expected:
                 status = "ok"
                 reason = ""
@@ -1791,14 +1833,14 @@ def apply_device(dev_id: str) -> dict:
             ok_layout = actual_layout == snapshot["layout"]
             items.append({
                 "field": "layout",
-                "label": "按键布局",
+                "label": t("ui.layout_label"),
                 "status": "ok" if ok_layout else "rejected",
                 "expected": snapshot["layout"],
                 "actual": actual_layout,
-                "reason": "" if ok_layout else "设备拒绝（布局仍是原来的）",
+                "reason": "" if ok_layout else t("log.layout_rejected"),
             })
             if not ok_layout:
-                add_event("cfg", "布局未生效：设备回报 " + actual_layout, dev_id, "warn")
+                add_event("cfg", t("log.layout_not_applied") + actual_layout, dev_id, "warn")
 
         ok_all = all(i["status"] == "ok" for i in items)
         # WS-512: only an apply whose every field read back with the value we
@@ -1891,7 +1933,7 @@ def read_sysinfo(dev_id: str, timeout: float = SYSINFO_TIMEOUT) -> dict:
 
     at = time.time()
     if not completed or payload is None:
-        add_event("device", "运行状态：设备未响应 CMD:SYSINFO（固件可能不支持）",
+        add_event("device", t("log.sysinfo_unanswered"),
                   dev_id)
         result = {"ok": False, "supported": False, "at": at,
                   "reason": "timeout"}
@@ -1932,7 +1974,7 @@ def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
     if not at:
         at = time.time()
     if got < total:
-        reason = "设备未回报配置" if got == 0 else "设备未回报完整配置"
+        reason = t("log.cfg_not_reported") if got == 0 else t("log.cfg_incomplete")
         return {"ok": False, "cfg": None, "fields": fields,
                 "at": at, "reason": reason}
 
@@ -1945,7 +1987,7 @@ def collect_cfg_snapshot(dev_id: str, values: dict, at: float = 0.0) -> dict:
         for field, _prefix, _label in _ALL_CFG_FIELDS:
             if field in values and not _apply_cfg_field(merged, field, values[field]):
                 return {"ok": False, "cfg": None, "fields": fields, "at": at,
-                        "reason": "设备回报的配置无法解析"}
+                        "reason": t("log.cfg_unparseable")}
         # WS-512: every tracked group came back and parsed, so the archive is
         # what the deck actually runs — the banner can go away.  A partial
         # answer returned above and keeps the untrusted flag untouched.
@@ -2051,10 +2093,10 @@ def _macro_step_text(step) -> str:
         count = len(str(value or ""))
         delay = _macro_text_delay_ms(step)
         if delay is not None:
-            return f"text({delay}ms, {count} 字符)"
-        return f"text({count} 字符)"
+            return t("log.macro_step_text_delay", delay=delay, count=count)
+        return t("log.macro_step_text", count=count)
     if stype == "paste":
-        return f"paste({len(str(value or ''))} 字符)"
+        return t("log.macro_step_paste", count=len(str(value or "")))
     if stype == "delay":
         return f"wait:{_truncate(str(value or 0))}"
     if stype == "url":
@@ -2075,15 +2117,15 @@ def macro_summary(action: dict) -> str:
     action = action or {}
     steps = action.get("macro")
     if not isinstance(steps, list) or not steps:
-        return "0 步"
+        return t("log.macro_zero_steps")
     total = len(steps)
     parts = [_macro_step_text(step) for step in steps]
-    head = f"{total} 步："
+    head = t("log.macro_head", total=total)
     summary = head + " → ".join(parts)
     if len(summary) > MACRO_SUMMARY_MAX:
         # Keep whole steps only — a half-printed step ("text(13 字") would
         # be misleading.  The tail carries the real step count.
-        tail = f"…（共 {total} 步）"
+        tail = t("log.macro_tail", total=total)
         budget = MACRO_SUMMARY_MAX - len(head) - len(tail)
         kept = []
         used = 0
@@ -2228,13 +2270,13 @@ def resolve_macro_browser(name: str):
 
     if sys.platform.startswith("win"):
         if key == "safari":
-            return None, "default", "Windows 不支持 Safari"
+            return None, "default", t("error.safari_windows")
         exe = _windows_browser_exe(key)
         if exe:
             return exe, label, ""
         # Never fall through to webbrowser.get() here: that is the call that
         # silently resolves to the default handler (Edge).
-        return None, "default", f"未找到浏览器 {key}"
+        return None, "default", t("error.browser_not_found", name=key)
 
     for alias in aliases:
         exe = shutil.which(alias)
@@ -2249,7 +2291,7 @@ def resolve_macro_browser(name: str):
             failures.append(f"{alias}: {e}")
         except Exception as e:  # noqa: BLE001
             failures.append(f"{alias}: {type(e).__name__}: {e}")
-    return None, "default", f"未找到浏览器 {key}（{'; '.join(failures)}）"
+    return None, "default", t("error.browser_not_found_detail", name=key, detail="; ".join(failures))
 
 
 def _open_url_with(target, url: str) -> str:
@@ -2270,7 +2312,7 @@ def _open_url_with(target, url: str) -> str:
             target.open(url)
         return ""
     except Exception as e:  # noqa: BLE001
-        print(f"[app] 宏浏览器打开失败 ({type(e).__name__}: {e})，回退默认浏览器")
+        print(f"[app] macro browser failed ({type(e).__name__}: {e}), falling back to the default browser")
         webbrowser.open(url)
         return f"{type(e).__name__}: {e}"
 
@@ -2400,13 +2442,13 @@ def _app_cmd_error(value: str) -> str:
     "unbalanced quote" and "no executable given" need different wording.
     """
     if not value.strip():
-        return "未指定可执行文件"
+        return t("error.no_executable")
     try:
         parts = _split_app_tokens(value)
     except ValueError:
-        return "命令行引号不配对"
+        return t("error.bad_quotes")
     if not parts or not parts[0]:
-        return "未指定可执行文件"
+        return t("error.no_executable")
     return ""
 
 
@@ -2670,7 +2712,7 @@ def _win32_api():
 
         _win32 = (user32, kernel32)
     except Exception as e:  # noqa: BLE001
-        print(f"[app] Win32 clipboard API 不可用 ({type(e).__name__}: {e})")
+        print(f"[app] Win32 clipboard API unavailable ({type(e).__name__}: {e})")
         _win32 = False
     return _win32 or None
 
@@ -2935,8 +2977,8 @@ def _paste_text(kb, text: str, dev_id: str = "") -> bool:
             except Exception as e:  # noqa: BLE001
                 sent = False
                 add_event("action",
-                          f"粘贴快捷键 {MACRO_PASTE_HOTKEY} 发送失败"
-                          f"（{type(e).__name__}: {e}），paste 步骤回退逐字符输入",
+                          t("error.macro_paste_hotkey", hotkey=MACRO_PASTE_HOTKEY,
+                            name=type(e).__name__, message=e),
                           dev_id, "error")
             # Restore on both paths: the clipboard already holds this step's
             # text, so bailing out on the failure path would lose what the
@@ -2945,7 +2987,7 @@ def _paste_text(kb, text: str, dev_id: str = "") -> bool:
             return sent
         finally:
             cb.close()
-    add_event("action", "剪贴板不可用，paste 步骤跳过（回退逐字符输入）",
+    add_event("action", t("log.clipboard_paste_skipped"),
               dev_id, "error")
     return False
 
@@ -3060,10 +3102,10 @@ def _macro_cancelled(action: dict, step: int, total: int,
     error toast, and so ``_record_action_result`` writes a ``warn`` row that
     names the step but never its body (WS-484 rule).
     """
-    label = MACRO_STEP_LABELS.get(step_type, step_type) or "未知步骤"
+    label = MACRO_STEP_LABELS.get(step_type, step_type) or t("log.macro_unknown_step")
     return {"ok": False,
             "cancelled": True,
-            "error": f"已停止（第 {step}/{total} 步，{label}）",
+            **_err(t("log.macro_cancelled", step=step, total=total, label=label)),
             "action_type": "macro",
             "target": _action_display_target(action),
             "step": step,
@@ -3100,14 +3142,14 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind in ("launch", "url"):
         if not value:
             if kind == "url":
-                return {"ok": False, "error": "地址为空",
+                return {"ok": False, **_err(t("error.empty_address")),
                         "action_type": kind, "target": target}
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         # Pre-check local launch targets so failures are visible on every
         # platform (xdg-open / open do not raise on Linux for missing files).
         if kind == "launch" and not value.startswith(("http://", "https://")):
             if not os.path.exists(value):
-                return {"ok": False, "error": "文件不存在: " + value,
+                return {"ok": False, **_err(t("log.file_missing") + value),
                         "action_type": kind, "target": target}
         try:
             _open_target(value)
@@ -3133,7 +3175,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind == "macro":
         kb = _load_keyboard()
         if kb is None:
-            return {"ok": False, "error": "宏需要 keyboard 库: pip install keyboard",
+            return {"ok": False, **_err(t("error.macro_need_keyboard")),
                     "action_type": kind, "target": target}
         # WS-484: remember which step failed so the log row can point at it
         # without echoing the macro body.
@@ -3215,9 +3257,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                     # 一律判死，以及环境变量展开在启动时丢失。
                     app_val = step.get("value", "")
                     if not app_val.strip():
-                        add_event("error",
-                                  "app: 未指定可执行文件，本步跳过，"
-                                  "继续执行后续步骤",
+                        add_event("error", t("log.macro_app_no_exe"),
                                   dev_id, "error")
                         continue
                     app_exe_raw, _app_args = _parse_app_cmd(app_val)
@@ -3227,19 +3267,16 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                         # _app_cmd_error 只在出错这条路径上再解析一次，
                         # 用于区分「引号不配对」和「没写可执行文件」。
                         add_event("error",
-                                  f"app: {_app_cmd_error(app_val)}，本步跳过，"
-                                  "继续执行后续步骤",
+                                  t("log.macro_app_bad_cmd", reason=_app_cmd_error(app_val)),
                                   dev_id, "error")
                         continue
                     app_exe = _resolve_exe(app_exe_raw)
                     if not app_exe:
                         add_event("error",
-                                  f"app: 未找到可执行文件 "
-                                  f"{app_exe_raw}（已尝试路径展开与 PATH "
-                                  "解析），本步跳过，继续执行后续步骤",
+                                  t("log.macro_app_exe_missing", exe=app_exe_raw),
                                   dev_id, "error")
                         continue
-                    add_event("action", f"正在启动 {app_val}", dev_id, "ok")
+                    add_event("action", t("log.macro_app_starting", target=app_val), dev_id, "ok")
                     prev_hwnd = _win_foreground_hwnd()
                     proc = None
                     try:
@@ -3247,8 +3284,8 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                     except (FileNotFoundError, PermissionError,
                             OSError) as e:
                         add_event("error",
-                                  f"app: 启动失败 "
-                                  f"{type(e).__name__}: {e}",
+                                  t("log.macro_app_start_failed",
+                                    name=type(e).__name__, message=e),
                                   dev_id, "error")
                     if proc is not None:
                         # Desktop apps start slower than browsers;
@@ -3262,17 +3299,15 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                             prev_hwnd, proc.pid)
                         if focused is False:
                             add_event("warn",
-                                      f"app: 等待窗口到前台超时（"
-                                      f"{MACRO_APP_FOCUS_TIMEOUT} "
-                                      "秒），后续 text:/key:/paste:"
-                                      "可能打到别的窗口",
+                                      t("log.macro_app_focus_timeout",
+                                        seconds=MACRO_APP_FOCUS_TIMEOUT),
                                       dev_id, "warn")
                 elif st == "browser":
                     browser_target, browser_used, browser_err = (
                         resolve_macro_browser(step.get("value", "")))
                     if browser_err:
-                        print("[app] 宏 browser 步骤:", browser_err)
-                        add_event("error", browser_err + "，已回退默认浏览器",
+                        print("[app] macro browser step:", browser_err)
+                        add_event("error", browser_err + t("log.macro_browser_fallback_suffix"),
                                   level="error")
                 elif st == "url":
                     # Empty url: skip silently (no exception).  Non-empty url:
@@ -3287,17 +3322,17 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                         if open_err:
                             add_event(
                                 "error",
-                                f"未能用 {browser_used} 打开 {url_log}"
-                                f"（{open_err}），已回退默认浏览器",
+                                t("log.macro_url_open_failed", browser=browser_used,
+                                  url=url_log, error=open_err),
                                 level="error")
                             browser_target = None
                             browser_used = "default"
                         elif browser_used == "default":
-                            add_event("action", f"已用默认浏览器打开 {url_log}",
+                            add_event("action", t("log.macro_url_opened_default", url=url_log),
                                       level="ok")
                         else:
                             add_event("action",
-                                      f"已用 {browser_used} 打开 {url_log}",
+                                      t("log.macro_url_opened", browser=browser_used, url=url_log),
                                       level="ok")
                         # Keep the freshly opened window in front, otherwise
                         # the next text:/paste: steps land in the old window.
@@ -3319,7 +3354,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind == "media":
         kb = _load_keyboard()
         if kb is None:
-            return {"ok": False, "error": "媒体键需要 keyboard 库: pip install keyboard",
+            return {"ok": False, **_err(t("error.media_need_keyboard")),
                     "action_type": kind, "target": target}
         try:
             kb.send(value)
@@ -3343,7 +3378,7 @@ def _action_label(idx: int, dev_id: str = "") -> str:
             cfg = _config["devices"].get(dev_id)
         if cfg is not None:
             return _input_label(cfg, idx)
-    return f"按键 {idx + 1}" if 0 <= idx < 9 else "编码器按压"
+    return t("ui.input_button_n") % (idx + 1) if 0 <= idx < 9 else t("ui.input_encoder_press")
 
 
 def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
@@ -3373,28 +3408,34 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
             total = len(steps) if isinstance(steps, list) else 0
         step_type = MACRO_STEP_LABELS.get(result.get("step_type", ""),
                                           result.get("step_type", ""))
-        where = f"第 {result.get('step', 0)}/{total} 步"
         if step_type:
-            where += f"（{step_type}）"
-        add_event("action", f"动作已停止：{label} · {where}", dev_id, "warn")
+            where = t("log.step_where_type", step=result.get("step", 0),
+                      total=total, type=step_type)
+        else:
+            where = t("log.step_where", step=result.get("step", 0), total=total)
+        add_event("action", t("log.action_stopped", label=label, where=where), dev_id, "warn")
         return
     if result["ok"]:
-        add_event("action", f"动作成功: {label} · {atype} · {target}", dev_id, "ok")
+        add_event("action", t("log.action_ok", label=label, type=atype, target=target), dev_id, "ok")
         return
     if atype == "macro" and "step" in result:
         steps = (action or {}).get("macro") or []
         total = len(steps) if isinstance(steps, list) else 0
         step_type = MACRO_STEP_LABELS.get(result.get("step_type", ""),
                                           result.get("step_type", ""))
-        where = f"宏第 {result.get('step', 0)}/{total} 步"
         if step_type:
-            where += f" {step_type}"
+            where = t("log.macro_where_type", step=result.get("step", 0),
+                      total=total, type=step_type)
+        else:
+            where = t("log.macro_where", step=result.get("step", 0), total=total)
         add_event("action",
-                  f"动作失败: {label} · {where} 失败：{result['error']}",
+                  t("log.action_failed_macro", label=label, where=where,
+                    error=result["error"]),
                   dev_id, "error")
         return
     add_event("action",
-              f"动作失败: {label} · {atype} · {target} · {result['error']}",
+              t("log.action_failed", label=label, type=atype, target=target,
+                error=result["error"]),
               dev_id, "error")
 
 
@@ -3423,8 +3464,8 @@ def _prune_stuck_actions(now: float | None = None):
             stuck.append((key, now - entry["started"]))
     for (dev_id, idx), elapsed in stuck:
         add_event("action",
-                  f"动作超时释放: {_action_label(idx, dev_id)} · 已运行 {elapsed:.1f} 秒，"
-                  f"强制解除执行中状态",
+                  t("log.action_timeout_release", label=_action_label(idx, dev_id),
+                    seconds=f"{elapsed:.1f}"),
                   dev_id, "warn")
 
 
@@ -3562,8 +3603,8 @@ def _run_action_for(dev_id: str, idx: int):
         # Re-entry: the previous macro is still typing into the focused window,
         # so a second one would interleave characters. Drop it silently.
         add_event("action",
-                  f"动作跳过: {_action_label(idx, dev_id)} · 上一次动作仍在执行"
-                  f"（已运行 {busy_for:.1f} 秒）",
+                  t("log.action_skipped_busy", label=_action_label(idx, dev_id),
+                    seconds=f"{busy_for:.1f}"),
                   dev_id, "warn")
         return
 
@@ -3591,7 +3632,7 @@ def _run_action_for(dev_id: str, idx: int):
 # --- encoder rotation actions (WS-389) -------------------------------------
 def _encoder_action_label(direction: str) -> str:
     """Human-readable label for one rotation direction."""
-    return "编码器顺时针" if direction == "CW" else "编码器逆时针"
+    return t("ui.input_encoder_cw") if direction == "CW" else t("ui.input_encoder_ccw")
 
 
 def _prune_stuck_encoder_actions(now: float | None = None):
@@ -3613,8 +3654,8 @@ def _prune_stuck_encoder_actions(now: float | None = None):
             stuck.append((key, now - entry["started"]))
     for (dev_id, direction), elapsed in stuck:
         add_event("action",
-                  f"动作超时释放: {_encoder_action_label(direction)} · 已运行 "
-                  f"{elapsed:.1f} 秒，强制解除执行中状态",
+                  t("log.action_timeout_release",
+                    label=_encoder_action_label(direction), seconds=f"{elapsed:.1f}"),
                   dev_id, "warn")
 
 
@@ -3721,8 +3762,7 @@ def _run_encoder_action(dev_id: str, direction: str):
         # A previous action of this direction is still running — dropping a
         # second one would interleave characters with the first (WS-360).
         add_event("action",
-                  f"动作跳过: {label} · 上一次动作仍在执行"
-                  f"（已运行 {busy_for:.1f} 秒）",
+                  t("log.action_skipped_busy", label=label, seconds=f"{busy_for:.1f}"),
                   dev_id, "warn")
         return
 
@@ -3845,7 +3885,7 @@ def api_action_test(dev_id, idx):
     # never start a second macro next to a running one.
     token, busy_for = _begin_action(dev_id, idx)
     if token is None:
-        return jsonify({"ok": False, "error": "该按键的动作仍在执行",
+        return jsonify({"ok": False, **_err(t("log.action_still_running_key")),
                         "running": True, "elapsed": round(busy_for, 1)}), 200
 
     # Execute synchronously (5 s cap) so the caller gets the real result.
@@ -3871,10 +3911,10 @@ def api_action_test(dev_id, idx):
             # the worker owns the claim then, so the card stays in "执行中".
             _end_action(dev_id, idx, token)
 
-    t = threading.Thread(target=_worker, daemon=True)
-    _bind_action_thread(dev_id, idx, token, t)
+    worker = threading.Thread(target=_worker, daemon=True)
+    _bind_action_thread(dev_id, idx, token, worker)
     try:
-        t.start()
+        worker.start()
     except Exception:  # noqa: BLE001 — Thread.start() failed, keep the table clean
         _end_action(dev_id, idx, token)
         raise
@@ -3882,7 +3922,7 @@ def api_action_test(dev_id, idx):
         result = result_queue.get(timeout=5.0)
     except queue.Empty:
         # Still running: report it as such instead of a misleading timeout.
-        return jsonify({"ok": False, "error": "仍在执行", "running": True}), 200
+        return jsonify({"ok": False, **_err(t("log.action_still_running")), "running": True}), 200
 
     _end_action(dev_id, idx, token)
     return jsonify({"ok": result["ok"], "error": result["error"],
@@ -3936,7 +3976,7 @@ def api_encoder_action_test(dev_id, direction):
         # only reached if the user somehow clicks. Report the refusal instead
         # of a fake success (WS-390 review #1).
         return jsonify({"ok": False,
-                        "error": "仅「上位机动作」模式可测试旋转动作"})
+                        **_err(t("error.encoder_test_mode"))})
     actions = cfg.get("encoder", {}).get("actions", {}) or {}
     action = actions.get(direction) or {}
     if not action or action.get("type", "none") == "none":
@@ -3948,7 +3988,7 @@ def api_encoder_action_test(dev_id, direction):
     token, busy_for = _begin_encoder_action(dev_id, direction, action,
                                             ignore_cooldown=True)
     if token is None:
-        return jsonify({"ok": False, "error": "该方向的动作仍在执行",
+        return jsonify({"ok": False, **_err(t("log.action_still_running_dir")),
                         "running": True, "elapsed": round(busy_for, 1)}), 200
 
     result_queue: "queue.Queue" = queue.Queue()
@@ -3963,10 +4003,10 @@ def api_encoder_action_test(dev_id, direction):
         finally:
             _end_encoder_action(dev_id, direction, token)
 
-    t = threading.Thread(target=_worker, daemon=True)
-    _bind_encoder_action_thread(dev_id, direction, token, t)
+    worker = threading.Thread(target=_worker, daemon=True)
+    _bind_encoder_action_thread(dev_id, direction, token, worker)
     try:
-        t.start()
+        worker.start()
     except Exception:  # noqa: BLE001
         _end_encoder_action(dev_id, direction, token)
         raise
@@ -3975,7 +4015,7 @@ def api_encoder_action_test(dev_id, direction):
     except queue.Empty:
         # Still running: the worker owns the claim, so the card stays
         # "执行中" until the action finishes. Do NOT release here.
-        return jsonify({"ok": False, "error": "仍在执行", "running": True}), 200
+        return jsonify({"ok": False, **_err(t("log.action_still_running")), "running": True}), 200
 
     _end_encoder_action(dev_id, direction, token)
     _record_action_result(dev_id, -1, action, result,
@@ -4057,13 +4097,12 @@ def _ota_validate(filename: str) -> str:
     """
     import re as _re
     if not filename:
-        return "未选择文件"
+        return t("error.ota_no_file")
     base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     # Accept the release naming (ota_binddecklite_c3_v1.3.0.bin) — dots are
     # part of the version, so do not restrict the stem to word characters.
     if not _re.fullmatch(r"ota_[^/\\]+\.bin", base, _re.IGNORECASE):
-        return ("文件名必须以 ota_ 开头、以 .bin 结尾（app-only 固件），"
-                "不要上传 merged 整片包")
+        return t("error.ota_filename_rule")
     return ""
 
 
@@ -4102,14 +4141,12 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
     target slot, otherwise a user-facing, actionable error string."""
     n = len(file_data)
     if n < 0x30:
-        return "文件过小，不是完整的 ESP32 固件镜像"
+        return t("error.ota_too_small")
     if file_data[0] != 0xE9:
-        return "不是 ESP32 固件镜像（缺少 0xE9 文件头），请选择 ota_*.bin"
+        return t("error.ota_not_esp_image")
     # app descriptor magic at 0x20 — only an app image has it there.
     if file_data[0x20:0x24] != b"\x32\x54\xcd\xab":
-        return ("这是整片 merged 包，OTA 只能刷 app-only 固件（ota_*.bin）。\n"
-                "请到发布页下载 ota_binddecklite_*_vX.Y.Z.bin，"
-                "或用配网页面 http://192.168.4.1 → 固件 OTA 升级。")
+        return t("error.ota_merged_pack")
     # Walk the segments to (a) reject a corrupt/truncated segment table and
     # (b) compute the declared image length (header + segments + checksum).
     # seg_count is one byte (0-255), so the loop is bounded; a corrupt count
@@ -4119,14 +4156,14 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
         pos = 24  # ESP_IMAGE_HEADER_LEN
         for _ in range(seg_count):
             if pos + 8 > n:
-                return "固件镜像段表损坏或被截断"
+                return t("error.ota_segment_table")
             seg_len = int.from_bytes(file_data[pos + 4:pos + 8], "little")
             if seg_len > n or pos + 8 + seg_len > n:
-                return "固件镜像已损坏或被截断（段长度越界）"
+                return t("error.ota_segment_bounds")
             pos += 8 + seg_len
         core_len = pos + 1  # + trailing checksum byte
     except Exception:
-        return "固件镜像结构无法解析"
+        return t("error.ota_bad_structure")
 
     # The image may carry an appended 32-byte SHA256 (the ESP-IDF toolchain rule,
     # flagged by bit 0 of byte 23). When the flag is set the hash MUST be the
@@ -4139,8 +4176,7 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
     if hash_appended:
         if n < core_len + 32 or \
                 file_data[n - 32:n] != hashlib.sha256(file_data[:n - 32]).digest():
-            return ("固件镜像不完整或尾部 SHA256 不匹配（已损坏/被截断）。"
-                    "请重新下载并核对发布页的 SHA256。")
+            return t("error.ota_truncated")
         # valid image with appended hash; alignment padding before the hash is
         # covered by the hash itself, so nothing more to check here.
     else:
@@ -4148,21 +4184,16 @@ def _ota_validate_image(file_data: bytes, slot_cap: int) -> str:
         # least core_len, with at most 16 bytes of alignment padding; anything
         # else is corrupt/truncated.
         if n < core_len:
-            return ("固件镜像不完整（已损坏或被截断）：文件 %d 字节，预期至少 %d 字节。"
-                    "请重新下载并核对发布页的 SHA256。" % (n, core_len))
+            return t("error.ota_size_short") % (n, core_len)
         if n > core_len + 16:
-            return ("固件镜像可能损坏或不完整（长度异常，预期约 %d 字节）。"
-                    "请重新下载并核对发布页的 SHA256。" % core_len)
+            return t("error.ota_size_suspect") % core_len
 
     if n > slot_cap:
         if slot_cap >= 1024 * 1024:
-            cap_txt = "约 %d MB" % (slot_cap // (1024 * 1024))
+            cap_txt = t("ui.megabytes") % (slot_cap // (1024 * 1024))
         else:
             cap_txt = "%d KB" % (slot_cap // 1024)
-        return ("固件 %d 字节，超出本设备 OTA 槽容量（%s）。\n"
-                "请确认选择了对应设备型号的固件；若确为此设备，"
-                "请用配网页面 /update 或 USB 刷 merged 整片包。"
-                % (n, cap_txt))
+        return t("error.ota_slot_overflow") % (n, cap_txt)
     return ""
 
 
@@ -4181,19 +4212,19 @@ def _ota_version_from_name(filename: str) -> str:
 
 # Device-side rejection reasons → what the user should do about them.
 _OTA_ERROR_TEXT = {
-    "timeout": "设备接收超时，请重试",
-    "not_app_image": "设备拒绝：不是 app-only 固件，请使用 ota_*.bin",
-    "not_bound": "设备拒绝：当前主机未绑定或无 HID 连接，请先在设备页确认绑定状态",
-    "size": "设备拒绝：固件长度与声明不一致",
-    "hash": "设备拒绝：SHA256 校验失败，固件可能已损坏",
-    "args": "设备拒绝：OTA 参数无效（固件版本过低？请使用配网页面）",
-    "begin_failed": "设备拒绝：固件超出 app 分区容量",
-    "write_failed": "设备写入失败，请重试",
-    "end_failed": "设备写入/激活失败（end_failed），固件已留在 OTA 槽未生效，旧固件仍可启动",
-    "busy": "设备正在执行其他 OTA",
-    "config_mode": "设备处于配网模式，请退出后重试",
-    "chunk_too_big": "块大小超出设备接受范围",
-    "not_active": "设备当前没有 OTA 会话",
+    "timeout": t("error.ota_rx_timeout"),
+    "not_app_image": t("error.ota_reject_not_app"),
+    "not_bound": t("error.ota_reject_unbound"),
+    "size": t("error.ota_reject_length"),
+    "hash": t("error.ota_reject_sha"),
+    "args": t("error.ota_reject_params"),
+    "begin_failed": t("error.ota_reject_capacity"),
+    "write_failed": t("error.ota_write_failed"),
+    "end_failed": t("error.ota_end_failed_stale"),
+    "busy": t("error.ota_busy_device"),
+    "config_mode": t("error.ota_provisioning"),
+    "chunk_too_big": t("error.ota_block_too_big"),
+    "not_active": t("error.ota_no_session"),
 }
 
 
@@ -4212,14 +4243,12 @@ def _ota_error_text(ack: str) -> str:
         if detail:
             guidance = ""
             if "read_error" in detail:
-                guidance = "（OTA 分区不可引导：检查 16MB 分区表 app1 槽与实际 flash，" \
-                           "或改用配网页面 /update 交叉验证）"
+                guidance = t("error.ota_guidance_read_error")
             elif "activate" in detail:
-                guidance = "（镜像激活失败：请用 esptool 从 OTA 槽读回比对，" \
-                           "或改用配网页面 /update 交叉验证）"
-            return f"设备写入/激活失败（end_failed: {detail}）{guidance}"
-        return _OTA_ERROR_TEXT.get("end_failed", "设备写入/激活失败，请重试")
-    return _OTA_ERROR_TEXT.get(reason, f"设备拒绝: {reason}")
+                guidance = t("error.ota_guidance_activate")
+            return t("error.ota_end_failed_detail", detail=detail, guidance=guidance)
+        return _OTA_ERROR_TEXT.get("end_failed", t("error.ota_end_failed"))
+    return _OTA_ERROR_TEXT.get(reason, t("error.ota_rejected_detail", reason=reason))
 
 
 def _wait_until(pred, timeout: float) -> bool:
@@ -4282,7 +4311,7 @@ def _ota_wait_restart(dev_id: str, old_version: str, old_build: str,
     if expected_version and fw["version"] == expected_version and fw["version"] != old_version:
         return True, ""
     if saw_down and fw["version"]:
-        return True, "版本号未变化（可能是同一构建重刷），设备已重启"
+        return True, t("log.ota_same_version")
     return False, ""
 
 
@@ -4300,21 +4329,20 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
     def _fail(message: str, level: str = "error"):
         window.status = "error"
         window.error = message
-        add_event("ota", f"OTA 失败: {filename} · {message}", dev_id, level)
+        add_event("ota", t("log.ota_failed", filename=filename, message=message), dev_id, level)
 
     def _run():
         total = window.total
-        add_event("ota", f"OTA 开始: {filename} ({total} bytes)", dev_id)
+        add_event("ota", t("log.ota_started", filename=filename, total=total), dev_id)
 
         # 1. CMD:OTA:<size>:<sha256> — arm the device. OTA is BLE-only: the
         #    CFG characteristic switches to binary mode and the WiFi UDP path
         #    has no OTA channel, so never fall back to it.
         if not ble.send(dev_id, f"CMD:OTA:{total}:{sha_hex}"):
-            _fail("设备未连接")
+            _fail(t("log.not_connected"))
             return
         if not _wait_until(lambda: window.ack_line or window.ack_error, OTA_CMD_TIMEOUT):
-            _fail("固件版本过低，不支持 OTA 升级。"
-                  "请使用配网页面（浏览器打开 http://192.168.4.1 → 固件 OTA 升级）")
+            _fail(t("error.ota_fw_too_old"))
             return
         ack = window.ack_line
         if ack.startswith("ACK:OTA:ERROR"):
@@ -4328,7 +4356,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         window.status = "uploading"
         chunk_size = min(OTA_CHUNK_MAX,
                          max(OTA_CHUNK_MIN, ble.max_payload(dev_id, OTA_CHUNK_MIN)))
-        add_event("ota", f"OTA 块大小 {chunk_size} B（MTU 窗口 32 KB）", dev_id)
+        add_event("ota", t("log.ota_chunk_size", size=chunk_size), dev_id)
         sent = 0
         while sent < total:
             if window.status == "cancelled":
@@ -4342,12 +4370,12 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
                         lambda: (sent - window.acked) < OTA_WINDOW_BYTES
                                 or bool(window.ack_error)
                                 or window.status == "cancelled", OTA_ACK_TIMEOUT):
-                    _fail("推送超时，请重试")
+                    _fail(t("error.ota_push_timeout"))
                     return
                 continue
             chunk = file_data[sent:sent + chunk_size]
             if not ble.send_raw(dev_id, chunk):
-                _fail("连接中断，请重试")
+                _fail(t("error.ota_link_lost"))
                 return
             sent += len(chunk)
             window.sent = sent
@@ -4358,7 +4386,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         if not _wait_until(lambda: window.acked >= total or bool(window.ack_error)
                                    or window.status == "cancelled",
                            OTA_ACK_TIMEOUT):
-            _fail("推送超时，请重试")
+            _fail(t("error.ota_push_timeout"))
             return
         if window.status == "cancelled":
             return
@@ -4372,7 +4400,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         #    is not fatal; step 4 decides.
         window.phase = "restart"
         if not ble.send(dev_id, "CMD:OTA_END"):
-            _fail("连接中断，请重试")
+            _fail(t("error.ota_link_lost"))
             return
         _wait_until(lambda: window.ack_line == "ACK:OTA:DONE"
                             or bool(window.ack_error)
@@ -4386,16 +4414,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
             # so the user is not left with a bare "verify failed" message.
             if err.startswith("ACK:OTA:ERROR:end_failed"):
                 detail = err[len("ACK:OTA:ERROR:end_failed:"):]
-                add_event("ota",
-                          "排查建议：end_failed 是设备侧写入/激活失败（主机已通过"
-                          "长度+SHA256 门禁，文件本身不是主因）。1) 查看日志里的 "
-                          "end_failed:<detail>(<code>)：read_error(3) 说明 OTA 分区"
-                          "不可引导（检查 16MB 分区表 app1 槽与实际 flash 容量），"
-                          "activate(9) 说明 esp_image_verify 失败（用 esptool 从 "
-                          "OTA 槽读回比对官方包）；2) 改用配网页面 "
-                          "http://192.168.4.1 → 固件 OTA 升级交叉验证（同一套 "
-                          "Update.end 路径）；3) 或 USB 刷 merged 整片包从 0x0 烧录。",
-                          dev_id, "warn")
+                add_event("ota", t("log.ota_end_failed_advice"), dev_id, "warn")
             _fail(_ota_error_text(err))
             return
 
@@ -4406,14 +4425,16 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         ok, note = _ota_wait_restart(dev_id, old_version, old_build,
                                      expected_version, OTA_VERIFY_TIMEOUT)
         if not ok:
-            _fail(f"设备未在 {int(OTA_VERIFY_TIMEOUT)} 秒内确认运行新固件"
-                  f"（期望 {expected_version or '新的构建'}），请检查设备是否正常启动")
+            _fail(t("error.ota_verify_timeout", seconds=int(OTA_VERIFY_TIMEOUT),
+                    expected=expected_version or t("log.ota_new_build")))
             return
 
         window.status = "done"
         got = _ota_current_fw(dev_id).get("version") or expected_version or "?"
-        add_event("ota", f"OTA 完成: {filename} ({total} bytes) → v{got}"
-                         + (f"（{note}）" if note else ""), dev_id, "ok")
+        done = t("log.ota_done", filename=filename, total=total, version=got)
+        if note:
+            done += t("log.ota_done_note", note=note)
+        add_event("ota", done, dev_id, "ok")
 
     threading.Thread(target=_run, daemon=True, name=f"ota-{dev_id}").start()
     return window
@@ -4427,10 +4448,10 @@ def api_ota(dev_id):
     immediately with a ``task`` id; poll ``/api/ota/<dev_id>/progress``.
     """
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": "未上传固件文件"}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_upload"))}), 400
     upload = request.files["file"]
     if not upload.filename:
-        return jsonify({"ok": False, "error": "未选择文件"}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_file"))}), 400
 
     err = _ota_validate(upload.filename)
     if err:
@@ -4438,7 +4459,7 @@ def api_ota(dev_id):
 
     file_data = upload.read()
     if not file_data:
-        return jsonify({"ok": False, "error": "文件为空"}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_empty_file"))}), 400
 
     # Pre-flight the image locally so a corrupt / truncated / wrong-kind file is
     # rejected before we spend 1-3 minutes pushing it over BLE. The firmware's
@@ -4446,10 +4467,7 @@ def api_ota(dev_id):
     fw = _ota_current_fw(dev_id)
     slot_cap = _ota_slot_cap(fw)
     if slot_cap <= 0:
-        return jsonify({"ok": False,
-                        "error": "本机型不支持上位机 OTA（2 MB 模块无 app1 分区）。"
-                                  "请用 USB 刷 merged 整片包从 0x0 烧录，"
-                                  "或使用配网页面 http://192.168.4.1 → 固件 OTA 升级。"}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_app1"))}), 400
     img_err = _ota_validate_image(file_data, slot_cap)
     if img_err:
         return jsonify({"ok": False, "error": img_err}), 400
@@ -4457,7 +4475,7 @@ def api_ota(dev_id):
     with _ota_lock:
         existing = _ota_windows.get(dev_id)
         if existing is not None and existing.status in ("starting", "uploading"):
-            return jsonify({"ok": False, "error": "该设备正在 OTA 中，请勿重复提交"}), 409
+            return jsonify({"ok": False, **_err(t("error.ota_busy_task"))}), 409
 
     # The device verifies both values before Update.end(), so a truncated or
     # tampered file can never replace the running firmware.
@@ -4481,15 +4499,15 @@ def api_ota_cancel(dev_id):
     with _ota_lock:
         window = _ota_windows.get(dev_id)
         if window is None:
-            return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
+            return jsonify({"ok": False, **_err(t("error.ota_no_task"))}), 404
         if window.status in ("done", "error", "cancelled"):
             _ota_windows.pop(dev_id, None)
             return jsonify({"ok": True, "sent": False, "status": window.status})
         window.status = "cancelled"
-        window.error = "已取消"
+        window.error = t("log.ota_cancelled_short")
 
     sent = ble.send(dev_id, "CMD:OTA_CANCEL")
-    add_event("ota", "OTA 已取消" + ("" if sent else "（取消指令未送达，设备将在 30 秒后自动中止）"),
+    add_event("ota", t("log.ota_cancelled") + ("" if sent else t("log.ota_cancel_undelivered")),
               dev_id, "warn")
     return jsonify({"ok": True, "sent": bool(sent), "status": "cancelled"})
 
@@ -4499,7 +4517,7 @@ def api_ota_progress(dev_id):
     with _ota_lock:
         window = _ota_windows.get(dev_id)
         if window is None:
-            return jsonify({"ok": False, "error": "无 OTA 任务"}), 404
+            return jsonify({"ok": False, **_err(t("error.ota_no_task"))}), 404
         # Clean up finished / errored windows after one last read so the poller
         # can detect completion by the task disappearing.
         done = window.status in ("done", "error", "cancelled")
@@ -4625,7 +4643,7 @@ def api_app_update_check():
     payload["release_url"] = info.get("release_url", online_update.RELEASE_PAGE_URL)
     if not app_asset:
         payload["ok"] = False
-        payload["error"] = "该发布版本没有可用的上位机安装包，请手动下载"
+        payload["error"] = t("error.app_update_no_asset")
         payload["error_code"] = "E_NO_APP_ASSET"
         return jsonify(payload)
 
@@ -4645,7 +4663,7 @@ def api_app_update_check():
         if not online_update.version_at_least(current, min_from):
             payload["min_from_ok"] = False
             payload["ok"] = False
-            payload["error"] = ("当前版本 %s 不能直接升级到 %s，请先手动升级到 %s 或更高版本"
+            payload["error"] = (t("error.app_update_jump")
                                 % (current, latest, min_from))
             payload["error_code"] = "E_MIN_FROM"
             return jsonify(payload)
@@ -4653,21 +4671,21 @@ def api_app_update_check():
         # 没有 SHA256 就不自动更新 —— 强制校验是硬性要求。
         if not app_asset.get("sha256"):
             payload["ok"] = False
-            payload["error"] = "该版本没有提供 SHA256 校验值，不能自动更新，请手动下载"
+            payload["error"] = t("error.app_update_no_sha")
             payload["error_code"] = "E_NO_SHA256"
             return jsonify(payload)
 
         # 清单里的资产必须真的在这次 Release 里（否则 apply 才会以 E_NO_URL 失败）。
         if not app_asset.get("url"):
             payload["ok"] = False
-            payload["error"] = ("该发布版本的安装包（%s）没有随 Release 上传，请手动下载"
+            payload["error"] = (t("error.app_update_asset_missing")
                                 % app_asset.get("asset", ""))
             payload["error_code"] = "E_NO_APP_ASSET"
             return jsonify(payload)
 
     if online_update.should_skip_version(current, latest, state["skipped_version"]):
         payload["skipped"] = True
-        payload["error"] = "已跳过版本 %s（如需恢复请重新检查更新）" % latest
+        payload["error"] = t("log.app_update_skipped", version=latest)
         payload["error_code"] = "E_SKIPPED"
         return jsonify(payload)
 
@@ -4686,7 +4704,7 @@ def api_app_update_apply():
         running = [t for t in _app_update_tasks.values()
                    if t.get("phase") not in _APP_UPDATE_DONE_PHASES]
         if running:
-            return jsonify({"ok": False, "error": "已有更新任务在运行"}), 409
+            return jsonify({"ok": False, **_err(t("error.update_busy"))}), 409
         # 清掉已结束的任务，dict 不会无限增长。
         for task_id in [k for k, v in _app_update_tasks.items()
                         if v.get("phase") in _APP_UPDATE_DONE_PHASES]:
@@ -4701,15 +4719,15 @@ def api_app_update_apply():
     release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
     app_asset = info.get("app") or {}
     if not app_asset:
-        return jsonify({"ok": False, "error": "该发布版本没有可用的上位机安装包",
+        return jsonify({"ok": False, **_err(t("error.app_update_no_asset")),
                         "error_code": "E_NO_APP_ASSET",
                         "release_url": release_url}), 409
     if not app_asset.get("sha256"):
-        return jsonify({"ok": False, "error": "该版本没有提供 SHA256 校验值，不能自动更新",
+        return jsonify({"ok": False, **_err(t("error.app_update_no_sha_short")),
                         "error_code": "E_NO_SHA256", "release_url": release_url}), 409
     if not app_asset.get("url"):
         return jsonify({"ok": False,
-                        "error": ("该发布版本的安装包（%s）没有随 Release 上传，请手动下载"
+                        "error": (t("error.app_update_asset_missing")
                                   % app_asset.get("asset", "")),
                         "error_code": "E_NO_APP_ASSET", "release_url": release_url}), 409
 
@@ -4717,16 +4735,17 @@ def api_app_update_apply():
     latest = app_asset["version"]
     state = _update_settings()
     if online_update.should_skip_version(current, latest, state["skipped_version"]):
-        return jsonify({"ok": False, "error": "已跳过版本 %s" % latest,
+        return jsonify({"ok": False,
+                        **_err(t("log.app_update_skipped_short", version=latest)),
                         "error_code": "E_SKIPPED", "release_url": release_url}), 409
     if not online_update.version_is_newer(latest, current):
-        return jsonify({"ok": False, "error": "已是最新（%s）" % current,
+        return jsonify({"ok": False, **_err(t("log.app_up_to_date", version=current)),
                         "release_url": release_url}), 409
     # min_from 与 check 阶段同一把尺：check 说不能升，apply 也不能升。
     min_from = app_asset.get("min_from") or ""
     if not online_update.version_at_least(current, min_from):
         return jsonify({"ok": False,
-                        "error": ("当前版本 %s 不能直接升级到 %s，请先手动升级到 %s 或更高版本"
+                        "error": (t("error.app_update_jump")
                                   % (current, latest, min_from)),
                         "error_code": "E_MIN_FROM", "release_url": release_url}), 409
     # 回滚失败计数只拦「同一个失败版本」：出现更高版本时放行并重新计数，
@@ -4740,8 +4759,7 @@ def api_app_update_apply():
             _set_update_state(update_fail_count=0)
         else:
             return jsonify({"ok": False,
-                            "error": ("上次更新到 %s 连续失败 %d 次，已暂停自动更新，"
-                                      "请手动下载新版本"
+                            "error": (t("error.app_update_paused")
                                       % (failed_version or latest, fail_count)),
                             "error_code": "E_UPDATE_PAUSED",
                             "release_url": release_url}), 409
@@ -4755,13 +4773,12 @@ def api_app_update_apply():
     target_dir = _update_target_dir()
     if not target_dir:
         return jsonify({"ok": False,
-                        "error": "找不到当前程序目录，无法自动替换，请手动下载",
+                        **_err(t("error.app_update_no_target")),
                         "error_code": "E_NO_TARGET", "release_url": release_url}), 409
     if not online_update.is_writable_dir(target_dir):
         # 不破坏原 exe：明确提示手动下载，并给出 Release 链接。
         return jsonify({"ok": False,
-                        "error": ("当前目录不可写（可能安装在 Program Files，需要管理员权限），"
-                                  "请手动下载新版本"),
+                        **_err(t("error.app_update_dir_readonly")),
                         "error_code": "E_DIR_RO",
                         "release_url": release_url}), 409
 
@@ -4842,13 +4859,13 @@ def _app_update_worker(task_id, info, app_asset, current):
             _phase("error", error=exc.message, error_code=exc.code)
             return
         if not online_update.launch_update_script(script_path):
-            _phase("error", error="无法启动更新脚本，请手动下载新版本",
+            _phase("error", error=t("error.app_update_script_failed"),
                    error_code="E_LAUNCH")
             return
 
         # 退出上位机：脚本等本进程退出后才替换 exe。
         _phase("restarting")
-        add_event("update", "上位机正在更新到 %s，程序即将重启" % version, level="ok")
+        add_event("update", t("log.app_update_restarting", version=version), level="ok")
         time.sleep(0.6)
         _quit_for_update()
         # 进程通常在 _quit_for_update() 里就退出了；走到这里说明退出被拒，
@@ -4857,7 +4874,7 @@ def _app_update_worker(task_id, info, app_asset, current):
     except online_update.UpdateError as exc:
         _phase("error", error=exc.message, error_code=exc.code)
     except Exception as exc:  # noqa: BLE001
-        _phase("error", error="更新失败：%s" % (exc,), error_code="E_INTERNAL")
+        _phase("error", error=t("error.app_update_failed") % (exc,), error_code="E_INTERNAL")
 
 
 def _quit_for_update():
@@ -4930,11 +4947,11 @@ def _ota_busy_reason() -> str:
     变成「卡住」。
     """
     if not _ota_lock.acquire(blocking=False):
-        return "设备正在升级，完成后再更新上位机"
+        return t("error.ota_busy_updating")
     try:
         for window in _ota_windows.values():
             if window.status in ("starting", "uploading"):
-                return "设备正在升级，完成后再更新上位机"
+                return t("error.ota_busy_updating")
     finally:
         _ota_lock.release()
     return ""
@@ -4966,7 +4983,7 @@ def _update_after_start():
         _set_update_state(last_update={**last, "status": "done", "result": "ok",
                                         "finished_at": time.time()},
                           update_fail_count=0)
-        add_event("update", "上位机已更新到 %s" % current, level="ok")
+        add_event("update", t("log.app_updated", version=current), level="ok")
         return
     # 回到旧版本 = 更新脚本回滚了。
     fail_count = state["update_fail_count"] + 1
@@ -4974,10 +4991,9 @@ def _update_after_start():
                                     "finished_at": time.time()},
                       update_fail_count=fail_count)
     if fail_count >= online_update.UPDATE_FAIL_LIMIT:
-        add_event("update", "上位机更新未成功（已连续失败 %d 次），已暂停自动更新"
-                  % fail_count, level="warn")
+        add_event("update", t("log.app_update_failed_paused", count=fail_count), level="warn")
     else:
-        add_event("update", "上位机更新未成功，已回滚到原版本", level="warn")
+        add_event("update", t("log.app_update_rolled_back"), level="warn")
 
 
 @app.route("/api/app/update/progress")
@@ -4986,7 +5002,7 @@ def api_app_update_progress():
     with _update_lock:
         task = _app_update_tasks.get(task_id)
         if task is None:
-            return jsonify({"ok": False, "error": "无更新任务"}), 404
+            return jsonify({"ok": False, **_err(t("error.no_update_task"))}), 404
         payload = dict(task)
     payload["ok"] = True
     return jsonify(payload)
@@ -4998,7 +5014,7 @@ def api_app_update_skip():
     data = request.get_json(silent=True) or {}
     version = str(data.get("version") or "").strip()
     if not version:
-        return jsonify({"ok": False, "error": "缺少版本号"}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_version"))}), 400
     _set_update_state(skipped_version=version)
     return jsonify({"ok": True, "skipped_version": version})
 
@@ -5008,7 +5024,7 @@ def api_app_update_cancel():
     """取消进行中的上位机更新（仅在下载阶段有效）。"""
     with _update_lock:
         if not _app_update_tasks:
-            return jsonify({"ok": False, "error": "无更新任务"}), 404
+            return jsonify({"ok": False, **_err(t("error.no_update_task"))}), 404
         for task in _app_update_tasks.values():
             task["cancelled"] = True
         _app_update_tasks.clear()
@@ -5025,7 +5041,7 @@ def api_firmware_update_check():
     """
     dev_id = request.args.get("dev_id") or ""
     if not dev_id:
-        return jsonify({"ok": False, "error": "缺少 dev_id"}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
 
     with _lock:
         cfg = _config["devices"].get(dev_id) or {}
@@ -5051,7 +5067,7 @@ def api_firmware_update_check():
     # 型号判定必须同时看 chip 与 flash —— 只看 flash 会把经典 ESP32 误判成 C3。
     variant = online_update.variant_for_device(chip, flash)
     if not variant:
-        payload["reason"] = "该型号暂无在线固件，请到发布页手动下载"
+        payload["reason"] = t("error.fw_no_online")
         payload["reason_code"] = "E_NO_VARIANT"
         return jsonify(payload)
     payload["device_variant"] = variant
@@ -5071,7 +5087,7 @@ def api_firmware_update_check():
 
     entry = (info.get("firmware") or {}).get(variant)
     if not entry:
-        payload["reason"] = "该型号暂无在线固件，请到发布页手动下载"
+        payload["reason"] = t("error.fw_no_online")
         payload["reason_code"] = "E_NO_VARIANT"
         return jsonify(payload)
 
@@ -5082,13 +5098,13 @@ def api_firmware_update_check():
         "sha256": entry.get("sha256", ""),
     }
     if not entry.get("sha256"):
-        payload["reason"] = "该固件没有提供 SHA256 校验值，不能自动升级，请手动下载"
+        payload["reason"] = t("error.fw_no_sha")
         payload["reason_code"] = "E_NO_SHA256"
         return jsonify(payload)
     # 清单里的固件必须真的在这次 Release 里 —— 否则 apply 才会以
     # E_NO_URL 失败，用户白等一次下载。
     if not entry.get("url"):
-        payload["reason"] = ("该固件文件（%s）没有随本次发布上传，请手动下载"
+        payload["reason"] = (t("error.fw_asset_missing")
                              % entry.get("asset", ""))
         payload["reason_code"] = "E_NO_FW_ASSET"
         return jsonify(payload)
@@ -5104,7 +5120,7 @@ def api_firmware_update_apply():
     data = request.get_json(silent=True) or {}
     dev_id = str(data.get("dev_id") or "")
     if not dev_id:
-        return jsonify({"ok": False, "error": "缺少 dev_id"}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
 
     busy = _ota_busy_reason()
     if busy:
@@ -5117,7 +5133,7 @@ def api_firmware_update_apply():
     flash = fw.get("flash", 0)
     variant = online_update.variant_for_device(chip, flash)
     if not variant:
-        return jsonify({"ok": False, "error": "该型号暂无在线固件，请到发布页手动下载",
+        return jsonify({"ok": False, **_err(t("error.fw_no_online")),
                         "error_code": "E_NO_VARIANT"}), 400
 
     try:
@@ -5129,15 +5145,16 @@ def api_firmware_update_apply():
     release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
     entry = (info.get("firmware") or {}).get(variant)
     if not entry or not entry.get("sha256"):
-        return jsonify({"ok": False, "error": "该型号暂无在线固件，请到发布页手动下载",
+        return jsonify({"ok": False, **_err(t("error.fw_no_online")),
                         "error_code": "E_NO_VARIANT", "release_url": release_url}), 409
     if not entry.get("url"):
         return jsonify({"ok": False,
-                        "error": ("该固件文件（%s）没有随本次发布上传，请手动下载"
+                        "error": (t("error.fw_asset_missing")
                                   % entry.get("asset", "")),
                         "error_code": "E_NO_FW_ASSET", "release_url": release_url}), 409
     if not online_update.version_is_newer(entry["version"], fw.get("version", "")):
-        return jsonify({"ok": False, "error": "已是最新（%s）" % (fw.get("version") or ""),
+        return jsonify({"ok": False,
+                        **_err(t("log.app_up_to_date", version=(fw.get("version") or ""))),
                         "release_url": release_url}), 409
 
     # 只接受 ota_*.bin（app-only），复用现有校验。
@@ -5148,7 +5165,7 @@ def api_firmware_update_apply():
 
     # 设备必须在线：否则整包下载完才发现推不上去，白等几分钟。
     if not _ota_is_connected(dev_id):
-        return jsonify({"ok": False, "error": "设备未连接，请先连接设备再升级固件",
+        return jsonify({"ok": False, **_err(t("error.fw_device_offline")),
                         "error_code": "E_NOT_CONNECTED", "release_url": release_url}), 409
 
     with _update_lock:
@@ -5205,13 +5222,13 @@ def _fw_update_worker(dev_id, variant, entry, fw):
         with open(final_path, "rb") as handle:
             file_data = handle.read()
         if not file_data:
-            _phase("error", error="固件文件为空", error_code="E_EMPTY")
+            _phase("error", error=t("error.fw_file_empty"), error_code="E_EMPTY")
             return
 
         # 推送前必须校验镜像能装进本设备的 OTA 槽（复用现有逻辑）。
         slot_cap = _ota_slot_cap(fw)
         if slot_cap <= 0:
-            _phase("error", error="本机型不支持上位机 OTA（2 MB 模块无 app1 分区）",
+            _phase("error", error=t("error.fw_no_app1_short"),
                    error_code="E_NO_SLOT")
             return
         img_err = _ota_validate_image(file_data, slot_cap)
@@ -5226,7 +5243,7 @@ def _fw_update_worker(dev_id, variant, entry, fw):
         with _ota_lock:
             existing = _ota_windows.get(dev_id)
             if existing is not None and existing.status in ("starting", "uploading"):
-                _phase("error", error="该设备正在 OTA 中，请勿重复提交",
+                _phase("error", error=t("error.ota_busy_task"),
                        error_code="E_OTA_BUSY")
                 return
         window = _ota_push(dev_id, entry["asset"], file_data, sha_hex, version,
@@ -5249,7 +5266,7 @@ def _fw_update_worker(dev_id, variant, entry, fw):
     except online_update.UpdateError as exc:
         _phase("error", error=exc.message, error_code=exc.code)
     except Exception as exc:  # noqa: BLE001
-        _phase("error", error="固件升级失败：%s" % (exc,), error_code="E_INTERNAL")
+        _phase("error", error=t("error.fw_update_failed") % (exc,), error_code="E_INTERNAL")
 
 
 @app.route("/api/firmware/update/progress")
@@ -5259,7 +5276,7 @@ def api_firmware_update_progress():
     with _update_lock:
         task = _fw_update_tasks.get(dev_id)
         if task is None:
-            return jsonify({"ok": False, "error": "无固件更新任务"}), 404
+            return jsonify({"ok": False, **_err(t("error.fw_no_task"))}), 404
         payload = dict(task)
     payload["ok"] = True
     # 推送阶段借用现有 OTA 窗口的进度（ack 百分比）。
@@ -5307,7 +5324,34 @@ def desktop_payload() -> dict:
         "start_minimized": start_minimized,
         "close_button_behavior": close_behavior,
         "recent_paths": recent,
+        # WS-529: 语言入口在「设备 → 桌面应用」。lang 是持久化偏好，
+        # lang_effective 是当前实际生效的 locale。
+        "lang": _config.get("lang", SYSTEM_PREF),
+        "lang_effective": current_lang(),
+        "langs": list(SUPPORTED_LANGS),
     }
+
+
+@app.route("/api/i18n")
+def api_i18n():
+    """Message table for the web UI (WS-529).
+
+    ``?lang=`` may be a tag (``en-US``) or ``system``; without it the stored
+    preference is used.  The server's own language is *not* changed here —
+    that only happens on ``POST /api/desktop`` so an unauthenticated page load
+    cannot flip the tray/log language behind the user's back.
+    """
+    tag = (request.args.get("lang") or "").strip()
+    if tag:
+        effective = resolve_lang(tag)
+    else:
+        effective = current_lang()
+    return jsonify({
+        "lang": effective,
+        "pref": normalize_pref(tag) if tag else _config.get("lang", SYSTEM_PREF),
+        "default": SUPPORTED_LANGS[0],
+        "messages": messages(effective),
+    })
 
 
 @app.route("/api/desktop", methods=["GET", "POST"])
@@ -5322,6 +5366,15 @@ def api_desktop():
             with _lock:
                 _config["settings"]["start_minimized"] = value
             save_config()
+        if "lang" in data:
+            # Only the three known preferences may be persisted: a stray
+            # {"lang": "xx"} used to be written verbatim into config.json.
+            pref = normalize_pref(str(data.get("lang") or SYSTEM_PREF))
+            with _lock:
+                _config["lang"] = pref
+            save_config()
+            set_lang(pref)
+
         if "close_button_behavior" in data:
             value = str(data["close_button_behavior"])
             if value not in ("minimize", "exit"):
@@ -5331,7 +5384,8 @@ def api_desktop():
             _close_behavior_ref["behavior"] = value
             save_config()
             add_event("desktop",
-                      "关闭按钮行为已设为 " + ("最小化到托盘" if value == "minimize" else "直接退出"),
+                      t("log.close_behavior",
+                        mode=t("ui.close_minimize") if value == "minimize" else t("ui.close_exit")),
                       level="ok")
 
         with _lock:
@@ -5342,7 +5396,7 @@ def api_desktop():
         # 当前条目确实是计划任务时才算「管理员模式」，否则一次只改
         # 「启动时最小化」就会把最高权限的任务静默降级成 Run 键。
         admin_pref = bool(current.get("admin"))
-        messages: list[str] = []
+        notes: list[str] = []
         rewrite = False
         result: dict | None = None
 
@@ -5352,12 +5406,12 @@ def api_desktop():
                 if "admin_autostart" in data:
                     admin_pref = bool(data["admin_autostart"])
                 rewrite = True
-                messages.append("已开启管理员自启动" if admin_pref else "已开启开机自启动")
+                notes.append(t("log.autostart_admin_on") if admin_pref else t("log.autostart_on"))
             else:
                 result = autostart.disable()
                 if result.get("ok"):
                     admin_pref = False
-                    messages.append("已关闭开机自启动")
+                    notes.append(t("log.autostart_off"))
         elif "admin_autostart" in data:
             # 提权模式变了：注册表 Run 值与计划任务互斥，重写一次。
             admin_pref = bool(data["admin_autostart"])
@@ -5365,8 +5419,8 @@ def api_desktop():
             # 否则「取消开机自启动」会被这一下顺手打开。
             if admin_pref or enabled:
                 rewrite = True
-                messages.append("已开启管理员自启动" if admin_pref
-                                else "已改为普通权限自启动")
+                notes.append(t("log.autostart_admin_on") if admin_pref
+                             else t("log.autostart_admin_off"))
         elif enabled and "start_minimized" in data:
             # 自启动已开、只改了「启动时最小化」：重写条目让它生效。
             rewrite = True
@@ -5376,14 +5430,14 @@ def api_desktop():
         if result is not None and not result.get("ok"):
             # 原样带上后端原因：UAC 被取消、需要管理员账户、schtasks 报错
             # 都不是「重写条目」失败，改写文案会让用户看不懂该做什么。
-            reason = str(result.get("error") or "设置失败")
-            add_event("desktop", "自启动设置失败：" + reason, level="warn")
+            reason = str(result.get("error") or t("error.setting_failed"))
+            add_event("desktop", t("log.autostart_failed", reason=reason), level="warn")
             # desktop_payload() also carries an "error" key (the desktop state
             # error), so it is spread *first* - written last, the real reason
             # below would be overwritten by that (usually empty) value and the
             # UI would fall back to the generic "设置失败".
             return jsonify({"ok": False, **desktop_payload(), "error": reason}), 500
-        for message in messages:
+        for message in notes:
             add_event("desktop", message, level="ok")
 
         if rewrite or "autostart" in data or "admin_autostart" in data:
@@ -5402,7 +5456,7 @@ def api_desktop_port_busy():
     instance shows it in its event log and in ``desktopHint``.
     """
     data = request.get_json(silent=True) or {}
-    message = str(data.get("message") or desktop.PORT_BUSY_HINT)
+    message = str(data.get("message") or desktop.port_busy_hint())
     desktop.STATE["error"] = message
     add_event("desktop", message, level="warn")
     return jsonify({"ok": True})
@@ -5461,27 +5515,27 @@ def api_desktop_restart_admin():
     quit path so the elevated one can take over the port.
     """
     if not sys.platform.startswith("win"):
-        return jsonify({"ok": False, "error": "仅 Windows 支持以管理员身份运行"}), 409
+        return jsonify({"ok": False, **_err(t("error.elevate_windows_only"))}), 409
     try:
         import ctypes
     except Exception as e:  # noqa: BLE001 - ctypes is always available on Windows
-        return jsonify({"ok": False, "error": f"无法调用系统提权接口：{e}"}), 500
+        return jsonify({"ok": False, **_err(t("error.elevate_api_failed", detail=e))}), 500
     args = _elevated_argv()
     params = subprocess.list2cmdline(args)
     try:
         rc = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, params, None, 1)
     except Exception as e:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"提权启动失败：{type(e).__name__}: {e}"}), 500
+        return jsonify({"ok": False, **_err(t("error.elevate_start_failed", name=type(e).__name__, message=e))}), 500
     if rc is None or rc <= 32:
         # <= 32: the UAC prompt was declined (or the launch failed).
-        add_event("desktop", "已取消提权，未能启动管理员实例", level="warn")
-        return jsonify({"ok": False, "error": "已取消提权"}), 409
-    add_event("desktop", "已启动管理员实例，正在退出当前实例", level="ok")
+        add_event("desktop", t("error.elevate_cancelled"), level="warn")
+        return jsonify({"ok": False, **_err(t("error.elevation_cancelled"))}), 409
+    add_event("desktop", t("log.elevated_started"), level="ok")
     # Leave through the existing exit path (server shutdown + window close),
     # never os._exit, so the elevated instance can bind the port.
     if not _exit_for_restart():
-        return jsonify({"ok": False, "error": "当前实例无法自动退出，请手动关闭后重试"}), 500
+        return jsonify({"ok": False, **_err(t("error.cannot_exit"))}), 500
     return jsonify({"ok": True})
 
 
@@ -5496,16 +5550,16 @@ def api_browse():
             recent.insert(0, path)
             _config["settings"]["recent_paths"] = recent[:8]
         save_config()
-        add_event("desktop", "已选择文件: " + path, level="ok")
+        add_event("desktop", t("log.file_selected") + path, level="ok")
     return jsonify(result), (200 if result.get("ok") else 503)
 
 
 @app.route("/api/quit", methods=["POST"])
 def api_quit():
     if desktop.request_quit():
-        add_event("desktop", "收到退出请求")
+        add_event("desktop", t("log.quit_requested"))
         return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "当前不是桌面/托盘模式，无法从页面退出"}), 409
+    return jsonify({"ok": False, **_err(t("error.quit_not_desktop"))}), 409
 
 
 @app.route("/api/show-window", methods=["POST"])
@@ -5518,11 +5572,11 @@ def api_show_window():
     endpoint is how the user brings the window back.
     """
     if not desktop.STATE.get("desktop"):
-        return jsonify({"ok": False, "error": "当前不是桌面模式"}), 409
+        return jsonify({"ok": False, **_err(t("error.not_desktop"))}), 409
     if desktop.show_window():
-        add_event("desktop", "已恢复窗口显示")
+        add_event("desktop", t("log.window_restored"))
         return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "没有可恢复的原生窗口（源码运行或 pywebview 不可用）"}), 409
+    return jsonify({"ok": False, **_err(t("error.no_window_to_restore"))}), 409
 
 
 @app.route("/api/log")
@@ -5544,13 +5598,13 @@ def api_keycodes():
 
 
 def _parse_args(argv):
-    parser = argparse.ArgumentParser(prog="BindDeckLite", description="BindDeckLite 上位机")
+    parser = argparse.ArgumentParser(prog="BindDeckLite", description=t("cli.description"))
     parser.add_argument("--desktop", "--tray", dest="desktop", action="store_true",
-                        help="桌面模式：pywebview 原生窗口 + 托盘（无控制台、无浏览器弹窗）")
+                        help=t("cli.desktop_help"))
     parser.add_argument("--minimized", action="store_true",
-                        help="启动时不显示窗口（最小化到托盘）")
+                        help=t("cli.minimized_help"))
     parser.add_argument("--no-tray", dest="no_tray", action="store_true",
-                        help="桌面模式但不创建托盘图标")
+                        help=t("cli.no_tray_help"))
     parser.add_argument("--file-dialog", choices=("file", "dir"), help=argparse.SUPPRESS)
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
@@ -5591,18 +5645,19 @@ def main(argv=None):
         if desktop.focus_running_instance(url):
             print(f"[app] already running at {url}, focused existing window")
             return 0
-        message = ("BindDeckLite 已在运行，但无法唤起它的窗口。"
-                   "请从任务栏或托盘打开已有窗口；若确实没有窗口，"
-                   "请先结束已有的 BindDeckLite 进程再重新启动。")
+        message = t("error.already_running")
         print("[app] " + message)
         desktop.show_error_dialog("BindDeckLite", message)
         return 1
 
     load_config()
+    # WS-529: 语言偏好落盘在 config.json 顶层，启动时先应用，
+    # 这样首屏渲染、SSE 事件与托盘文案都是用户上次选的语言。
+    set_lang(_config.get("lang", SYSTEM_PREF))
     _update_after_start()
     started = ble.start()
     if not started:
-        add_event("error", "BLE 不可用: " + str(ble.error), level="warn")
+        add_event("error", t("log.ble_unavailable") + str(ble.error), level="warn")
         print("[app] BLE unavailable:", ble.error)
     print(f"[app] BindDeckLite host running at {url}")
 

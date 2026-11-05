@@ -1385,3 +1385,27 @@ body.modal-open .main { overflow: hidden; }
   vertical-align: middle;
 }
 .update-dot[hidden] { display: none; }
+
+/* ---------- i18n (WS-529): 英文比中文长 ----------
+   English copy runs 30–50% longer than the Chinese it replaces, so labels may
+   wrap and grow instead of being clipped. Nothing here changes the Chinese
+   layout: the widths that were fixed for Chinese are turned into minimums. */
+.lang-select {
+  min-width: 150px;
+  padding: 6px 10px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+}
+.lang-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn { max-width: 100%; white-space: normal; text-align: center; }
+.tab { white-space: normal; }
+.kc-tag { width: auto; min-width: 30px; white-space: nowrap; }
+.ms-type { width: auto; min-width: 132px; }
+.hint { white-space: normal; }
+.panel-head { flex-wrap: wrap; }
+.dev-status-strip > div { min-width: 0; }
+.dev-status-strip b { overflow: hidden; text-overflow: ellipsis; }

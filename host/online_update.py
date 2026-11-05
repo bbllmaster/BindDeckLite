@@ -30,6 +30,8 @@ import time
 import urllib.error
 import urllib.request
 
+from i18n import t
+
 SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- 常量 -------------------------------------------------------------------
@@ -258,27 +260,27 @@ def fetch_latest_release(api_url: str = GITHUB_API_LATEST,
             if cached:
                 return {"release": cached["release"], "from_cache": True,
                         "not_modified": True}
-            raise UpdateError("GitHub 返回 304 但本地没有缓存，请重新检查更新",
+            raise UpdateError(t("error.gh_not_modified"),
                               "E_NO_CACHE")
         if exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0":
-            raise UpdateError("GitHub 访问频率超限（每小时匿名额度用尽），请稍后再试",
+            raise UpdateError(t("error.gh_rate_limited"),
                               "E_RATE_LIMIT")
         if exc.code == 404:
-            raise UpdateError("没有找到正式发布版本（GitHub 返回 404）", "E_NOT_FOUND")
-        raise UpdateError("GitHub 返回 HTTP %d" % exc.code, "E_HTTP_%d" % exc.code)
+            raise UpdateError(t("error.gh_no_release"), "E_NOT_FOUND")
+        raise UpdateError(t("error.gh_http") % exc.code, "E_HTTP_%d" % exc.code)
     except urllib.error.URLError as exc:
-        raise UpdateError("无法连接 GitHub：%s" % (exc.reason,), "E_NETWORK")
+        raise UpdateError(t("error.gh_unreachable") % (exc.reason,), "E_NETWORK")
     except TimeoutError:
-        raise UpdateError("连接 GitHub 超时，请检查网络或代理设置", "E_TIMEOUT")
+        raise UpdateError(t("error.gh_timeout"), "E_TIMEOUT")
     except OSError as exc:
-        raise UpdateError("网络错误：%s" % (exc,), "E_NETWORK")
+        raise UpdateError(t("error.network") % (exc,), "E_NETWORK")
 
     try:
         release = json.loads(raw)
     except ValueError:
-        raise UpdateError("GitHub 返回的内容不是合法 JSON", "E_BAD_JSON")
+        raise UpdateError(t("error.gh_bad_json"), "E_BAD_JSON")
     if not isinstance(release, dict):
-        raise UpdateError("GitHub 返回的 Release 格式异常", "E_BAD_JSON")
+        raise UpdateError(t("error.gh_bad_release"), "E_BAD_JSON")
 
     with _cache_lock:
         _release_cache[api_url] = {"release": release, "at": now, "not_modified": False}
@@ -304,14 +306,14 @@ def fetch_text(url: str, timeout: float = UPDATE_CHECK_TIMEOUT,
         with urllib.request.urlopen(request, timeout=timeout) as response:
             text = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        raise UpdateError("下载 %s 失败：HTTP %d" % (url.rsplit("/", 1)[-1], exc.code),
+        raise UpdateError(t("error.download_http") % (url.rsplit("/", 1)[-1], exc.code),
                           "E_HTTP_%d" % exc.code)
     except urllib.error.URLError as exc:
-        raise UpdateError("无法连接 GitHub：%s" % (exc.reason,), "E_NETWORK")
+        raise UpdateError(t("error.gh_unreachable") % (exc.reason,), "E_NETWORK")
     except TimeoutError:
-        raise UpdateError("连接 GitHub 超时，请检查网络或代理设置", "E_TIMEOUT")
+        raise UpdateError(t("error.gh_timeout"), "E_TIMEOUT")
     except OSError as exc:
-        raise UpdateError("网络错误：%s" % (exc,), "E_NETWORK")
+        raise UpdateError(t("error.network") % (exc,), "E_NETWORK")
 
     with _cache_lock:
         _text_cache[url] = {"text": text, "at": now}
@@ -354,9 +356,9 @@ def parse_manifest(text: str) -> dict:
     try:
         data = json.loads(text)
     except ValueError:
-        raise UpdateError("发布清单 update.json 不是合法 JSON", "E_MANIFEST")
+        raise UpdateError(t("error.release_manifest_bad_json"), "E_MANIFEST")
     if not isinstance(data, dict):
-        raise UpdateError("发布清单 update.json 格式异常", "E_MANIFEST")
+        raise UpdateError(t("error.release_manifest_bad_shape"), "E_MANIFEST")
     return data
 
 
@@ -563,13 +565,13 @@ def verify_downloaded_file(path: str, expected_sha256: str,
     ``digest`` 是下载时边下边算出来的 SHA256；给了它就不再读一遍文件。
     """
     if not expected_sha256:
-        return "发布清单缺少 SHA256 校验值，不能自动更新"
+        return t("error.release_no_sha")
     try:
         actual_size = os.path.getsize(path)
     except OSError as exc:
-        return "无法读取下载文件：%s" % (exc,)
+        return t("error.download_read") % (exc,)
     if expected_size and actual_size != int(expected_size):
-        return ("文件大小不符（清单 %d 字节，实际 %d 字节）"
+        return (t("error.download_size")
                 % (int(expected_size), actual_size))
     if not digest:
         digest = hashlib.sha256()
@@ -581,10 +583,10 @@ def verify_downloaded_file(path: str, expected_sha256: str,
                         break
                     digest.update(chunk)
         except OSError as exc:
-            return "无法读取下载文件：%s" % (exc,)
+            return t("error.download_read") % (exc,)
         digest = digest.hexdigest()
     if digest.lower() != expected_sha256.strip().lower():
-        return "SHA256 校验失败，文件已损坏或被篡改"
+        return t("error.download_sha")
     return ""
 
 
@@ -622,7 +624,7 @@ def download_to_file(url: str, dest_dir: str, filename: str,
     文件再读一遍（验收 2 的「边下边算」）。
     """
     if not url:
-        raise UpdateError("下载地址为空", "E_NO_URL")
+        raise UpdateError(t("error.download_empty_url"), "E_NO_URL")
     os.makedirs(dest_dir, exist_ok=True)
     part_path = os.path.join(dest_dir, filename + ".part")
 
@@ -643,9 +645,9 @@ def download_to_file(url: str, dest_dir: str, filename: str,
             with open(part_path, "wb") as handle:
                 while True:
                     if cancel is not None and cancel():
-                        raise UpdateError("已取消下载", "E_CANCELLED")
+                        raise UpdateError(t("error.download_cancelled"), "E_CANCELLED")
                     if time.monotonic() > deadline:
-                        raise UpdateError("下载超时，请检查网络后重试", "E_TIMEOUT")
+                        raise UpdateError(t("error.download_timeout"), "E_TIMEOUT")
                     chunk = response.read(DOWNLOAD_CHUNK)
                     if not chunk:
                         break
@@ -657,20 +659,20 @@ def download_to_file(url: str, dest_dir: str, filename: str,
                         progress(downloaded, total)
     except urllib.error.HTTPError as exc:
         remove_quiet(part_path)
-        raise UpdateError("下载失败：HTTP %d" % exc.code, "E_HTTP_%d" % exc.code)
+        raise UpdateError(t("error.download_http_plain") % exc.code, "E_HTTP_%d" % exc.code)
     except urllib.error.URLError as exc:
         remove_quiet(part_path)
-        raise UpdateError("无法连接 GitHub：%s" % (exc.reason,), "E_NETWORK")
+        raise UpdateError(t("error.gh_unreachable") % (exc.reason,), "E_NETWORK")
     except UpdateError:
         remove_quiet(part_path)
         raise
     except OSError as exc:
         remove_quiet(part_path)
-        raise UpdateError("下载失败：%s" % (exc,), "E_IO")
+        raise UpdateError(t("error.download_failed") % (exc,), "E_IO")
 
     if expected_size and downloaded != int(expected_size):
         remove_quiet(part_path)
-        raise UpdateError("文件大小不符（清单 %d 字节，实际 %d 字节）"
+        raise UpdateError(t("error.download_size")
                           % (int(expected_size), downloaded), "E_SIZE")
     return part_path
 
@@ -693,7 +695,7 @@ def finalize_download(part_path: str, final_path: str, expected_sha256: str,
         os.replace(part_path, final_path)
     except OSError as exc:
         remove_quiet(part_path)
-        return "保存下载文件失败：%s" % (exc,)
+        return t("error.download_save") % (exc,)
     return ""
 
 
@@ -743,7 +745,7 @@ def _bat_quote(value: str) -> str:
     """
     text = str(value or "")
     if '"' in text or "\n" in text or "\r" in text or "%" in text:
-        raise UpdateError("路径包含非法字符，已中止更新", "E_BAD_PATH")
+        raise UpdateError(t("error.update_illegal_path"), "E_BAD_PATH")
     return text
 
 
@@ -782,10 +784,10 @@ def write_update_script(path: str, script: str, encoding: str = "") -> None:
             handle.write(script)
     except UnicodeEncodeError:
         raise UpdateError(
-            "当前控制台代码页无法表示安装路径中的字符，请手动下载新版本",
+            t("error.update_path_codepage"),
             "E_PATH_ENCODING")
     except OSError as exc:
-        raise UpdateError("写入更新脚本失败：%s" % (exc,), "E_IO")
+        raise UpdateError(t("error.download_script") % (exc,), "E_IO")
 
 
 def stage_update_script(script_path: str, script: str, marker_path: str) -> None:

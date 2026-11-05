@@ -5,11 +5,18 @@
  * window.LogFollow，Node 走 module.exports，测试无需 mock DOM。
  */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module === "object" && module && module.exports) module.exports = api;
   if (root) root.LogFollow = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (root) {
   "use strict";
+
+  // 文案表在 i18n.js；Node 测试直接 require，浏览器取 window.i18n。
+  const i18n =
+    typeof module === "object" && module && module.exports
+      ? require("./i18n.js")
+      : root && root.i18n;
+  const t = (code, params) => (i18n && i18n.t ? i18n.t(code, params) : code);
 
   // 距底 ≤ 24 px 视为「还在底部」，> 24 px 视为用户主动上滚。
   const DEFAULT_THRESHOLD = 24;
@@ -63,7 +70,8 @@
   /** 胶囊文案：N > 99 显示 99+。 */
   function pendingLabel(pending) {
     const n = Number.isFinite(pending) && pending > 0 ? Math.floor(pending) : 0;
-    return n > MAX_PENDING ? "↓ " + MAX_PENDING + "+ 条新日志" : "↓ " + n + " 条新日志";
+    if (n > MAX_PENDING) return t("log.pending_count_capped", { count: MAX_PENDING });
+    return t("log.pending_count", { count: n });
   }
 
   return {

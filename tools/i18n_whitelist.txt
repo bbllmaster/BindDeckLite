@@ -1,0 +1,16 @@
+# BindDeckLite host i18n whitelist (WS-529 / WS-534)
+#
+# Format: <path-glob>\t<reason>[\t<text-regex>]
+#   * The reason is mandatory — a waiver without a reason is a rubber stamp.
+#   * The optional third column narrows the waiver to matching text, so an
+#     entry can never blanket-waive a whole file.
+#
+# Only these categories belong here:
+#   * protocol literals (CFG: / CMD: / BTN: / ENC: / VERSION: ...)
+#   * the language's own name ("中文" in the language picker)
+#   * raw device output / test fixtures that must stay verbatim
+# Real UI copy does NOT belong here; it belongs in host/locales/*.json.
+
+# schtasks reports a missing task in the console language of the machine;
+# these are markers we grep for in that output, never shown to the user.
+host/autostart.py	schtasks console output markers (matched, not rendered)	找不到|不存在|系统找不到

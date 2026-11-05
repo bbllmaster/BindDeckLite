@@ -80,8 +80,12 @@ function makeEl(sel = "") {
  *
  * ``calls`` 记录被调用的接口（用来断言 apply 只在用户确认后才发），
  * ``confirms`` 记录弹过的确认框与用户的回答。
+ *
+ * ``preloadZh=false`` 复刻**浏览器**的顺序：i18n.js 先执行（此时没有文案表），
+ * app.js 解析完，最后才由 initLanguage() 的 i18n.load() 填表。模块级
+ * ``const ... = t(...)`` 在这个顺序下会把 key 名冻住（WS-541 must fix 3）。
  */
-function loadApp() {
+function loadApp({ preloadZh = true } = {}) {
   const registry = {};
   const body = makeEl("body");
   const document = {
@@ -125,6 +129,12 @@ function loadApp() {
 
   const run = (name) => vm.runInContext(
     readFileSync(new URL(name, STATIC_DIR), "utf8"), sandbox, { filename: name });
+  // 生产 i18n + 生产 zh-CN 文案表（默认语言），断言仍是生产函数的输出。
+  run("i18n.js");
+  if (preloadZh) {
+    sandbox.i18n.setMessages(
+      JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
+  }
   run("log_follow.js");
   run("log_device.js");
   run("keys.js");
@@ -138,8 +148,8 @@ globalThis.__host = {
   state, applyAppUpdate,
   appUpdateNeedsConfirm: typeof appUpdateNeedsConfirm !== "undefined"
     ? appUpdateNeedsConfirm : null,
-  APP_UPDATE_CONFIRM_TEXT: typeof APP_UPDATE_CONFIRM_TEXT !== "undefined"
-    ? APP_UPDATE_CONFIRM_TEXT : "",
+  appUpdateConfirmText: typeof appUpdateConfirmText !== "undefined"
+    ? appUpdateConfirmText : null,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -216,4 +226,26 @@ test("正在 OTA 时不弹确认（服务端的 E_OTA_BUSY 硬拦保持原样）
     calls.filter((c) => c.path === "/api/app/update/apply").length, 1,
     "OTA 中的拦截由服务端负责，前端照常请求"
   );
+});
+
+/* WS-541 must fix 3：确认文案在浏览器里曾经渲染成原始 key。
+ *
+ * 浏览器分支下 i18n.js 没有 require，messages 初始是空表；app.js 里
+ * `const APP_UPDATE_CONFIRM_TEXT = t("update.confirm_quit")` 在解析时就执行，
+ * 于是常量里冻住的是 "update.confirm_quit"，确认框弹出来就是这串英文。
+ * 旧用例因为先 setMessages 再跑 app.js，正好绕过了这个顺序（假绿）。
+ */
+test("语言表晚于 app.js 加载时，确认文案仍是句子而不是 key", () => {
+  const { host, sandbox } = loadApp({ preloadZh: false });
+  assert.equal(
+    typeof host.appUpdateConfirmText, "function",
+    "确认文案必须是函数：模块级 const 会在 i18n.load() 之前把 key 冻住"
+  );
+
+  // 复刻 initLanguage()：app.js 已解析完，这时 i18n.load() 才填表。
+  sandbox.i18n.setMessages(
+    JSON.parse(readFileSync(new URL("../locales/en-US.json", STATIC_DIR), "utf8")), "en-US");
+  const text = host.appUpdateConfirmText();
+  assert.notEqual(text, "update.confirm_quit");
+  assert.match(text, /Updating quits the host/);
 });

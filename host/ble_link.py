@@ -46,6 +46,8 @@ import threading
 import time
 import traceback
 
+from i18n import t
+
 SVC = "b1d3c0de-0001-4a5b-9c6d-1a2b3c4d5e6f"
 RX = "b1d3c0de-0002-4a5b-9c6d-1a2b3c4d5e6f"
 TX = "b1d3c0de-0003-4a5b-9c6d-1a2b3c4d5e6f"
@@ -132,13 +134,13 @@ def scan_reason(n_raw, n_found, error=None):
         text = str(error)
         low = text.lower()
         if any(k in low for k in _PERMISSION_KEYWORDS):
-            return "扫描失败：系统未授予蓝牙权限"
-        return f"扫描出错：{text}"
+            return t("error.ble_scan_permission")
+        return t("error.ble_scan_error", detail=text)
     if n_found > 0:
         return None
     if n_raw == 0:
-        return "扫描未发现任何 BLE 设备（系统蓝牙已关闭 / 未授权 / 设备未广播）"
-    return f"看到 {n_raw} 个 BLE 设备，没有 BindDeckLite"
+        return t("error.ble_no_devices")
+    return t("error.ble_no_binddeck", count=n_raw)
 
 
 def conn_reason(err):
@@ -147,11 +149,11 @@ def conn_reason(err):
     只做字符串判断，不引用 bleak 的异常类，因此 bleak 没装也能 import。
     """
     if _is_security_error(err):
-        return "配对失败：请在系统蓝牙设置里删除该设备的旧配对后重试"
+        return t("error.ble_pair_failed")
     if type(err).__name__ == "BleakDeviceNotFoundError":
-        return "设备不在广播范围（可能已断电或换了地址）"
+        return t("error.ble_out_of_range")
     # 其余异常：类名 + 消息，消息本身截断到 120 字符（完整文本放 title）。
-    return f"{type(err).__name__}：{str(err)[:REASON_MAX_LEN]}"
+    return t("error.ble_other", name=type(err).__name__, message=str(err)[:REASON_MAX_LEN])
 
 
 def dev_id_from_name(name):
@@ -558,7 +560,7 @@ class BleLinkManager:
         if link.last_error is None:
             return
         link.last_error = None
-        self._emit_diag(link.dev_id, "连接已恢复", "ok")
+        self._emit_diag(link.dev_id, t("log.ble_connected_again"), "ok")
 
     def _emit_diag(self, dev_id, text, level):
         """Hand a connection diagnosis to the app (it writes the log page)."""
@@ -886,7 +888,7 @@ class BleLinkManager:
         if not _load_bleak():
             # bleak is missing entirely - record why, so the UI can say so
             # instead of "no devices found".
-            self._note_scan_error(str(_BLEAK_ERROR or "bleak 不可用"))
+            self._note_scan_error(str(_BLEAK_ERROR or t("error.bleak_missing")))
             return []
         loop = self._loop
         if loop is not None and loop.is_running():

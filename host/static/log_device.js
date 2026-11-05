@@ -6,11 +6,18 @@
  * 因此测试断言的就是生产代码本身。
  */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module === "object" && module && module.exports) module.exports = api;
   if (root) root.LogDevice = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
+})(typeof globalThis !== "undefined" ? globalThis : this, function (root) {
   "use strict";
+
+  // 文案表在 i18n.js；Node 测试直接 require，浏览器取 window.i18n。
+  const i18n =
+    typeof module === "object" && module && module.exports
+      ? require("./i18n.js")
+      : root && root.i18n;
+  const t = (code, params) => (i18n && i18n.t ? i18n.t(code, params) : code);
 
   /** 「全部设备」选项的 value（空串 = 不按设备过滤）。 */
   const ALL_DEVICES = "";
@@ -74,13 +81,13 @@
    */
   function deviceOptions(deviceIds, logDevs, devices) {
     const online = new Set((deviceIds || []).filter(Boolean));
-    const options = [{ value: ALL_DEVICES, label: "全部设备", offline: false }];
+    const options = [{ value: ALL_DEVICES, label: t("log.all_devices"), offline: false }];
     deviceUnion(deviceIds, logDevs).forEach((dev) => {
       const name = deviceDisplayName(dev, devices);
       const offline = !online.has(dev);
       options.push({
         value: dev,
-        label: offline ? name + "（已离线）" : name,
+        label: offline ? name + t("log.device_offline_suffix") : name,
         offline,
       });
     });
