@@ -8,26 +8,29 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">
-    <div class="logo">BD<span>L</span></div>
-    <div>
-      <h1>BindDeckLite</h1>
-      <p>9 键 + EC11 / 12 键 · 无屏幕精简版</p>
-    </div>
-  </div>
-
-  <div class="topbar-right">
-    <div class="status" id="status">
-      <span class="dot" id="statusDot"></span>
+  <!-- 与内容区同宽：250px 设备栏 + 1440px 主内容列，右侧按钮与 .main 内容右边缘对齐。 -->
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">BD<span>L</span></div>
       <div>
-        <div class="status-main" id="statusText">正在连接…</div>
-        <div class="status-sub" id="statusSub">BLE</div>
+        <h1>BindDeckLite</h1>
+        <p>9 键 + EC11 / 12 键 · 无屏幕精简版</p>
       </div>
     </div>
-    <span class="last-apply" id="lastApplyInfo" hidden></span>
-    <button class="pending-badge" id="pendingBadge" type="button" hidden></button>
-    <button class="btn ghost" id="btnHelp" title="宏语法、键名对照与常见错误">帮助</button>
-    <button class="btn primary" id="btnApply">应用配置</button>
+
+    <div class="topbar-right">
+      <div class="status" id="status">
+        <span class="dot" id="statusDot"></span>
+        <div>
+          <div class="status-main" id="statusText">正在连接…</div>
+          <div class="status-sub" id="statusSub">BLE</div>
+        </div>
+      </div>
+      <span class="last-apply" id="lastApplyInfo" hidden></span>
+      <button class="pending-badge" id="pendingBadge" type="button" hidden></button>
+      <button class="btn ghost" id="btnHelp" title="宏语法、键名对照与常见错误">帮助</button>
+      <button class="btn primary" id="btnApply">应用配置</button>
+    </div>
   </div>
 </header>
 
@@ -117,21 +120,32 @@
           <h2>设备</h2>
           <p>引脚按实际接线调整；应用后立即生效并写入设备 NVS。</p>
         </div>
-        <div class="chip-badge" id="chipBadge">—</div>
+        <!-- 页面级操作只留刷新（OTA 入口移入下方概览 hero） -->
+        <button class="btn secondary small-btn" id="btnSysRefresh" title="重新读取运行状态">刷新</button>
       </div>
 
-      <!-- 概览：只保留 4 格关键信息 -->
-      <section class="dev-section" aria-labelledby="devOverviewTitle">
-        <div class="section-head">
-          <h3 id="devOverviewTitle">概览</h3>
+      <!-- 概览 hero：设备名为主信息，芯片 / 固件为次行；右侧布局与 OTA -->
+      <section class="dev-hero" aria-labelledby="devOverviewTitle">
+        <div class="hero-main">
+          <h3 class="hero-name" id="devOverviewTitle"><span id="devName">—</span></h3>
+          <p class="hero-sub" id="devSub">—</p>
+        </div>
+        <div class="hero-side">
+          <span class="hero-layout" id="devLayout">—</span>
           <button class="btn primary small-btn" id="btnOta" title="打开 OTA 升级向导">OTA 升级</button>
         </div>
-        <div class="device-meta" id="deviceMeta"></div>
       </section>
 
-      <!-- 硬件与行为 -->
-      <section class="dev-section" aria-labelledby="devHardwareTitle">
-        <div class="section-head"><h3 id="devHardwareTitle">硬件与行为</h3></div>
+      <!-- 首屏运行状态条：只放最常看的 3 项，完整字段在下方「运行状态」卡片 -->
+      <div class="dev-status-strip" id="devStatusStrip">
+        <div><span>连接</span><b id="stripConn">—</b></div>
+        <div><span>运行时长</span><b id="stripUptime">—</b></div>
+        <div><span>可用空间</span><b id="stripHeap">—</b></div>
+      </div>
+
+      <!-- 设备设置：6 张卡放在同一个网格里，2 / 3 / 1 列都能整行填满，不留落单空格 -->
+      <section class="dev-section" aria-labelledby="devSetupTitle">
+        <div class="section-head"><h3 id="devSetupTitle">设备与上位机</h3></div>
         <div class="card-grid">
           <div class="card">
             <h3>按键布局</h3>
@@ -159,35 +173,9 @@
             </label>
             <p class="muted small">ESP32-C3 只能被 GPIO0–5 上的按键唤醒；经典 ESP32 由第 10 个输入（编码器按压 / 12 键布局的第 10 键）唤醒。</p>
           </div>
-
-          <div class="card span-2">
-            <h3>按键引脚 <span class="muted">（9 个，GPIO 编号）</span><span class="pin-error-count" id="pinErrorCount" hidden></span></h3>
-            <div class="pins" id="pinGrid"></div>
-            <p class="muted small" id="pinHint"></p>
-          </div>
-        </div>
-      </section>
-
-      <!-- 上位机与系统 -->
-      <section class="dev-section" aria-labelledby="devHostTitle">
-        <div class="section-head"><h3 id="devHostTitle">上位机与系统</h3></div>
-        <div class="card-grid">
-          <div class="card">
-            <div class="card-head">
-              <h3>上位机动作</h3>
-              <label class="switch" title="按下按键时执行上位机动作（宏 / 启动程序 / 命令）">
-                <input type="checkbox" id="actionsToggle">
-                <span class="slider"></span>
-                <span class="switch-label">启用</span>
-              </label>
-            </div>
-            <p class="muted small" id="actionsStateHint">读取中…</p>
-          </div>
-
           <div class="card" id="sysCard">
             <div class="card-head">
               <h3>运行状态</h3>
-              <button class="btn secondary small-btn" id="btnSysRefresh">刷新</button>
             </div>
             <div class="sys-grid" id="sysInfo"><span class="muted">读取中…</span></div>
             <p class="muted small" id="sysSampleAt"></p>
@@ -228,8 +216,32 @@
               <button class="btn danger small-btn" id="btnQuitHost" hidden>退出上位机</button>
             </div>
           </div>
+
+          <!-- 下沉到本区最后一张卡：次要开关，不与运行状态抢首屏 -->
+          <div class="card">
+            <div class="card-head">
+              <h3>上位机动作</h3>
+              <label class="switch" title="按下按键时执行上位机动作（宏 / 启动程序 / 命令）">
+                <input type="checkbox" id="actionsToggle">
+                <span class="slider"></span>
+                <span class="switch-label">启用</span>
+              </label>
+            </div>
+            <p class="muted small" id="actionsStateHint">读取中…</p>
+          </div>
         </div>
       </section>
+
+      <!-- 按键引脚：次要块，默认收起；展开后 9 个引脚均匀铺满一行 -->
+      <details class="advanced" id="pinsBlock">
+        <summary>按键引脚 <span class="muted small">（9 个，GPIO 编号）</span><span class="pin-error-count" id="pinErrorCount" hidden></span></summary>
+        <div class="advanced-body single-col">
+          <div class="card">
+            <div class="pins" id="pinGrid"></div>
+            <p class="muted small" id="pinHint"></p>
+          </div>
+        </div>
+      </details>
 
       <!-- 高级操作：默认折叠 -->
       <details class="advanced" id="advancedOps">

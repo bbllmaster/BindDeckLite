@@ -516,6 +516,8 @@ function renderDevices() {
 
     const name = d.name || d.dev_id || "BindDeckLite";
     if (li._name.textContent !== name) li._name.textContent = name;
+    // 名字被省略号截断时，悬停看全文。
+    if (li._name.title !== name) li._name.title = name;
     const label = `${name}（${d.connected ? "已连接" : "未连接"}）`;
     if (li.getAttribute("aria-label") !== label) li.setAttribute("aria-label", label);
 
@@ -523,7 +525,8 @@ function renderDevices() {
     if (li._sub.textContent !== sub) li._sub.textContent = sub;
     const subClass = reason ? "reason" : "";
     if (li._sub.className !== subClass) li._sub.className = subClass;
-    if (li._sub.title !== reason) li._sub.title = reason;
+    // 地址同样可能被截断，悬停提示用全文（失败原因本来就是全文）。
+    if (li._sub.title !== sub) li._sub.title = sub;
   });
 
   // 扫描后设备可能消失：移除对应的行。
@@ -1231,7 +1234,35 @@ async function loadSysinfo(devId) {
   return sysinfoFor(devId);
 }
 
+/** 首屏状态条：连接 / 运行时长 / 可用空间；完整字段仍看下方「运行状态」卡片。 */
+function renderStatusStrip() {
+  const conn = $("#stripConn");
+  if (!conn) return;
+  const uptime = $("#stripUptime");
+  const heap = $("#stripHeap");
+  const devId = state.selected;
+  const dev = devId ? state.devices.find((d) => d.dev_id === devId) : null;
+  const connected = !!(devId && dev && dev.connected);
+  conn.textContent = !devId || state.preview ? "未选择" : connected ? "已连接" : "未连接";
+  conn.className = connected ? "" : "bad";
+  if (otaBusy()) {
+    uptime.textContent = "OTA 中";
+    heap.textContent = "—";
+    return;
+  }
+  const info = devId && !state.preview ? sysinfoFor(devId) : null;
+  if (info && info.supported === false) {
+    uptime.textContent = "当前固件不支持";
+    heap.textContent = "—";
+    return;
+  }
+  const d = (info && info.display) || {};
+  uptime.textContent = d.uptime || (connected ? "读取中…" : "—");
+  heap.textContent = d.heap || "—";
+}
+
 function renderSysinfo() {
+  renderStatusStrip();
   const box = $("#sysInfo");
   const atEl = $("#sysSampleAt");
   if (!box || !atEl) return;
@@ -1366,15 +1397,22 @@ function renderDeviceMeta() {
   if (!state.cfg) return;
   const chip = state.cfg.chip || "ESP32";
   const fw = state.cfg.fw || {};
-  const badge = $("#chipBadge");
-  if (badge) badge.textContent = chip;
-  // 概览只留 4 格：把「输入」和「布局」合并成一条可读的布局说明。
-  const layoutText = is12Key() ? "12 键（无编码器）" : "编码器（9 键 + EC11）";
-  $("#deviceMeta").innerHTML = `
-    <div><span>设备名</span><b>${escapeHtml(state.cfg.name || state.selected || "—")}</b></div>
-    <div><span>固件版本</span><b>${escapeHtml(fw.version || "—")}</b></div>
-    <div><span>编译 / 芯片</span><b class="mono">${escapeHtml(fw.build || "—")} · ${escapeHtml(chip)}</b></div>
-    <div><span>布局</span><b>${layoutText}</b></div>`;
+  // 概览 hero：设备名是主信息，芯片 / 固件 / 编译号合并成次行（不再重复展示）。
+  const name = state.cfg.name || state.selected || "—";
+  const nameEl = $("#devName");
+  if (nameEl) { nameEl.textContent = name; nameEl.title = name; }
+  const subEl = $("#devSub");
+  if (subEl) {
+    const parts = [chip];
+    if (fw.version) parts.push(`固件 ${fw.version}`);
+    if (fw.build) parts.push(`编译 ${fw.build}`);
+    subEl.textContent = parts.join(" · ");
+    subEl.title = subEl.textContent;
+  }
+  const layoutEl = $("#devLayout");
+  if (layoutEl) {
+    layoutEl.textContent = is12Key() ? "12 键（无编码器）" : "编码器（9 键 + EC11）";
+  }
   renderLayoutCard();
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
@@ -1564,6 +1602,9 @@ function renderPinErrorCount() {
 function focusFirstPinError(errors) {
   const first = (errors || [])[0];
   if (!first) return;
+  // 引脚块默认收起：先展开，否则 scrollIntoView 看不到目标。
+  const block = $("#pinsBlock");
+  if (block && !block.open) block.open = true;
   const row = $$("#pinGrid .pin")[first.index];
   if (!row) return;
   row.scrollIntoView({ block: "center" });
