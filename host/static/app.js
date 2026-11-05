@@ -119,14 +119,24 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     // 后端 400 会带 {ok:false,error:"按键 3 不能为空"}，把它显示出来，
     // 别再让用户只看到 "400 BAD REQUEST"。
-    let detail = "";
+    let body = null;
     try {
-      const body = await res.json();
-      if (body && body.error) detail = body.error;
+      body = await res.json();
     } catch (_) {
       /* 不是 JSON：退回状态码文案 */
     }
-    throw new Error(detail || `${res.status} ${res.statusText}`);
+    const detail = (body && (body.error || body.reason)) || "";
+    const code = (body && (body.error_code || body.reason_code)) || "";
+    const url = (body && body.release_url) || "";
+    // 错误码要一起给用户：只报一句「更新失败」的话，用户没法反馈。
+    // 完整报文挂在 err.payload 上，需要 Release 链接的界面自己取。
+    let text = detail || `${res.status} ${res.statusText}`;
+    if (code) text += `（错误码：${code}）`;
+    const err = new Error(text);
+    err.payload = body || null;
+    err.error_code = code;
+    err.release_url = url;
+    throw err;
   }
   return res.json();
 }
@@ -3413,7 +3423,8 @@ function renderUpdateApp() {
     st.textContent = `已跳过 ${fmtVersion(r.latest)}，出现更高版本时会再次提示`;
     st.classList.remove("ok");
   } else if (r.ok === false) {
-    st.textContent = "检查失败";
+    // 说清楚为什么不能升 —— 只写「检查失败」用户会以为是网络问题。
+    st.textContent = r.error || "检查失败";
     st.classList.remove("ok");
   } else {
     st.textContent = `已是最新（${fmtVersion(r.current)}）`;
@@ -3566,6 +3577,8 @@ async function applyAppUpdate() {
     updateState.appTask = r.task;
     pollAppUpdate(r.task);
   } catch (e) {
+    // 失败原因 + 错误码 + Release 链接都要给用户（验收 10）。
+    setUpdateError("updAppError", e.payload || null);
     if (hint) {
       hint.hidden = false;
       hint.textContent = "更新失败：" + (e.message || e);
@@ -3650,6 +3663,8 @@ async function applyFwUpdate() {
     pollFwUpdate(sel.dev_id);
     toast("开始推送固件 " + fmtVersion(r.version), "ok");
   } catch (e) {
+    // 失败原因 + 错误码 + Release 链接都要给用户（验收 10）。
+    setUpdateError("updFwError", e.payload || null);
     toast("固件升级失败：" + (e.message || e), "bad");
   } finally {
     if (btn) {
@@ -3659,15 +3674,35 @@ async function applyFwUpdate() {
   }
 }
 
-function updateFwStep(step) {
+/* 固件在线更新的五段进度：后端 phase → 展示阶段名。
+   后端在下载/校验阶段发 starting/downloading/verifying/pushing，推送阶段
+   借用 OTA 窗口的 push/restart/confirm —— 两套名字对不上时 order.indexOf()
+   会返回 -1，五个点全灭（WS-530 评审）。 */
+const FW_STAGE_BY_PHASE = {
+  starting: "download",
+  downloading: "download",
+  download: "download",
+  verifying: "verify",
+  verify: "verify",
+  pushing: "push",
+  push: "push",
+  restart: "restart",
+  confirm: "confirm",
+};
+
+function updateFwStep(phase) {
   const steps = $("#updFwSteps");
   if (!steps) return;
   const order = ["download", "verify", "push", "restart", "confirm"];
-  const active = order.indexOf(step);
+  const finished = phase === "done";
+  const stage = FW_STAGE_BY_PHASE[phase];
+  // 未知阶段（如 error）：保持上一次的高亮，不要把进度清空。
+  if (!finished && !stage) return;
+  const active = finished ? order.length : order.indexOf(stage);
   steps.querySelectorAll(".ota-step-dot").forEach((dot) => {
     const idx = order.indexOf(dot.dataset.step);
-    dot.classList.toggle("active", idx === active);
-    dot.classList.toggle("done", active > idx && active >= 0);
+    dot.classList.toggle("active", !finished && idx === active);
+    dot.classList.toggle("done", finished || (active >= 0 && idx < active));
   });
 }
 

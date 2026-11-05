@@ -465,6 +465,98 @@ def test_update_script_rejects_paths_that_could_break_the_batch_file():
         online_update.build_update_script('C:\\bad"path\\a.exe', "b", "c", "d", 1)
 
 
+def test_update_script_rejects_percent_in_paths():
+    """``%`` 在批处理里会被当成变量引用 —— 路径里有它就一定会坏。"""
+    with pytest.raises(online_update.UpdateError):
+        online_update.build_update_script("C:\\Users\\100%\\a.exe", "b", "c", "d", 1)
+
+
+def test_update_script_body_is_pure_ascii():
+    """脚本正文只用 ASCII：非 ASCII 的部分只能是路径本身。
+
+    cmd.exe 按系统 ANSI 代码页（zh-CN = 936）解析批处理文件；脚本正文里
+    出现中文注释，在非中文代码页上根本写不出来。
+    """
+    script = online_update.build_update_script(
+        exe_path=r"C:\Apps\BindDeckLite.exe", new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=r"C:\new\updated.marker", pid=1)
+
+    assert script.isascii(), "更新器脚本正文必须是纯 ASCII"
+
+
+def test_update_script_is_written_in_the_ansi_code_page(tmp_path):
+    """落盘字节必须能被 cmd 的 ANSI 代码页解回原文（中文路径不变形）。
+
+    评审实测：UTF-8 落盘时 ``line.decode("cp936")`` 得到 ``寮犱笁``，
+    ``if not exist "%NEW%"`` 直接跳 ``:fail`` —— 此时上位机已经退出，
+    用户的程序就消失了。
+    """
+    exe = r"C:\Users\张三\AppData\Local\BindDeckLite\BindDeckLite.exe"
+    script = online_update.build_update_script(
+        exe_path=exe, new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=r"C:\new\updated.marker", pid=1)
+    path = tmp_path / "update.bat"
+
+    # 用 zh-CN 的 ANSI 代码页（cp936）落盘 —— 这正是目标机器的情形。
+    online_update.write_update_script(str(path), script, encoding="cp936")
+
+    raw = path.read_bytes()
+    text = raw.decode("cp936")
+    assert exe in text, "ANSI 代码页下中文路径必须原样保留"
+    assert "寮犱笁" not in text, "路径不能被解成乱码"
+    # 同一份字节用 UTF-8 解出来就不是原文 —— 说明落盘用的不是 UTF-8。
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
+
+
+def test_write_update_script_refuses_paths_the_code_page_cannot_represent(tmp_path):
+    """代码页表示不了的字符要明确报错，而不是写出一个 cmd 解析不了的脚本。"""
+    script = online_update.build_update_script(
+        exe_path=r"C:\Users\张三\a.exe", new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=r"C:\new\updated.marker", pid=1)
+    path = tmp_path / "update.bat"
+
+    with pytest.raises(online_update.UpdateError):
+        online_update.write_update_script(str(path), script, encoding="ascii")
+
+
+def test_stage_update_script_removes_the_stale_marker(tmp_path):
+    """上次失败留下的 marker 会让新脚本立刻判成功 —— 生成前必须清掉。"""
+    marker = tmp_path / "updated.marker"
+    marker.write_text("update failed", encoding="utf-8")
+    script = online_update.build_update_script(
+        exe_path=r"C:\Apps\BindDeckLite.exe", new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=str(marker), pid=1)
+
+    online_update.stage_update_script(str(tmp_path / "update.bat"), script, str(marker))
+
+    assert not marker.exists(), "陈旧 marker 必须先删掉"
+
+
+def test_the_batch_file_is_written_in_the_windows_ansi_code_page():
+    """Windows 上必须用 mbcs（= 系统 ANSI 代码页，简体中文 = 936）。"""
+    assert online_update.batch_encoding("nt") == "mbcs"
+    assert online_update.batch_encoding("posix") == "utf-8"
+
+
+def test_the_update_script_restarts_the_old_version_on_failure():
+    """:fail 时上位机已经退出 —— 必须把旧版本再拉起来，否则程序直接消失。"""
+    script = online_update.build_update_script(
+        exe_path=r"C:\Apps\BindDeckLite.exe", new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=r"C:\new\updated.marker", pid=1)
+
+    fail_block = script.split(":fail", 1)[1]
+    assert 'start "" "%EXE%"' in fail_block, \
+        ":fail 分支必须重启旧 exe（上位机已退出，不重启用户就什么都没有了）"
+    # 失败时不能写成功标记：那会让同版本重试时脚本立刻判成功、跳过回滚。
+    assert "MARKER%" not in fail_block.replace('if exist "%MARKER%"', "")
+
+
 # --- 8. 目录不可写 -----------------------------------------------------------
 
 def test_unwritable_directory_is_detected(tmp_path):
@@ -520,6 +612,156 @@ def test_apply_is_refused_while_a_device_is_updating(client, monkeypatch,
     assert resp.status_code == 409
     assert body["error_code"] == "E_OTA_BUSY"
     assert "设备正在升级" in body["error"]
+
+
+# --- 10. WS-530 评审提出的缺陷 -----------------------------------------------
+
+def _install_app_manifest(monkeypatch, min_from="1.0.0", sha="a" * 64,
+                           current="1.4.2", assets=None, version="1.5.0"):
+    """让 check/apply 看到一份指定的清单。"""
+    monkeypatch.setattr(online_update, "read_app_version", lambda: current)
+    manifest = _manifest()
+    manifest["app"]["version"] = version
+    manifest["app"]["min_from"] = min_from
+    manifest["app"]["sha256"] = sha
+    if assets is None:
+        assets = [{"name": "BindDeckLite.exe", "size": 1234,
+                   "browser_download_url": "https://example.invalid/BindDeckLite.exe"}]
+    release = _release_json()
+    release["assets"] = assets
+    monkeypatch.setattr(
+        online_update, "resolve_latest_update",
+        lambda *a, **k: online_update.resolve_release_update(
+            release, online_update.parse_manifest(json.dumps(manifest))))
+
+
+def test_check_reports_min_from_as_an_error(client, monkeypatch, cfgfile, clean_caches):
+    """min_from 不满足时 check 必须 ok=false —— 否则前端显示「已是最新」。
+
+    评审实测：``min_from=9.0.0``、当前 ``0.0.0+dev`` → check 回
+    ``{"ok":true,...,"error_code":"E_MIN_FROM"}``，前端只认 ``r.ok===false``，
+    于是用户看到「已是最新（v0.0.0+dev）」，根本不知道要先手动升级。
+    """
+    _install_app_manifest(monkeypatch, min_from="9.0.0", current="0.0.0+dev")
+
+    body = client.get("/api/app/update/check").get_json()
+
+    assert body["ok"] is False
+    assert body["error_code"] == "E_MIN_FROM"
+    assert body["min_from_ok"] is False
+    assert body["has_update"] is False
+    assert "手动升级" in body["error"]
+
+
+def test_check_reports_a_missing_sha256_as_an_error(client, monkeypatch, cfgfile,
+                                                      clean_caches):
+    """清单没有 SHA256 时 check 必须 ok=false（强制校验是硬性要求）。"""
+    _install_app_manifest(monkeypatch, sha="")
+
+    body = client.get("/api/app/update/check").get_json()
+
+    assert body["ok"] is False
+    assert body["error_code"] == "E_NO_SHA256"
+    assert body["has_update"] is False
+
+
+def test_check_reports_an_app_asset_missing_from_the_release(client, monkeypatch,
+                                                              cfgfile, clean_caches):
+    """清单里的安装包不在 Release 资产里 → check 阶段就报错。"""
+    _install_app_manifest(monkeypatch, assets=[])
+
+    body = client.get("/api/app/update/check").get_json()
+
+    assert body["ok"] is False
+    assert body["error_code"] == "E_NO_APP_ASSET"
+    assert body["has_update"] is False
+
+
+def test_apply_refuses_when_min_from_is_not_satisfied(client, monkeypatch, cfgfile,
+                                                        clean_caches):
+    """apply 与 check 用同一把尺：check 说不能升，apply 也不能升。"""
+    _install_app_manifest(monkeypatch, min_from="9.0.0", current="1.4.2")
+
+    resp = client.post("/api/app/update/apply")
+    body = resp.get_json()
+
+    assert resp.status_code == 409
+    assert body["error_code"] == "E_MIN_FROM"
+
+
+def test_apply_refuses_an_app_asset_missing_from_the_release(client, monkeypatch,
+                                                              cfgfile, clean_caches):
+    """清单里的安装包不在 Release 资产里 → apply 直接拒绝，不下载。"""
+    _install_app_manifest(monkeypatch, assets=[])
+
+    resp = client.post("/api/app/update/apply")
+    body = resp.get_json()
+
+    assert resp.status_code == 409
+    assert body["error_code"] == "E_NO_APP_ASSET"
+
+
+def test_apply_is_allowed_for_a_newer_version_after_failures(client, monkeypatch,
+                                                             cfgfile, clean_caches):
+    """连续失败只拦同一个版本：出了更高版本就放行（否则在线更新永久失效）。"""
+    _install_app_manifest(monkeypatch, current="1.4.2", version="1.6.0")
+    host_app._config["update_fail_count"] = 2
+    host_app._config["last_update"] = {"status": "done", "result": "rollback",
+                                       "from": "1.4.2", "to": "1.5.0"}
+    monkeypatch.setattr(host_app, "_update_target_dir", lambda: "")
+
+    resp = client.post("/api/app/update/apply")
+    body = resp.get_json()
+
+    assert body.get("error_code") != "E_UPDATE_PAUSED", \
+        "更高版本必须放行，不能被失败计数永久挡住"
+
+
+def test_apply_stays_blocked_for_the_same_failed_version(client, monkeypatch,
+                                                         cfgfile, clean_caches):
+    """同一个版本连续失败后仍要挡住（避免反复重启失败）。"""
+    _install_app_manifest(monkeypatch, current="1.4.2", version="1.5.0")
+    host_app._config["update_fail_count"] = 2
+    host_app._config["last_update"] = {"status": "done", "result": "rollback",
+                                       "from": "1.4.2", "to": "1.5.0"}
+
+    resp = client.post("/api/app/update/apply")
+    body = resp.get_json()
+
+    assert resp.status_code == 409
+    assert body["error_code"] == "E_UPDATE_PAUSED"
+
+
+def test_the_download_hashes_the_file_while_downloading(client, monkeypatch, cfgfile,
+                                                        clean_caches, tmp_path):
+    """下载时边下边算 SHA256，校验不用把文件再读一遍（验收 2 的措辞）。"""
+    payload = b"new-exe-bytes"
+    part = tmp_path / "BindDeckLite.exe.part"
+    part.write_bytes(payload)
+    final = tmp_path / "BindDeckLite.exe"
+
+    hasher = hashlib.sha256()
+    hasher.update(payload)
+    error = online_update.finalize_download(str(part), str(final),
+                                            hasher.hexdigest(), len(payload),
+                                            digest=hasher.hexdigest())
+
+    assert error == ""
+    assert final.read_bytes() == payload
+
+
+def test_the_wrong_digest_is_still_rejected(client, monkeypatch, cfgfile,
+                                             clean_caches, tmp_path):
+    """给了错误的边下边算结果 → 一样要拒绝（不能因为省了一次读文件就放过）。"""
+    part = tmp_path / "BindDeckLite.exe.part"
+    part.write_bytes(b"new-exe-bytes")
+    final = tmp_path / "BindDeckLite.exe"
+
+    error = online_update.finalize_download(str(part), str(final), "b" * 64, 12,
+                                            digest="c" * 64)
+
+    assert error
+    assert not final.exists()
 
 
 # --- 版本源 -------------------------------------------------------------------

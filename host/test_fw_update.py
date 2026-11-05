@@ -50,10 +50,19 @@ def _manifest(fw_version="1.4.2"):
 
 
 def _install_manifest(monkeypatch, fw_version="1.4.2"):
-    """Make every release lookup return the same manifest."""
+    """Make every release lookup return the same manifest.
+
+    Release 里必须真的带上清单列出的固件资产 —— 清单与 Release 资产不
+    一致时，check 阶段就该报 E_NO_FW_ASSET（WS-530）。
+    """
     def _resolve(*args, **kwargs):
+        assets = []
+        for target in ("esp32", "c3", "c3_16mb"):
+            name = "ota_binddecklite_%s_v%s.bin" % (target, fw_version)
+            assets.append({"name": name, "size": 100,
+                           "browser_download_url": "https://example.invalid/" + name})
         return online_update.resolve_release_update(
-            {"tag_name": "v1.5.0", "body": "", "assets": []},
+            {"tag_name": "v1.5.0", "body": "", "assets": assets},
             online_update.parse_manifest(json.dumps(_manifest(fw_version))))
     monkeypatch.setattr(online_update, "resolve_latest_update", _resolve)
 
@@ -243,6 +252,173 @@ def test_apply_refuses_when_the_remote_is_not_newer(client, monkeypatch, cfgfile
 
     assert resp.status_code == 409
     assert "已是最新" in resp.get_json()["error"]
+
+
+# --- 进度接口的终态（WS-530 must fix 1）--------------------------------------
+
+def test_progress_keeps_the_terminal_phase_of_the_task(client, monkeypatch, cfgfile):
+    """任务已经 error/done 时，进度接口不能把终态覆盖成窗口的 confirm。
+
+    评审实测：``_fw_update_tasks["d2"]={"phase":"error"}`` + 窗口
+    ``status="error"``/``phase="confirm"`` → 接口回 ``phase:"confirm"``，
+    前端只认 error/done，于是永久轮询、成功不提示、失败不报错。
+    """
+    class _Window:
+        status = "error"
+        phase = "confirm"
+        error = "推送失败"
+
+        def percent(self):
+            return 42
+
+    host_app._fw_update_tasks["d2"] = {"phase": "error", "downloaded": 0,
+                                         "total": 0, "percent": 0,
+                                         "error": "推送失败", "error_code": "E_OTA",
+                                         "ota_window": True}
+    host_app._ota_windows["d2"] = _Window()
+    try:
+        body = client.get("/api/firmware/update/progress?dev_id=d2").get_json()
+    finally:
+        host_app._fw_update_tasks.pop("d2", None)
+        host_app._ota_windows.pop("d2", None)
+
+    assert body["phase"] == "error", "终态必须原样传给前端"
+    assert body["error"] == "推送失败"
+    assert body["error_code"] == "E_OTA"
+
+
+def test_progress_reports_done_when_the_task_finished(client, monkeypatch, cfgfile):
+    """任务 done 时，进度接口回 done（前端据此结束轮询并提示成功）。"""
+    class _Window:
+        status = "done"
+        phase = "confirm"
+        error = ""
+
+        def percent(self):
+            return 100
+
+    host_app._fw_update_tasks["d2"] = {"phase": "done", "downloaded": 0,
+                                         "total": 0, "percent": 100,
+                                         "error": "", "error_code": "",
+                                         "ota_window": True}
+    host_app._ota_windows["d2"] = _Window()
+    try:
+        body = client.get("/api/firmware/update/progress?dev_id=d2").get_json()
+    finally:
+        host_app._fw_update_tasks.pop("d2", None)
+        host_app._ota_windows.pop("d2", None)
+
+    assert body["phase"] == "done"
+
+
+def test_progress_uses_the_window_stage_while_the_ota_is_running(client, monkeypatch,
+                                                                   cfgfile):
+    """推送过程中用 OTA 窗口的细分阶段（push/restart/confirm）。"""
+    class _Window:
+        status = "uploading"
+        phase = "restart"
+        error = ""
+
+        def percent(self):
+            return 55
+
+    host_app._fw_update_tasks["d2"] = {"phase": "pushing", "downloaded": 0,
+                                         "total": 0, "percent": 55,
+                                         "error": "", "error_code": "",
+                                         "ota_window": True}
+    host_app._ota_windows["d2"] = _Window()
+    try:
+        body = client.get("/api/firmware/update/progress?dev_id=d2").get_json()
+    finally:
+        host_app._fw_update_tasks.pop("d2", None)
+        host_app._ota_windows.pop("d2", None)
+
+    assert body["phase"] == "restart"
+    assert body["percent"] == 55
+
+
+def test_progress_ignores_a_window_from_an_unrelated_ota(client, monkeypatch, cfgfile):
+    """别的 OTA 留下的窗口不能把本任务的下载进度冲掉。
+
+    ``_ota_windows`` 里可能还留着上一次手动 OTA 的窗口；只有本任务自己
+    推上去的窗口（ota_window 标记）才能借用它的百分比。
+    """
+    class _Window:
+        status = "done"
+        phase = "confirm"
+        error = ""
+
+        def percent(self):
+            return 100
+
+    host_app._fw_update_tasks["d2"] = {"phase": "downloading", "downloaded": 10,
+                                         "total": 100, "percent": 10,
+                                         "error": "", "error_code": ""}
+    host_app._ota_windows["d2"] = _Window()
+    try:
+        body = client.get("/api/firmware/update/progress?dev_id=d2").get_json()
+    finally:
+        host_app._fw_update_tasks.pop("d2", None)
+        host_app._ota_windows.pop("d2", None)
+
+    assert body["phase"] == "downloading"
+    assert body["percent"] == 10
+
+
+# --- 清单资产必须真的在 Release 里（WS-530 should fix 8）----------------------
+
+def test_check_reports_a_firmware_asset_missing_from_the_release(client, monkeypatch,
+                                                                  cfgfile):
+    """清单里的固件不在 Release 资产里 → check 阶段就说清楚，不等 apply 失败。"""
+    def _resolve(*args, **kwargs):
+        return online_update.resolve_release_update(
+            {"tag_name": "v1.5.0", "body": "",
+             "assets": [{"name": "ota_binddecklite_c3_16mb_v1.4.2.bin",
+                         "size": 100,
+                         "browser_download_url": "https://example.invalid/x.bin"}]},
+            online_update.parse_manifest(json.dumps(_manifest())))
+
+    monkeypatch.setattr(online_update, "resolve_latest_update", _resolve)
+    _set_device_fw("dev1", "1.3.8", "C3", 4096)
+
+    body = client.get("/api/firmware/update/check?dev_id=dev1").get_json()
+
+    assert body["has_update"] is False
+    assert body["reason_code"] == "E_NO_FW_ASSET"
+    assert "没有随本次发布上传" in body["reason"]
+
+
+def test_apply_refuses_a_firmware_asset_missing_from_the_release(client, monkeypatch,
+                                                                  cfgfile):
+    """同样的问题在 apply 阶段也要挡住（不能下到一半才失败）。"""
+    def _resolve(*args, **kwargs):
+        return online_update.resolve_release_update(
+            {"tag_name": "v1.5.0", "body": "", "assets": []},
+            online_update.parse_manifest(json.dumps(_manifest())))
+
+    monkeypatch.setattr(online_update, "resolve_latest_update", _resolve)
+    _set_device_fw("dev1", "1.3.8", "C3", 4096)
+
+    resp = client.post("/api/firmware/update/apply", json={"dev_id": "dev1"})
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error_code"] == "E_NO_FW_ASSET"
+
+
+# --- 设备必须在线（WS-530 should fix 9）---------------------------------------
+
+def test_apply_refuses_when_the_device_is_offline(client, monkeypatch, cfgfile):
+    """设备不在线时不要下完整个包才发现推不上去。"""
+    _install_manifest(monkeypatch)
+    _set_device_fw("dev1", "1.3.8", "C3", 4096)
+    monkeypatch.setattr(host_app, "_ota_is_connected", lambda dev_id: False)
+
+    resp = client.post("/api/firmware/update/apply", json={"dev_id": "dev1"})
+
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["error_code"] == "E_NOT_CONNECTED"
+    assert "未连接" in body["error"]
 
 
 # --- 既有 OTA 行为回归 -------------------------------------------------------

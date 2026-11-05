@@ -554,11 +554,13 @@ def resolve_latest_update(api_url: str = GITHUB_API_LATEST,
 # --- 下载与校验 -------------------------------------------------------------
 
 def verify_downloaded_file(path: str, expected_sha256: str,
-                           expected_size: int = 0) -> str:
+                           expected_size: int = 0, digest: str = "") -> str:
     """校验已下载文件；返回错误字符串（空串 = 通过）。
 
     校验大小与 SHA256（大小写不敏感）。**没有 sha256 一律不通过** ——
     清单里缺校验和时不自动更新。
+
+    ``digest`` 是下载时边下边算出来的 SHA256；给了它就不再读一遍文件。
     """
     if not expected_sha256:
         return "发布清单缺少 SHA256 校验值，不能自动更新"
@@ -569,17 +571,19 @@ def verify_downloaded_file(path: str, expected_sha256: str,
     if expected_size and actual_size != int(expected_size):
         return ("文件大小不符（清单 %d 字节，实际 %d 字节）"
                 % (int(expected_size), actual_size))
-    digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(DOWNLOAD_CHUNK)
-                if not chunk:
-                    break
-                digest.update(chunk)
-    except OSError as exc:
-        return "无法读取下载文件：%s" % (exc,)
-    if digest.hexdigest().lower() != expected_sha256.strip().lower():
+    if not digest:
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as exc:
+            return "无法读取下载文件：%s" % (exc,)
+        digest = digest.hexdigest()
+    if digest.lower() != expected_sha256.strip().lower():
         return "SHA256 校验失败，文件已损坏或被篡改"
     return ""
 
@@ -607,11 +611,15 @@ def update_dir(version: str) -> str:
 def download_to_file(url: str, dest_dir: str, filename: str,
                      progress=None, cancel=None,
                      timeout: float | None = None,
-                     expected_size: int = 0) -> str:
+                     expected_size: int = 0,
+                     hasher=None) -> str:
     """把资产下载到 ``<dest_dir>/<filename>.part``，返回临时文件路径。
 
     只下载，不改名 —— 校验由 :func:`finalize_download` 负责，所以中途失败
     绝不会留下一个「看起来像 exe」的半成品。
+
+    ``hasher`` 传入一个 hashlib 对象即可**边下边算** SHA256：校验时不用把
+    文件再读一遍（验收 2 的「边下边算」）。
     """
     if not url:
         raise UpdateError("下载地址为空", "E_NO_URL")
@@ -642,6 +650,8 @@ def download_to_file(url: str, dest_dir: str, filename: str,
                     if not chunk:
                         break
                     handle.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
                     downloaded += len(chunk)
                     if progress:
                         progress(downloaded, total)
@@ -666,12 +676,16 @@ def download_to_file(url: str, dest_dir: str, filename: str,
 
 
 def finalize_download(part_path: str, final_path: str, expected_sha256: str,
-                       expected_size: int = 0) -> str:
+                       expected_size: int = 0, digest: str = "") -> str:
     """校验临时文件；通过则改名为正式文件，返回错误字符串（空串 = 成功）。
 
     校验不通过时删除临时文件 —— 不留半成品，也不自动重试循环。
+
+    ``digest`` 是下载时**边下边算**得到的 SHA256：给了它就不用把文件再读
+    一遍。没给（比如手动准备的文件）才回退到读文件算。
     """
-    error = verify_downloaded_file(part_path, expected_sha256, expected_size)
+    error = verify_downloaded_file(part_path, expected_sha256, expected_size,
+                                   digest=digest)
     if error:
         remove_quiet(part_path)
         return error
@@ -722,11 +736,58 @@ def is_writable_dir(path: str) -> bool:
 
 
 def _bat_quote(value: str) -> str:
-    """把路径安全地放进批处理：拒绝会破坏脚本的字符。"""
+    """把路径安全地放进批处理：拒绝会破坏脚本的字符。
+
+    ``%`` 会被 cmd 当成变量引用（``%PATH%`` 之类）展开，路径里有它就一定
+    出错 —— 直接拒绝，不生成脚本。
+    """
     text = str(value or "")
-    if '"' in text or "\n" in text or "\r" in text:
+    if '"' in text or "\n" in text or "\r" in text or "%" in text:
         raise UpdateError("路径包含非法字符，已中止更新", "E_BAD_PATH")
     return text
+
+
+def batch_encoding(platform: str = "") -> str:
+    """写 ``.bat`` 用的编码。
+
+    cmd.exe 按**系统 ANSI 代码页**解析批处理文件：UTF-8 落盘时中文用户
+    名路径会被解成乱码（``set "EXE=C:\\Users\\张三\\..."`` → ``寮犱笁``），
+    ``if not exist "%NEW%"`` 直接跳 ``:fail``。所以 Windows 上必须用
+    ``mbcs``（= 当前系统 ANSI 代码页，简体中文 = 936）。
+
+    其它平台没有 ``mbcs``（只有 Windows 才有这个 codec），退回 UTF-8 ——
+    上位机 exe 只在 Windows 上跑，这里只是让开发与测试环境可用。
+    """
+    name = platform or os.name
+    return "mbcs" if name == "nt" else "utf-8"
+
+
+def write_update_script(path: str, script: str, encoding: str = "") -> None:
+    """把替换脚本落盘（编码见 :func:`batch_encoding`）。
+
+    路径里有当前系统代码页表示不了的字符时抛 :class:`UpdateError` ——
+    与其写出一个 cmd 解析不了的脚本，不如明确告诉用户手动更新。
+    """
+    enc = encoding or batch_encoding()
+    try:
+        with open(path, "w", encoding=enc, newline="") as handle:
+            handle.write(script)
+    except UnicodeEncodeError:
+        raise UpdateError(
+            "当前系统代码页无法表示安装路径中的字符，请手动下载新版本",
+            "E_PATH_ENCODING")
+    except OSError as exc:
+        raise UpdateError("写入更新脚本失败：%s" % (exc,), "E_IO")
+
+
+def stage_update_script(script_path: str, script: str, marker_path: str) -> None:
+    """准备好替换脚本：先清掉陈旧 marker，再落盘脚本。
+
+    陈旧的 marker（上次 ``:fail`` 留下的）会让新脚本的 ``if exist
+    "%MARKER%"`` 立刻判成功 —— 同版本重试时脚本直接跳过等待与回滚。
+    """
+    remove_quiet(marker_path)
+    write_update_script(script_path, script)
 
 
 def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
@@ -746,6 +807,10 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
     6. 超时则回滚 ``*.bak`` 并启动旧版。
 
     只用 ``cmd`` 内建命令与 ``ping`` 延时，不依赖 PowerShell。
+
+    脚本正文**只用 ASCII**（注释也是）：路径是唯一可能含非 ASCII 的部分，
+    它按 cmd 的代码页落盘（见 :func:`write_update_script`）。脚本里出现
+    中文注释会让英文 Windows 的代码页直接写不出来。
     """
     exe = _bat_quote(exe_path)
     new = _bat_quote(new_exe)
@@ -754,7 +819,7 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
     pid_text = str(int(pid))
     return "\r\n".join([
         "@echo off",
-        "rem BindDeckLite 自更新脚本（由上位机生成，只操作固定路径）",
+        "rem BindDeckLite self-update script (generated by the host, fixed paths only)",
         "setlocal",
         'set "EXE=%s"' % exe,
         'set "NEW=%s"' % new,
@@ -763,8 +828,8 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         'set "PID=%s"' % pid_text,
         "set COUNT=0",
         "",
-        "rem 1. 等当前进程退出 —— 运行中的 exe 不能被覆盖。",
-        "rem    （不用括号块：括号里的 %COUNT% 不会重新展开，计数会失效）",
+        "rem 1. wait for the host process to exit -- a running exe cannot be overwritten.",
+        "rem    (no parenthesis block: %COUNT% inside one is not re-expanded)",
         ":waitpid",
         'tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL',
         "if errorlevel 1 goto copyexe",
@@ -772,7 +837,7 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         "set /a COUNT+=1",
         "if %COUNT% LSS 120 goto waitpid",
         "",
-        "rem 2. 备份旧 exe，再覆盖。",
+        "rem 2. back up the old exe, then overwrite it.",
         ":copyexe",
         'if not exist "%NEW%" goto fail',
         'copy /Y "%EXE%" "%BAK%" >NUL 2>&1',
@@ -781,7 +846,7 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         "if errorlevel 1 goto rollback",
         'start "" "%EXE%"',
         "",
-        "rem 3. 等新版本写标记 —— 出现即新版本已启动，脚本收工。",
+        "rem 3. wait for the marker the new version writes -- it means it started.",
         "set COUNT=0",
         ":waitnew",
         'if exist "%MARKER%" goto done',
@@ -789,14 +854,16 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         "set /a COUNT+=1",
         "if %COUNT% LSS " + str(int(wait_seconds)) + " goto waitnew",
         "",
-        "rem 4. 超时：回滚 .bak 并启动旧版。",
+        "rem 4. timed out: roll back to the .bak and start the old version.",
         ":rollback",
         'copy /Y "%BAK%" "%EXE%" >NUL 2>&1',
         'start "" "%EXE%"',
         "goto done",
         "",
+        "rem Failed before the swap: the old exe is still in place -- start it again,",
+        "rem otherwise the user is left with no program at all.",
         ":fail",
-        'echo update failed> "%MARKER%"',
+        'start "" "%EXE%"',
         "",
         ":done",
         "endlocal",
