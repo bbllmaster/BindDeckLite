@@ -22,6 +22,10 @@
   --sp-6: 24px;
   --sp-8: 32px;
 
+  /* 顶栏基础高度：上下 padding + 内容行 + 底边。窄屏换行时顶栏会变高，
+     布局用 flex 吸收这部分，不再用 calc(100vh - 75px) 推算。 */
+  --topbar-h: 75px;
+
   /* 字号 5 档：说明/时间戳 → 次要 → 正文 → 标题 → 区块 */
   --fs-cap: 11px;
   --fs-sm: 12px;
@@ -65,6 +69,63 @@ html, body {
   font-size: var(--fs-body);
 }
 
+/* 整页只有 .main 一个纵向滚动容器：body 锁掉滚动，顶栏与布局按 flex 分配高度。 */
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------- scrollbars ---------- */
+/* 细滚动条只挂在真正会滚动的容器上；不使用 scrollbar-gutter，避免常驻留白。 */
+.main,
+.device-list,
+.log,
+.modal-body,
+.key-drawer,
+.apply-results,
+.help-code {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(149, 161, 182, 0.38) transparent;
+}
+.main::-webkit-scrollbar,
+.device-list::-webkit-scrollbar,
+.log::-webkit-scrollbar,
+.modal-body::-webkit-scrollbar,
+.key-drawer::-webkit-scrollbar,
+.apply-results::-webkit-scrollbar,
+.help-code::-webkit-scrollbar {
+  width: 8px; height: 8px;
+}
+.main::-webkit-scrollbar-track,
+.device-list::-webkit-scrollbar-track,
+.log::-webkit-scrollbar-track,
+.modal-body::-webkit-scrollbar-track,
+.key-drawer::-webkit-scrollbar-track,
+.apply-results::-webkit-scrollbar-track,
+.help-code::-webkit-scrollbar-track {
+  background: transparent;
+}
+.main::-webkit-scrollbar-thumb,
+.device-list::-webkit-scrollbar-thumb,
+.log::-webkit-scrollbar-thumb,
+.modal-body::-webkit-scrollbar-thumb,
+.key-drawer::-webkit-scrollbar-thumb,
+.apply-results::-webkit-scrollbar-thumb,
+.help-code::-webkit-scrollbar-thumb {
+  background: rgba(149, 161, 182, 0.38);
+  border-radius: var(--r-pill);
+}
+.main::-webkit-scrollbar-thumb:hover,
+.device-list::-webkit-scrollbar-thumb:hover,
+.log::-webkit-scrollbar-thumb:hover,
+.modal-body::-webkit-scrollbar-thumb:hover,
+.key-drawer::-webkit-scrollbar-thumb:hover,
+.apply-results::-webkit-scrollbar-thumb:hover,
+.help-code::-webkit-scrollbar-thumb:hover {
+  background: rgba(149, 161, 182, 0.68);
+}
+
 h1, h2, h3, p { margin: 0; }
 code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; border-radius: var(--r-control); font-size: var(--fs-sm); }
 
@@ -72,16 +133,27 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; bor
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: var(--sp-2) var(--sp-6);
-  padding: var(--sp-4) var(--sp-6);
+  flex: none;
+  min-height: var(--topbar-h);
+  padding: var(--sp-4) 0;
   border-bottom: 1px solid var(--line);
   background: rgba(11, 14, 20, 0.85);
   backdrop-filter: blur(10px);
   position: sticky;
   top: 0;
   z-index: 20;
+}
+
+/* 顶栏内容不再限宽：与铺满后的 .main 共用左右 24px 内边距，
+   按钮右边缘与 .main 内容右边缘对齐（≤860 同为 16px）。 */
+.topbar-inner {
+  width: 100%;
+  padding-inline: var(--sp-6);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-6);
 }
 
 .brand { display: flex; align-items: center; gap: var(--sp-3); }
@@ -249,11 +321,14 @@ textarea:focus-visible {
 }
 
 /* ---------- layout ---------- */
-.layout { display: flex; min-height: calc(100vh - 75px); }
+/* 布局吃掉顶栏之外的剩余高度；不设 min-height 推算，避免窄屏顶栏换行后溢出。 */
+.layout { display: flex; flex: 1 1 auto; min-height: 0; }
 
 .sidebar {
   width: 250px;
   flex: none;
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid var(--line);
   padding: var(--sp-4) var(--sp-3);
   display: flex;
@@ -264,24 +339,38 @@ textarea:focus-visible {
 
 .side-head {
   display: flex; align-items: center; justify-content: space-between;
+  flex: none;
   color: var(--muted); font-size: var(--fs-cap); letter-spacing: 1.2px; text-transform: uppercase;
   padding: 0 6px;
 }
 
-.device-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+/* 设备多时侧栏内部滚动，不把整页撑高。 */
+.device-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px;
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+}
+/* 固定两行行高（19 + 15），行高一致：单行/双行/无副标题都是 52px。 */
 .device {
   display: flex; align-items: center; gap: 10px;
-  min-height: 44px;
+  min-height: 52px;
   padding: var(--sp-2) var(--sp-3); border-radius: var(--r-control); cursor: pointer;
   border: 1px solid transparent; transition: 0.15s;
 }
 .device:hover { background: var(--card); }
 .device.active { background: var(--card); border-color: rgba(53, 224, 194, 0.35); }
-.dev-main { display: flex; flex-direction: column; min-width: 0; }
-.dev-main b { font-size: var(--fs-body); }
+.dev-main { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+/* 设备名与副标题都单行省略，长名字/长地址只出省略号，不会把行撑高。 */
+.dev-main b {
+  font-size: var(--fs-body); line-height: 19px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* 地址在正常时保持原样；连接失败时换成失败原因摘要（单行省略，悬停看全文） */
-.dev-main small { color: var(--muted); font-size: var(--fs-cap); overflow: hidden; text-overflow: ellipsis; }
-.dev-main small.reason { white-space: nowrap; color: var(--warn); }
+.dev-main small {
+  color: var(--muted); font-size: var(--fs-cap); line-height: 15px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dev-main small.reason { color: var(--warn); }
 .device-empty { color: var(--muted); font-size: var(--fs-sm); padding: 12px; }
 .device-empty b { display: block; color: var(--text); margin-bottom: 6px; }
 .device-empty span { display: block; line-height: 1.8; }
@@ -290,12 +379,23 @@ textarea:focus-visible {
 .device-empty .dev-scan[hidden] { display: none; }
 
 .side-note {
+  flex: none;
   margin-top: auto; border-top: 1px solid var(--line); padding-top: var(--sp-3);
-  color: var(--muted); font-size: var(--fs-cap); line-height: 1.8;
+  color: var(--muted); font-size: var(--fs-sm); line-height: 1.7;
 }
-.side-note code { font-size: var(--fs-cap); }
+.side-note code { font-size: var(--fs-sm); }
 
-.main { flex: 1; padding: var(--sp-6) var(--sp-6) var(--sp-8); max-width: 1180px; }
+/* 主内容区是唯一纵向滚动容器；页签、提示条、页签面板按自然高度排列。 */
+.main {
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden;
+  padding: var(--sp-6) var(--sp-6) var(--sp-8);
+  /* 不再限宽：铺满设备栏右侧的可用宽度，滚动条随内容列贴到可见区域右边缘。 */
+}
+.main > .tabs,
+.main > .untrusted-banner,
+.main > .panel { flex: none; }
 
 /* ---------- tabs ---------- */
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line); margin-bottom: var(--sp-6); }
@@ -315,6 +415,19 @@ textarea:focus-visible {
 .panel { display: none; animation: fade 0.18s ease; }
 .panel.active { display: block; }
 @keyframes fade { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+/* 日志页：面板占满主内容区剩余高度；标题与过滤条固定，只有日志区内部滚动。
+   过滤条在不同断点换行时由 flex 自动让位，不再用 calc(100vh - Npx) 猜高度。 */
+#tab-log.panel.active {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+}
+#tab-log > .panel-head,
+#tab-log > .log-filters { flex: none; }
+#tab-log > .log-wrap {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+}
 
 .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-6); margin-bottom: var(--sp-6); }
 .panel-head h2 { font-size: var(--fs-section); margin-bottom: 6px; }
@@ -417,7 +530,12 @@ textarea:focus-visible {
     display: grid; grid-template-columns: minmax(0, 1fr) 400px;
     gap: var(--sp-4); align-items: start;
   }
-  .key-drawer { position: sticky; top: 88px; max-height: calc(100vh - 104px); overflow-y: auto; }
+  /* 抽屉已在 .main 内部，sticky 偏移基于主内容滚动区，不再叠加顶栏高度。 */
+  .key-drawer {
+    position: sticky; top: var(--sp-3);
+    max-height: calc(100vh - var(--topbar-h) - var(--sp-6));
+    overflow-y: auto;
+  }
   #keyDrawerBackdrop { display: none !important; }
 }
 @media (max-width: 1099px) {
@@ -429,7 +547,10 @@ textarea:focus-visible {
     overflow-y: auto;
   }
   .key-drawer.open { display: flex; }
+  /* 窄屏抽屉是浮层：锁住主内容区与侧栏，避免背景还能滚。 */
   body.drawer-open { overflow: hidden; }
+  body.drawer-open .main,
+  body.drawer-open .sidebar { overflow: hidden; }
 }
 
 .kd-field { display: flex; flex-direction: column; gap: 6px; }
@@ -659,7 +780,11 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   align-items: start;
 }
 .card-grid > .card { margin-bottom: 0; }
-.card-grid > .span-2 { grid-column: 1 / -1; }
+/* ≥1600：6 张卡分 3 列（约 520px/列），两行填满；不用 auto-fit 是因为
+   minmax(360px) 在 1920 会塞下 4 列，与“3 列约 520”的目标不符。 */
+@media (min-width: 1600px) {
+  .card-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 @media (max-width: 1000px) {
   .card-grid { grid-template-columns: minmax(0, 1fr); }
 }
@@ -698,22 +823,47 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   gap: var(--sp-4); padding: 0 var(--sp-4) var(--sp-4);
 }
 .advanced-body > .card { margin-bottom: 0; }
+.advanced-body.single-col { grid-template-columns: minmax(0, 1fr); }
 @media (max-width: 1000px) {
   .advanced-body { grid-template-columns: minmax(0, 1fr); }
 }
 
-.chip-badge {
-  border: 1px solid var(--line); background: var(--card);
-  padding: 6px 12px; border-radius: var(--r-pill); font-size: var(--fs-sm); color: var(--accent);
+/* 概览 hero：设备名主信息 → 芯片/固件次行；右侧布局胶囊 + OTA 主按钮。 */
+.dev-hero {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: var(--sp-3) var(--sp-6);
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: var(--sp-4);
+  margin-bottom: var(--sp-3);
 }
-.device-meta {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 1px; background: var(--line); border: 1px solid var(--line);
-  border-radius: var(--radius); overflow: hidden; margin-bottom: var(--sp-4);
+.hero-main { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.hero-name { font-size: 22px; font-weight: 700; letter-spacing: 0.2px; overflow-wrap: anywhere; }
+.hero-sub { color: var(--muted); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.hero-side { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-3); }
+.hero-layout {
+  color: var(--accent); font-size: var(--fs-sm);
+  border: 1px solid rgba(53, 224, 194, 0.35); background: rgba(53, 224, 194, 0.08);
+  border-radius: var(--r-pill); padding: 4px 10px; white-space: nowrap;
 }
-.device-meta > div { background: var(--card); padding: var(--sp-3) var(--sp-4); display: flex; flex-direction: column; gap: 4px; }
-.device-meta span { color: var(--muted); font-size: var(--fs-cap); text-transform: uppercase; letter-spacing: 0.8px; }
-.device-meta b { font-size: var(--fs-body); font-weight: 600; overflow-wrap: anywhere; }
+
+/* 首屏状态条：连接 / 运行时长 / 可用空间；完整字段在下方运行状态卡片。 */
+.dev-status-strip {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  margin-bottom: var(--sp-6);
+}
+.dev-status-strip > div {
+  background: var(--card); padding: 10px var(--sp-4);
+  display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0;
+}
+.dev-status-strip span { flex: none; color: var(--muted); font-size: var(--fs-cap); }
+.dev-status-strip b { font-size: var(--fs-body); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.dev-status-strip b.bad { color: var(--warn); }
+@media (max-width: 520px) {
+  .dev-status-strip { grid-template-columns: minmax(0, 1fr); }
+}
+
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-cap) !important; }
 
 .card {
@@ -742,7 +892,12 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
 .sys-notes { margin: 10px 0 0; padding: 0; list-style: none; }
 .sys-notes li { color: var(--warn); font-size: var(--fs-cap); line-height: 1.7; }
 
-.pins { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: var(--sp-2); }
+/* 9 个引脚在展开后的全宽卡里均匀铺满一行；窄屏再按最小列宽自动换行。 */
+.pins { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: var(--sp-2); }
+@media (max-width: 1099px) {
+  /* 窄屏一行放不下 9 个时改 3×3，避免输入框被压到 58px 以下。 */
+  .pins { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 .pin { display: flex; flex-direction: column; gap: 5px; font-size: var(--fs-cap); color: var(--muted); }
 .pin input { text-align: center; }
 /* 12 键布局固定的第 10–12 键，只读展示。 */
@@ -796,6 +951,14 @@ input.short { width: 80px; }
 .log-empty[hidden] { display: none; }
 
 .log-wrap { position: relative; }
+/* 日志区由 flex 占满剩余高度后，「没有匹配的日志」不能再排在容器下方，
+   改成覆盖在日志区内居中显示（不拦截点击）。 */
+#tab-log .log-empty {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  padding: 0; pointer-events: none;
+}
+#tab-log .log-empty[hidden] { display: none; }
 
 /* 暂停跟随时浮在日志区底部居中的胶囊：计数 + 一键回底 */
 .log-new {
@@ -826,8 +989,8 @@ input.short { width: 80px; }
 
 .log {
   background: #080b11; border: 1px solid var(--line); border-radius: var(--radius);
-  /* 过滤条占一行高度，容器相应缩短，避免整页出现纵向滚动 */
-  height: calc(100vh - 282px); min-height: 260px; overflow-y: auto;
+  /* 高度由日志页 flex 分配，只有这一层滚动；不再用 calc(100vh - Npx)。 */
+  flex: 1 1 auto; min-height: 0; height: auto; overflow-y: auto;
   padding: var(--sp-2) var(--sp-3); font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-cap);
   /* 裁剪由 script 自己补偿 scrollTop，关掉浏览器的滚动锚定避免补偿两次 */
   overflow-anchor: none;
@@ -938,7 +1101,9 @@ input.short { width: 80px; }
   line-height: 1.7;
   color: #c2ccdd;
 }
+/* 弹窗打开时 body 已不滚，还要锁住唯一滚动容器 .main。 */
 body.modal-open { overflow: hidden; }
+body.modal-open .main { overflow: hidden; }
 
 /* ---------- OTA wizard ---------- */
 .ota-modal { width: min(620px, 100%); }
@@ -1158,9 +1323,13 @@ body.modal-open { overflow: hidden; }
 
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
-  .sidebar { width: auto; border-right: none; border-bottom: 1px solid var(--line); }
-  .topbar { flex-wrap: wrap; }
+  /* 纵排后侧栏不再吃满高度：限高并让设备列表内部滚动，主内容区拿走剩余空间。 */
+  .sidebar {
+    width: auto; height: auto; max-height: 34vh;
+    border-right: none; border-bottom: 1px solid var(--line);
+  }
   /* 窄屏（含 390 px 验收）下右侧状态/按钮换行，整页不出现横向滚动。 */
+  .topbar-inner { padding-inline: var(--sp-4); }
   .topbar-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; }
   .main { padding: var(--sp-4); }
 }
