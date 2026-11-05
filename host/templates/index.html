@@ -215,6 +215,14 @@
               <input type="checkbox" id="closeMinimizeToggle">
               <span data-i18n="ui.close_minimized">关闭窗口时最小化到托盘</span>
             </label>
+            <label class="row">
+              <span data-i18n="ui.language">语言</span>
+              <select id="langSelect" class="lang-select">
+                <option value="system" data-i18n="ui.lang_system">跟随系统</option>
+                <option value="zh-CN" data-i18n="ui.lang_zh">中文</option>
+                <option value="en-US" data-i18n="ui.lang_en">English</option>
+              </select>
+            </label>
             <p class="muted small" id="desktopHint" data-i18n="ui.reading">读取中…</p>
             <div class="btn-row">
               <button class="btn secondary small-btn" id="btnShowWindow" hidden data-i18n="tray.show_window">显示窗口</button>

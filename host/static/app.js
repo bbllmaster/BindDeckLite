@@ -3,35 +3,41 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
+// 文案存 key 而不是译文：模块加载时 t() 一次会把语言冻结在那一刻，
+// 之后切换到英文，这些卡片仍是中文。
 const ENCODER_MODES = [
-  { id: 0, name: "音量", desc: "媒体音量加 / 减" },
-  { id: 1, name: "缩放", desc: "Ctrl + / Ctrl -" },
-  { id: 2, name: "标签页", desc: "Ctrl + Tab / Ctrl + Shift + Tab" },
-  { id: 3, name: "撤销 / 重做", desc: "Ctrl + Z / Ctrl + Y" },
-  { id: 4, name: "上位机动作", desc: "旋转方向由下方「旋转动作」决定" },
+  { id: 0, nameKey: "ui.enc_mode_volume", descKey: "ui.enc_mode_volume_desc" },
+  { id: 1, nameKey: "ui.enc_mode_zoom", desc: "Ctrl + / Ctrl -" },
+  { id: 2, nameKey: "ui.enc_mode_tabs", desc: "Ctrl + Tab / Ctrl + Shift + Tab" },
+  { id: 3, nameKey: "ui.enc_mode_undo", desc: "Ctrl + Z / Ctrl + Y" },
+  { id: 4, nameKey: "ui.enc_mode_actions", descKey: "ui.enc_mode_actions_desc" },
 ];
 
 const ACTION_TYPES = [
-  { id: "none", name: "仅 HID 按键" },
-  { id: "launch", name: "启动程序 / 文件" },
-  { id: "url", name: "打开网址" },
-  { id: "command", name: "执行命令" },
-  { id: "media", name: "媒体键" },
-  { id: "macro", name: "宏" },
+  { id: "none", nameKey: "ui.act_none" },
+  { id: "launch", nameKey: "ui.act_launch" },
+  { id: "url", nameKey: "ui.act_url" },
+  { id: "command", nameKey: "ui.act_command" },
+  { id: "media", nameKey: "ui.act_media" },
+  { id: "macro", nameKey: "ui.act_macro" },
 ];
+
+const modeName = (m) => (m.nameKey ? t(m.nameKey) : m.name || "");
+const modeDesc = (m) => (m.descKey ? t(m.descKey) : m.desc || "");
+const actionName = (a) => (a && a.nameKey ? t(a.nameKey) : (a && a.name) || "");
 
 const MEDIA_KEYS = ["volume up", "volume down", "volume mute", "play/pause", "next track", "previous track"];
 
 // 测试按钮空闲态的固定提示。执行中临时换成「仍在执行」，结束后恢复成这一句，
 // 而不是把 title 清空。
-const TEST_BTN_IDLE_TITLE = "立即执行这条上位机动作（不会发送 HID 键）";
+const testBtnIdleTitle = () => t("ui.test_btn_title");
 
 // 宏输入框 placeholder 里展示的键名列表（映射规则见 host/app.py 的
 // MACRO_KEY_NAMES）。这里只是提示，真正的归一化在主机端完成。
-const MACRO_KEY_HINT =
+const macroKeyHint = () =>
   "Tab Enter Esc Space Backspace Insert Delete Home End PageUp PageDown " +
   "Left Right Up Down LCtrl RCtrl LShift RShift LAlt RAlt LWin RWin " +
-  "F1-F12、单个字母/数字；组合键用 + 连接（ctrl+alt+t）";
+  t("ui.macro_key_hint");
 
 // 按键引脚校验。判定规则只有一份，在 host/app.py 的 validate_pins()
 // 里（与固件 isValidButtonPin / isValidPinSet 对齐）。这里只负责把当前 9 个
@@ -61,9 +67,11 @@ function inputCount() {
 
 /** 第 i 个输入的显示名（0 起）；第 10 个在两种布局下含义不同。 */
 function inputTitle(i) {
-  if (i < 9) return "按键 " + (i + 1);
-  if (i === 9) return is12Key() ? "按键 10（配网键）" : "编码器按压";
-  return is12Key() ? `按键 ${i + 1}（扩展）` : `按键 ${i + 1}`;
+  if (i < 9) return t("ui.input_button_n_js", { n: i + 1 });
+  if (i === 9) return is12Key() ? t("ui.input_button_10_config") : t("ui.input_encoder_press");
+  return is12Key()
+    ? t("ui.input_button_extra_js", { n: i + 1 })
+    : t("ui.input_button_n_js", { n: i + 1 });
 }
 // 停止输入 300 ms 后才校验：13 改成 1 会先经过空串，不能每敲一个字符就飘红。
 const PIN_VALIDATE_DEBOUNCE_MS = 300;
@@ -131,7 +139,7 @@ async function api(path, opts = {}) {
     // 错误码要一起给用户：只报一句「更新失败」的话，用户没法反馈。
     // 完整报文挂在 err.payload 上，需要 Release 链接的界面自己取。
     let text = detail || `${res.status} ${res.statusText}`;
-    if (code) text += `（错误码：${code}）`;
+    if (code) text += t("ui.error_code_suffix", { code });
     const err = new Error(text);
     err.payload = body || null;
     err.error_code = code;
@@ -199,19 +207,19 @@ function collectPending() {
   const base = b.applied;
   const out = [];
   if (!sameJson(cfg.keys, base.keys)) {
-    out.push({ field: "keys", label: "按键映射", tab: "keys", index: firstChangedIndex(cfg.keys, base.keys) });
+    out.push({ field: "keys", label: t("ui.keys_title"), tab: "keys", index: firstChangedIndex(cfg.keys, base.keys) });
   }
   if (cfgLayout(cfg) !== cfgLayout(base)) {
-    out.push({ field: "layout", label: "按键布局", tab: "device" });
+    out.push({ field: "layout", label: t("ui.layout_label"), tab: "device" });
   }
   if (!sameJson(cfg.pins, base.pins)) {
-    out.push({ field: "pins", label: "按键引脚", tab: "device", index: firstChangedIndex(cfg.pins, base.pins) });
+    out.push({ field: "pins", label: t("ui.group_pins"), tab: "device", index: firstChangedIndex(cfg.pins, base.pins) });
   }
   if (!sameJson(cfg.sleep, base.sleep)) {
-    out.push({ field: "sleep", label: "自动休眠", tab: "device" });
+    out.push({ field: "sleep", label: t("ui.sleep_card"), tab: "device" });
   }
   if (!sameJson(cfg.enc, base.enc)) {
-    out.push({ field: "enc", label: "编码器设置", tab: "encoder" });
+    out.push({ field: "enc", label: t("ui.panel_encoder"), tab: "encoder" });
   }
   return out;
 }
@@ -221,12 +229,12 @@ function updatePendingUi() {
   const badge = $("#pendingBadge");
   if (badge) {
     badge.hidden = !items.length;
-    badge.textContent = items.length ? `待下发 ${items.length} 项` : "";
-    badge.title = items.length ? `点击跳到第一处改动：${items[0].label}` : "";
+    badge.textContent = items.length ? t("ui.pending_items", { count: items.length }) : "";
+    badge.title = items.length ? t("ui.pending_jump", { label: items[0].label }) : "";
   }
   const apply = $("#btnApply");
   if (apply) {
-    apply.textContent = "应用配置";
+    apply.textContent = t("ui.apply_config");
     apply.classList.toggle("dirty", !!items.length);
   }
   state.dirty = !!items.length;
@@ -247,9 +255,12 @@ function renderLastApply() {
     return;
   }
   el.hidden = false;
-  el.textContent = `上次下发 ${fmtClock(la.at)} · ${la.failed ? `${la.failed} 项未生效` : "全部生效"}`;
+  el.textContent = t("ui.last_apply_line", {
+    time: fmtClock(la.at),
+    result: la.failed ? t("ui.items_failed", { count: la.failed }) : t("ui.all_applied_short"),
+  });
   el.classList.toggle("bad", !!la.failed);
-  el.title = la.failed ? "点击查看未生效项" : "本次配置已全部生效";
+  el.title = la.failed ? t("ui.view_pending_items") : t("ui.all_applied");
   el.onclick = la.failed && b.lastResult ? () => renderApplyResults(b.lastResult) : null;
 }
 
@@ -260,15 +271,15 @@ function renderActionsState() {
   const keysHint = $("#keysActionsHint");
   if (keysHint) {
     keysHint.textContent = on
-      ? "上位机动作已开启：按键会执行宏 / 启动程序等动作。可在「设备 → 上位机与系统」中关闭。"
-      : "上位机动作已关闭：按键只发送设备 HID，宏 / 启动程序不会执行。可在「设备 → 上位机与系统」中开启。";
+      ? t("ui.actions_on_long")
+      : t("ui.actions_off_long");
     keysHint.classList.toggle("off", !on);
   }
   const devHint = $("#actionsStateHint");
   if (devHint) {
     devHint.textContent = on
-      ? "已开启：按下按键时执行配置的宏 / 启动程序 / 命令。"
-      : "已关闭：仅发送设备自身的 HID 按键，上位机动作不执行。";
+      ? t("ui.actions_on_short")
+      : t("ui.actions_off_short");
   }
 }
 
@@ -328,7 +339,7 @@ function showNotice(msg, kind) {
   const close = document.createElement("button");
   close.type = "button";
   close.className = "notice-close";
-  close.setAttribute("aria-label", "关闭提示");
+  close.setAttribute("aria-label", t("ui.close_hint"));
   close.textContent = "×";
   close.onclick = () => removeNotice(item);
   item.appendChild(close);
@@ -428,24 +439,25 @@ async function pollStatus() {
     const connected = state.devices.filter((d) => d.connected).length;
     if (sel) {
       $("#statusDot").className = "dot " + (sel.connected ? "ok" : "warn");
-      $("#statusText").textContent = sel.connected ? "已连接" : "未连接";
+      $("#statusText").textContent = sel.connected ? t("ui.connected") : t("ui.disconnected");
     } else {
       $("#statusDot").className = "dot bad";
-      $("#statusText").textContent = "未发现设备";
+      $("#statusText").textContent = t("ui.no_devices");
     }
     // 副标题按优先级说明「为什么连不上」（蓝牙不可用 > 单设备失败
     // 原因 > 扫描结论），而不是一律显示「请给设备上电」。
     let sub;
     if (s.ble_ok === false) {
-      sub = `蓝牙依赖不可用：${s.ble_error || "未知原因"}`;
+      sub = t("ui.ble_unavailable_short", { reason: s.ble_error || t("ui.unknown_reason") });
     } else if (sel && !sel.connected && sel.last_error) {
-      sub = `未连接 · ${sel.last_error.text}`;
+      sub = t("ui.not_connected_reason", { reason: sel.last_error.text });
     } else if (!sel) {
       sub = scanDiagSub(state.scan)
-        || (state.preview ? "显示默认配置（预览）" : "请给设备上电");
+        || (state.preview ? t("ui.show_defaults_preview") : t("ui.power_on_device"));
     } else {
       const fw = sel.fw && sel.fw.version
-        ? `固件 ${sel.fw.version} · ${sel.fw.chip || ""}` : "等待设备信息";
+        ? t("ui.fw_chip_line", { version: sel.fw.version, chip: sel.fw.chip || "" })
+        : t("ui.waiting_device_info");
       sub = `${sel.name} · ${fw}`;
     }
     $("#statusSub").textContent = sub;
@@ -455,7 +467,7 @@ async function pollStatus() {
     applyEncoderRunningState();
   } catch (e) {
     $("#statusDot").className = "dot bad";
-    $("#statusText").textContent = "上位机未就绪";
+    $("#statusText").textContent = t("ui.host_not_ready");
     $("#statusSub").textContent = String(e.message || e);
     $("#statusSub").title = String(e.message || e);
   }
@@ -470,8 +482,8 @@ async function pollStatus() {
  */
 function scanDiagSub(scan) {
   if (!scan) return null;
-  if (scan.at === null || scan.at === undefined) return "扫描中…";
-  if (scan.reason) return `未发现设备：${scan.reason}`;
+  if (scan.at === null || scan.at === undefined) return t("ui.scanning");
+  if (scan.reason) return t("ui.no_devices_reason", { reason: scan.reason });
   return null;
 }
 
@@ -535,7 +547,10 @@ function renderDevices() {
     if (li._name.textContent !== name) li._name.textContent = name;
     // 名字被省略号截断时，悬停看全文。
     if (li._name.title !== name) li._name.title = name;
-    const label = `${name}（${d.connected ? "已连接" : "未连接"}）`;
+    const label = t("ui.device_with_state", {
+      name,
+      state: d.connected ? t("ui.connected") : t("ui.disconnected"),
+    });
     if (li.getAttribute("aria-label") !== label) li.setAttribute("aria-label", label);
 
     const sub = reason || d.address || "";
@@ -567,10 +582,10 @@ function renderDeviceEmpty(ul) {
     li = document.createElement("li");
     li.className = "device-empty";
     li.innerHTML = [
-      "<b>未发现 BindDeckLite 设备</b>",
-      "<span>① 系统蓝牙已开启</span>",
-      "<span>② 设备已上电且在 1 米内</span>",
-      "<span>③ 刚进过配网模式的话，长按编码器约 1 秒退出</span>",
+      t("ui.empty_devices_title"),
+      t("ui.empty_devices_step1"),
+      t("ui.empty_devices_step2"),
+      t("ui.empty_devices_step3"),
       '<span class="dev-scan" hidden></span>',
     ].join("");
     li._scan = li.querySelector(".dev-scan");
@@ -583,7 +598,7 @@ function renderDeviceEmpty(ul) {
     return;
   }
   const tail = scan.reason ? ` · ${scan.reason}` : "";
-  const text = `最后扫描 ${fmtClock(scan.at)}${tail}`;
+  const text = t("ui.last_scan", { time: fmtClock(scan.at), tail });
   if (li._scan.textContent !== text) li._scan.textContent = text;
   li._scan.hidden = false;
 }
@@ -654,7 +669,7 @@ async function selectDevice(devId) {
     // 12 键选项直接禁用，而不是让用户选完再被后端拒绝。
     probeDeviceLayout(devId);
   } catch (e) {
-    toast("读取配置失败：" + e.message, "bad");
+    toast(t("ui.read_config_failed") + e.message, "bad");
   }
 }
 
@@ -665,17 +680,17 @@ function renderKeys() {
   grid.innerHTML = "";
   if (!state.cfg) return;
   const total = inputCount();
-  const layoutText = is12Key() ? " · 12 键布局" : "";
+  const layoutText = is12Key() ? t("ui.layout_12_suffix") : "";
   $("#keyHint").textContent = state.preview
-    ? "预览 · 未连接设备"
-    : `共 ${total} 个输入${layoutText} · 摘要卡点「编辑」可改映射与动作`;
+    ? t("ui.preview_no_device")
+    : t("ui.inputs_summary", { total, layout: layoutText });
   // 后端 device_cfg() 已把历史配置的 keys 幂等补齐到 12 条；这里只
   // 兜住异常数据。补出来的条目必须写进 state.cfg.keys —— 以前每次渲染都新建
   // 临时对象，第 11/12 张卡上改的键码落在临时对象里，重绘即丢（改完看不见）。
   if (!Array.isArray(state.cfg.keys)) state.cfg.keys = [];
   const keys = state.cfg.keys;
   while (keys.length < total) {
-    keys.push({ code: 0, label: "未配置",
+    keys.push({ code: 0, label: t("ui.not_configured"),
                 action: { type: "none", value: "", macro: [] } });
   }
   for (let i = 0; i < total; i++) {
@@ -694,11 +709,11 @@ function renderKeys() {
       </div>
       <div class="kc-sum">
         <div class="kc-line"><span class="kc-tag">HID</span><b class="kc-hid"></b></div>
-        <div class="kc-line"><span class="kc-tag">动作</span><b class="kc-act"></b></div>
+        <div class="kc-line"><span class="kc-tag">${t("ui.card_action_tag")}</span><b class="kc-act"></b></div>
       </div>
       <div class="kc-actions">
-        <button type="button" class="btn tiny edit">编辑</button>
-        <button type="button" class="btn tiny test">测试</button>
+        <button type="button" class="btn tiny edit">${t("ui.card_edit")}</button>
+        <button type="button" class="btn tiny test">${t("ui.card_test")}</button>
       </div>`;
     grid.appendChild(card);
 
@@ -722,8 +737,8 @@ function renderKeys() {
  * 下一步边界退出。已经发出的按键收不回来，所以文案必须写明这一点。 */
 
 // 执行中（可点）与已请求停止（不可点）两态的提示。
-const STOP_BTN_TITLE = "在当前步骤结束后停止，已经发出的按键不会被撤回";
-const STOPPING_BTN_TITLE = "已发出停止请求，当前步骤结束后退出";
+const stopBtnTitle = () => t("ui.stop_hint");
+const stoppingBtnTitle = () => t("ui.stop_requested");
 
 function runningFor(devId) {
   return (state.running && state.running[devId]) || {};
@@ -790,7 +805,7 @@ async function stopAction(devId, idx) {
     // 网络异常：退回「停止」，让用户还能再点一次；不写「停止失败」日志。
     clearStopping(devId, idx);
     applyRunningState();
-    toast("停止请求没有送达，请再试一次", "warn");
+    toast(t("ui.stop_not_delivered"), "warn");
     return;
   }
   if (r.cancelling) {
@@ -802,7 +817,7 @@ async function stopAction(devId, idx) {
     clearStopping(devId, idx);
   }
   applyRunningState();
-  toast("已停止", "");        // 中性提示：停止不是失败
+  toast(t("ui.stopped"), "");        // 中性提示：停止不是失败
   nudgeStatus();
 }
 
@@ -814,26 +829,26 @@ function setCardRunning(card, secs, stopping) {
   if (live && stopping) {
     // 已请求停止：防连点，等状态轮询确认退出。
     btn.disabled = true;
-    btn.textContent = "正在停止…";
+    btn.textContent = t("ui.stopping");
     btn.classList.add("danger");
-    btn.title = STOPPING_BTN_TITLE;
+    btn.title = stoppingBtnTitle();
     return;
   }
   if (live) {
     // 执行中：按钮可点，就是止损入口。
     btn.disabled = false;
-    btn.textContent = "停止";
+    btn.textContent = t("ui.stop");
     btn.classList.add("danger");
-    btn.title = STOP_BTN_TITLE;
+    btn.title = stopBtnTitle();
     return;
   }
   // 「仅 HID」的按键没有上位机动作可测；按钮置灰并给出原因，
   // 不再允许点出一句「动作执行成功：无上位机动作」的假成功。
   const noAction = card.dataset.noaction === "1";
   btn.disabled = noAction;
-  btn.textContent = "测试动作";
+  btn.textContent = t("ui.test_action");
   btn.classList.remove("danger");
-  btn.title = noAction ? "仅 HID：没有上位机动作可测试" : TEST_BTN_IDLE_TITLE;
+  btn.title = noAction ? t("ui.test_none") : testBtnIdleTitle();
   // 动作结束后顺手清掉残留的停止标记，避免下次执行还显示「正在停止…」。
   const idx = card.dataset.idx;
   if (idx !== undefined && state.selected) clearStopping(state.selected, idx);
@@ -860,8 +875,8 @@ function renderActionInput(holder, item, card) {
     // 键码 0 = 不发键。没有上位机动作时这个键按下去什么都不会发生，
     // 必须说清楚，否则用户只会看到一个「没反应」的死键。
     holder.innerHTML = item.code === 0
-      ? `<p class="muted small">该键不会发送任何输入</p>`
-      : `<p class="muted small">只发送上面的 HID 键。</p>`;
+      ? t("ui.key_sends_nothing")
+      : t("ui.key_sends_hid_only");
     return;
   }
   if (action.type === "media") {
@@ -894,10 +909,10 @@ function renderActionInput(holder, item, card) {
     // 键名列表放在第一行：卡片里的输入框只有 3 行高，用户一眼能看到支持
     // 哪些键名；完整示例与语法说明见右上角「帮助」。
     ta.placeholder =
-      "键名：" + MACRO_KEY_HINT + "\n" +
-      "每行一步：app: / browser: / url: / wait:（毫秒）/ text: / text!80: / paste: / key:\n" +
-      "例：app:C:\\path\\app.exe → text:hello";
-    ta.title = "每行一步；完整语法与键名对照见右上角「帮助」";
+      t("ui.macro_key_label") + macroKeyHint() + "\n" +
+      t("ui.macro_placeholder") +
+      t("ui.macro_example");
+    ta.title = t("ui.macro_hint");
     ta.value = formatMacro(action.macro || []);
     ta.oninput = () => {
       action.macro = parseMacro(ta.value);
@@ -933,11 +948,11 @@ function renderActionInput(holder, item, card) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "btn tiny browse";
-  btn.textContent = "浏览…";
-  btn.title = "调用系统文件选择器";
+  btn.textContent = t("ui.browse");
+  btn.title = t("ui.browse_title");
   btn.onclick = async () => {
     btn.disabled = true;
-    btn.textContent = "选择中…";
+    btn.textContent = t("ui.browsing");
     try {
       const res = await fetch("/api/browse", {
         method: "POST",
@@ -946,7 +961,7 @@ function renderActionInput(holder, item, card) {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) {
-        toast(data.error || "无法打开系统文件选择器", "bad");
+        toast(data.error || t("ui.browse_unavailable"), "bad");
         return;
       }
       if (data.path) {
@@ -957,10 +972,10 @@ function renderActionInput(holder, item, card) {
         syncLaunchRecents();
       }
     } catch (e) {
-      toast("文件选择失败：" + (e.message || e), "bad");
+      toast(t("ui.file_pick_failed") + (e.message || e), "bad");
     } finally {
       btn.disabled = false;
-      btn.textContent = "浏览…";
+      btn.textContent = t("ui.browse");
     }
   };
   row.append(input, btn, list);
@@ -990,10 +1005,10 @@ function renderEncoder() {
     const el = document.createElement("button");
     el.className = "mode-card" + (m.id === mode ? " active" : "") + (disabled ? " locked" : "");
     el.disabled = disabled;
-    el.innerHTML = `<b>${m.name}</b><span>${m.desc}</span>`;
+    el.innerHTML = `<b>${modeName(m)}</b><span>${modeDesc(m)}</span>`;
     el.onclick = () => {
       if (disabled) {
-        toast("当前为 12 键布局，编码器不可用", "warn");
+        toast(t("ui.encoder_12key_unavailable"), "warn");
         return;
       }
       state.cfg.encoder = state.cfg.encoder || {};
@@ -1041,12 +1056,12 @@ function setEncRowRunning(row, secs) {
   const locked = row.dataset.locked === "1";
   const noAction = row.dataset.noaction === "1";
   btn.disabled = live || locked || noAction;
-  btn.textContent = live ? "执行中…" : "测试动作";
+  btn.textContent = live ? t("ui.running") : t("ui.test_action");
   btn.title = live
-    ? `动作仍在执行（已运行 ${Number(secs).toFixed(1)} 秒），重复按下会被忽略`
-    : locked ? "切到「上位机动作」模式后可配置旋转动作"
-      : noAction ? "仅 HID：没有上位机动作可测试"
-        : TEST_BTN_IDLE_TITLE;
+    ? t("ui.action_running_for", { seconds: Number(secs).toFixed(1) })
+    : locked ? t("ui.encoder_need_actions")
+      : noAction ? t("ui.test_none")
+        : testBtnIdleTitle();
 }
 
 function applyEncoderRunningState() {
@@ -1060,20 +1075,20 @@ function applyEncoderRunningState() {
 function encoderStatusText(actions, editable) {
   // 顶部状态说明。必须跟着当前配置走：改完动作类型后要立刻反映出来，
   // 不能一直显示旧文案。
-  if (!editable) return "切到「上位机动作」模式后可配置";
+  if (!editable) return t("ui.encoder_need_actions_short");
   const cw = actions.CW || defaultEncoderAction();
   const ccw = actions.CCW || defaultEncoderAction();
   const cwType = cw.type || "none";
   const ccwType = ccw.type || "none";
   if (cwType === "none" && ccwType === "none") {
-    return "未配置：旋转只会发送 F23/F24，不会有任何效果";
+    return t("ui.encoder_none_hint");
   }
-  const nameOf = (t) => {
-    const hit = ACTION_TYPES.find((a) => a.id === t);
-    return hit ? hit.name : t;
+  const nameOf = (id) => {
+    const hit = ACTION_TYPES.find((a) => a.id === id);
+    return hit ? actionName(hit) : id;
   };
-  return `顺时针：${nameOf(cwType)} · 逆时针：${nameOf(ccwType)}；` +
-    "上位机动作模式下设备仍会额外发送 F23/F24，如与现有软件冲突请改用其他模式";
+  return t("ui.encoder_summary", { cw: nameOf(cwType), ccw: nameOf(ccwType) }) +
+    t("ui.encoder_f23_warning");
 }
 
 function renderEncoderActions() {
@@ -1101,15 +1116,15 @@ function renderEncoderActions() {
   statusEl.className = "enc-action-status";
   const refreshStatus = () => {
     statusEl.textContent = is12Key()
-      ? "当前为 12 键布局，编码器不可用（配置会保留，切回编码器布局后恢复）"
+      ? t("ui.encoder_12key_kept")
       : encoderStatusText(actions, editable);
   };
   refreshStatus();
   card.appendChild(statusEl);
 
   const dirs = [
-    { dir: "CW", label: "顺时针" },
-    { dir: "CCW", label: "逆时针" },
+    { dir: "CW", label: t("ui.clockwise") },
+    { dir: "CCW", label: t("ui.counter_clockwise") },
   ];
   dirs.forEach(({ dir, label }) => {
     const action = actions[dir];
@@ -1128,7 +1143,7 @@ function renderEncoderActions() {
           `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${a.name}</option>`).join("")}
       </select>
       <div class="enc-act-input"></div>
-      <button class="btn tiny test">测试动作</button>`;
+      <button class="btn tiny test">${t("ui.test_action")}</button>`;
     card.appendChild(row);
 
     const sel = row.querySelector("select");
@@ -1159,23 +1174,23 @@ function renderEncoderActions() {
     btn.onclick = async () => {
       if (row.classList.contains("running")) {
         // 按钮此时本应 disabled，兜底防止键盘触发第二次动作。
-        toast("该方向的动作仍在执行", "warn");
+        toast(t("log.action_still_running_dir"), "warn");
         return;
       }
       if (!editable) {
         // 灰卡上的按钮本应 disabled，兜底挡住键盘触发。
-        toast("切到「上位机动作」模式后可配置旋转动作", "warn");
+        toast(t("ui.encoder_need_actions"), "warn");
         return;
       }
       const devId = state.selected;
       if (!devId || !state.selectedConnected) {
-        toast("未连接设备", "bad");
+        toast(t("ui.no_device_selected"), "bad");
         return;
       }
       const noAction = !actions[dir] || (actions[dir].type || "none") === "none";
       if (noAction) {
         // 按钮本应 disabled；这里兜住键盘触发，不给假成功。
-        toast("仅 HID：没有上位机动作可测试", "warn");
+        toast(t("ui.test_none"), "warn");
         return;
       }
       markEncRunning(devId, dir);
@@ -1187,13 +1202,13 @@ function renderEncoderActions() {
         if (r.ok) {
           const used = r.browser_used && r.browser_used !== "default"
             ? ` · ${r.browser_used}` : "";
-          toast("动作执行成功：" + actions[dir].type + used, "ok");
+          toast(t("ui.action_ok_prefix") + actions[dir].type + used, "ok");
         } else if (r.running) {
           if (devId) markEncRunning(devId, dir, r.elapsed || 0);
           applyEncoderRunningState();
-          toast(r.error || "该方向的动作仍在执行", "warn");
+          toast(r.error || t("log.action_still_running_dir"), "warn");
         } else {
-          toast("动作执行失败：" + (r.error || "未知错误"), "bad");
+          toast(t("ui.action_failed_prefix") + (r.error || t("ui.unknown_error")), "bad");
         }
       } catch (e) {
         toast(e.message, "bad");
@@ -1260,21 +1275,21 @@ function renderStatusStrip() {
   const devId = state.selected;
   const dev = devId ? state.devices.find((d) => d.dev_id === devId) : null;
   const connected = !!(devId && dev && dev.connected);
-  conn.textContent = !devId || state.preview ? "未选择" : connected ? "已连接" : "未连接";
+  conn.textContent = !devId || state.preview ? t("ui.not_selected") : connected ? t("ui.connected") : t("ui.disconnected");
   conn.className = connected ? "" : "bad";
   if (otaBusy()) {
-    uptime.textContent = "OTA 中";
+    uptime.textContent = t("ui.ota_running_badge");
     heap.textContent = "—";
     return;
   }
   const info = devId && !state.preview ? sysinfoFor(devId) : null;
   if (info && info.supported === false) {
-    uptime.textContent = "当前固件不支持";
+    uptime.textContent = t("ui.fw_not_supported");
     heap.textContent = "—";
     return;
   }
   const d = (info && info.display) || {};
-  uptime.textContent = d.uptime || (connected ? "读取中…" : "—");
+  uptime.textContent = d.uptime || (connected ? t("ui.reading") : "—");
   heap.textContent = d.heap || "—";
 }
 
@@ -1285,12 +1300,12 @@ function renderSysinfo() {
   if (!box || !atEl) return;
   const devId = state.selected;
   if (!devId || state.preview) {
-    box.innerHTML = `<span class="k">状态</span><span class="v muted">未选择设备</span>`;
+    box.innerHTML = `<span class="k">${t("ui.status_label")}</span><span class="v muted">${t("ui.no_device_selected")}</span>`;
     atEl.textContent = "";
     return;
   }
   if (otaBusy()) {
-    box.innerHTML = `<span class="k">状态</span><span class="v warn">OTA 中，暂停查询</span>`;
+    box.innerHTML = `<span class="k">${t("ui.status_label")}</span><span class="v warn">${t("ui.ota_pause_query")}</span>`;
     atEl.textContent = "";
     return;
   }
@@ -1299,8 +1314,8 @@ function renderSysinfo() {
   const info = sysinfoFor(devId);
 
   if (!info) {
-    box.innerHTML = `<span class="k">状态</span><span class="v muted">${
-      connected ? "读取中…" : "设备未连接，暂无采样"
+    box.innerHTML = `<span class="k">${t("ui.status_label")}</span><span class="v muted">${
+      connected ? t("ui.reading") : t("ui.no_sample_offline")
     }</span>`;
     atEl.textContent = "";
     return;
@@ -1308,9 +1323,9 @@ function renderSysinfo() {
 
   if (info.supported === false) {
     // 旧固件：2 秒内没有 SYS: 行。这是「不支持」，不是错误。
-    box.innerHTML = `<span class="k">状态</span><span class="v muted">当前固件不支持运行状态（需更新固件）</span>`;
-    atEl.textContent = (info.at ? `采样 ${fmtClock(info.at)}` : "")
-      + (connected ? "" : " · 已断开，非实时");
+    box.innerHTML = `<span class="k">${t("ui.status_label")}</span><span class="v muted">${t("ui.sysinfo_unsupported")}</span>`;
+    atEl.textContent = (info.at ? t("ui.sampled_at", { time: fmtClock(info.at) }) : "")
+      + (connected ? "" : t("ui.disconnected_not_live"));
     return;
   }
 
@@ -1320,10 +1335,10 @@ function renderSysinfo() {
   const resetNote = notes.deepsleep
     ? `<span class="muted small"> · ${escapeHtml(notes.deepsleep)}</span>` : "";
   const rows = [
-    ["上次复位", escapeHtml(d.reset || "未知") + resetNote, flags.deepsleep ? "warn" : ""],
-    ["运行时长", escapeHtml(d.uptime || "未知"), ""],
-    ["NVS", escapeHtml(d.nvs || "未知"), flags.nvs_bad ? "bad" : ""],
-    ["空闲堆", escapeHtml(d.heap || "未知"), flags.heap_low ? "warn" : ""],
+    [t("ui.last_reset"), escapeHtml(d.reset || t("log.reset_unknown")) + resetNote, flags.deepsleep ? "warn" : ""],
+    [t("ui.strip_uptime"), escapeHtml(d.uptime || t("log.reset_unknown")), ""],
+    ["NVS", escapeHtml(d.nvs || t("log.reset_unknown")), flags.nvs_bad ? "bad" : ""],
+    [t("ui.free_heap"), escapeHtml(d.heap || t("log.reset_unknown")), flags.heap_low ? "warn" : ""],
   ];
   const extraNotes = [];
   if (notes.safe) extraNotes.push(`<li>${escapeHtml(notes.safe)}</li>`);
@@ -1333,8 +1348,8 @@ function renderSysinfo() {
     .join("") + (extraNotes.length
       ? `<span class="k"></span><ul class="sys-notes">${extraNotes.join("")}</ul>` : "");
 
-  const when = info.at ? `采样 ${fmtClock(info.at)}` : "";
-  const stale = connected ? "" : " · 已断开，非实时";
+  const when = info.at ? t("ui.sampled_at", { time: fmtClock(info.at) }) : "";
+  const stale = connected ? "" : t("ui.disconnected_not_live");
   atEl.textContent = when + stale;
 }
 
@@ -1392,12 +1407,12 @@ function renderLayoutCard() {
     twelve.checked = is12Key();
   }
   if (blocked) {
-    hint.textContent = "该设备固件不支持 12 键布局（需 v1.3.7 及以上），请先升级固件。";
+    hint.textContent = t("ui.layout_unsupported_old");
     return;
   }
   hint.textContent = is12Key()
-    ? "第 10–12 键固定在原编码器按压 / A / B 三脚上；旋转编码器不可用，第 10 键同时承担配网手势。"
-    : "9 个按键 + EC11：旋转 = 编码器模式，按压 = 第 10 个输入。";
+    ? t("ui.layout_12key_hint")
+    : t("ui.layout_encoder_hint");
 }
 
 function setLayout(value) {
@@ -1421,14 +1436,14 @@ function renderDeviceMeta() {
   const subEl = $("#devSub");
   if (subEl) {
     const parts = [chip];
-    if (fw.version) parts.push(`固件 ${fw.version}`);
-    if (fw.build) parts.push(`编译 ${fw.build}`);
+    if (fw.version) parts.push(t("ui.fw_version_short", { version: fw.version }));
+    if (fw.build) parts.push(t("ui.build_label", { build: fw.build }));
     subEl.textContent = parts.join(" · ");
     subEl.title = subEl.textContent;
   }
   const layoutEl = $("#devLayout");
   if (layoutEl) {
-    layoutEl.textContent = is12Key() ? "12 键（无编码器）" : "编码器（9 键 + EC11）";
+    layoutEl.textContent = is12Key() ? t("ui.layout_12key_name") : t("ui.layout_encoder_name");
   }
   renderLayoutCard();
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
@@ -1442,14 +1457,17 @@ function renderDeviceMeta() {
     // the live NimBLE bond state now arrives on BOND_DIAG (separate
     // from BOND_STATUS), so the address stays clean. Show it next to the addr.
     const diag = bond.peer_sec === undefined ? "" :
-      ` <span class="muted small">· 配对 ${bond.peer_sec} 个 · NimBLE 绑定 ${bond.nimble_bond ? "正常" : "缺失"}</span>`;
-    bondEl.innerHTML = `<span class="dot ok"></span>已绑定 <b>${escapeHtml(bond.addr || "—")}</b>${diag}`;
+      `<span class="muted small">${t("ui.bond_diag", {
+        count: bond.peer_sec,
+        state: bond.nimble_bond ? t("ui.bond_ok") : t("ui.bond_missing"),
+      })}</span>`;
+    bondEl.innerHTML = `<span class="dot ok"></span>${t("ui.bound_as", { addr: `<b>${escapeHtml(bond.addr || "—")}</b>` })}${diag}`;
     clearBtn.hidden = false;
-    $("#bondHint").textContent = "只有已绑定的主机能发送 HID 按键；清除会同时断开它的连接，之后任何主机均可接入。";
+    $("#bondHint").textContent = t("ui.bond_clear_hint");
   } else {
-    bondEl.innerHTML = `<span class="dot warn"></span>未绑定`;
+    bondEl.innerHTML = `<span class="dot warn"></span>${t("ui.unbound")}`;
     clearBtn.hidden = true;
-    $("#bondHint").textContent = "首次 HID 订阅的主机会被绑定；按住编码器 5 秒也可清除。";
+    $("#bondHint").textContent = t("ui.bond_pair_hint");
   }
 
   // 引脚提示文案也来自后端规则（/api/defaults 的 pinRules），避免 JS 里再写一份
@@ -1472,7 +1490,7 @@ function renderPins() {
     const wrap = document.createElement("label");
     wrap.className = "pin";
     const name = document.createElement("span");
-    name.textContent = `按键 ${i + 1}`;
+    name.textContent = t("ui.input_button_n_js", { n: i + 1 });
     const input = document.createElement("input");
     input.type = "number";
     input.min = "0";
@@ -1518,7 +1536,7 @@ function renderFixedPins() {
     const wrap = document.createElement("div");
     wrap.className = "pin pin-fixed";
     const name = document.createElement("span");
-    name.textContent = `按键 ${idx + 1}（固定）`;
+    name.textContent = t("ui.fixed_key", { n: idx + 1 });
     const val = document.createElement("span");
     val.className = "mono";
     val.textContent = `GPIO ${pin}`;
@@ -1611,7 +1629,7 @@ function renderPinErrorCount() {
   const el = $("#pinErrorCount");
   if (!el) return;
   const n = state.pinErrors.length;
-  el.textContent = n ? `${n} 处需要修正` : "";
+  el.textContent = n ? t("ui.pin_errors", { count: n }) : "";
   el.hidden = !n;
 }
 
@@ -1644,7 +1662,7 @@ function renderDesktop() {
   const d = state.desktop;
   if (!d) return;
   const badge = $("#desktopMode");
-  badge.textContent = d.frozen ? "打包版 exe" : d.desktop_mode ? "托盘模式" : "源码运行";
+  badge.textContent = d.frozen ? t("ui.mode_frozen") : d.desktop_mode ? t("ui.mode_tray") : t("ui.mode_source");
 
   const auto = d.autostart || {};
   const isWindows = String(d.platform || "").startsWith("win");
@@ -1670,28 +1688,31 @@ function renderDesktop() {
   $("#btnShowWindow").hidden = !(d.desktop_mode && d.window_hidden);
 
   const bits = [];
-  if (d.tray_active) bits.push("托盘图标在任务栏右下角：单击显示控制台，右键可显示 / 退出");
+  if (d.tray_active) bits.push(t("ui.tray_hint_ok"));
   else if (d.desktop_mode) {
-    if (d.window_hidden) bits.push("托盘不可用，窗口已隐藏：可用下方「显示窗口」恢复，或「退出上位机」关闭");
-    else bits.push("托盘不可用，程序在后台运行，可用下方「退出上位机」关闭");
+    if (d.window_hidden) bits.push(t("ui.tray_hint_hidden"));
+    else bits.push(t("ui.tray_hint_background"));
   }
-  else bits.push("当前由 run.sh / python app.py 启动，没有托盘图标；打包版双击即带托盘");
+  else bits.push(t("ui.tray_hint_source"));
   if (auto.supported) {
-    bits.push(`开机自启动${auto.enabled ? "已开启" : "未开启"}（${auto.method}）`);
+    bits.push(t("ui.autostart_state", {
+      state: auto.enabled ? t("ui.autostart_on") : t("ui.autostart_off"),
+      method: auto.method,
+    }));
   } else {
-    bits.push("开机自启动不可用");
+    bits.push(t("ui.autostart_unavailable"));
   }
   if (auto.error) bits.push(auto.error);
   // auto.admin：自启动条目是不是「计划任务（最高权限）」。
   // auto.is_admin：当前这个进程本身有没有提权。两者互相独立。
-  if (auto.admin) bits.push("当前以计划任务最高权限启动");
+  if (auto.admin) bits.push(t("ui.autostart_admin_task"));
   if (isWindows && !auto.is_admin) {
-    bits.push("当前未提权，宏无法输入到以管理员运行的程序，可点「立即以管理员身份重启」");
+    bits.push(t("ui.autostart_not_elevated"));
   }
   if (auto.admin_error) bits.push(auto.admin_error);
-  const desktopError = (d.error || "").replace(/^托盘不可用：/, "");
+  const desktopError = (d.error || "").replace(/^(托盘不可用：|Tray unavailable: )/, "");
   if (desktopError && !bits.includes(desktopError)) bits.push(desktopError);
-  $("#desktopHint").textContent = bits.join("；") + "。";
+  $("#desktopHint").textContent = bits.join(t("ui.list_separator")) + t("ui.sentence_end");
   if (auto.detail) $("#desktopHint").title = auto.detail;
 }
 
@@ -1702,7 +1723,7 @@ async function updateDesktop(patch) {
     body: JSON.stringify(patch),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(data.error || "设置失败");
+  if (!res.ok || data.ok === false) throw new Error(data.error || t("error.setting_failed"));
   state.desktop = data;
   renderDesktop();
   return data;
@@ -1745,17 +1766,17 @@ async function saveConfigFor(devId, cfg) {
       body: JSON.stringify(cfg),
     });
   } catch (e) {
-    toast("保存失败：" + e.message, "bad");
+    toast(t("ui.save_failed") + e.message, "bad");
   }
 }
 
 async function applyConfig() {
   if (otaBusy()) {
-    toast("OTA 进行中，配置下发已锁定", "bad");
+    toast(t("ui.locked_ota"), "bad");
     return;
   }
   if (!state.selected) {
-    toast("未连接设备，当前只是默认配置预览", "bad");
+    toast(t("ui.no_device_preview"), "bad");
     return;
   }
   // 固定本次下发的设备与配置快照：等待期间用户切换设备时不要把结果记到别的桶。
@@ -1766,7 +1787,7 @@ async function applyConfig() {
   const pinErrors = await validatePins();
   if (state.selected !== devId) return;
   if (pinErrors.length) {
-    toast(`按键引脚有 ${pinErrors.length} 处错误`, "bad");
+    toast(t("ui.pin_error_count", { count: pinErrors.length }), "bad");
     focusFirstPinError(pinErrors);
     return;
   }
@@ -1775,8 +1796,8 @@ async function applyConfig() {
   // （在 saveConfigFor / /api/apply 之前 return）。
   if (cfg.trusted === false && !state.sessionRead[devId]) {
     const go = window.confirm(
-      "本机没有这台设备的配置存档，界面里的引脚与键码是默认值。" +
-      "继续会覆盖设备当前的引脚、键码、编码器模式与休眠设置。仍要下发吗？");
+      t("ui.untrusted_confirm_title") +
+      t("ui.untrusted_confirm_body"));
     if (!go) return;
   }
   await saveConfigFor(devId, cfg);
@@ -1802,9 +1823,9 @@ async function applyConfig() {
       }
       recordApply(r.items, allOk);
       if (allOk) {
-        toast("配置已生效", "ok");
+        toast(t("ui.config_applied"), "ok");
       } else {
-        toast("部分配置未生效，请查看「上次下发」结果", "bad");
+        toast(t("ui.config_partly_applied"), "bad");
       }
       return;
     }
@@ -1812,9 +1833,9 @@ async function applyConfig() {
     // Legacy fallback (old backend that only returns {ok, results}).
     if (r.ok) {
       recordApply([], true);
-      toast(`已下发到设备（${r.results.filter((x) => x.sent).length} 条）`, "ok");
+      toast(t("ui.config_applied_count", { count: r.results.filter((x) => x.sent).length }), "ok");
     } else {
-      toast("下发失败：设备未连接？", "bad");
+      toast(t("ui.apply_failed_offline"), "bad");
     }
   } catch (e) {
     toast(e.message, "bad");
@@ -1874,13 +1895,13 @@ function renderApplyResults(items) {
   const head = document.createElement("div");
   head.className = "apply-results-head";
   const title = document.createElement("span");
-  title.textContent = allOk ? "配置结果 · 全部已生效" : "配置结果 · 有项目未生效";
+  title.textContent = allOk ? t("ui.result_all_ok") : t("ui.result_partial");
   const closeBtn = document.createElement("button");
   closeBtn.type = "button";
   closeBtn.className = "apply-results-close";
   closeBtn.textContent = "×";
-  closeBtn.title = "关闭（Esc）";
-  closeBtn.setAttribute("aria-label", "关闭配置结果");
+  closeBtn.title = t("ui.close_esc");
+  closeBtn.setAttribute("aria-label", t("ui.close_result"));
   closeBtn.onclick = clearApplyResults;
   head.appendChild(title);
   head.appendChild(closeBtn);
@@ -1893,13 +1914,13 @@ function renderApplyResults(items) {
     let statusText;
     switch (item.status) {
       case "ok":
-        statusText = "已生效";
+        statusText = t("ui.effective");
         break;
       case "rejected":
-        statusText = `未生效：设备拒绝（${item.reason}）`;
+        statusText = t("ui.result_rejected", { reason: item.reason });
         break;
       case "unconfirmed":
-        statusText = `未确认：${item.reason}`;
+        statusText = t("ui.result_unconfirmed", { reason: item.reason });
         break;
       case "unverified":
         statusText = item.reason;
@@ -1909,7 +1930,7 @@ function renderApplyResults(items) {
     }
 
     const actionBtn = (item.status !== "ok")
-      ? `<button class="btn tiny secondary accept-device-value" onclick="acceptDeviceValue('${item.field}')">以设备为准</button>`
+      ? `<button class="btn tiny secondary accept-device-value" onclick="acceptDeviceValue('${item.field}')">${t("ui.accept_device_value")}</button>`
       : "";
 
     row.innerHTML = `
@@ -1956,11 +1977,12 @@ function highlightFormField(field) {
 // 设备回报的配置分组（与服务端 app.py 的 _CFG_READ_FIELDS 一致）。
 // 这四组全部回来才算一次完整的回读；缺任何一组都按「设备未回报」处理。
 const READ_FIELDS = ["pins", "keys", "enc", "sleep"];
+// 存函数而不是译文：切换语言后这些标签要跟着变（模块加载时求值会冻结）。
 const READ_FIELD_LABELS = {
-  pins: "按键引脚",
-  keys: "按键码",
-  enc: "编码器模式",
-  sleep: "休眠",
+  pins: () => t("ui.group_pins"),
+  keys: () => t("ui.group_keys"),
+  enc: () => t("ui.group_enc"),
+  sleep: () => t("ui.group_sleep"),
 };
 
 /** 回读结果里设备回报了几组配置。 */
@@ -1983,11 +2005,11 @@ function readFieldCount(fields) {
 async function readDeviceConfig(devId) {
   if (!devId) return null;
   if (otaBusy()) {
-    toast("OTA 进行中，设备指令已锁定", "bad");
+    toast(t("ui.cmd_locked_ota"), "bad");
     return null;
   }
   if (state.dirty) {
-    if (!window.confirm("有修改尚未下发到设备，读取设备配置会丢弃它们")) return null;
+    if (!window.confirm(t("ui.unsent_confirm"))) return null;
   }
   // 挂起的自动保存必须先停掉：它会把前端旧副本写回服务端，把刚读回来的
   // 设备真值覆盖掉。
@@ -2004,7 +2026,7 @@ async function readDeviceConfig(devId) {
     if (!r.ok) {
       // 表单与本地配置都不动，但用户原本的修改仍要能存下去。
       if (wasDirty) armPendingSave();
-      toast(`${r.reason || "设备未回报配置"}，可能固件过旧`, "bad");
+      toast(t("ui.read_incomplete_old_fw", { reason: r.reason || t("ui.cfg_not_reported_short") }), "bad");
       return r;
     }
     applyReadback(r);
@@ -2013,7 +2035,7 @@ async function readDeviceConfig(devId) {
     return r;
   } catch (e) {
     if (wasDirty) armPendingSave();
-    toast("读取设备配置失败：" + (e.message || e), "bad");
+    toast(t("ui.read_config_failed_short") + (e.message || e), "bad");
     return null;
   }
 }
@@ -2036,7 +2058,7 @@ function applyReadback(r) {
   renderReadStatus();
   renderUntrustedBanner();
   const got = readFieldCount(r.fields);
-  toast(`已读取设备配置（${fmtClock(r.at)}）· ${got}/${READ_FIELDS.length} 项`, "ok");
+  toast(t("ui.read_done", { time: fmtClock(r.at), got, total: READ_FIELDS.length }), "ok");
 }
 
 /** 设备页状态行：上次读取时间 + 设备回报了几组（缺的标「设备未回报」）。 */
@@ -2045,17 +2067,17 @@ function renderReadStatus() {
   if (!el) return;
   const st = state.readStatus[state.selected];
   if (!st || !st.at) {
-    el.textContent = "尚未读取设备配置";
+    el.textContent = t("ui.cfg_not_read");
     return;
   }
   const got = readFieldCount(st.fields);
   const missing = READ_FIELDS.filter((k) => !(st.fields || {})[k]);
-  let text = `上次读取：${fmtClock(st.at)}（设备回报 ${got}/${READ_FIELDS.length} 项）`;
+  let text = t("ui.last_read", { time: fmtClock(st.at), got, total: READ_FIELDS.length });
   if (!got) {
     // 设备一句都没回：不要笼统报成功。
-    text += " · 设备未回报配置";
+    text += t("ui.cfg_not_reported_suffix");
   } else if (missing.length) {
-    text += " · " + missing.map((k) => `${READ_FIELD_LABELS[k]} 设备未回报`).join("、");
+    text += t("ui.list_separator") + missing.map((k) => t("ui.field_not_reported", { field: READ_FIELD_LABELS[k]() })).join(t("ui.list_comma"));
   }
   el.textContent = text;
 }
@@ -2080,7 +2102,7 @@ function renderUntrustedBanner() {
   // 布局是唯一一项从设备读回来的字段（WS-499 探测）；探测确实回了才这么说，
   // 不回就老实承认布局也是本机默认值。
   const note = $("#untrustedLayoutNote");
-  if (note) note.textContent = cfg.layout_supported === true ? "（按键布局已从设备读取）" : "";
+  if (note) note.textContent = cfg.layout_supported === true ? t("ui.layout_read_note") : "";
 
   // 旧固件只回部分字段：读取状态里缺哪几组就点名，并说明表单仍是默认值。
   const st = state.readStatus[devId];
@@ -2090,7 +2112,7 @@ function renderUntrustedBanner() {
     const partial = missing.length > 0 && missing.length < READ_FIELDS.length;
     extra.hidden = !partial;
     extra.textContent = partial
-      ? "读取不完整：缺少 " + missing.map((k) => READ_FIELD_LABELS[k]).join("、")
+      ? t("ui.read_incomplete") + missing.map((k) => READ_FIELD_LABELS[k]()).join(t("ui.list_comma"))
       : "";
   }
 
@@ -2099,9 +2121,9 @@ function renderUntrustedBanner() {
   if (read) {
     const connected = !!state.selectedConnected;
     read.disabled = !connected || otaBusy();
-    read.title = !connected ? "设备未连接，无法读取"
-      : otaBusy() ? "OTA 进行中，读取已锁定"
-        : "从设备读取引脚 / 键码 / 编码器模式 / 休眠";
+    read.title = !connected ? t("ui.read_offline")
+      : otaBusy() ? t("ui.read_locked_ota")
+        : t("ui.read_btn_title");
   }
 }
 
@@ -2450,15 +2472,19 @@ async function pollLog() {
       // 设备归属：空串表示上位机自身事件或无后缀旧固件，这类行不加标签、
       // 也不参与任何设备过滤。
       row.dataset.dev = e.dev || "";
-      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(e.text)}</span>`;
+      // 事件带 code/params（WS-529）：优先本地翻译，语言切换后旧行也跟随；
+      // 没有 code 的（设备原始行、旧后端）继续用服务端渲染好的 text。
+      const rowText = e.code ? t(e.code, e.params) : e.text;
+      row._event = e;
+      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(rowText)}</span>`;
 
       // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
       // 放进剪贴板，方便贴到 issue / 聊天里。有设备归属时带上 [设备名]。
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "log-copy";
-      copyBtn.textContent = "复制";
-      copyBtn.title = "复制这一行（宏正文已隐藏）";
+      copyBtn.textContent = t("ui.copy");
+      copyBtn.title = t("ui.copy_row_title");
       copyBtn.onclick = () => copyLogLine(window.LogDevice.logCopyText(e, state.devices), copyBtn);
       row.appendChild(copyBtn);
 
@@ -2468,7 +2494,7 @@ async function pollLog() {
       // Physical-button action failures arrive through the log stream;
       // surface them as a toast so the user sees them immediately.
       if (e.kind === "action" && e.level === "error") {
-        toast(e.text, "bad");
+        toast(rowText, "bad");
       }
     });
 
@@ -2535,13 +2561,13 @@ async function copyText(text) {
 async function copyLogLine(text, btn) {
   const ok = await copyText(text);
   if (!ok) {
-    toast("复制失败，请手动选中日志文本后按 Ctrl+C", "bad");
+    toast(t("ui.copy_failed"), "bad");
     return;
   }
-  toast("已复制日志");
+  toast(t("ui.copied_log"));
   if (!btn) return;
   const label = btn.textContent;
-  btn.textContent = "已复制";
+  btn.textContent = t("ui.copied");
   btn.classList.add("copied");
   setTimeout(() => {
     btn.textContent = label;
@@ -2703,7 +2729,52 @@ function stopPolling() {
   });
 }
 
+/** 语言：取服务端持久化的偏好并加载对应文案（WS-529）。 */
+async function initLanguage() {
+  try {
+    const d = await api("/api/desktop");
+    state.langPref = d.lang || "system";
+    await window.i18n.load(d.lang_effective || d.lang);
+    window.i18n.apply(document);
+    const sel = $("#langSelect");
+    if (sel) sel.value = state.langPref;
+  } catch (_) {
+    /* 旧后端没有 lang：保持 DOM 里的中文兜底 */
+  }
+}
+
+/** 日志行记着原始事件，切语言后按 code/params 重新渲染（不重新拉日志）。 */
+function retranslateLog() {
+  $$("#logList .log-row").forEach((row) => {
+    const e = row._event;
+    const textEl = row.querySelector(".log-text");
+    if (!e || !textEl) return;
+    textEl.textContent = e.code ? t(e.code, e.params) : e.text;
+  });
+}
+
+/** 切语言后重绘动态内容；表单与选中的设备都来自 state，不会丢。 */
+function retranslateDynamic() {
+  renderDevices();
+  renderActionsState();
+  renderLastApply();
+  renderKeys();
+  renderEncoder();
+  renderDeviceMeta();
+  renderPins();
+  renderSysinfo();
+  renderDesktop();
+  renderReadStatus();
+  renderUntrustedBanner();
+  retranslateLog();
+  syncLogFollowUi();
+  renderOta();
+  renderUpdateApp();
+  renderUpdateFw();
+}
+
 async function init() {
+  await initLanguage();
   bindTabs();
   bindHelp();
   bindApplyResults();
@@ -2729,17 +2800,36 @@ async function init() {
     btn.disabled = true;
     btn.classList.add("loading");
     btn.setAttribute("aria-busy", "true");
-    toast("正在扫描…");
+    toast(t("ui.scanning_dots"));
     try {
       const r = await api("/api/scan");
       // 说清楚为什么没扫到，而不是只报一个「0 台设备」。
-      toast(r.reason ? `扫描未发现设备：${r.reason}` : `扫描到 ${r.found ? r.found.length : 0} 台设备`);
+      toast(r.reason
+        ? t("ui.scan_no_devices_reason", { reason: r.reason })
+        : t("ui.scan_found", { count: r.found ? r.found.length : 0 }));
     } catch (e) {
-      toast("扫描失败：" + e.message, "bad");
+      toast(t("ui.scan_failed") + e.message, "bad");
     } finally {
       btn.disabled = false;
       btn.classList.remove("loading");
       btn.removeAttribute("aria-busy");
+    }
+  };
+  $("#langSelect").onchange = async (e) => {
+    const pref = e.target.value;
+    e.target.disabled = true;
+    try {
+      const d = await updateDesktop({ lang: pref });
+      state.langPref = d.lang || pref;
+      await window.i18n.load(d.lang_effective || d.lang);
+      window.i18n.apply(document);
+      retranslateDynamic();
+      toast(t("ui.language_changed"), "ok");
+    } catch (err) {
+      e.target.value = state.langPref || "system";
+      toast(err.message, "bad");
+    } finally {
+      e.target.disabled = false;
     }
   };
   $("#btnApply").onclick = applyConfig;
@@ -2762,7 +2852,7 @@ async function init() {
       await api("/api/settings", { method: "POST", body: JSON.stringify({ actions_enabled: want }) });
       state.actionsEnabled = want;
       renderActionsState();
-      toast(want ? "上位机动作已启用" : "上位机动作已关闭", want ? "ok" : "");
+      toast(want ? t("ui.actions_enabled_toast") : t("ui.actions_disabled_toast"), want ? "ok" : "");
     } catch (err) {
       target.checked = !want;
       toast(err.message, "bad");
@@ -2786,10 +2876,10 @@ async function init() {
     target.disabled = true;
     try {
       await updateDesktop({ autostart: want });
-      toast(want ? "已开启开机自启动" : "已关闭开机自启动", "ok");
+      toast(want ? t("ui.autostart_on_toast") : t("ui.autostart_off_toast"), "ok");
     } catch (err) {
       target.checked = !want;
-      toast("设置开机自启动失败：" + err.message, "bad");
+      toast(t("ui.autostart_failed_toast") + err.message, "bad");
     } finally {
       const auto = (state.desktop && state.desktop.autostart) || {};
       target.disabled = !auto.supported;
@@ -2803,8 +2893,8 @@ async function init() {
     const auto = (state.desktop && state.desktop.autostart) || {};
     if (!auto.is_admin && (want || auto.admin)) {
       const hint = want
-        ? "将请求 UAC 授权（仅用于创建计划任务，不会重启上位机）"
-        : "将请求 UAC 授权（用于删除计划任务，不会重启上位机）";
+        ? t("ui.autostart_uac_create")
+        : t("ui.autostart_uac_delete");
       if (!confirm(hint)) {
         target.checked = !want;
         return;
@@ -2813,10 +2903,10 @@ async function init() {
     target.disabled = true;
     try {
       await updateDesktop({ admin_autostart: want });
-      toast(want ? "开机自启动将以管理员身份运行" : "已改为普通权限开机自启动", "ok");
+      toast(want ? t("ui.autostart_admin_on_toast") : t("ui.autostart_admin_off_toast"), "ok");
     } catch (err) {
       target.checked = !want;
-      toast("设置管理员自启动失败：" + err.message, "bad");
+      toast(t("ui.autostart_admin_failed") + err.message, "bad");
     } finally {
       const auto = (state.desktop && state.desktop.autostart) || {};
       target.disabled = !auto.admin_supported || !auto.enabled;
@@ -2828,7 +2918,7 @@ async function init() {
     target.disabled = true;
     try {
       await updateDesktop({ start_minimized: want });
-      toast(want ? "开机启动时收进托盘" : "开机启动时打开控制台");
+      toast(want ? t("ui.minimized_on_toast") : t("ui.minimized_off_toast"));
     } catch (err) {
       target.checked = !want;
       toast(err.message, "bad");
@@ -2842,7 +2932,7 @@ async function init() {
     target.disabled = true;
     try {
       await updateDesktop({ close_button_behavior: minimize ? "minimize" : "exit" });
-      toast(minimize ? "关闭窗口将最小化到托盘" : "关闭窗口将直接退出应用");
+      toast(minimize ? t("ui.close_minimize_toast") : t("ui.close_exit_toast"));
     } catch (err) {
       target.checked = !minimize;
       toast(err.message, "bad");
@@ -2856,24 +2946,24 @@ async function init() {
     try {
       const res = await fetch("/api/desktop/restart-admin", { method: "POST" });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.ok === false) throw new Error(data.error || "提权重启失败");
-      toast("已拉起管理员实例，本实例即将退出", "ok");
+      if (!res.ok || data.ok === false) throw new Error(data.error || t("ui.elevate_failed"));
+      toast(t("ui.elevate_started"), "ok");
     } catch (err) {
-      toast("提权重启失败：" + (err.message || err), "bad");
+      toast(t("ui.elevate_failed_detail") + (err.message || err), "bad");
       target.disabled = false;
     }
   };
   $("#btnQuitHost").onclick = async () => {
-    if (!window.confirm("退出 BindDeckLite 上位机？退出后按键的上位机动作将不再执行。")) return;
+    if (!window.confirm(t("ui.quit_confirm"))) return;
     const target = $("#btnQuitHost");
     target.disabled = true;
     try {
       const res = await fetch("/api/quit", { method: "POST" });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "退出失败");
-      toast("已退出，可以关闭此页面", "ok");
+      if (!res.ok || !data.ok) throw new Error(data.error || t("ui.quit_failed"));
+      toast(t("ui.quit_done"), "ok");
     } catch (err) {
-      toast("退出失败：" + (err.message || err), "bad");
+      toast(t("ui.quit_failed_detail") + (err.message || err), "bad");
       target.disabled = false;
     }
   };
@@ -2883,24 +2973,24 @@ async function init() {
     try {
       const res = await fetch("/api/show-window", { method: "POST" });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.ok) throw new Error(data.error || "恢复窗口失败");
-      toast("已显示窗口", "ok");
+      if (!res.ok || !data.ok) throw new Error(data.error || t("ui.restore_failed"));
+      toast(t("ui.show_window"), "ok");
       await refreshDesktop();
     } catch (err) {
-      toast("恢复窗口失败：" + (err.message || err), "bad");
+      toast(t("ui.restore_failed_detail") + (err.message || err), "bad");
       target.disabled = false;
     }
   };
   const devAction = async (act, okText, confirmText) => {
     if (!state.selected) return;
     if (otaBusy()) {
-      toast("OTA 进行中，设备指令已锁定", "bad");
+      toast(t("ui.cmd_locked_ota"), "bad");
       return;
     }
     if (confirmText && !window.confirm(confirmText)) return;
     try {
       const r = await api(`/api/device/${encodeURIComponent(state.selected)}/${act}`, { method: "POST" });
-      toast(r.sent === false ? "指令未送出：设备未连接" : okText, r.sent === false ? "bad" : "ok");
+      toast(r.sent === false ? t("ui.cmd_not_sent_offline") : okText, r.sent === false ? "bad" : "ok");
     } catch (e) {
       toast(e.message, "bad");
     }
@@ -2913,12 +3003,12 @@ async function init() {
       setLayout(Number(el.value) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER);
     };
   });
-  $("#btnPing").onclick = () => devAction("ping", "已发送 Ping");
+  $("#btnPing").onclick = () => devAction("ping", t("ui.ping_sent"));
   // 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
   $("#btnSysRefresh").onclick = async () => {
     const btn = $("#btnSysRefresh");
     if (!state.selected) {
-      toast("没有选中设备", "bad");
+      toast(t("ui.no_device_selected_short"), "bad");
       return;
     }
     btn.disabled = true;
@@ -2942,33 +3032,33 @@ async function init() {
   };
   $("#btnPortal").onclick = () => devAction(
     "portal",
-    "设备将重启进入配网模式",
-    "进入配网模式会重启设备并暂时断开蓝牙连接，按键映射与上位机动作在配网期间不可用；可在设备上长按编码器约 1 秒退出。此操作可逆，确定继续？",
+    t("ui.portal_toast"),
+    t("ui.portal_confirm"),
   );
   $("#btnReboot").onclick = () => devAction(
     "reboot",
-    "设备重启中",
-    "重启会断开当前蓝牙连接，并中断正在执行的上位机动作；配置和已下发的设置不会丢失，设备会自动重连。此操作可逆，确定重启？",
+    t("ui.reboot_toast"),
+    t("ui.reboot_confirm"),
   );
   // clear the persisted host binding so a new central can take over.
   $("#btnClearBond").onclick = async () => {
     if (!state.selected) return;
-    if (!window.confirm("清除主机绑定后，当前连接会断开，任何主机首次连接都会重新绑定；按键映射与配置不会丢失。此操作可逆，确定清除吗？")) return;
+    if (!window.confirm(t("ui.clear_bond_confirm"))) return;
     const btn = $("#btnClearBond");
     btn.disabled = true;
     try {
       const r = await api(`/api/device/${encodeURIComponent(state.selected)}/clearbond`, { method: "POST" });
       if (r.sent === false) {
-        toast("指令未送出：设备未连接", "bad");
+        toast(t("ui.cmd_not_sent_offline"), "bad");
         return;
       }
-      toast("已发送清除绑定指令", "ok");
+      toast(t("ui.clear_bond_sent"), "ok");
       // The device ACKs on the same CFG channel; give it a moment then refresh.
       setTimeout(() => {
         if (state.selected) api(`/api/device/${encodeURIComponent(state.selected)}/refresh`, { method: "POST" });
       }, 500);
     } catch (e) {
-      toast("清除失败：" + (e.message || e), "bad");
+      toast(t("ui.clear_bond_failed") + (e.message || e), "bad");
     } finally {
       btn.disabled = false;
     }
@@ -3004,7 +3094,7 @@ function selectedDevice() {
 }
 
 function fmtVersion(v) {
-  if (!v) return "未知";
+  if (!v) return t("ui.unknown");
   const s = String(v);
   return /^v/i.test(s) ? s : "v" + s;
 }
@@ -3038,12 +3128,12 @@ function parseOtaVersion(buffer) {
 
 /** 前端预检：与后端 /api/ota 的 app-only 校验保持一致，后端仍是最终裁决。 */
 function localOtaImageError(buffer, size) {
-  if (!buffer) return "无法读取文件内容，请重新选择";
-  if (size < 0x30) return "文件过小，不是完整的 ESP32 固件镜像";
+  if (!buffer) return t("ota.unreadable_file");
+  if (size < 0x30) return t("ota.too_small");
   const b = new Uint8Array(buffer);
-  if (b[0] !== 0xe9) return "不是 ESP32 固件镜像（缺少 0xE9 文件头）";
+  if (b[0] !== 0xe9) return t("ota.not_esp_image");
   if (!(b[32] === 0x32 && b[33] === 0x54 && b[34] === 0xcd && b[35] === 0xab)) {
-    return "这是整片 merged 包或其他镜像；OTA 只能刷 app-only 的 ota_*.bin";
+    return t("ota.merged_pack");
   }
   return "";
 }
@@ -3102,10 +3192,10 @@ function renderOta() {
   $("#otaCheckSize").textContent = formatBytes(ota.total);
   const checking = ota.status === "checking";
   $("#otaCheckSha").textContent = ota.sha256
-    || (checking ? "计算中…" : "本机无法计算（将由主机与设备校验）");
+    || (checking ? t("ota.calculating") : t("ota.no_local_hash"));
   const bad = ota.status === "invalid";
   $("#otaCheckState").textContent = bad
-    ? "校验未通过" : checking ? "正在校验…" : "校验通过";
+    ? t("ota.check_failed") : checking ? t("ota.checking") : t("ota.check_ok");
   $("#otaCheckState").className = "ota-check-state " + (bad ? "bad" : ota.status === "ready" ? "ok" : "");
   $("#otaCheckError").hidden = !bad;
   $("#otaCheckError").textContent = ota.imageError || "";
@@ -3113,11 +3203,11 @@ function renderOta() {
 
   /* 3. 确认页：设备名 + 当前版本 → 新版本 + 不可断电提示 */
   const devName = (state.cfg && state.cfg.name) || (sel && sel.name) || state.selected || "—";
-  $("#otaConfirmDevice").textContent = `${devName}${connected ? " · 已连接" : " · 未连接"}`;
+  $("#otaConfirmDevice").textContent = `${devName}${t(connected ? "ui.connected_suffix" : "ui.disconnected_suffix")}`;
   const currentVersion = (sel && sel.fw && sel.fw.version)
     || (state.cfg && state.cfg.fw && state.cfg.fw.version) || "";
   $("#otaConfirmVersions").textContent =
-    `${fmtVersion(currentVersion)} → ${ota.version ? fmtVersion(ota.version) : "文件名未标注"}`;
+    `${fmtVersion(currentVersion)} → ${ota.version ? fmtVersion(ota.version) : t("ota.version_not_in_name")}`;
   $("#otaConfirmFile").textContent = `${ota.filename || "—"} · ${formatBytes(ota.total)}`;
   $("#otaConfirmSha").textContent = ota.sha256 || "—";
   $("#btnOtaStart").disabled = !connected;
@@ -3125,40 +3215,46 @@ function renderOta() {
   /* 4. 上传 / 结果 */
   const shaLine = ota.sha256 ? ` · SHA256 ${ota.sha256}` : "";
   if (ota.status === "done") {
-    $("#otaResultTitle").textContent = "升级成功";
+    $("#otaResultTitle").textContent = t("ota.success");
     $("#otaResultTitle").className = "ota-result-title ok";
-    $("#otaResultDetail").textContent = `${ota.filename || ""} · ${formatBytes(ota.total)} · 设备即将重启`;
+    $("#otaResultDetail").textContent = t("ota.result_done_line", {
+      file: ota.filename || "",
+      size: formatBytes(ota.total),
+    });
     $("#otaResultHint").textContent = ota.sha256
-      ? `SHA256 ${ota.sha256}。重启后会自动重连；若 60 秒内未恢复，请检查设备电源。`
-      : "重启后会自动重连；若 60 秒内未恢复，请检查设备电源。";
+      ? t("ota.success_hint_sha", { sha: ota.sha256 })
+      : t("ota.success_hint");
     $("#btnOtaRetry").hidden = true;
-    $("#btnOtaDone").textContent = "完成";
+    $("#btnOtaDone").textContent = t("ota.done");
   } else if (ota.status === "error") {
-    $("#otaResultTitle").textContent = "升级失败";
+    $("#otaResultTitle").textContent = t("ota.failed");
     $("#otaResultTitle").className = "ota-result-title bad";
-    $("#otaResultDetail").textContent = ota.error || "未知错误";
+    $("#otaResultDetail").textContent = ota.error || t("ui.unknown_error");
     $("#otaResultHint").textContent = ota.sha256
-      ? `所选文件 SHA256 ${ota.sha256}，请与固件发布页核对后再重试。`
-      : "请确认设备已连接、固件与设备型号匹配后重试。";
+      ? t("ota.failed_hint_sha", { sha: ota.sha256 })
+      : t("ota.failed_hint");
     $("#btnOtaRetry").hidden = !state.otaFile;
-    $("#btnOtaDone").textContent = "关闭";
+    $("#btnOtaDone").textContent = t("ota.close");
   } else if (ota.status === "cancelled") {
-    $("#otaResultTitle").textContent = "已取消";
+    $("#otaResultTitle").textContent = t("ota.cancelled");
     $("#otaResultTitle").className = "ota-result-title";
-    $("#otaResultDetail").textContent = `${ota.filename || ""} · 设备保持原固件`;
-    $("#otaResultHint").textContent = "已发送取消指令；若设备仍在 OTA 模式，会在 30 秒内自动中止。";
+    $("#otaResultDetail").textContent = t("ota.result_cancelled_line", { file: ota.filename || "" });
+    $("#otaResultHint").textContent = t("ota.cancel_sent");
     $("#btnOtaRetry").hidden = !state.otaFile;
-    $("#btnOtaDone").textContent = "关闭";
+    $("#btnOtaDone").textContent = t("ota.close");
   }
 
   const acked = ota.acked != null ? ota.acked : ota.sent != null ? ota.sent : 0;
   $("#otaStatusText").textContent =
-    ota.status === "starting" ? "启动中" : ota.status === "uploading" ? "上传中" : "准备中";
+    ota.status === "starting" ? t("ota.phase_starting")
+      : ota.status === "uploading" ? t("ota.phase_uploading") : t("ota.phase_preparing");
   $("#otaFileLine").textContent = `${ota.filename || ""} · ${formatBytes(ota.total)}${shaLine}`;
   $("#otaProgressBar").style.width = (ota.percent || 0) + "%";
   $("#otaHint").textContent = ota.status === "starting"
-    ? "正在进入 OTA 模式…"
-    : `${acked} / ${ota.total || 0} bytes（${ota.percent || 0}%）已确认 · 升级中请勿断电`;
+    ? t("ota.entering_mode")
+    : t("ota.progress_line", {
+      acked, total: ota.total || 0, percent: ota.percent || 0,
+    });
 
   applyOtaLock();
 }
@@ -3195,10 +3291,10 @@ async function pollOta() {
       // The server no longer has the task (app restarted or device gone).
       state.ota = Object.assign({}, state.ota, {
         status: "error",
-        error: "连接中断，请重试",
+        error: t("ota.link_lost"),
       });
       state.otaStep = "result";
-      toast("连接中断，请重试", "bad");
+      toast(t("ota.link_lost"), "bad");
       renderOta();
       return;
     }
@@ -3213,9 +3309,9 @@ async function pollOta() {
     });
     state.otaStep = ["done", "error", "cancelled"].includes(r.status) ? "result" : "upload";
     if (r.status === "done") {
-      toast("升级成功，设备即将重启", "ok");
+      toast(t("ota.success_reboot"), "ok");
     } else if (r.status === "error") {
-      toast(r.error || "升级失败", "bad");
+      toast(r.error || t("ota.failed"), "bad");
     }
     renderOta();
   } catch (_) {
@@ -3255,7 +3351,7 @@ async function handleOtaFile(file) {
 
   let error = "";
   if (!/^ota_[^/\\]+\.bin$/i.test(file.name)) {
-    error = "文件名必须以 ota_ 开头、以 .bin 结尾（app-only 固件）";
+    error = t("ota.filename_rule");
   } else {
     error = localOtaImageError(buffer, file.size);
   }
@@ -3294,7 +3390,7 @@ function closeOtaWizard() {
 function openOtaWizard() {
   const sel = selectedDevice();
   if (!sel || !sel.connected) {
-    toast("设备未连接，无法 OTA", "bad");
+    toast(t("ota.offline"), "bad");
     return;
   }
   if (otaBusy()) {
@@ -3393,11 +3489,11 @@ function bindOtaWizard() {
 async function startOta() {
   const sel = selectedDevice();
   if (!sel || !sel.connected) {
-    toast("设备未连接，无法 OTA", "bad");
+    toast(t("ota.offline"), "bad");
     return;
   }
   if (!state.ota || state.ota.status !== "ready" || !state.otaFile) {
-    toast("请先完成文件校验", "bad");
+    toast(t("ota.verify_first"), "bad");
     return;
   }
   const btn = $("#btnOtaStart");
@@ -3413,7 +3509,7 @@ async function startOta() {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.ok === false) {
-      const message = data.error || "OTA 启动失败";
+      const message = data.error || t("ota.start_failed");
       toast(message, "bad");
       // 失败留在结果页：保留已选文件，方便直接重试。
       state.ota = Object.assign({}, state.ota, { status: "error", error: message });
@@ -3434,7 +3530,7 @@ async function startOta() {
     state.otaStep = "upload";
     renderOta();
   } catch (e) {
-    const message = "OTA 启动失败：" + (e.message || e);
+    const message = t("ota.start_failed_detail") + (e.message || e);
     toast(message, "bad");
     state.ota = Object.assign({}, state.ota, { status: "error", error: message });
     state.otaStep = "result";
@@ -3458,12 +3554,12 @@ async function cancelOta() {
     try {
       const r = await api(`/api/ota/${encodeURIComponent(state.selected)}/cancel`, { method: "POST" });
       if (r.sent === false) {
-        toast("已取消；取消指令未送达，设备将在 30 秒后自动中止", "bad");
+        toast(t("ota.cancel_undelivered"), "bad");
       } else {
-        toast("已取消升级，设备保持原固件", "ok");
+        toast(t("ota.cancel_kept_fw"), "ok");
       }
     } catch (e) {
-      toast("取消失败：" + (e.message || e), "bad");
+      toast(t("ota.cancel_failed") + (e.message || e), "bad");
     }
     state.ota = Object.assign({}, state.ota, { status: "cancelled" });
     state.otaStep = "result";
@@ -3488,13 +3584,13 @@ const updateState = {
 
 /** 失败提示：中文原因 + 可复制错误码 + Release 链接。 */
 function updateErrorText(payload, fallback) {
-  const reason = (payload && (payload.error || payload.reason)) || fallback || "未知错误";
+  const reason = (payload && (payload.error || payload.reason)) || fallback || t("ui.unknown_error");
   const code = (payload && (payload.error_code || payload.reason_code)) || "";
   const url = (payload && payload.release_url) || "";
   const parts = [reason];
-  if (code) parts.push(`错误码：${code}`);
-  if (url) parts.push(`发布页：${url}`);
-  return parts.join("　");
+  if (code) parts.push(t("ui.update_error_code", { code }));
+  if (url) parts.push(t("ui.update_release_page", { url }));
+  return parts.join(t("ui.update_error_join"));
 }
 
 function setUpdateError(id, payload, fallback) {
@@ -3539,7 +3635,7 @@ function renderUpdateApp() {
     latest.textContent = "—";
     size.textContent = "—";
     sha.textContent = "—";
-    st.textContent = "正在检查…";
+    st.textContent = t("update.checking");
     st.classList.remove("ok");
     if (applyBtn) applyBtn.hidden = true;
     if (skipBtn) skipBtn.hidden = true;
@@ -3554,17 +3650,17 @@ function renderUpdateApp() {
   setUpdateError("updAppError", r.ok === false ? r : null);
 
   if (r.has_update) {
-    st.textContent = `发现新版本 ${fmtVersion(r.latest)}（当前 ${fmtVersion(r.current)}）`;
+    st.textContent = t("update.new_version", { latest: fmtVersion(r.latest), current: fmtVersion(r.current) });
     st.classList.remove("ok");
   } else if (r.skipped) {
-    st.textContent = `已跳过 ${fmtVersion(r.latest)}，出现更高版本时会再次提示`;
+    st.textContent = t("update.skipped_version", { latest: fmtVersion(r.latest) });
     st.classList.remove("ok");
   } else if (r.ok === false) {
     // 说清楚为什么不能升 —— 只写「检查失败」用户会以为是网络问题。
-    st.textContent = r.error || "检查失败";
+    st.textContent = r.error || t("update.check_failed");
     st.classList.remove("ok");
   } else {
-    st.textContent = `已是最新（${fmtVersion(r.current)}）`;
+    st.textContent = t("update.up_to_date", { current: fmtVersion(r.current) });
     st.classList.add("ok");
   }
   if (applyBtn) applyBtn.hidden = !r.has_update;
@@ -3585,14 +3681,14 @@ function renderUpdateFw() {
   if (!st) return;
 
   const sel = selectedDevice();
-  if (dev) dev.textContent = sel ? sel.name || sel.dev_id : "未选择设备";
+  if (dev) dev.textContent = sel ? sel.name || sel.dev_id : t("update.no_device");
   if (!r) {
     if (variant) variant.textContent = "—";
     if (current) current.textContent = "—";
     if (latest) latest.textContent = "—";
     if (size) size.textContent = "—";
     if (sha) sha.textContent = "—";
-    st.textContent = sel ? "点击「检查固件更新」查询在线固件" : "选择设备后可检查在线固件";
+    st.textContent = sel ? t("update.check_fw_hint") : t("update.pick_device_hint");
     st.classList.remove("ok");
     setUpdateError("updFwError", null);
     setUpdateNotes("updFwNotesBox", "updFwNotes", "");
@@ -3601,7 +3697,7 @@ function renderUpdateFw() {
     return;
   }
 
-  if (variant) variant.textContent = r.device_variant || "未知";
+  if (variant) variant.textContent = r.device_variant || t("ui.unknown");
   if (current) current.textContent = fmtVersion(r.current);
   if (latest) latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
   if (size) size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
@@ -3610,13 +3706,13 @@ function renderUpdateFw() {
   setUpdateError("updFwError", r.reason ? r : null);
 
   if (r.has_update) {
-    st.textContent = `发现新固件 ${fmtVersion(r.latest)}（当前 ${fmtVersion(r.current)}）`;
+    st.textContent = t("update.new_firmware", { latest: fmtVersion(r.latest), current: fmtVersion(r.current) });
     st.classList.remove("ok");
   } else if (r.reason) {
     st.textContent = r.reason;
     st.classList.remove("ok");
   } else {
-    st.textContent = `固件已是最新（${fmtVersion(r.current)}）`;
+    st.textContent = t("update.fw_up_to_date", { current: fmtVersion(r.current) });
     st.classList.add("ok");
   }
   if (checkBtn) checkBtn.hidden = false;
@@ -3638,14 +3734,14 @@ async function checkAppUpdate(quiet) {
   } catch (e) {
     updateState.app = {
       ok: false, has_update: false, current: "", latest: "",
-      error: "检查失败：" + (e.message || e), error_code: "E_REQUEST",
+      error: t("update.check_failed_detail") + (e.message || e), error_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
   }
   renderUpdateApp();
   refreshUpdateDot();
   if (!quiet && updateState.app.has_update) {
-    toast(`发现新版本 ${fmtVersion(updateState.app.latest)}`, "ok");
+    toast(t("update.found_new_version", { latest: fmtVersion(updateState.app.latest) }), "ok");
   }
 }
 
@@ -3655,7 +3751,7 @@ async function checkFwUpdate(quiet) {
     updateState.fw = null;
     renderUpdateFw();
     refreshUpdateDot();
-    if (!quiet) toast("请先选择设备", "bad");
+    if (!quiet) toast(t("update.pick_device_first"), "bad");
     return;
   }
   try {
@@ -3664,14 +3760,14 @@ async function checkFwUpdate(quiet) {
   } catch (e) {
     updateState.fw = {
       has_update: false, device_variant: "", current: "", latest: "",
-      reason: "检查失败：" + (e.message || e), reason_code: "E_REQUEST",
+      reason: t("update.check_failed_detail") + (e.message || e), reason_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
   }
   renderUpdateFw();
   refreshUpdateDot();
   if (!quiet && updateState.fw.has_update) {
-    toast(`发现新固件 ${fmtVersion(updateState.fw.latest)}`, "ok");
+    toast(t("update.found_new_firmware", { latest: fmtVersion(updateState.fw.latest) }), "ok");
   }
 }
 
@@ -3696,7 +3792,7 @@ function closeUpdateModal() {
 
 /* 上位机更新的确认文案：更新会退出上位机进程，连着的设备会被断开。
    放在常量里，测试（test_app_update_confirm.mjs）直接断言这一句。 */
-const APP_UPDATE_CONFIRM_TEXT = "更新会退出上位机并断开设备连接，是否继续？";
+const APP_UPDATE_CONFIRM_TEXT = t("update.confirm_quit");
 
 /** 「立即更新」前要不要先问一句。
 
@@ -3724,7 +3820,7 @@ async function applyAppUpdate() {
   if (bar) bar.style.width = "0%";
   if (hint) {
     hint.hidden = false;
-    hint.textContent = "更新期间请勿关闭程序…";
+    hint.textContent = t("update.do_not_close");
   }
   try {
     const r = await api("/api/app/update/apply", { method: "POST" });
@@ -3735,9 +3831,9 @@ async function applyAppUpdate() {
     setUpdateError("updAppError", e.payload || null);
     if (hint) {
       hint.hidden = false;
-      hint.textContent = "更新失败：" + (e.message || e);
+      hint.textContent = t("update.failed_detail") + (e.message || e);
     }
-    toast("更新失败：" + (e.message || e), "bad");
+    toast(t("update.failed_detail") + (e.message || e), "bad");
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -3751,24 +3847,24 @@ function pollAppUpdate(task) {
   const bar = $("#updAppProgressBar");
   const hint = $("#updAppHint");
   const phaseText = {
-    starting: "准备中…",
-    downloading: "正在下载新版本…",
-    verifying: "正在校验 SHA256…",
-    installing: "正在替换程序…",
-    restarting: "正在重启，请稍候…",
+    starting: t("update.phase_preparing"),
+    downloading: t("update.phase_downloading"),
+    verifying: t("update.phase_verifying"),
+    installing: t("update.phase_replacing"),
+    restarting: t("update.phase_restarting"),
   };
   updateState.polling = setInterval(async () => {
     try {
       const p = await api(`/api/app/update/progress?task=${encodeURIComponent(task)}`);
       if (bar) bar.style.width = (p.percent || 0) + "%";
       if (hint) {
-        hint.textContent = (phaseText[p.phase] || "正在更新…") + "　更新期间请勿关闭程序";
+        hint.textContent = (phaseText[p.phase] || t("update.in_progress")) + t("update.in_progress_note");
       }
       if (p.phase === "error") {
         clearInterval(updateState.polling);
         updateState.polling = null;
-        if (hint) hint.textContent = "更新失败：" + (p.error || "未知错误");
-        toast("更新失败：" + (p.error || "未知错误"), "bad");
+        if (hint) hint.textContent = t("update.failed_detail") + (p.error || t("ui.unknown_error"));
+        toast(t("update.failed_detail") + (p.error || t("ui.unknown_error")), "bad");
       } else if (p.phase === "restarting") {
         // 程序即将退出重启：轮询会随进程退出而中断，这里停掉。
         clearInterval(updateState.polling);
@@ -3790,17 +3886,17 @@ async function skipAppUpdate() {
       method: "POST",
       body: JSON.stringify({ version: r.latest }),
     });
-    toast(`已跳过 ${fmtVersion(r.latest)}`, "ok");
+    toast(t("update.skipped_done", { latest: fmtVersion(r.latest) }), "ok");
     await checkAppUpdate(true);
   } catch (e) {
-    toast("跳过失败：" + (e.message || e), "bad");
+    toast(t("update.skip_failed") + (e.message || e), "bad");
   }
 }
 
 async function applyFwUpdate() {
   const sel = selectedDevice();
   if (!sel) {
-    toast("请先选择设备", "bad");
+    toast(t("update.pick_device_first"), "bad");
     return;
   }
   const btn = $("#btnFwApply");
@@ -3815,11 +3911,11 @@ async function applyFwUpdate() {
     });
     updateState.fwTask = sel.dev_id;
     pollFwUpdate(sel.dev_id);
-    toast("开始推送固件 " + fmtVersion(r.version), "ok");
+    toast(t("update.fw_pushing") + fmtVersion(r.version), "ok");
   } catch (e) {
     // 失败原因 + 错误码 + Release 链接都要给用户（验收 10）。
     setUpdateError("updFwError", e.payload || null);
-    toast("固件升级失败：" + (e.message || e), "bad");
+    toast(t("update.fw_failed") + (e.message || e), "bad");
   } finally {
     if (btn) {
       btn.disabled = false;
@@ -3871,13 +3967,13 @@ function pollFwUpdate(devId) {
         clearInterval(updateState.polling);
         updateState.polling = null;
         setUpdateError("updFwError", {
-          error: p.error || "未知错误", error_code: p.error_code || "",
+          error: p.error || t("ui.unknown_error"), error_code: p.error_code || "",
         });
-        toast("固件升级失败：" + (p.error || "未知错误"), "bad");
+        toast(t("update.fw_failed") + (p.error || t("ui.unknown_error")), "bad");
       } else if (p.phase === "done") {
         clearInterval(updateState.polling);
         updateState.polling = null;
-        toast("固件升级完成", "ok");
+        toast(t("update.fw_done"), "ok");
         await checkFwUpdate(true);
       }
     } catch (e) {

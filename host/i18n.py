@@ -161,6 +161,12 @@ class Message(str):
         obj.params = dict(params)
         return obj
 
+    def __mod__(self, args):
+        """``t("key") % value`` keeps the key, so the error body still has code."""
+        rendered = super().__mod__(args)
+        values = list(args) if isinstance(args, tuple) else [args]
+        return Message(rendered, self.code, {"args": values})
+
 
 def t(key: str, **params) -> str:
     """Translate ``code`` for the current language, filling ``{name}`` params."""

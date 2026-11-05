@@ -133,6 +133,10 @@ function loadApp() {
   // log_follow.js / log_device.js 是 UMD（app.js 顶层要读 window.LogFollow，
   // 轮询追加日志要读 window.LogDevice）；
   // keys.js 提供 bindKeyDrawer / syncKeyDrawerRunning（app.js 的 init() 会调用）。
+  // 生产 i18n + 生产 zh-CN 文案表（默认语言），断言仍是生产函数的输出。
+  run("i18n.js");
+  sandbox.i18n.setMessages(
+    JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
   run("keys.js");

@@ -13,24 +13,24 @@ function keyOptions(selected) {
   const special = state.keycodes.filter((k) => k.code === 0);
   let html = normal.map(opt).join("");
   if (special.length) {
-    html += `<optgroup label="特殊">${special.map(opt).join("")}</optgroup>`;
+    html += `<optgroup label="${t("keys.special_group")}">${special.map(opt).join("")}</optgroup>`;
   }
   return html;
 }
 
 function keyActionSummary(action) {
   const type = (action && action.type) || "none";
-  if (type === "none") return "仅 HID";
+  if (type === "none") return t("keys.act_none");
   if (type === "macro") {
     const n = Array.isArray(action.macro) ? action.macro.length : 0;
-    return `宏 · ${n} 步`;
+    return t("keys.macro_summary", { count: n });
   }
-  if (type === "launch") return "启动程序";
-  if (type === "url") return "打开网址";
-  if (type === "command") return "执行命令";
-  if (type === "media") return "媒体键";
+  if (type === "launch") return t("keys.act_launch");
+  if (type === "url") return t("ui.act_url");
+  if (type === "command") return t("ui.act_command");
+  if (type === "media") return t("ui.act_media");
   const known = ACTION_TYPES.find((a) => a.id === type);
-  return known ? known.name : type;
+  return known ? actionName(known) : type;
 }
 
 function keyItem(idx) {
@@ -46,7 +46,7 @@ function refreshKeyCard(idx) {
   if (!card || !item) return;
   const code = parseInt(item.code, 10);
   const known = state.keycodes.find((k) => k.code === code);
-  const hid = code === 0 ? "不发键" : item.label || (known && known.label) || String(code);
+  const hid = code === 0 ? t("keys.key_none") : item.label || (known && known.label) || String(code);
   const hidEl = $(".kc-hid", card);
   const actEl = $(".kc-act", card);
   if (hidEl) hidEl.textContent = hid;
@@ -69,11 +69,11 @@ async function testKeyAction(item, idx, card) {
   }
   const noAction = !item.action || (item.action.type || "none") === "none";
   if (noAction) {
-    toast("仅 HID：没有上位机动作可测试", "warn");
+    toast(t("ui.test_none"), "warn");
     return;
   }
   if (!devId) {
-    toast("未连接设备", "bad");
+    toast(t("ui.no_device_selected"), "bad");
     return;
   }
   let armTimer = null;
@@ -86,15 +86,15 @@ async function testKeyAction(item, idx, card) {
     r = await api(`/api/action/test/${encodeURIComponent(devId)}/${idx}`, { method: "POST" });
     if (r.ok) {
       const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
-      toast("动作执行成功：" + (item.action.type || "") + used, "ok");
+      toast(t("ui.action_ok_prefix") + (item.action.type || "") + used, "ok");
     } else if (r.cancelled) {
-      toast("已停止", "");
+      toast(t("ui.stopped"), "");
     } else if (r.running) {
       markRunning(devId, idx, r.elapsed || 0);
       applyRunningState();
-      toast(r.error || "该按键的动作仍在执行", "warn");
+      toast(r.error || t("log.action_still_running_key"), "warn");
     } else {
-      toast("动作执行失败：" + (r.error || "未知错误"), "bad");
+      toast(t("ui.action_failed_prefix") + (r.error || t("ui.unknown_error")), "bad");
     }
   } catch (e) {
     toast(e.message, "bad");
@@ -161,8 +161,8 @@ function renderKeyDrawer() {
   const idx = state.editingKey;
   const item = idx === null ? null : keyItem(idx);
   if (!item) {
-    title.textContent = "按键编辑";
-    body.innerHTML = `<p class="muted small">选择左侧的按键开始编辑。修改会按设备自动保存，点顶栏「应用配置」后下发。</p>`;
+    title.textContent = t("ui.key_editor");
+    body.innerHTML = `<p class="muted small">${t("ui.key_editor_hint")}</p>`;
     drawer.classList.remove("open");
     $("#keyDrawerBackdrop").hidden = true;
     document.body.classList.remove("drawer-open");
@@ -173,21 +173,21 @@ function renderKeyDrawer() {
   title.textContent = inputTitle(idx);
   body.innerHTML = `
     <div class="kd-field">
-      <label class="field-label" for="kdHid">HID 键</label>
+      <label class="field-label" for="kdHid">${t("keys.hid_label")}</label>
       <select id="kdHid" class="sel-key">${keyOptions(item.code)}</select>
     </div>
     <div class="kd-field">
-      <label class="field-label" for="kdAct">上位机动作</label>
+      <label class="field-label" for="kdAct">${t("keys.action_label")}</label>
       <select id="kdAct" class="sel-act">
-        ${ACTION_TYPES.map((a) => `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${a.name}</option>`).join("")}
+        ${ACTION_TYPES.map((a) => `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${actionName(a)}</option>`).join("")}
       </select>
     </div>
     <div class="kd-field">
-      <label class="field-label" id="kdValueLabel" for="kdValue">动作参数</label>
+      <label class="field-label" id="kdValueLabel" for="kdValue">${t("keys.action_params")}</label>
       <div class="act-input" id="kdValueBox"></div>
     </div>
     <div class="kd-test-row">
-      <button type="button" class="btn secondary small-btn" id="kdTest">测试动作</button>
+      <button type="button" class="btn secondary small-btn" id="kdTest">${t("ui.test_action")}</button>
       <span class="muted small" id="kdTestHint"></span>
     </div>`;
 
@@ -212,7 +212,7 @@ function renderKeyDrawer() {
 
   const label = $("#kdValueLabel");
   if (action.type === "macro") {
-    if (label) label.textContent = "宏步骤";
+    if (label) label.textContent = t("keys.macro_steps");
     if (label) label.removeAttribute("for");
     const editor = $(".macro-editor", holder);
     if (editor && label) editor.setAttribute("aria-labelledby", "kdValueLabel");
@@ -248,25 +248,25 @@ function syncKeyDrawerRunning() {
   if (running !== undefined) {
     if (stopping) {
       btn.disabled = true;
-      btn.textContent = "正在停止…";
+      btn.textContent = t("ui.stopping");
       btn.title = STOPPING_BTN_TITLE;
     } else {
       btn.disabled = false;
-      btn.textContent = "停止";
+      btn.textContent = t("ui.stop");
       btn.classList.add("danger");
       btn.title = STOP_BTN_TITLE;
     }
-    if (hint) hint.textContent = "动作执行中；停止会在当前步骤结束后生效。";
+    if (hint) hint.textContent = t("keys.running_hint");
     return;
   }
   btn.disabled = noAction;
-  btn.textContent = "测试动作";
+  btn.textContent = t("ui.test_action");
   btn.title = noAction
-    ? "仅 HID：没有上位机动作可测试"
+    ? t("ui.test_none")
     : TEST_BTN_IDLE_TITLE;
   if (hint) {
     hint.textContent = noAction
-      ? "仅 HID：该键只发送 HID，没有上位机动作可测试。"
+      ? t("keys.hid_only_hint")
       : "";
   }
 }
@@ -379,33 +379,33 @@ function lintMacroLine(line) {
   const value = line.slice(i + 1).trim();
   if (kind.startsWith("text!")) {
     if (!/^text!\d+$/.test(kind)) {
-      return { level: "error", message: "text! 后的延迟必须是整数毫秒（如 text!80:）" };
+      return { level: "error", message: t("keys.err_text_delay") };
     }
     kind = "text";
   }
   if (!MACRO_KNOWN_KINDS.has(kind)) {
-    return { level: "error", message: `未知步骤类型「${kind}」` };
+    return { level: "error", message: t("keys.unknown_step_type", { kind }) };
   }
   if (kind === "wait" || kind === "delay") {
-    if (!/^\d+$/.test(value)) return { level: "error", message: "wait/delay 后必须是毫秒整数" };
+    if (!/^\d+$/.test(value)) return { level: "error", message: t("keys.err_wait_ms") };
     return null;
   }
   if (kind === "key") {
-    return value ? null : { level: "error", message: "key: 后缺少键名" };
+    return value ? null : { level: "error", message: t("keys.err_key_missing") };
   }
   if (kind === "app") {
-    return value ? null : { level: "error", message: "app: 后缺少可执行文件" };
+    return value ? null : { level: "error", message: t("keys.err_app_missing") };
   }
   if (kind === "url") {
-    if (!value) return { level: "error", message: "url: 后缺少网址" };
+    if (!value) return { level: "error", message: t("keys.err_url_missing") };
     return /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
-      ? null : { level: "warn", message: "建议以 http:// 或 https:// 开头" };
+      ? null : { level: "warn", message: t("keys.hint_http") };
   }
   if (kind === "browser" && !value) {
-    return { level: "warn", message: "未指定浏览器，将使用系统默认" };
+    return { level: "warn", message: t("keys.hint_default_browser") };
   }
   if ((kind === "text" || kind === "paste") && !value) {
-    return { level: "warn", message: `${kind}: 内容为空` };
+    return { level: "warn", message: t("keys.step_empty", { kind }) };
   }
   return null;
 }
@@ -423,24 +423,24 @@ function lintMacroText(text) {
 
 function lintMacroStep(step) {
   const type = step.type;
-  if (!MACRO_KNOWN_KINDS.has(type)) return { level: "error", message: `未知步骤类型「${type}」` };
+  if (!MACRO_KNOWN_KINDS.has(type)) return { level: "error", message: t("keys.unknown_step_type", { kind: type }) };
   const value = String(step.value === undefined ? "" : step.value);
   if (type === "delay") {
-    return /^\d+$/.test(value) ? null : { level: "error", message: "等待必须是毫秒整数" };
+    return /^\d+$/.test(value) ? null : { level: "error", message: t("keys.err_wait_int") };
   }
-  if (type === "key") return value ? null : { level: "error", message: "缺少键名" };
-  if (type === "app") return value ? null : { level: "error", message: "缺少可执行文件" };
+  if (type === "key") return value ? null : { level: "error", message: t("keys.err_key_absent") };
+  if (type === "app") return value ? null : { level: "error", message: t("keys.err_app_absent") };
   if (type === "url") {
-    if (!value) return { level: "error", message: "缺少网址" };
+    if (!value) return { level: "error", message: t("keys.err_url_absent") };
     return /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
-      ? null : { level: "warn", message: "建议以 http:// 或 https:// 开头" };
+      ? null : { level: "warn", message: t("keys.hint_http") };
   }
-  if (type === "browser" && !value) return { level: "warn", message: "未指定浏览器，将使用系统默认" };
+  if (type === "browser" && !value) return { level: "warn", message: t("keys.hint_default_browser") };
   if (type === "text" && step.delay !== undefined && !/^\d+$/.test(String(step.delay))) {
-    return { level: "error", message: "延迟必须是整数毫秒" };
+    return { level: "error", message: t("keys.err_delay_int") };
   }
   if ((type === "text" || type === "paste") && !value) {
-    return { level: "warn", message: "内容为空" };
+    return { level: "warn", message: t("keys.err_empty_body") };
   }
   return null;
 }
@@ -448,7 +448,7 @@ function lintMacroStep(step) {
 function macroLintHtml(issues) {
   if (!issues.length) return "";
   return issues.map((it) => {
-    const where = it.line ? `第 ${it.line} 行：` : "";
+    const where = it.line ? t("keys.line_prefix", { line: it.line }) : "";
     const cls = it.level === "error" ? "" : "class=\"warn\"";
     return `<span ${cls}>${where}${escapeHtml(it.message)}</span>`;
   }).join("<br>");
@@ -456,14 +456,15 @@ function macroLintHtml(issues) {
 
 /* ---------------- 宏：结构化 + 纯文本双视图 ---------------- */
 
-const MACRO_STEP_OPTIONS = [
-  ["key", "按键 key:"],
-  ["text", "文本 text:"],
-  ["paste", "粘贴 paste:"],
-  ["delay", "等待 wait:"],
-  ["url", "网址 url:"],
-  ["browser", "浏览器 browser:"],
-  ["app", "程序 app:"],
+// 函数而不是常量：模块加载时求值会把语言冻结在启动那一刻。
+const macroStepOptions = () => [
+  ["key", t("keys.step_key")],
+  ["text", t("keys.step_text")],
+  ["paste", t("keys.step_paste")],
+  ["delay", t("keys.step_wait")],
+  ["url", t("keys.step_url")],
+  ["browser", t("keys.step_browser")],
+  ["app", t("keys.step_app")],
 ];
 
 const MACRO_STEP_DEFAULTS = {
@@ -477,13 +478,13 @@ const MACRO_STEP_DEFAULTS = {
 };
 
 const MACRO_QUICK_INSERTS = [
-  ["key", "按键"],
-  ["delay", "等待"],
-  ["text", "文本"],
-  ["paste", "粘贴"],
-  ["url", "网址"],
-  ["browser", "浏览器"],
-  ["app", "程序"],
+  ["key", t("ui.tab_keys")],
+  ["delay", t("keys.kind_wait")],
+  ["text", t("keys.kind_text")],
+  ["paste", t("keys.kind_paste")],
+  ["url", t("keys.kind_url")],
+  ["browser", t("keys.kind_browser")],
+  ["app", t("keys.kind_app")],
 ];
 
 function mountMacroEditor(holder, action) {
@@ -495,9 +496,9 @@ function mountMacroEditor(holder, action) {
   const wrap = document.createElement("div");
   wrap.className = "macro-editor";
   wrap.innerHTML = `
-    <div class="macro-tabs" role="tablist" aria-label="宏编辑视图">
-      <button type="button" class="macro-tab" data-view="steps" role="tab">结构化</button>
-      <button type="button" class="macro-tab" data-view="text" role="tab">纯文本</button>
+    <div class="macro-tabs" role="tablist" aria-label="${t("keys.macro_view_aria")}">
+      <button type="button" class="macro-tab" data-view="steps" role="tab">${t("keys.macro_view_steps")}</button>
+      <button type="button" class="macro-tab" data-view="text" role="tab">${t("keys.macro_view_text")}</button>
       <span class="macro-count"></span>
     </div>
     <div class="macro-pane" data-pane="steps" role="tabpanel">
@@ -507,8 +508,8 @@ function mountMacroEditor(holder, action) {
     </div>
     <div class="macro-pane" data-pane="text" role="tabpanel" hidden>
       <textarea class="macro-text" spellcheck="false"
-        placeholder="每行一步：key: / wait: / text: / text!80: / paste: / url: / browser: / app:"></textarea>
-      <p class="muted small">可直接粘贴整段文本；text:/paste: 的正文不会写入日志（只记字符数）。</p>
+        placeholder="${t("keys.macro_text_placeholder")}"></textarea>
+      <p class="muted small">${t("keys.macro_text_hint")}</p>
       <p class="macro-lint" data-lint="text"></p>
     </div>`;
 
@@ -530,7 +531,7 @@ function mountMacroEditor(holder, action) {
       if (fromText) textValue = textArea.value;
       else textArea.value = serializeMacroSteps(steps);
     }
-    count.textContent = `${steps.length} 步`;
+    count.textContent = t("keys.macro_count", { count: steps.length });
     lintSteps.innerHTML = macroLintHtml(
       steps.map((s, i) => {
         const issue = lintMacroStep(s);
@@ -550,18 +551,18 @@ function mountMacroEditor(holder, action) {
   function renderRows() {
     list.innerHTML = "";
     if (!steps.length) {
-      list.innerHTML = `<p class="muted small">还没有步骤。用下方快捷按钮添加，或切到「纯文本」直接粘贴。</p>`;
+      list.innerHTML = `<p class="muted small">${t("keys.macro_empty")}</p>`;
     }
     steps.forEach((step, i) => {
       const row = document.createElement("div");
       row.className = "macro-step";
       row.dataset.i = String(i);
-      const opts = MACRO_STEP_OPTIONS.map(([id, label]) => {
+      const opts = macroStepOptions().map(([id, label]) => {
         const unknown = id === step.type ? "" : "";
         return `<option value="${id}" ${id === step.type ? "selected" : ""}>${label}${unknown}</option>`;
       }).join("");
       const extra = MACRO_KNOWN_KINDS.has(step.type) ? "" :
-        `<option value="${step.type}" selected>未知（${escapeHtml(step.type)}）</option>`;
+        `<option value="${step.type}" selected>${t("keys.unknown_type_option", { type: escapeHtml(step.type) })}</option>`;
       row.innerHTML = `
         <select class="ms-type">${opts}${extra}</select>
         <input class="ms-value" type="${step.type === "delay" ? "number" : "text"}"
@@ -569,16 +570,16 @@ function mountMacroEditor(holder, action) {
           placeholder="${macroValuePlaceholder(step.type)}"
           value="${escapeHtml(String(step.value === undefined ? "" : step.value))}">
         ${step.type === "text"
-          ? `<input class="ms-delay" type="number" min="0" step="1" title="逐字符延迟（毫秒），留空用默认"
+          ? `<input class="ms-delay" type="number" min="0" step="1" title="${t("keys.text_delay_placeholder")}"
                value="${step.delay === undefined ? "" : step.delay}">`
           : ""}
         ${step.type === "text" || step.type === "paste"
-          ? `<span class="macro-sensitive" title="正文只记字符数，不写入日志">日志不回显</span>`
+          ? `<span class="macro-sensitive" title="${t("keys.text_body_hint")}">${t("keys.log_not_echoed")}</span>`
           : ""}
         <span class="ms-move">
-          <button type="button" class="btn tiny ms-up" title="上移" ${i === 0 ? "disabled" : ""}>↑</button>
-          <button type="button" class="btn tiny ms-down" title="下移" ${i === steps.length - 1 ? "disabled" : ""}>↓</button>
-          <button type="button" class="btn tiny ms-del" title="删除这一步">✕</button>
+          <button type="button" class="btn tiny ms-up" title="${t("keys.move_up")}" ${i === 0 ? "disabled" : ""}>↑</button>
+          <button type="button" class="btn tiny ms-down" title="${t("keys.move_down")}" ${i === steps.length - 1 ? "disabled" : ""}>↓</button>
+          <button type="button" class="btn tiny ms-del" title="${t("keys.delete_step")}">✕</button>
         </span>
         <p class="ms-error"></p>`;
       list.appendChild(row);
@@ -683,10 +684,10 @@ function mountMacroEditor(holder, action) {
 }
 
 function macroValuePlaceholder(type) {
-  if (type === "delay") return "毫秒，如 500";
+  if (type === "delay") return t("keys.wait_placeholder");
   if (type === "key") return "Tab / F5 / ctrl+alt+t";
-  if (type === "text") return "要输入的文本（不会写入日志）";
-  if (type === "paste") return "要粘贴的文本（不会写入日志）";
+  if (type === "text") return t("keys.text_placeholder");
+  if (type === "paste") return t("keys.paste_placeholder");
   if (type === "url") return "https://example.com";
   if (type === "browser") return "chrome / firefox / edge / default";
   if (type === "app") return "C:\\path\\app.exe --flag";

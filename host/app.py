@@ -1043,6 +1043,9 @@ def load_config():
         pass
     except Exception as e:  # noqa: BLE001
         print("[app] config load failed:", e)
+    # WS-529: 老 config.json 没有 lang，读完后统一补上默认值，
+    # 这样调用方拿到的 _config 一定带这个顶层键。
+    _config.setdefault("lang", SYSTEM_PREF)
 
 
 def save_config():
@@ -1104,6 +1107,22 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
         # every access so apply/read-back/UI all see the same 12-entry list.
         ensure_key_items(cfg)
         return cfg
+
+
+def _err(message, **extra) -> dict:
+    """JSON error body that keeps both rendered text and the message key.
+
+    ``error`` stays the rendered sentence (old consumers and the pytest suite
+    read it); ``code`` + ``params`` let the web UI re-translate the same error
+    after a language switch (WS-529).
+    """
+    body = {
+        "error": str(message),
+        "code": getattr(message, "code", ""),
+        "params": getattr(message, "params", {}),
+    }
+    body.update(extra)
+    return body
 
 
 # --- event log ------------------------------------------------------------
@@ -3077,7 +3096,7 @@ def _macro_cancelled(action: dict, step: int, total: int,
     label = MACRO_STEP_LABELS.get(step_type, step_type) or t("log.macro_unknown_step")
     return {"ok": False,
             "cancelled": True,
-            "error": t("log.macro_cancelled", step=step, total=total, label=label),
+            **_err(t("log.macro_cancelled", step=step, total=total, label=label)),
             "action_type": "macro",
             "target": _action_display_target(action),
             "step": step,
@@ -3114,14 +3133,14 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind in ("launch", "url"):
         if not value:
             if kind == "url":
-                return {"ok": False, "error": t("error.empty_address"),
+                return {"ok": False, **_err(t("error.empty_address")),
                         "action_type": kind, "target": target}
             return {"ok": True, "error": "", "action_type": kind, "target": target}
         # Pre-check local launch targets so failures are visible on every
         # platform (xdg-open / open do not raise on Linux for missing files).
         if kind == "launch" and not value.startswith(("http://", "https://")):
             if not os.path.exists(value):
-                return {"ok": False, "error": t("log.file_missing") + value,
+                return {"ok": False, **_err(t("log.file_missing") + value),
                         "action_type": kind, "target": target}
         try:
             _open_target(value)
@@ -3147,7 +3166,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind == "macro":
         kb = _load_keyboard()
         if kb is None:
-            return {"ok": False, "error": t("error.macro_need_keyboard"),
+            return {"ok": False, **_err(t("error.macro_need_keyboard")),
                     "action_type": kind, "target": target}
         # WS-484: remember which step failed so the log row can point at it
         # without echoing the macro body.
@@ -3326,7 +3345,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
     if kind == "media":
         kb = _load_keyboard()
         if kb is None:
-            return {"ok": False, "error": t("error.media_need_keyboard"),
+            return {"ok": False, **_err(t("error.media_need_keyboard")),
                     "action_type": kind, "target": target}
         try:
             kb.send(value)
@@ -3857,7 +3876,7 @@ def api_action_test(dev_id, idx):
     # never start a second macro next to a running one.
     token, busy_for = _begin_action(dev_id, idx)
     if token is None:
-        return jsonify({"ok": False, "error": t("log.action_still_running_key"),
+        return jsonify({"ok": False, **_err(t("log.action_still_running_key")),
                         "running": True, "elapsed": round(busy_for, 1)}), 200
 
     # Execute synchronously (5 s cap) so the caller gets the real result.
@@ -3894,7 +3913,7 @@ def api_action_test(dev_id, idx):
         result = result_queue.get(timeout=5.0)
     except queue.Empty:
         # Still running: report it as such instead of a misleading timeout.
-        return jsonify({"ok": False, "error": t("log.action_still_running"), "running": True}), 200
+        return jsonify({"ok": False, **_err(t("log.action_still_running")), "running": True}), 200
 
     _end_action(dev_id, idx, token)
     return jsonify({"ok": result["ok"], "error": result["error"],
@@ -3948,7 +3967,7 @@ def api_encoder_action_test(dev_id, direction):
         # only reached if the user somehow clicks. Report the refusal instead
         # of a fake success (WS-390 review #1).
         return jsonify({"ok": False,
-                        "error": t("error.encoder_test_mode")})
+                        **_err(t("error.encoder_test_mode"))})
     actions = cfg.get("encoder", {}).get("actions", {}) or {}
     action = actions.get(direction) or {}
     if not action or action.get("type", "none") == "none":
@@ -3960,7 +3979,7 @@ def api_encoder_action_test(dev_id, direction):
     token, busy_for = _begin_encoder_action(dev_id, direction, action,
                                             ignore_cooldown=True)
     if token is None:
-        return jsonify({"ok": False, "error": t("log.action_still_running_dir"),
+        return jsonify({"ok": False, **_err(t("log.action_still_running_dir")),
                         "running": True, "elapsed": round(busy_for, 1)}), 200
 
     result_queue: "queue.Queue" = queue.Queue()
@@ -3987,7 +4006,7 @@ def api_encoder_action_test(dev_id, direction):
     except queue.Empty:
         # Still running: the worker owns the claim, so the card stays
         # "执行中" until the action finishes. Do NOT release here.
-        return jsonify({"ok": False, "error": t("log.action_still_running"), "running": True}), 200
+        return jsonify({"ok": False, **_err(t("log.action_still_running")), "running": True}), 200
 
     _end_encoder_action(dev_id, direction, token)
     _record_action_result(dev_id, -1, action, result,
@@ -4420,10 +4439,10 @@ def api_ota(dev_id):
     immediately with a ``task`` id; poll ``/api/ota/<dev_id>/progress``.
     """
     if "file" not in request.files:
-        return jsonify({"ok": False, "error": t("error.ota_no_upload")}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_upload"))}), 400
     upload = request.files["file"]
     if not upload.filename:
-        return jsonify({"ok": False, "error": t("error.ota_no_file")}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_file"))}), 400
 
     err = _ota_validate(upload.filename)
     if err:
@@ -4431,7 +4450,7 @@ def api_ota(dev_id):
 
     file_data = upload.read()
     if not file_data:
-        return jsonify({"ok": False, "error": t("error.ota_empty_file")}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_empty_file"))}), 400
 
     # Pre-flight the image locally so a corrupt / truncated / wrong-kind file is
     # rejected before we spend 1-3 minutes pushing it over BLE. The firmware's
@@ -4439,7 +4458,7 @@ def api_ota(dev_id):
     fw = _ota_current_fw(dev_id)
     slot_cap = _ota_slot_cap(fw)
     if slot_cap <= 0:
-        return jsonify({"ok": False, "error": t("error.ota_no_app1")}), 400
+        return jsonify({"ok": False, **_err(t("error.ota_no_app1"))}), 400
     img_err = _ota_validate_image(file_data, slot_cap)
     if img_err:
         return jsonify({"ok": False, "error": img_err}), 400
@@ -4447,7 +4466,7 @@ def api_ota(dev_id):
     with _ota_lock:
         existing = _ota_windows.get(dev_id)
         if existing is not None and existing.status in ("starting", "uploading"):
-            return jsonify({"ok": False, "error": t("error.ota_busy_task")}), 409
+            return jsonify({"ok": False, **_err(t("error.ota_busy_task"))}), 409
 
     # The device verifies both values before Update.end(), so a truncated or
     # tampered file can never replace the running firmware.
@@ -4471,7 +4490,7 @@ def api_ota_cancel(dev_id):
     with _ota_lock:
         window = _ota_windows.get(dev_id)
         if window is None:
-            return jsonify({"ok": False, "error": t("error.ota_no_task")}), 404
+            return jsonify({"ok": False, **_err(t("error.ota_no_task"))}), 404
         if window.status in ("done", "error", "cancelled"):
             _ota_windows.pop(dev_id, None)
             return jsonify({"ok": True, "sent": False, "status": window.status})
@@ -4489,7 +4508,7 @@ def api_ota_progress(dev_id):
     with _ota_lock:
         window = _ota_windows.get(dev_id)
         if window is None:
-            return jsonify({"ok": False, "error": t("error.ota_no_task")}), 404
+            return jsonify({"ok": False, **_err(t("error.ota_no_task"))}), 404
         # Clean up finished / errored windows after one last read so the poller
         # can detect completion by the task disappearing.
         done = window.status in ("done", "error", "cancelled")
@@ -4676,7 +4695,7 @@ def api_app_update_apply():
         running = [t for t in _app_update_tasks.values()
                    if t.get("phase") not in _APP_UPDATE_DONE_PHASES]
         if running:
-            return jsonify({"ok": False, "error": t("error.update_busy")}), 409
+            return jsonify({"ok": False, **_err(t("error.update_busy"))}), 409
         # 清掉已结束的任务，dict 不会无限增长。
         for task_id in [k for k, v in _app_update_tasks.items()
                         if v.get("phase") in _APP_UPDATE_DONE_PHASES]:
@@ -4691,11 +4710,11 @@ def api_app_update_apply():
     release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
     app_asset = info.get("app") or {}
     if not app_asset:
-        return jsonify({"ok": False, "error": t("error.app_update_no_asset"),
+        return jsonify({"ok": False, **_err(t("error.app_update_no_asset")),
                         "error_code": "E_NO_APP_ASSET",
                         "release_url": release_url}), 409
     if not app_asset.get("sha256"):
-        return jsonify({"ok": False, "error": t("error.app_update_no_sha_short"),
+        return jsonify({"ok": False, **_err(t("error.app_update_no_sha_short")),
                         "error_code": "E_NO_SHA256", "release_url": release_url}), 409
     if not app_asset.get("url"):
         return jsonify({"ok": False,
@@ -4707,10 +4726,10 @@ def api_app_update_apply():
     latest = app_asset["version"]
     state = _update_settings()
     if online_update.should_skip_version(current, latest, state["skipped_version"]):
-        return jsonify({"ok": False, "error": t("log.app_update_skipped_short") % latest,
+        return jsonify({"ok": False, **_err(t("log.app_update_skipped_short") % latest),
                         "error_code": "E_SKIPPED", "release_url": release_url}), 409
     if not online_update.version_is_newer(latest, current):
-        return jsonify({"ok": False, "error": t("log.app_up_to_date") % current,
+        return jsonify({"ok": False, **_err(t("log.app_up_to_date") % current),
                         "release_url": release_url}), 409
     # min_from 与 check 阶段同一把尺：check 说不能升，apply 也不能升。
     min_from = app_asset.get("min_from") or ""
@@ -4744,12 +4763,12 @@ def api_app_update_apply():
     target_dir = _update_target_dir()
     if not target_dir:
         return jsonify({"ok": False,
-                        "error": t("error.app_update_no_target"),
+                        **_err(t("error.app_update_no_target")),
                         "error_code": "E_NO_TARGET", "release_url": release_url}), 409
     if not online_update.is_writable_dir(target_dir):
         # 不破坏原 exe：明确提示手动下载，并给出 Release 链接。
         return jsonify({"ok": False,
-                        "error": t("error.app_update_dir_readonly"),
+                        **_err(t("error.app_update_dir_readonly")),
                         "error_code": "E_DIR_RO",
                         "release_url": release_url}), 409
 
@@ -4973,7 +4992,7 @@ def api_app_update_progress():
     with _update_lock:
         task = _app_update_tasks.get(task_id)
         if task is None:
-            return jsonify({"ok": False, "error": t("error.no_update_task")}), 404
+            return jsonify({"ok": False, **_err(t("error.no_update_task"))}), 404
         payload = dict(task)
     payload["ok"] = True
     return jsonify(payload)
@@ -4985,7 +5004,7 @@ def api_app_update_skip():
     data = request.get_json(silent=True) or {}
     version = str(data.get("version") or "").strip()
     if not version:
-        return jsonify({"ok": False, "error": t("error.missing_version")}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_version"))}), 400
     _set_update_state(skipped_version=version)
     return jsonify({"ok": True, "skipped_version": version})
 
@@ -4995,7 +5014,7 @@ def api_app_update_cancel():
     """取消进行中的上位机更新（仅在下载阶段有效）。"""
     with _update_lock:
         if not _app_update_tasks:
-            return jsonify({"ok": False, "error": t("error.no_update_task")}), 404
+            return jsonify({"ok": False, **_err(t("error.no_update_task"))}), 404
         for task in _app_update_tasks.values():
             task["cancelled"] = True
         _app_update_tasks.clear()
@@ -5012,7 +5031,7 @@ def api_firmware_update_check():
     """
     dev_id = request.args.get("dev_id") or ""
     if not dev_id:
-        return jsonify({"ok": False, "error": t("error.missing_dev_id")}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
 
     with _lock:
         cfg = _config["devices"].get(dev_id) or {}
@@ -5091,7 +5110,7 @@ def api_firmware_update_apply():
     data = request.get_json(silent=True) or {}
     dev_id = str(data.get("dev_id") or "")
     if not dev_id:
-        return jsonify({"ok": False, "error": t("error.missing_dev_id")}), 400
+        return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
 
     busy = _ota_busy_reason()
     if busy:
@@ -5104,7 +5123,7 @@ def api_firmware_update_apply():
     flash = fw.get("flash", 0)
     variant = online_update.variant_for_device(chip, flash)
     if not variant:
-        return jsonify({"ok": False, "error": t("error.fw_no_online"),
+        return jsonify({"ok": False, **_err(t("error.fw_no_online")),
                         "error_code": "E_NO_VARIANT"}), 400
 
     try:
@@ -5116,7 +5135,7 @@ def api_firmware_update_apply():
     release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
     entry = (info.get("firmware") or {}).get(variant)
     if not entry or not entry.get("sha256"):
-        return jsonify({"ok": False, "error": t("error.fw_no_online"),
+        return jsonify({"ok": False, **_err(t("error.fw_no_online")),
                         "error_code": "E_NO_VARIANT", "release_url": release_url}), 409
     if not entry.get("url"):
         return jsonify({"ok": False,
@@ -5124,7 +5143,7 @@ def api_firmware_update_apply():
                                   % entry.get("asset", "")),
                         "error_code": "E_NO_FW_ASSET", "release_url": release_url}), 409
     if not online_update.version_is_newer(entry["version"], fw.get("version", "")):
-        return jsonify({"ok": False, "error": t("log.app_up_to_date") % (fw.get("version") or ""),
+        return jsonify({"ok": False, **_err(t("log.app_up_to_date") % (fw.get("version") or "")),
                         "release_url": release_url}), 409
 
     # 只接受 ota_*.bin（app-only），复用现有校验。
@@ -5135,7 +5154,7 @@ def api_firmware_update_apply():
 
     # 设备必须在线：否则整包下载完才发现推不上去，白等几分钟。
     if not _ota_is_connected(dev_id):
-        return jsonify({"ok": False, "error": t("error.fw_device_offline"),
+        return jsonify({"ok": False, **_err(t("error.fw_device_offline")),
                         "error_code": "E_NOT_CONNECTED", "release_url": release_url}), 409
 
     with _update_lock:
@@ -5246,7 +5265,7 @@ def api_firmware_update_progress():
     with _update_lock:
         task = _fw_update_tasks.get(dev_id)
         if task is None:
-            return jsonify({"ok": False, "error": t("error.fw_no_task")}), 404
+            return jsonify({"ok": False, **_err(t("error.fw_no_task"))}), 404
         payload = dict(task)
     payload["ok"] = True
     # 推送阶段借用现有 OTA 窗口的进度（ack 百分比）。
@@ -5483,27 +5502,27 @@ def api_desktop_restart_admin():
     quit path so the elevated one can take over the port.
     """
     if not sys.platform.startswith("win"):
-        return jsonify({"ok": False, "error": t("error.elevate_windows_only")}), 409
+        return jsonify({"ok": False, **_err(t("error.elevate_windows_only"))}), 409
     try:
         import ctypes
     except Exception as e:  # noqa: BLE001 - ctypes is always available on Windows
-        return jsonify({"ok": False, "error": t("error.elevate_api_failed", detail=e)}), 500
+        return jsonify({"ok": False, **_err(t("error.elevate_api_failed", detail=e))}), 500
     args = _elevated_argv()
     params = subprocess.list2cmdline(args)
     try:
         rc = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, params, None, 1)
     except Exception as e:  # noqa: BLE001
-        return jsonify({"ok": False, "error": t("error.elevate_start_failed", name=type(e).__name__, message=e)}), 500
+        return jsonify({"ok": False, **_err(t("error.elevate_start_failed", name=type(e).__name__, message=e))}), 500
     if rc is None or rc <= 32:
         # <= 32: the UAC prompt was declined (or the launch failed).
         add_event("desktop", t("error.elevate_cancelled"), level="warn")
-        return jsonify({"ok": False, "error": t("error.elevation_cancelled")}), 409
+        return jsonify({"ok": False, **_err(t("error.elevation_cancelled"))}), 409
     add_event("desktop", t("log.elevated_started"), level="ok")
     # Leave through the existing exit path (server shutdown + window close),
     # never os._exit, so the elevated instance can bind the port.
     if not _exit_for_restart():
-        return jsonify({"ok": False, "error": t("error.cannot_exit")}), 500
+        return jsonify({"ok": False, **_err(t("error.cannot_exit"))}), 500
     return jsonify({"ok": True})
 
 
@@ -5527,7 +5546,7 @@ def api_quit():
     if desktop.request_quit():
         add_event("desktop", t("log.quit_requested"))
         return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": t("error.quit_not_desktop")}), 409
+    return jsonify({"ok": False, **_err(t("error.quit_not_desktop"))}), 409
 
 
 @app.route("/api/show-window", methods=["POST"])
@@ -5540,11 +5559,11 @@ def api_show_window():
     endpoint is how the user brings the window back.
     """
     if not desktop.STATE.get("desktop"):
-        return jsonify({"ok": False, "error": t("error.not_desktop")}), 409
+        return jsonify({"ok": False, **_err(t("error.not_desktop"))}), 409
     if desktop.show_window():
         add_event("desktop", t("log.window_restored"))
         return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": t("error.no_window_to_restore")}), 409
+    return jsonify({"ok": False, **_err(t("error.no_window_to_restore"))}), 409
 
 
 @app.route("/api/log")
