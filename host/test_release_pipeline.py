@@ -100,6 +100,28 @@ def test_the_new_tests_run_in_ci():
     assert "test_fw_update.py" in text
 
 
+def test_every_front_end_test_runs_in_ci():
+    """每个 ``host/test_*.mjs`` 都必须被某个 CI 作业跑到。
+
+    没被列进去的测试文件等于不存在：本地跑绿了，CI 照样放过回归
+    （WS-480 就是这么漏的）。这里直接扫目录，不靠人肉维护清单。
+    """
+    workflows_dir = os.path.join(ROOT, ".github", "workflows")
+    ci_text = "".join(
+        _read(os.path.join(workflows_dir, name))
+        for name in sorted(os.listdir(workflows_dir))
+        if name.endswith((".yml", ".yaml"))
+    )
+    host_dir = os.path.join(ROOT, "host")
+    scripts = sorted(
+        name for name in os.listdir(host_dir)
+        if name.startswith("test_") and name.endswith(".mjs")
+    )
+    assert scripts, "host/ 下应该还有 .mjs 前端测试"
+    for name in scripts:
+        assert name in ci_text, "%s 没有被任何 CI 作业跑到" % name
+
+
 # --- 版本语义 ----------------------------------------------------------------
 
 def test_tag_versions():

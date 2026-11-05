@@ -3557,7 +3557,24 @@ function closeUpdateModal() {
   syncModalOpenClass();
 }
 
+/* 上位机更新的确认文案：更新会退出上位机进程，连着的设备会被断开。
+   放在常量里，测试（test_app_update_confirm.mjs）直接断言这一句。 */
+const APP_UPDATE_CONFIRM_TEXT = "更新会退出上位机并断开设备连接，是否继续？";
+
+/** 「立即更新」前要不要先问一句。
+
+   有设备连着时才问：更新要退出上位机进程，BLE 会被断掉（上位机动作全停）。
+   正在 OTA 时不问 —— 那时本来就被服务端的 E_OTA_BUSY 硬拦（见 app.py
+   _ota_busy_reason），先弹确认再报「设备正在升级」是多余的打扰。 */
+function appUpdateNeedsConfirm() {
+  if (otaBusy()) return false;
+  return state.devices.some((d) => d.connected);
+}
+
 async function applyAppUpdate() {
+  // 确认放在最前面：用户取消时不该看到「更新期间请勿关闭程序」，按钮也不该
+  // 被置灰 —— 什么都没发生。
+  if (appUpdateNeedsConfirm() && !window.confirm(APP_UPDATE_CONFIRM_TEXT)) return;
   const btn = $("#btnUpdateApply");
   if (btn) {
     btn.disabled = true;

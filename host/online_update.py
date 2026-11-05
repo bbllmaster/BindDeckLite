@@ -750,22 +750,30 @@ def _bat_quote(value: str) -> str:
 def batch_encoding(platform: str = "") -> str:
     """写 ``.bat`` 用的编码。
 
-    cmd.exe 按**系统 ANSI 代码页**解析批处理文件：UTF-8 落盘时中文用户
-    名路径会被解成乱码（``set "EXE=C:\\Users\\张三\\..."`` → ``寮犱笁``），
-    ``if not exist "%NEW%"`` 直接跳 ``:fail``。所以 Windows 上必须用
-    ``mbcs``（= 当前系统 ANSI 代码页，简体中文 = 936）。
+    cmd.exe 按**控制台 OEM 代码页**（CP_OEMCP）解析批处理文件，不是 ANSI
+    代码页（CP_ACP）：``chcp`` 默认报的就是 OEM 页，cmd.exe 也用它来读批处理
+    和写重定向。
 
-    其它平台没有 ``mbcs``（只有 Windows 才有这个 codec），退回 UTF-8 ——
+    * 简体中文系统两个代码页都是 936（GBK），所以两种写法等价 —— 这也是
+      旧实现用 ``mbcs`` 一直没出问题的原因。
+    * 西文系统不等价（en-US：ANSI = 1252、OEM = 437；西欧 OEM = 850）。
+      按 ANSI 落盘、cmd.exe 按 OEM 读，路径里的重音字符会被解成另一个字符，
+      ``if not exist "%NEW%"`` 直接跳 ``:fail`` —— 此时上位机已经退出，
+      用户的程序就消失了。
+
+    所以 Windows 上必须用 ``oem``（= CP_OEMCP）。
+
+    其它平台没有 ``oem``（只有 Windows 才有这个 codec），退回 UTF-8 ——
     上位机 exe 只在 Windows 上跑，这里只是让开发与测试环境可用。
     """
     name = platform or os.name
-    return "mbcs" if name == "nt" else "utf-8"
+    return "oem" if name == "nt" else "utf-8"
 
 
 def write_update_script(path: str, script: str, encoding: str = "") -> None:
     """把替换脚本落盘（编码见 :func:`batch_encoding`）。
 
-    路径里有当前系统代码页表示不了的字符时抛 :class:`UpdateError` ——
+    路径里有当前控制台代码页表示不了的字符时抛 :class:`UpdateError` ——
     与其写出一个 cmd 解析不了的脚本，不如明确告诉用户手动更新。
     """
     enc = encoding or batch_encoding()
@@ -774,7 +782,7 @@ def write_update_script(path: str, script: str, encoding: str = "") -> None:
             handle.write(script)
     except UnicodeEncodeError:
         raise UpdateError(
-            "当前系统代码页无法表示安装路径中的字符，请手动下载新版本",
+            "当前控制台代码页无法表示安装路径中的字符，请手动下载新版本",
             "E_PATH_ENCODING")
     except OSError as exc:
         raise UpdateError("写入更新脚本失败：%s" % (exc,), "E_IO")

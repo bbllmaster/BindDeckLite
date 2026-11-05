@@ -22,6 +22,13 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
 
+      # The front-end regression tests are plain node scripts under host/.
+      # Pin the node version: `node --test` with several file arguments needs
+      # a recent node, and the runner image's preinstalled one drifts.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install dependencies
         working-directory: host
         run: |
@@ -65,9 +72,18 @@ jobs:
         run: |
           python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_device_trust.py test_app_update.py test_fw_update.py test_release_pipeline.py -v
 
-      - name: Portal OTA progress test (WS-519)
+      # Front-end regression tests (plain node scripts under host/).  All of
+      # them are listed explicitly: a test file that is not named here never
+      # runs, so a "local-only" regression test protects nobody (WS-480).
+      #   test_log_follow.mjs        WS-470 log follow / pause
+      #   test_portal_ota_progress.mjs WS-519 portal OTA progress
+      #   test_stop_button.mjs       WS-498 macro stop button
+      #   test_update_progress.mjs   WS-530 firmware update progress
+      #   test_app_update_confirm.mjs WS-531 update confirm prompt
+      - name: Front-end regression tests (node --test)
         working-directory: host
-        run: node --test test_portal_ota_progress.mjs
+        run: |
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs
 
       - uses: actions/upload-artifact@v4
         with:
