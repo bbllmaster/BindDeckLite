@@ -474,7 +474,7 @@ def test_update_script_rejects_percent_in_paths():
 def test_update_script_body_is_pure_ascii():
     """脚本正文只用 ASCII：非 ASCII 的部分只能是路径本身。
 
-    cmd.exe 按系统 ANSI 代码页（zh-CN = 936）解析批处理文件；脚本正文里
+    cmd.exe 按控制台 OEM 代码页（zh-CN = 936）解析批处理文件；脚本正文里
     出现中文注释，在非中文代码页上根本写不出来。
     """
     script = online_update.build_update_script(
@@ -485,8 +485,8 @@ def test_update_script_body_is_pure_ascii():
     assert script.isascii(), "更新器脚本正文必须是纯 ASCII"
 
 
-def test_update_script_is_written_in_the_ansi_code_page(tmp_path):
-    """落盘字节必须能被 cmd 的 ANSI 代码页解回原文（中文路径不变形）。
+def test_update_script_is_written_in_the_console_code_page(tmp_path):
+    """落盘字节必须能被 cmd 的代码页解回原文（中文路径不变形）。
 
     评审实测：UTF-8 落盘时 ``line.decode("cp936")`` 得到 ``寮犱笁``，
     ``if not exist "%NEW%"`` 直接跳 ``:fail`` —— 此时上位机已经退出，
@@ -499,12 +499,12 @@ def test_update_script_is_written_in_the_ansi_code_page(tmp_path):
         marker_path=r"C:\new\updated.marker", pid=1)
     path = tmp_path / "update.bat"
 
-    # 用 zh-CN 的 ANSI 代码页（cp936）落盘 —— 这正是目标机器的情形。
+    # 用 zh-CN 的控制台代码页（cp936）落盘 —— 这正是目标机器的情形。
     online_update.write_update_script(str(path), script, encoding="cp936")
 
     raw = path.read_bytes()
     text = raw.decode("cp936")
-    assert exe in text, "ANSI 代码页下中文路径必须原样保留"
+    assert exe in text, "控制台代码页下中文路径必须原样保留"
     assert "寮犱笁" not in text, "路径不能被解成乱码"
     # 同一份字节用 UTF-8 解出来就不是原文 —— 说明落盘用的不是 UTF-8。
     with pytest.raises(UnicodeDecodeError):
@@ -537,10 +537,77 @@ def test_stage_update_script_removes_the_stale_marker(tmp_path):
     assert not marker.exists(), "陈旧 marker 必须先删掉"
 
 
-def test_the_batch_file_is_written_in_the_windows_ansi_code_page():
-    """Windows 上必须用 mbcs（= 系统 ANSI 代码页，简体中文 = 936）。"""
-    assert online_update.batch_encoding("nt") == "mbcs"
+def test_the_batch_file_is_written_in_the_windows_console_oem_code_page():
+    """Windows 上必须用 ``oem``（控制台 OEM 代码页 = CP_OEMCP）。
+
+    cmd.exe 按**控制台**代码页读批处理（``chcp`` 默认报的就是它），
+    不是 ANSI 代码页（CP_ACP）。简体中文系统两个代码页都是 936（GBK），
+    所以旧实现用 ``mbcs`` 一直没暴露问题；非 936 系统不等价
+    （en-US：OEM = 437 / ANSI = 1252），按 ANSI 落盘 cmd.exe 会把路径里的
+    重音字符读成另一个字符，``if not exist`` 直接跳 ``:fail``。
+    """
+    assert online_update.batch_encoding("nt") == "oem"
     assert online_update.batch_encoding("posix") == "utf-8"
+
+
+def test_a_non_936_code_page_path_is_only_readable_back_as_oem(tmp_path):
+    """「非 936 代码页」路径：OEM（437）与 ANSI（1252）不是同一页。
+
+    用 en-US 控制台的真实组合走一遍落盘：按 OEM 落的字节 cmd.exe 能原样
+    读回路径；同一份字节按 ANSI 读就是乱码 —— 这正是当年用 ``mbcs`` 的隐患。
+    """
+    exe = r"C:\Users\José\AppData\Local\BindDeckLite\BindDeckLite.exe"
+    script = online_update.build_update_script(
+        exe_path=exe, new_exe=r"C:\new\a.exe",
+        backup_exe=r"C:\Apps\BindDeckLite.exe.bak",
+        marker_path=r"C:\new\updated.marker", pid=1)
+    path = tmp_path / "update.bat"
+
+    # en-US 控制台：OEM = 437。
+    online_update.write_update_script(str(path), script, encoding="cp437")
+
+    raw = path.read_bytes()
+    assert exe in raw.decode("cp437"), "OEM 代码页下路径必须原样保留"
+    # 同一份字节按 ANSI（1252）读就不是原文了 —— 用 mbcs 落盘就是这个下场。
+    assert exe not in raw.decode("cp1252")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="OEM 代码页只在 Windows 上存在")
+def test_the_oem_codec_matches_the_windows_console_code_page():
+    """``oem`` 必须等于本机的控制台 OEM 代码页（CP_OEMCP）。
+
+    这是 ``batch_encoding("nt")`` 选 ``oem`` 的前提：只有 ``oem`` 真的按
+    CP_OEMCP 编码，cmd.exe 才能把批处理里的路径原样读回来。CI 在
+    windows-latest 上跑这条，非 Windows 上跳过。
+    """
+    import ctypes
+
+    oem_cp = ctypes.windll.kernel32.GetOEMCP()
+    ansi_cp = ctypes.windll.kernel32.GetACP()
+    assert oem_cp > 0, "拿不到本机的 OEM 代码页"
+
+    # 找一个「本机 OEM 页能表示、且两种代码页表示得不一样」的重音字符：
+    # 它在 OEM 与 ANSI 页里是两组不同的字节，用它才能把两个代码页区分开。
+    sample = None
+    for candidate in ("é", "ü", "ñ", "à"):
+        try:
+            oem_bytes = candidate.encode("oem")
+            ansi_bytes = candidate.encode("mbcs")
+        except UnicodeEncodeError:
+            continue
+        if oem_bytes != ansi_bytes:
+            sample = candidate
+            break
+    if sample is None:
+        pytest.skip("本机 OEM 与 ANSI 代码页表示不出可区分的字符")
+
+    # oem == cp<CP_OEMCP>：同一字符两种写法必须落成同样的字节。
+    assert sample.encode("oem") == sample.encode("cp%d" % oem_cp)
+    # mbcs == cp<CP_ACP>：它是 ANSI 代码页，不是 cmd.exe 读批处理用的那一页。
+    assert sample.encode("mbcs") == sample.encode("cp%d" % ansi_cp)
+    # 非中文系统上两者不是同一页 —— 这正是必须用 oem 而不是 mbcs 的原因。
+    if oem_cp != ansi_cp:
+        assert sample.encode("oem") != sample.encode("mbcs")
 
 
 def test_the_update_script_restarts_the_old_version_on_failure():
