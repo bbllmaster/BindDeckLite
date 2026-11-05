@@ -9,6 +9,7 @@ Release 少了「本次更新」小节、或清单里的 SHA256 与实际文件�
 
 import hashlib
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -29,6 +30,29 @@ BUILD_HOST_YML = os.path.join(ROOT, ".github", "workflows", "build-host.yml")
 def _read(path: str) -> str:
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def _run_pipeline_script(args):
+    """跑一个发布脚本（``tools/`` 下），并按 UTF-8 收发它的输出。
+
+    Windows runner 的区域编码是 ANSI 代码页（en-US → cp1252），不是 UTF-8：
+    子进程写 stderr 时用的是代码页，中文编不进去，而 stderr 的默认错误处理
+    是 ``backslashreplace``，于是中文被写成 ``\\u5347\\u7ea7\\u63d0\\u793a``
+    字面量 —— 对 stderr 的中文断言就假失败了。WS-532 就是这么红的
+    （门禁本身没坏：退出码仍是 1，坏的是那条子串断言）。
+
+    这里把**两端**都钉成 UTF-8：子进程用 ``PYTHONIOENCODING=utf-8`` 写，
+    父进程用 ``encoding="utf-8"`` 解。只改一端不够：写的若是代码页、读的
+    是 utf-8（或反过来）一样是乱码。
+
+    用 ``PYTHONIOENCODING`` 而不是 ``PYTHONUTF8=1``：后者会把子进程的**文件
+    系统编码**也换成 utf-8，那是对「标准流编码」这个问题的过度改动；这里要
+    修的只是 stdout/stderr。
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run([sys.executable] + list(args), capture_output=True,
+                          text=True, encoding="utf-8", env=env)
 
 
 # --- release.yml 的结构 ------------------------------------------------------
@@ -157,14 +181,65 @@ def test_the_release_notes_script_fails_on_incomplete_notes(tmp_path):
     (notes_dir / "v9.9.9.md").write_text("## 本次更新\n\n### 新增\n- x\n",
                                            encoding="utf-8")
     out = tmp_path / "out.md"
-    result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "tools", "release_notes.py"),
+    result = _run_pipeline_script(
+        [os.path.join(ROOT, "tools", "release_notes.py"),
          "--tag", "v9.9.9", "--out", str(out),
          "--notes-dir", str(notes_dir),
-         "--changelog", str(tmp_path / "nope.md")],
-        capture_output=True, text=True)
+         "--changelog", str(tmp_path / "nope.md")])
     assert result.returncode != 0, "残缺的小节必须让脚本失败"
     assert "升级提示" in result.stderr
+
+
+def test_the_release_notes_stderr_survives_a_non_utf8_environment(monkeypatch,
+                                                                   tmp_path):
+    """WS-532：子进程的中文 stderr 不能被区域编码转义掉。
+
+    Windows runner 的区域编码会退化成 ANSI 代码页，Python 于是把中文写成
+    ``\\u5347\\u7ea7\\u63d0\\u793a`` 字面量，「升级提示」再也匹配不上 ——
+    门禁本身（退出码 1）没坏，坏的是这条断言。
+
+    这里把环境强制成 ASCII 来复现该条件：跑**真实的**
+    ``tools/release_notes.py``，要求 stderr 里仍是可读的中文。
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "ascii")
+    notes_dir = tmp_path / "release-notes"
+    notes_dir.mkdir()
+    (notes_dir / "v9.9.9.md").write_text("## 本次更新\n\n### 新增\n- x\n",
+                                           encoding="utf-8")
+    result = _run_pipeline_script(
+        [os.path.join(ROOT, "tools", "release_notes.py"),
+         "--tag", "v9.9.9", "--out", str(tmp_path / "out.md"),
+         "--notes-dir", str(notes_dir),
+         "--changelog", str(tmp_path / "nope.md")])
+    assert result.returncode != 0
+    assert "升级提示" in result.stderr, (
+        "中文被区域编码转义了：%r" % result.stderr)
+
+
+def test_the_release_notes_stderr_is_decoded_as_utf8(monkeypatch, tmp_path):
+    """父进程必须按 UTF-8 解码子进程的输出，不能依赖 runner 的区域编码。
+
+    子进程写 UTF-8、父进程按 ANSI 代码页解，是同一个坑的另一半：这台
+    Linux 的区域编码本来就是 UTF-8，不模拟就测不出来。这里把 locale 的
+    首选编码改成 ASCII（Windows 上就是 cp1252/cp936 这类），复现 runner
+    的条件。``subprocess`` 在不同 Python 版本上分别问
+    ``locale.getencoding()`` 与 ``locale.getpreferredencoding()``，两个都改。
+    """
+    monkeypatch.setattr(locale, "getencoding", lambda: "ascii", raising=False)
+    monkeypatch.setattr(locale, "getpreferredencoding",
+                        lambda do_setlocale=True: "ascii", raising=False)
+    notes_dir = tmp_path / "release-notes"
+    notes_dir.mkdir()
+    (notes_dir / "v9.9.9.md").write_text("## 本次更新\n\n### 新增\n- x\n",
+                                           encoding="utf-8")
+    result = _run_pipeline_script(
+        [os.path.join(ROOT, "tools", "release_notes.py"),
+         "--tag", "v9.9.9", "--out", str(tmp_path / "out.md"),
+         "--notes-dir", str(notes_dir),
+         "--changelog", str(tmp_path / "nope.md")])
+    assert result.returncode != 0
+    assert "升级提示" in result.stderr, (
+        "父进程按区域编码解码，中文成了乱码：%r" % result.stderr)
 
 
 # --- update.json 清单 --------------------------------------------------------
@@ -225,11 +300,10 @@ def test_the_manifest_fails_when_an_asset_is_missing(tmp_path):
 def test_the_manifest_script_writes_valid_json(tmp_path):
     assets = _fake_assets(tmp_path)
     out = tmp_path / "update.json"
-    result = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "tools", "build_manifest.py"),
+    result = _run_pipeline_script(
+        [os.path.join(ROOT, "tools", "build_manifest.py"),
          "--assets", str(assets), "--app-version", "1.5.0",
-         "--published-at", "2026-11-04T00:00:00Z", "--out", str(out)],
-        capture_output=True, text=True)
+         "--published-at", "2026-11-04T00:00:00Z", "--out", str(out)])
     assert result.returncode == 0, result.stderr
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["app"]["version"] == "1.5.0"
