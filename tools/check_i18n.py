@@ -36,6 +36,7 @@ import re
 import sys
 import tokenize
 from fnmatch import fnmatch
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -238,32 +239,72 @@ def scan_js(path: Path) -> list[tuple[int, str]]:
     return findings
 
 
-HTML_TAG = re.compile(r"<[^>]*>")
+class _TextCollector(HTMLParser):
+    """Collect Chinese text nodes / attribute values that are *not* translated.
+
+    A text node under an element with ``data-i18n`` (or ``data-i18n-html``) is
+    already fed from the locale table, so it is not a finding — that is what
+    lets the template keep the Chinese as first-paint fallback.  The same goes
+    for ``title`` / ``placeholder`` / ``aria-label`` values whose element
+    carries the matching ``data-i18n-*`` attribute.
+    """
+
+    ATTR_KEYS = {
+        "title": "data-i18n-title",
+        "placeholder": "data-i18n-placeholder",
+        "aria-label": "data-i18n-aria-label",
+        "alt": "data-i18n-alt",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.findings: list[tuple[int, str]] = []
+        self._stack: list[tuple[str, bool]] = []
+        self._skip = 0
+
+    @property
+    def _translated(self) -> bool:
+        return any(flag for _tag, flag in self._stack)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        mapping = dict(attrs)
+        translated = "data-i18n" in mapping or "data-i18n-html" in mapping
+        self._stack.append((tag, translated))
+        if self._skip:
+            return
+        line = self.getpos()[0]
+        for attr, key in self.ATTR_KEYS.items():
+            value = mapping.get(attr) or ""
+            if ZH.search(value) and not mapping.get(key):
+                self.findings.append((line, value))
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if self._stack:
+            self._stack.pop()
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+        for i in range(len(self._stack) - 1, -1, -1):
+            if self._stack[i][0] == tag:
+                del self._stack[i:]
+                break
+
+    def handle_data(self, data):
+        if self._skip or self._translated:
+            return
+        if ZH.search(data):
+            self.findings.append((self.getpos()[0], data.strip()))
 
 
 def scan_html(path: Path) -> list[tuple[int, str]]:
-    text = path.read_text(encoding="utf-8")
-    text = re.sub(r"<!--.*?-->", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
-    text = re.sub(
-        r"<(script|style)\b[^>]*>.*?</\1>",
-        lambda m: "\n" * m.group(0).count("\n"),
-        text,
-        flags=re.S | re.I,
-    )
-    findings: list[tuple[int, str]] = []
-    for lineno, raw in enumerate(text.splitlines(), 1):
-        line = raw.strip()
-        if not line or not ZH.search(line):
-            continue
-        # Attribute values (title / aria-label / placeholder) are checked
-        # verbatim; text nodes are checked after removing the tags around them.
-        for attr in re.finditer(r"\b(?:title|aria-label|placeholder|alt)=\"([^\"]*)\"", line):
-            if ZH.search(attr.group(1)):
-                findings.append((lineno, attr.group(1)))
-        bare = HTML_TAG.sub(" ", line)
-        if ZH.search(bare):
-            findings.append((lineno, bare.strip()))
-    return findings
+    collector = _TextCollector()
+    collector.feed(path.read_text(encoding="utf-8"))
+    collector.close()
+    return [(line, text) for line, text in collector.findings if text]
 
 
 SCANNERS = {".py": scan_python, ".js": scan_js, ".html": scan_html}

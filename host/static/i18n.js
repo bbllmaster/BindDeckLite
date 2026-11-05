@@ -68,6 +68,9 @@
     return lang;
   }
 
+  // `data-i18n-html` is only used by the help page, whose paragraphs carry
+  // inline <code> markers. The markup comes from our own locale table, never
+  // from user input or a device line.
   const ATTRS = {
     "data-i18n-title": "title",
     "data-i18n-placeholder": "placeholder",
@@ -87,6 +90,10 @@
     node.querySelectorAll("[data-i18n]").forEach((el) => {
       const key = el.getAttribute("data-i18n");
       if (key) el.textContent = t(key);
+    });
+    node.querySelectorAll("[data-i18n-html]").forEach((el) => {
+      const key = el.getAttribute("data-i18n-html");
+      if (key) el.innerHTML = t(key);
     });
     Object.keys(ATTRS).forEach((dataAttr) => {
       node.querySelectorAll(`[${dataAttr}]`).forEach((el) => {
