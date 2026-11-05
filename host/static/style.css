@@ -931,6 +931,8 @@ input.short { width: 80px; }
 }
 .log-filter-label { color: var(--muted); font-size: var(--fs-cap); }
 .log-select { width: auto; min-width: 122px; min-height: 36px; }
+/* 「设备」下拉与标签只在设备并集 ≥ 2 时出现，其余情况保持原样。 */
+.log-select[hidden], .log-filter-label[hidden] { display: none; }
 .log-level-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .log-chip {
   min-height: 34px; padding: 6px 12px;
@@ -996,6 +998,17 @@ input.short { width: 80px; }
   overflow-anchor: none;
 }
 .log-row { display: grid; grid-template-columns: 62px 66px 1fr auto; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(36, 44, 61, 0.5); }
+/* 双设备及以上多一列设备名：时间 / 类型 / 设备 / 正文 / 复制。
+   设备列固定宽度，所有行对齐；名字超长省略，靠 title 看全文。 */
+.log.show-dev .log-row { grid-template-columns: 62px 66px 132px 1fr auto; }
+.log-dev {
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  padding-top: 1px;
+}
 /* 过滤隐藏的行不占高度；用 hidden 属性而不是移除节点，轮询追加与裁剪补偿不受影响。 */
 .log-row[hidden] { display: none; }
 .log-time { color: var(--muted); }
@@ -1040,6 +1053,14 @@ input.short { width: 80px; }
   .log-kind { grid-area: kind; }
   .log-copy { grid-area: copy; }
   .log-text { grid-area: text; }
+  /* 双设备时设备名挤进首行类型之后，正文仍独占第二行（不新增第三行）。 */
+  .log.show-dev .log-row {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "time kind dev copy"
+      "text text text text";
+  }
+  .log.show-dev .log-dev { grid-area: dev; }
   .log-search { flex-basis: 100%; }
 }
 
