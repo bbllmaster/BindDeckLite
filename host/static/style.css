@@ -1333,3 +1333,34 @@ body.modal-open .main { overflow: hidden; }
   .topbar-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; }
   .main { padding: var(--sp-4); }
 }
+
+/* ---------- online update (WS-523) ---------- */
+/* 检查更新弹窗：上位机更新 + 固件更新两块。 */
+.update-modal { width: min(680px, 100%); }
+.update-body { padding: var(--sp-4) var(--sp-5) var(--sp-6); }
+.update-block { margin-bottom: var(--sp-5); }
+.update-block:last-child { margin-bottom: 0; }
+.update-block h3 { margin-top: 0; }
+.update-state {
+  margin: var(--sp-2) 0 var(--sp-1);
+  font-size: var(--fs-sm); color: var(--text);
+}
+.update-state.ok { color: var(--ok); }
+.update-notes {
+  margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line); border-radius: var(--r-control);
+  background: var(--card-2);
+}
+.update-notes summary { cursor: pointer; color: var(--muted); font-size: var(--fs-cap); }
+.update-notes-body {
+  margin: var(--sp-2) 0 0; white-space: pre-wrap; word-break: break-word;
+  font-size: var(--fs-sm); line-height: 1.7; color: var(--text);
+  font-family: inherit;
+}
+.update-btn { position: relative; }
+.update-dot {
+  display: inline-block; width: 7px; height: 7px; margin-left: 6px;
+  border-radius: 50%; background: var(--danger);
+  vertical-align: middle;
+}
+.update-dot[hidden] { display: none; }

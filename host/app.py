@@ -46,6 +46,7 @@ from flask import Flask, jsonify, render_template, request
 
 import autostart
 import desktop
+import online_update
 from ble_link import BleLinkManager, scan_reason
 
 SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,7 +142,13 @@ _config = {"devices": {}, "settings": {
     "close_button_behavior": "minimize",
     "admin_autostart": False,
     "recent_paths": [],
-}}
+},
+    # WS-523: 在线更新状态。这三个键写在 config.json **顶层**（不放 settings），
+    # load_config() 会显式把它们读回来。
+    "skipped_version": "",     # 用户跳过的上位机版本
+    "last_update": {},         # {status, from, to, at, result, marker}
+    "update_fail_count": 0,    # 连续失败次数，>=2 暂停自动更新
+}
 
 # WS-359: a stuck action thread never reaches its ``finally``, so an entry kept
 # past this many seconds is force-released instead of breathing forever.
@@ -841,6 +848,9 @@ class OtaWindow:
         self.sent = 0              # enqueued to the BLE link
         self.acked = 0             # confirmed by the device
         self.status = "starting"   # starting -> uploading -> done -> error
+        # WS-523: 细分的推送阶段，供「固件在线更新」的五段进度展示使用
+        # （下载 → 校验 → 推送 → 设备重启 → 确认版本）。status 语义不变。
+        self.phase = "push"        # push -> restart -> confirm
         self.error = ""
         self._ack_line = ""
         self._cond = threading.Condition()
@@ -1009,6 +1019,10 @@ def load_config():
             _config = {
                 "devices": data.get("devices", {}) or {},
                 "settings": {**_config["settings"], **(data.get("settings", {}) or {})},
+                # WS-523: 在线更新状态在 config.json 顶层，读回来时保留。
+                "skipped_version": str(data.get("skipped_version", "") or ""),
+                "last_update": data.get("last_update", {}) or {},
+                "update_fail_count": int(data.get("update_fail_count", 0) or 0),
             }
             # WS-503: configs written before the 12-key layout carry 10 key
             # entries; repair them on load so an upgraded deck cannot get
@@ -3756,6 +3770,9 @@ def api_status():
         # WS-445: additive — the last runtime-health sample per device, so a
         # page reload (or a disconnect) keeps showing the real last values.
         "sysinfo": sysinfo_snapshot(),
+        # WS-523: additive — the host's own version, so the UI can show
+        # "current v1.4.2" next to the update check.
+        "app_version": _app_version_payload(),
     })
 
 
@@ -4353,6 +4370,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         # 3. CMD:OTA_END — device verifies size + SHA256, then Update.end()
         #    and reboots. The ACK may be lost to the reset, so a timeout here
         #    is not fatal; step 4 decides.
+        window.phase = "restart"
         if not ble.send(dev_id, "CMD:OTA_END"):
             _fail("连接中断，请重试")
             return
@@ -4384,6 +4402,7 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         # 4. Prove the deck actually came back on the image we pushed instead
         #    of trusting a BLE reconnect: compare the version / build stamp
         #    reported by VERSION: against the values captured before the push.
+        window.phase = "confirm"
         ok, note = _ota_wait_restart(dev_id, old_version, old_build,
                                      expected_version, OTA_VERIFY_TIMEOUT)
         if not ok:
@@ -4510,6 +4529,762 @@ def api_settings():
                 _config["settings"][k] = bool(data[k])
         save_config()
     return jsonify({"ok": True, "settings": _config["settings"]})
+
+
+# --- online update (WS-523) -------------------------------------------------
+# 上位机自更新（换 exe）+ 固件 OTA 在线检测/推送。逻辑与网络部分在
+# online_update.py，这里只做路由、状态与 UI 数据组装。
+_update_lock = threading.RLock()
+#: 上位机自更新任务：task id -> 进度 dict（phase / downloaded / total / …）
+_app_update_tasks: dict = {}
+#: 固件在线更新任务：dev_id -> 进度 dict（复用现有 OTA 进度接口的窗口）
+_fw_update_tasks: dict = {}
+
+#: 上位机更新任务的终态 —— 到了这些状态就不再算「有任务在跑」。
+_APP_UPDATE_DONE_PHASES = ("error", "restarting", "done")
+
+
+def _update_settings() -> dict:
+    """config.json 里的在线更新状态（顶层三个键）。"""
+    with _lock:
+        return {
+            "skipped_version": str(_config.get("skipped_version") or ""),
+            "last_update": dict(_config.get("last_update") or {}),
+            "update_fail_count": int(_config.get("update_fail_count") or 0),
+        }
+
+
+def _set_update_state(**fields):
+    """写在线更新状态并落盘。"""
+    with _lock:
+        for key, value in fields.items():
+            _config[key] = value
+        save_config()
+
+
+@app.route("/api/app/version")
+def api_app_version():
+    """上位机版本与可更新性信息（前端顶栏显示用）。"""
+    return jsonify({
+        "version": online_update.read_app_version(),
+        "build": online_update.read_app_build(),
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "executable": sys.executable if getattr(sys, "frozen", False) else "",
+        "update_fail_count": _update_settings()["update_fail_count"],
+    })
+
+
+def _app_version_payload() -> dict:
+    """上位机版本信息（``/api/status`` 与 ``/api/app/version`` 共用一份）。"""
+    frozen = bool(getattr(sys, "frozen", False))
+    return {
+        "version": online_update.read_app_version(),
+        "build": online_update.read_app_build(),
+        "frozen": frozen,
+        "executable": sys.executable if frozen else "",
+        "update_fail_count": _update_settings()["update_fail_count"],
+    }
+
+
+@app.route("/api/app/update/check")
+def api_app_update_check():
+    """检查上位机是否有新版本。
+
+    返回 ``{current, latest, has_update, notes, published_at, asset, …}``。
+    失败时返回可读的中文原因 + 可复制错误码 + Release 链接，不静默失败。
+    """
+    current = online_update.read_app_version()
+    state = _update_settings()
+    payload = {
+        "ok": True,
+        "current": current,
+        "latest": "",
+        "has_update": False,
+        "notes": "",
+        "published_at": "",
+        "asset": {"name": "", "size": 0, "sha256": ""},
+        "min_from_ok": True,
+        "skipped": False,
+        "source": "",
+        "release_url": online_update.RELEASE_PAGE_URL,
+        "error": "",
+        "error_code": "",
+    }
+    try:
+        info = online_update.resolve_latest_update()
+    except online_update.UpdateError as exc:
+        payload["ok"] = False
+        payload["error"] = exc.message
+        payload["error_code"] = exc.code
+        return jsonify(payload)
+
+    app_asset = info.get("app") or {}
+    payload["source"] = info.get("source", "")
+    payload["notes"] = info.get("notes", "")
+    payload["published_at"] = info.get("published_at", "")
+    payload["release_url"] = info.get("release_url", online_update.RELEASE_PAGE_URL)
+    if not app_asset:
+        payload["ok"] = False
+        payload["error"] = "该发布版本没有可用的上位机安装包，请手动下载"
+        payload["error_code"] = "E_NO_APP_ASSET"
+        return jsonify(payload)
+
+    latest = app_asset["version"]
+    payload["latest"] = latest
+    payload["asset"] = {
+        "name": app_asset["asset"],
+        "size": app_asset.get("size", 0),
+        "sha256": app_asset.get("sha256", ""),
+    }
+
+    # 有新版本时才检查「能不能升」—— 没有新版本就没有「不能升」这回事，
+    # 也不该拿 SHA256/资产缺失去打扰已经是最新的用户。
+    if online_update.version_is_newer(latest, current):
+        # min_from：低于它的版本不能直接自动升级（需要先手动升到中间版本）。
+        min_from = app_asset.get("min_from") or ""
+        if not online_update.version_at_least(current, min_from):
+            payload["min_from_ok"] = False
+            payload["ok"] = False
+            payload["error"] = ("当前版本 %s 不能直接升级到 %s，请先手动升级到 %s 或更高版本"
+                                % (current, latest, min_from))
+            payload["error_code"] = "E_MIN_FROM"
+            return jsonify(payload)
+
+        # 没有 SHA256 就不自动更新 —— 强制校验是硬性要求。
+        if not app_asset.get("sha256"):
+            payload["ok"] = False
+            payload["error"] = "该版本没有提供 SHA256 校验值，不能自动更新，请手动下载"
+            payload["error_code"] = "E_NO_SHA256"
+            return jsonify(payload)
+
+        # 清单里的资产必须真的在这次 Release 里（否则 apply 才会以 E_NO_URL 失败）。
+        if not app_asset.get("url"):
+            payload["ok"] = False
+            payload["error"] = ("该发布版本的安装包（%s）没有随 Release 上传，请手动下载"
+                                % app_asset.get("asset", ""))
+            payload["error_code"] = "E_NO_APP_ASSET"
+            return jsonify(payload)
+
+    if online_update.should_skip_version(current, latest, state["skipped_version"]):
+        payload["skipped"] = True
+        payload["error"] = "已跳过版本 %s（如需恢复请重新检查更新）" % latest
+        payload["error_code"] = "E_SKIPPED"
+        return jsonify(payload)
+
+    payload["has_update"] = online_update.version_is_newer(latest, current)
+    return jsonify(payload)
+
+
+@app.route("/api/app/update/apply", methods=["POST"])
+def api_app_update_apply():
+    """下载新版本并安排原地替换 + 重启。
+
+    立即返回 ``{task}``；进度轮询 ``/api/app/update/progress?task=``。
+    """
+    with _update_lock:
+        # 只有还在跑的任务才算「占用」—— 上一轮失败/结束的任务不该挡住下一次。
+        running = [t for t in _app_update_tasks.values()
+                   if t.get("phase") not in _APP_UPDATE_DONE_PHASES]
+        if running:
+            return jsonify({"ok": False, "error": "已有更新任务在运行"}), 409
+        # 清掉已结束的任务，dict 不会无限增长。
+        for task_id in [k for k, v in _app_update_tasks.items()
+                        if v.get("phase") in _APP_UPDATE_DONE_PHASES]:
+            _app_update_tasks.pop(task_id, None)
+
+    try:
+        info = online_update.resolve_latest_update()
+    except online_update.UpdateError as exc:
+        return jsonify({"ok": False, "error": exc.message, "error_code": exc.code,
+                        "release_url": online_update.RELEASE_PAGE_URL}), 503
+
+    release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
+    app_asset = info.get("app") or {}
+    if not app_asset:
+        return jsonify({"ok": False, "error": "该发布版本没有可用的上位机安装包",
+                        "error_code": "E_NO_APP_ASSET",
+                        "release_url": release_url}), 409
+    if not app_asset.get("sha256"):
+        return jsonify({"ok": False, "error": "该版本没有提供 SHA256 校验值，不能自动更新",
+                        "error_code": "E_NO_SHA256", "release_url": release_url}), 409
+    if not app_asset.get("url"):
+        return jsonify({"ok": False,
+                        "error": ("该发布版本的安装包（%s）没有随 Release 上传，请手动下载"
+                                  % app_asset.get("asset", "")),
+                        "error_code": "E_NO_APP_ASSET", "release_url": release_url}), 409
+
+    current = online_update.read_app_version()
+    latest = app_asset["version"]
+    state = _update_settings()
+    if online_update.should_skip_version(current, latest, state["skipped_version"]):
+        return jsonify({"ok": False, "error": "已跳过版本 %s" % latest,
+                        "error_code": "E_SKIPPED", "release_url": release_url}), 409
+    if not online_update.version_is_newer(latest, current):
+        return jsonify({"ok": False, "error": "已是最新（%s）" % current,
+                        "release_url": release_url}), 409
+    # min_from 与 check 阶段同一把尺：check 说不能升，apply 也不能升。
+    min_from = app_asset.get("min_from") or ""
+    if not online_update.version_at_least(current, min_from):
+        return jsonify({"ok": False,
+                        "error": ("当前版本 %s 不能直接升级到 %s，请先手动升级到 %s 或更高版本"
+                                  % (current, latest, min_from)),
+                        "error_code": "E_MIN_FROM", "release_url": release_url}), 409
+    # 回滚失败计数只拦「同一个失败版本」：出现更高版本时放行并重新计数，
+    # 否则 apply 把自己挡死 → 在线更新永久失效。
+    fail_count = state["update_fail_count"]
+    last_update = state.get("last_update") or {}
+    failed_version = (str(last_update.get("to") or "")
+                      if last_update.get("result") == "rollback" else "")
+    if fail_count >= online_update.UPDATE_FAIL_LIMIT:
+        if failed_version and online_update.version_is_newer(latest, failed_version):
+            _set_update_state(update_fail_count=0)
+        else:
+            return jsonify({"ok": False,
+                            "error": ("上次更新到 %s 连续失败 %d 次，已暂停自动更新，"
+                                      "请手动下载新版本"
+                                      % (failed_version or latest, fail_count)),
+                            "error_code": "E_UPDATE_PAUSED",
+                            "release_url": release_url}), 409
+
+    # 退出上位机会断 BLE —— 设备正在 OTA 时绝不能重启上位机。
+    busy = _ota_busy_reason()
+    if busy:
+        return jsonify({"ok": False, "error": busy, "error_code": "E_OTA_BUSY",
+                        "release_url": release_url}), 409
+
+    target_dir = _update_target_dir()
+    if not target_dir:
+        return jsonify({"ok": False,
+                        "error": "找不到当前程序目录，无法自动替换，请手动下载",
+                        "error_code": "E_NO_TARGET", "release_url": release_url}), 409
+    if not online_update.is_writable_dir(target_dir):
+        # 不破坏原 exe：明确提示手动下载，并给出 Release 链接。
+        return jsonify({"ok": False,
+                        "error": ("当前目录不可写（可能安装在 Program Files，需要管理员权限），"
+                                  "请手动下载新版本"),
+                        "error_code": "E_DIR_RO",
+                        "release_url": release_url}), 409
+
+    task_id = "app-%d" % int(time.time() * 1000)
+    with _update_lock:
+        _app_update_tasks[task_id] = {
+            "phase": "starting", "downloaded": 0, "total": 0, "percent": 0,
+            "error": "", "error_code": "",
+        }
+    threading.Thread(target=_app_update_worker,
+                     args=(task_id, info, app_asset, current),
+                     daemon=True, name="app-update").start()
+    return jsonify({"ok": True, "task": task_id, "version": latest})
+
+
+def _app_update_worker(task_id, info, app_asset, current):
+    """后台：下载 → 校验 → 落状态 → 替换 → 重启。"""
+    def _phase(phase, **fields):
+        with _update_lock:
+            task = _app_update_tasks.get(task_id)
+            if task is None:
+                return
+            task.update(fields)
+            task["phase"] = phase
+
+    try:
+        version = app_asset["version"]
+        dest_dir = online_update.update_dir(version)
+        final_path = os.path.join(dest_dir, app_asset["asset"])
+
+        _phase("downloading", total=app_asset.get("size", 0))
+        def _progress(done, total):
+            with _update_lock:
+                task = _app_update_tasks.get(task_id)
+                if task is None:
+                    return
+                task["downloaded"] = done
+                task["total"] = total or task.get("total", 0)
+                if task["total"]:
+                    task["percent"] = min(100, int(done * 100 / task["total"]))
+
+        # 边下边算 SHA256：校验时不用把文件再读一遍。
+        hasher = hashlib.sha256()
+        part_path = online_update.download_to_file(
+            app_asset.get("url", ""), dest_dir, app_asset["asset"],
+            progress=_progress, expected_size=app_asset.get("size", 0),
+            hasher=hasher)
+        _phase("verifying")
+        error = online_update.finalize_download(part_path, final_path,
+                                                app_asset.get("sha256", ""),
+                                                app_asset.get("size", 0),
+                                                digest=hasher.hexdigest())
+        if error:
+            _phase("error", error=error, error_code="E_SHA256")
+            return
+
+        # 先落盘状态：新版本启动后据此写 last_update；失败回滚也能记结果。
+        marker = os.path.join(dest_dir, "updated.marker")
+        _set_update_state(last_update={
+            "status": "pending",
+            "from": current,
+            "to": version,
+            "at": time.time(),
+            "marker": marker,
+        })
+
+        _phase("installing")
+        exe_path = _current_exe_path()
+        backup_path = exe_path + ".bak"
+        script_path = os.path.join(dest_dir, "update.bat")
+        script = online_update.build_update_script(exe_path, final_path, backup_path,
+                                                   marker, os.getpid())
+        # 上一次失败留下的 marker 会让脚本 ``if exist "%MARKER%"`` 立刻判成功、
+        # 跳过回滚等待 —— 生成脚本前先清掉。
+        try:
+            online_update.stage_update_script(script_path, script, marker)
+        except online_update.UpdateError as exc:
+            _phase("error", error=exc.message, error_code=exc.code)
+            return
+        if not online_update.launch_update_script(script_path):
+            _phase("error", error="无法启动更新脚本，请手动下载新版本",
+                   error_code="E_LAUNCH")
+            return
+
+        # 退出上位机：脚本等本进程退出后才替换 exe。
+        _phase("restarting")
+        add_event("update", "上位机正在更新到 %s，程序即将重启" % version, level="ok")
+        time.sleep(0.6)
+        _quit_for_update()
+        # 进程通常在 _quit_for_update() 里就退出了；走到这里说明退出被拒，
+        # 记终态，别让任务永远占着「已有更新任务在运行」。
+        _phase("done")
+    except online_update.UpdateError as exc:
+        _phase("error", error=exc.message, error_code=exc.code)
+    except Exception as exc:  # noqa: BLE001
+        _phase("error", error="更新失败：%s" % (exc,), error_code="E_INTERNAL")
+
+
+def _quit_for_update():
+    """退出上位机，让更新脚本接管 exe 替换。
+
+    先走既有的优雅退出路径（``_exit_for_restart``：关窗口、停托盘、收服务器），
+    让 BLE 与托盘正常清理；只有在它没能真正结束进程时才强制退出 ——
+    更新脚本在等本进程退出，不退出 exe 就替换不了。
+    """
+    try:
+        _exit_for_restart()
+    except Exception:  # noqa: BLE001
+        pass
+    # 给优雅退出留一点时间（0.4 s 的响应缓冲 + 清理）。
+    for _ in range(30):
+        time.sleep(0.1)
+        if not _process_alive():
+            return
+    # 还没退出：强制结束。更新必须真的把 exe 换掉。
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    os._exit(0)
+
+
+def _process_alive() -> bool:
+    """宿主是否还在正常跑（更新脚本在等本进程退出）。
+
+    不能用 ``os.kill(getpid(), 0)``：那问的是「信号能否送到本进程」，
+    自己给自己发信号永远成功，恒为真 —— 于是这段等待永远白等 3 秒，
+    然后直接 ``os._exit(0)``。真正能问的是：主线程结束、且没有别的非
+    daemon 线程拖住进程时，解释器就会自行退出。
+    """
+    if threading.main_thread().is_alive():
+        return True
+    for thread in threading.enumerate():
+        if thread is threading.current_thread():
+            continue
+        if not thread.daemon:
+            return True
+    return False
+
+
+def _current_exe_path() -> str:
+    """当前运行的 exe 路径（未打包时返回空串）。"""
+    if not getattr(sys, "frozen", False):
+        return ""
+    return os.path.abspath(sys.executable)
+
+
+def _update_target_dir() -> str:
+    """exe 所在目录（替换目标）；未打包时返回空串。"""
+    exe = _current_exe_path()
+    return os.path.dirname(exe) if exe else ""
+
+
+def _ota_busy_reason() -> str:
+    """有 OTA 在跑时返回原因，空串表示空闲。
+
+    上位机更新要退出进程 → 会断 BLE；设备正在升级时绝不能重启上位机。
+
+    两种判据都要看：
+
+    * ``_ota_windows`` 里还有 ``starting`` / ``uploading`` 的窗口 → 推送在跑；
+    * ``_ota_lock`` 被**别的线程**占着 → 推送线程正在临界区里。
+
+    锁必须用非阻塞方式试取：RLock 对同一线程可重入，阻塞取锁会把「忙」
+    变成「卡住」。
+    """
+    if not _ota_lock.acquire(blocking=False):
+        return "设备正在升级，完成后再更新上位机"
+    try:
+        for window in _ota_windows.values():
+            if window.status in ("starting", "uploading"):
+                return "设备正在升级，完成后再更新上位机"
+    finally:
+        _ota_lock.release()
+    return ""
+
+
+def _update_after_start():
+    """启动后处理上次自更新的结果（WS-523）。
+
+    * 首次启动的是**新版本**（当前版本 == last_update.to）→ 写标记文件，
+      更新脚本看到它就确认成功；同时把 last_update.result 记为 ok。
+    * 首次启动的是**旧版本**（更新脚本回滚了 .bak）→ 结果记为 rollback，
+      连续失败计数 +1；连续失败 >= 2 次后暂停自动更新。
+    """
+    state = _update_settings()
+    last = state["last_update"]
+    if not last or last.get("status") != "pending":
+        return
+    current = online_update.read_app_version()
+    target = str(last.get("to") or "")
+    marker = str(last.get("marker") or "")
+    if target and online_update.version_tuple(current) == online_update.version_tuple(target):
+        if marker:
+            try:
+                with open(marker, "w", encoding="utf-8") as handle:
+                    handle.write(current)
+            except OSError:
+                pass
+        # 成功一次就把失败计数清零 —— 否则「失败两次 → 暂停」会永远停着。
+        _set_update_state(last_update={**last, "status": "done", "result": "ok",
+                                        "finished_at": time.time()},
+                          update_fail_count=0)
+        add_event("update", "上位机已更新到 %s" % current, level="ok")
+        return
+    # 回到旧版本 = 更新脚本回滚了。
+    fail_count = state["update_fail_count"] + 1
+    _set_update_state(last_update={**last, "status": "done", "result": "rollback",
+                                    "finished_at": time.time()},
+                      update_fail_count=fail_count)
+    if fail_count >= online_update.UPDATE_FAIL_LIMIT:
+        add_event("update", "上位机更新未成功（已连续失败 %d 次），已暂停自动更新"
+                  % fail_count, level="warn")
+    else:
+        add_event("update", "上位机更新未成功，已回滚到原版本", level="warn")
+
+
+@app.route("/api/app/update/progress")
+def api_app_update_progress():
+    task_id = request.args.get("task") or ""
+    with _update_lock:
+        task = _app_update_tasks.get(task_id)
+        if task is None:
+            return jsonify({"ok": False, "error": "无更新任务"}), 404
+        payload = dict(task)
+    payload["ok"] = True
+    return jsonify(payload)
+
+
+@app.route("/api/app/update/skip", methods=["POST"])
+def api_app_update_skip():
+    """跳过某个版本（写 config.json 的 skipped_version）。"""
+    data = request.get_json(silent=True) or {}
+    version = str(data.get("version") or "").strip()
+    if not version:
+        return jsonify({"ok": False, "error": "缺少版本号"}), 400
+    _set_update_state(skipped_version=version)
+    return jsonify({"ok": True, "skipped_version": version})
+
+
+@app.route("/api/app/update/cancel", methods=["POST"])
+def api_app_update_cancel():
+    """取消进行中的上位机更新（仅在下载阶段有效）。"""
+    with _update_lock:
+        if not _app_update_tasks:
+            return jsonify({"ok": False, "error": "无更新任务"}), 404
+        for task in _app_update_tasks.values():
+            task["cancelled"] = True
+        _app_update_tasks.clear()
+    return jsonify({"ok": True})
+
+
+# --- firmware online update (WS-523) ---------------------------------------
+
+@app.route("/api/firmware/update/check")
+def api_firmware_update_check():
+    """检查某个设备的在线固件版本。
+
+    返回 ``{device_variant, current, latest, has_update, asset, notes, reason}``。
+    """
+    dev_id = request.args.get("dev_id") or ""
+    if not dev_id:
+        return jsonify({"ok": False, "error": "缺少 dev_id"}), 400
+
+    with _lock:
+        cfg = _config["devices"].get(dev_id) or {}
+    fw = cfg.get("fw") or {}
+    current = str(fw.get("version") or "")
+    chip = str(fw.get("chip") or cfg.get("chip") or "")
+    flash = fw.get("flash", 0)
+
+    payload = {
+        "ok": True,
+        "dev_id": dev_id,
+        "device_variant": "",
+        "current": current,
+        "latest": "",
+        "has_update": False,
+        "asset": {"name": "", "size": 0, "sha256": ""},
+        "notes": "",
+        "published_at": "",
+        "release_url": online_update.RELEASE_PAGE_URL,
+        "reason": "",
+    }
+
+    # 型号判定必须同时看 chip 与 flash —— 只看 flash 会把经典 ESP32 误判成 C3。
+    variant = online_update.variant_for_device(chip, flash)
+    if not variant:
+        payload["reason"] = "该型号暂无在线固件，请到发布页手动下载"
+        payload["reason_code"] = "E_NO_VARIANT"
+        return jsonify(payload)
+    payload["device_variant"] = variant
+
+    try:
+        info = online_update.resolve_latest_update()
+    except online_update.UpdateError as exc:
+        payload["ok"] = False
+        payload["reason"] = exc.message
+        payload["reason_code"] = exc.code
+        payload["release_url"] = online_update.RELEASE_PAGE_URL
+        return jsonify(payload)
+
+    payload["notes"] = info.get("notes", "")
+    payload["published_at"] = info.get("published_at", "")
+    payload["release_url"] = info.get("release_url", online_update.RELEASE_PAGE_URL)
+
+    entry = (info.get("firmware") or {}).get(variant)
+    if not entry:
+        payload["reason"] = "该型号暂无在线固件，请到发布页手动下载"
+        payload["reason_code"] = "E_NO_VARIANT"
+        return jsonify(payload)
+
+    payload["latest"] = entry["version"]
+    payload["asset"] = {
+        "name": entry["asset"],
+        "size": entry.get("size", 0),
+        "sha256": entry.get("sha256", ""),
+    }
+    if not entry.get("sha256"):
+        payload["reason"] = "该固件没有提供 SHA256 校验值，不能自动升级，请手动下载"
+        payload["reason_code"] = "E_NO_SHA256"
+        return jsonify(payload)
+    # 清单里的固件必须真的在这次 Release 里 —— 否则 apply 才会以
+    # E_NO_URL 失败，用户白等一次下载。
+    if not entry.get("url"):
+        payload["reason"] = ("该固件文件（%s）没有随本次发布上传，请手动下载"
+                             % entry.get("asset", ""))
+        payload["reason_code"] = "E_NO_FW_ASSET"
+        return jsonify(payload)
+
+    # 远端 ≤ 当前 → 已是最新，不提供更新（也不做降级/重装）。
+    payload["has_update"] = online_update.version_is_newer(entry["version"], current)
+    return jsonify(payload)
+
+
+@app.route("/api/firmware/update/apply", methods=["POST"])
+def api_firmware_update_apply():
+    """下载在线固件并推送给设备（复用现有 OTA 通道与进度接口）。"""
+    data = request.get_json(silent=True) or {}
+    dev_id = str(data.get("dev_id") or "")
+    if not dev_id:
+        return jsonify({"ok": False, "error": "缺少 dev_id"}), 400
+
+    busy = _ota_busy_reason()
+    if busy:
+        return jsonify({"ok": False, "error": busy, "error_code": "E_OTA_BUSY"}), 409
+
+    with _lock:
+        cfg = _config["devices"].get(dev_id) or {}
+    fw = cfg.get("fw") or {}
+    chip = str(fw.get("chip") or cfg.get("chip") or "")
+    flash = fw.get("flash", 0)
+    variant = online_update.variant_for_device(chip, flash)
+    if not variant:
+        return jsonify({"ok": False, "error": "该型号暂无在线固件，请到发布页手动下载",
+                        "error_code": "E_NO_VARIANT"}), 400
+
+    try:
+        info = online_update.resolve_latest_update()
+    except online_update.UpdateError as exc:
+        return jsonify({"ok": False, "error": exc.message, "error_code": exc.code,
+                        "release_url": online_update.RELEASE_PAGE_URL}), 503
+
+    release_url = info.get("release_url", online_update.RELEASE_PAGE_URL)
+    entry = (info.get("firmware") or {}).get(variant)
+    if not entry or not entry.get("sha256"):
+        return jsonify({"ok": False, "error": "该型号暂无在线固件，请到发布页手动下载",
+                        "error_code": "E_NO_VARIANT", "release_url": release_url}), 409
+    if not entry.get("url"):
+        return jsonify({"ok": False,
+                        "error": ("该固件文件（%s）没有随本次发布上传，请手动下载"
+                                  % entry.get("asset", "")),
+                        "error_code": "E_NO_FW_ASSET", "release_url": release_url}), 409
+    if not online_update.version_is_newer(entry["version"], fw.get("version", "")):
+        return jsonify({"ok": False, "error": "已是最新（%s）" % (fw.get("version") or ""),
+                        "release_url": release_url}), 409
+
+    # 只接受 ota_*.bin（app-only），复用现有校验。
+    name_err = _ota_validate(entry["asset"])
+    if name_err:
+        return jsonify({"ok": False, "error": name_err, "error_code": "E_BAD_ASSET",
+                        "release_url": release_url}), 400
+
+    # 设备必须在线：否则整包下载完才发现推不上去，白等几分钟。
+    if not _ota_is_connected(dev_id):
+        return jsonify({"ok": False, "error": "设备未连接，请先连接设备再升级固件",
+                        "error_code": "E_NOT_CONNECTED", "release_url": release_url}), 409
+
+    with _update_lock:
+        _fw_update_tasks[dev_id] = {"phase": "starting", "downloaded": 0,
+                                     "total": entry.get("size", 0), "percent": 0,
+                                     "error": "", "error_code": ""}
+    threading.Thread(target=_fw_update_worker,
+                     args=(dev_id, variant, entry, fw),
+                     daemon=True, name="fw-update-%s" % dev_id).start()
+    return jsonify({"ok": True, "task": dev_id, "version": entry["version"],
+                    "asset": entry["asset"]})
+
+
+def _fw_update_worker(dev_id, variant, entry, fw):
+    """后台：下载固件 → 校验 → 走现有 OTA 推送通道。"""
+
+    def _phase(phase, **fields):
+        with _update_lock:
+            task = _fw_update_tasks.get(dev_id)
+            if task is None:
+                return
+            task.update(fields)
+            task["phase"] = phase
+
+    try:
+        dest_dir = online_update.update_dir("fw-" + variant)
+        final_path = os.path.join(dest_dir, entry["asset"])
+        _phase("downloading", total=entry.get("size", 0))
+
+        def _progress(done, total):
+            with _update_lock:
+                task = _fw_update_tasks.get(dev_id)
+                if task is None:
+                    return
+                task["downloaded"] = done
+                task["total"] = total or task.get("total", 0)
+                if task["total"]:
+                    task["percent"] = min(100, int(done * 100 / task["total"]))
+
+        hasher = hashlib.sha256()
+        part_path = online_update.download_to_file(
+            entry.get("url", ""), dest_dir, entry["asset"],
+            progress=_progress, expected_size=entry.get("size", 0),
+            hasher=hasher)
+        _phase("verifying")
+        error = online_update.finalize_download(part_path, final_path,
+                                                entry.get("sha256", ""),
+                                                entry.get("size", 0),
+                                                digest=hasher.hexdigest())
+        if error:
+            _phase("error", error=error, error_code="E_SHA256")
+            return
+
+        with open(final_path, "rb") as handle:
+            file_data = handle.read()
+        if not file_data:
+            _phase("error", error="固件文件为空", error_code="E_EMPTY")
+            return
+
+        # 推送前必须校验镜像能装进本设备的 OTA 槽（复用现有逻辑）。
+        slot_cap = _ota_slot_cap(fw)
+        if slot_cap <= 0:
+            _phase("error", error="本机型不支持上位机 OTA（2 MB 模块无 app1 分区）",
+                   error_code="E_NO_SLOT")
+            return
+        img_err = _ota_validate_image(file_data, slot_cap)
+        if img_err:
+            _phase("error", error=img_err, error_code="E_BAD_IMAGE")
+            return
+
+        _phase("pushing")
+        sha_hex = hashlib.sha256(file_data).hexdigest()
+        version = online_update.version_from_asset_name(entry["asset"])
+        old = _ota_current_fw(dev_id)
+        with _ota_lock:
+            existing = _ota_windows.get(dev_id)
+            if existing is not None and existing.status in ("starting", "uploading"):
+                _phase("error", error="该设备正在 OTA 中，请勿重复提交",
+                       error_code="E_OTA_BUSY")
+                return
+        window = _ota_push(dev_id, entry["asset"], file_data, sha_hex, version,
+                           old_version=old["version"], old_build=old["build"])
+        _phase("pushing", ota_window=True)
+        # 推送结束后由现有 /api/ota/<dev_id>/progress 报告结果；这里等它收尾。
+        deadline = time.monotonic() + OTA_VERIFY_TIMEOUT + 60.0
+        while time.monotonic() < deadline:
+            with _ota_lock:
+                live = _ota_windows.get(dev_id)
+                if live is None or live.status in ("done", "error", "cancelled"):
+                    break
+            time.sleep(0.5)
+        with _ota_lock:
+            live = _ota_windows.get(dev_id)
+            if live is not None and live.status == "error":
+                _phase("error", error=live.error, error_code="E_OTA")
+            else:
+                _phase("done")
+    except online_update.UpdateError as exc:
+        _phase("error", error=exc.message, error_code=exc.code)
+    except Exception as exc:  # noqa: BLE001
+        _phase("error", error="固件升级失败：%s" % (exc,), error_code="E_INTERNAL")
+
+
+@app.route("/api/firmware/update/progress")
+def api_firmware_update_progress():
+    """固件在线更新的五段进度（下载 → 校验 → 推送 → 重启 → 确认版本）。"""
+    dev_id = request.args.get("dev_id") or ""
+    with _update_lock:
+        task = _fw_update_tasks.get(dev_id)
+        if task is None:
+            return jsonify({"ok": False, "error": "无固件更新任务"}), 404
+        payload = dict(task)
+    payload["ok"] = True
+    # 推送阶段借用现有 OTA 窗口的进度（ack 百分比）。
+    # 只有本任务自己推上去的窗口才作数（ota_window 标记）——_ota_windows
+    # 里可能还留着上一次手动 OTA 的窗口，借它的百分比会把下载进度冲成 100%。
+    if payload.get("ota_window"):
+        with _ota_lock:
+            window = _ota_windows.get(dev_id)
+        if window is not None:
+            payload["percent"] = window.percent()
+            payload["ota_status"] = window.status
+            # 终态（done/error）由任务自己决定：OTA 窗口的 phase 最后停在
+            # "confirm"，无条件覆盖会让 done/error 永远到不了前端。
+            if payload.get("phase") not in ("done", "error"):
+                if window.status in ("starting", "uploading"):
+                    payload["phase"] = window.phase
+                elif window.status == "error":
+                    payload["phase"] = "error"
+                    payload["error"] = window.error
+                    payload["error_code"] = "E_OTA"
+                elif window.status == "done":
+                    payload["phase"] = "done"
+            if window.error and not payload.get("error"):
+                payload["error"] = window.error
+    return jsonify(payload)
 
 
 # --- desktop / shell integration -----------------------------------------
@@ -4824,6 +5599,7 @@ def main(argv=None):
         return 1
 
     load_config()
+    _update_after_start()
     started = ble.start()
     if not started:
         add_event("error", "BLE 不可用: " + str(ble.error), level="warn")

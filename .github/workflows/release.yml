@@ -62,6 +62,11 @@ jobs:
   host:
     name: release / host-exe
     runs-on: windows-latest
+    outputs:
+      # The app version baked into the exe. The publish job reuses it verbatim
+      # so update.json.app.version and the exe can never disagree.
+      version: ${{ steps.version.outputs.VERSION }}
+      prerelease: ${{ steps.version.outputs.PRERELEASE }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -76,6 +81,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r host/requirements.txt
           python -m pip install -r host/requirements-build.txt
+
+      # The version must be in host/_version.py BEFORE PyInstaller runs, so the
+      # exe carries it. The same value is exported to the publish job, so
+      # update.json.app.version and the exe can never disagree.
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          python tools/release_version.py --ref "$GITHUB_REF" --sha "$GITHUB_SHA" \
+            --write-version-file host/_version.py --build "$GITHUB_SHA" \
+            | tee -a "$GITHUB_OUTPUT"
 
       - name: Build Windows exe
         working-directory: host
@@ -99,8 +115,15 @@ jobs:
           if (-not $ok) { throw "exe did not serve /api/desktop" }
           $body = $r.Content | ConvertFrom-Json
           if (-not $body.frozen) { throw "exe did not report frozen=true" }
+          # The version baked into the exe must be the one the release
+          # publishes - otherwise the app would never see its own update.
+          $v = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8799/api/app/version -TimeoutSec 2
+          $ver = ($v.Content | ConvertFrom-Json).version
+          if ($ver -ne "${{ steps.version.outputs.VERSION }}") {
+            throw "exe version '$ver' != release version '${{ steps.version.outputs.VERSION }}'"
+          }
           taskkill /PID $p.Id /T /F
-          Write-Host "smoke test ok"
+          Write-Host "smoke test ok (version $ver)"
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
@@ -117,6 +140,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -130,27 +156,62 @@ jobs:
           sha256sum *.bin BindDeckLite.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # Release body + manifest notes must carry the "本次更新" section
+      # (WS-523 验收 11). A release without it is an unfinished release, so
+      # this step fails the job BEFORE any Release is created.
+      - name: Resolve release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="main-$(date -u +%Y%m%d-%H%M)"
+          fi
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          python tools/release_notes.py --tag "${TAG}" --out RELEASE_NOTES_BODY.md
+
+      - name: Build update.json manifest
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.host.outputs.version }}
+        run: |
+          set -euo pipefail
+          python tools/build_manifest.py \
+            --assets artifacts \
+            --app-version "${APP_VERSION}" \
+            --notes-file RELEASE_NOTES_BODY.md \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --out artifacts/update.json
+          cat artifacts/update.json
+
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ needs.host.outputs.version }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          FILES=(artifacts/*.bin artifacts/BindDeckLite.exe artifacts/SHA256SUMS.txt)
+          FILES=(artifacts/*.bin artifacts/BindDeckLite.exe artifacts/update.json artifacts/SHA256SUMS.txt)
 
           # Tag push -> formal release on that tag; main push -> rolling
           # pre-release tagged main-<utc> (never collides, recreated per run).
+          # The prerelease flag comes from the host job, so the exe version and
+          # the channel can never disagree.
+          TAG="${{ steps.notes.outputs.TAG }}"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
             EXTRA=()
             TITLE="BindDeckLite ${TAG}"
             CHANNEL="正式发布"
           else
-            TAG="main-$(date -u +%Y%m%d-%H%M)"
             EXTRA=(--prerelease)
             TITLE="BindDeckLite main (rolling)"
             CHANNEL="滚动预发布 (pre-release)"
+          fi
+          if [[ "${{ needs.host.outputs.prerelease }}" == "true" ]]; then
+            EXTRA+=(--prerelease)
           fi
 
           {
@@ -158,6 +219,10 @@ jobs:
             echo
             echo "${CHANNEL} of the BindDeckLite firmware (merged + app-only OTA"
             echo "images) and the Windows host executable."
+            echo
+            # The "本次更新" section is mandatory (WS-523 验收 11); its content
+            # is identical to update.json.notes.
+            cat RELEASE_NOTES_BODY.md
             echo
             echo "## SHA256"
             echo
@@ -168,12 +233,17 @@ jobs:
             echo "- Firmware: merged images flash whole-chip from 0x0; ota_ images are"
             echo "  app-only for the config-mode OTA page."
             echo "- Host: BindDeckLite.exe - single-file Windows executable (Flask + BLE)."
+            echo "- 版本清单 update.json 随本次发布一同上传，上位机据此在线更新。"
             echo
             echo "Board-specific flashing notes and the full version manifest live in the"
             echo "[WS-279](https://github.com/bbllmaster/BindDeckLite) release tracker."
             echo
             echo "Full checksum list: SHA256SUMS.txt (attached to this release)."
           } > RELEASE_NOTES.md
+
+          # The release body must carry the mandatory section.
+          grep -q "^## 本次更新" RELEASE_NOTES.md \
+            || { echo "release body has no '## 本次更新' section"; exit 1; }
 
           gh release create "${TAG}" \
             --repo bbllmaster/BindDeckLite \

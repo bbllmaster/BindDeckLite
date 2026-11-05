@@ -119,14 +119,24 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     // 后端 400 会带 {ok:false,error:"按键 3 不能为空"}，把它显示出来，
     // 别再让用户只看到 "400 BAD REQUEST"。
-    let detail = "";
+    let body = null;
     try {
-      const body = await res.json();
-      if (body && body.error) detail = body.error;
+      body = await res.json();
     } catch (_) {
       /* 不是 JSON：退回状态码文案 */
     }
-    throw new Error(detail || `${res.status} ${res.statusText}`);
+    const detail = (body && (body.error || body.reason)) || "";
+    const code = (body && (body.error_code || body.reason_code)) || "";
+    const url = (body && body.release_url) || "";
+    // 错误码要一起给用户：只报一句「更新失败」的话，用户没法反馈。
+    // 完整报文挂在 err.payload 上，需要 Release 链接的界面自己取。
+    let text = detail || `${res.status} ${res.statusText}`;
+    if (code) text += `（错误码：${code}）`;
+    const err = new Error(text);
+    err.payload = body || null;
+    err.error_code = code;
+    err.release_url = url;
+    throw err;
   }
   return res.json();
 }
@@ -2535,7 +2545,8 @@ function bindApplyResults() {
     // 兜底：即使帮助浮层的监听没有阻止冒泡，也不连带关掉结果浮层。
     const help = $("#helpModal");
     const ota = $("#otaModal");
-    if ((help && !help.hidden) || (ota && !ota.hidden)) return;
+    const update = $("#updateModal");
+    if ((help && !help.hidden) || (ota && !ota.hidden) || (update && !update.hidden)) return;
     clearApplyResults();
   });
 }
@@ -2562,6 +2573,7 @@ async function init() {
   bindHelp();
   bindApplyResults();
   bindOtaWizard();
+  bindUpdate();
   bindKeyDrawer();
   bindLogFilters();
   bindLogFollow();
@@ -3130,8 +3142,9 @@ async function handleOtaFile(file) {
 function syncModalOpenClass() {
   const help = $("#helpModal");
   const ota = $("#otaModal");
+  const update = $("#updateModal");
   document.body.classList.toggle("modal-open",
-    !!((help && !help.hidden) || (ota && !ota.hidden)));
+    !!((help && !help.hidden) || (ota && !ota.hidden) || (update && !update.hidden)));
 }
 
 function closeOtaWizard() {
@@ -3321,6 +3334,445 @@ async function cancelOta() {
     return;
   }
   resetOta();
+}
+
+/* ================= 在线更新（WS-523） =================
+ * 上位机自更新（换 exe）+ 固件 OTA 在线检测/推送。
+ * 失败提示一律带中文原因；错误码与 Release 链接在弹窗里可复制。
+ */
+
+const updateState = {
+  app: null,        // /api/app/update/check 的结果
+  appTask: null,    // 上位机更新任务 id
+  fw: null,         // /api/firmware/update/check 的结果
+  fwTask: null,     // 固件更新设备 id
+  polling: null,    // 进度轮询定时器
+};
+
+/** 失败提示：中文原因 + 可复制错误码 + Release 链接。 */
+function updateErrorText(payload, fallback) {
+  const reason = (payload && (payload.error || payload.reason)) || fallback || "未知错误";
+  const code = (payload && (payload.error_code || payload.reason_code)) || "";
+  const url = (payload && payload.release_url) || "";
+  const parts = [reason];
+  if (code) parts.push(`错误码：${code}`);
+  if (url) parts.push(`发布页：${url}`);
+  return parts.join("　");
+}
+
+function setUpdateError(id, payload, fallback) {
+  const box = $("#" + id);
+  if (!box) return;
+  if (!payload) {
+    box.hidden = true;
+    box.textContent = "";
+    return;
+  }
+  box.hidden = false;
+  box.textContent = updateErrorText(payload, fallback);
+}
+
+function setUpdateNotes(boxId, bodyId, notes) {
+  const box = $("#" + boxId);
+  const body = $("#" + bodyId);
+  if (!box || !body) return;
+  const text = String(notes || "").trim();
+  if (!text) {
+    box.hidden = true;
+    body.textContent = "";
+    return;
+  }
+  body.textContent = text;
+  box.hidden = false;
+}
+
+function renderUpdateApp() {
+  const r = updateState.app;
+  const current = $("#updAppCurrent");
+  const latest = $("#updAppLatest");
+  const size = $("#updAppSize");
+  const sha = $("#updAppSha");
+  const st = $("#updAppState");
+  const applyBtn = $("#btnUpdateApply");
+  const skipBtn = $("#btnUpdateSkip");
+  if (!current || !st) return;
+
+  if (!r) {
+    current.textContent = "—";
+    latest.textContent = "—";
+    size.textContent = "—";
+    sha.textContent = "—";
+    st.textContent = "正在检查…";
+    st.classList.remove("ok");
+    if (applyBtn) applyBtn.hidden = true;
+    if (skipBtn) skipBtn.hidden = true;
+    return;
+  }
+
+  current.textContent = fmtVersion(r.current);
+  latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
+  size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
+  sha.textContent = r.asset && r.asset.sha256 ? r.asset.sha256.slice(0, 16) + "…" : "—";
+  setUpdateNotes("updAppNotesBox", "updAppNotes", r.notes);
+  setUpdateError("updAppError", r.ok === false ? r : null);
+
+  if (r.has_update) {
+    st.textContent = `发现新版本 ${fmtVersion(r.latest)}（当前 ${fmtVersion(r.current)}）`;
+    st.classList.remove("ok");
+  } else if (r.skipped) {
+    st.textContent = `已跳过 ${fmtVersion(r.latest)}，出现更高版本时会再次提示`;
+    st.classList.remove("ok");
+  } else if (r.ok === false) {
+    // 说清楚为什么不能升 —— 只写「检查失败」用户会以为是网络问题。
+    st.textContent = r.error || "检查失败";
+    st.classList.remove("ok");
+  } else {
+    st.textContent = `已是最新（${fmtVersion(r.current)}）`;
+    st.classList.add("ok");
+  }
+  if (applyBtn) applyBtn.hidden = !r.has_update;
+  if (skipBtn) skipBtn.hidden = !r.has_update;
+}
+
+function renderUpdateFw() {
+  const r = updateState.fw;
+  const dev = $("#updFwDevice");
+  const variant = $("#updFwVariant");
+  const current = $("#updFwCurrent");
+  const latest = $("#updFwLatest");
+  const size = $("#updFwSize");
+  const sha = $("#updFwSha");
+  const st = $("#updFwState");
+  const checkBtn = $("#btnFwCheck");
+  const applyBtn = $("#btnFwApply");
+  if (!st) return;
+
+  const sel = selectedDevice();
+  if (dev) dev.textContent = sel ? sel.name || sel.dev_id : "未选择设备";
+  if (!r) {
+    if (variant) variant.textContent = "—";
+    if (current) current.textContent = "—";
+    if (latest) latest.textContent = "—";
+    if (size) size.textContent = "—";
+    if (sha) sha.textContent = "—";
+    st.textContent = sel ? "点击「检查固件更新」查询在线固件" : "选择设备后可检查在线固件";
+    st.classList.remove("ok");
+    setUpdateError("updFwError", null);
+    setUpdateNotes("updFwNotesBox", "updFwNotes", "");
+    if (checkBtn) checkBtn.hidden = !sel;
+    if (applyBtn) applyBtn.hidden = true;
+    return;
+  }
+
+  if (variant) variant.textContent = r.device_variant || "未知";
+  if (current) current.textContent = fmtVersion(r.current);
+  if (latest) latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
+  if (size) size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
+  if (sha) sha.textContent = r.asset && r.asset.sha256 ? r.asset.sha256.slice(0, 16) + "…" : "—";
+  setUpdateNotes("updFwNotesBox", "updFwNotes", r.notes);
+  setUpdateError("updFwError", r.reason ? r : null);
+
+  if (r.has_update) {
+    st.textContent = `发现新固件 ${fmtVersion(r.latest)}（当前 ${fmtVersion(r.current)}）`;
+    st.classList.remove("ok");
+  } else if (r.reason) {
+    st.textContent = r.reason;
+    st.classList.remove("ok");
+  } else {
+    st.textContent = `固件已是最新（${fmtVersion(r.current)}）`;
+    st.classList.add("ok");
+  }
+  if (checkBtn) checkBtn.hidden = false;
+  if (applyBtn) applyBtn.hidden = !r.has_update;
+}
+
+/** 顶栏红点：有新版本时提示。 */
+function refreshUpdateDot() {
+  const dot = $("#updateDot");
+  if (!dot) return;
+  const hasApp = !!(updateState.app && updateState.app.has_update);
+  const hasFw = !!(updateState.fw && updateState.fw.has_update);
+  dot.hidden = !(hasApp || hasFw);
+}
+
+async function checkAppUpdate(quiet) {
+  try {
+    updateState.app = await api("/api/app/update/check");
+  } catch (e) {
+    updateState.app = {
+      ok: false, has_update: false, current: "", latest: "",
+      error: "检查失败：" + (e.message || e), error_code: "E_REQUEST",
+      release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
+    };
+  }
+  renderUpdateApp();
+  refreshUpdateDot();
+  if (!quiet && updateState.app.has_update) {
+    toast(`发现新版本 ${fmtVersion(updateState.app.latest)}`, "ok");
+  }
+}
+
+async function checkFwUpdate(quiet) {
+  const sel = selectedDevice();
+  if (!sel) {
+    updateState.fw = null;
+    renderUpdateFw();
+    refreshUpdateDot();
+    if (!quiet) toast("请先选择设备", "bad");
+    return;
+  }
+  try {
+    updateState.fw = await api(
+      `/api/firmware/update/check?dev_id=${encodeURIComponent(sel.dev_id)}`);
+  } catch (e) {
+    updateState.fw = {
+      has_update: false, device_variant: "", current: "", latest: "",
+      reason: "检查失败：" + (e.message || e), reason_code: "E_REQUEST",
+      release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
+    };
+  }
+  renderUpdateFw();
+  refreshUpdateDot();
+  if (!quiet && updateState.fw.has_update) {
+    toast(`发现新固件 ${fmtVersion(updateState.fw.latest)}`, "ok");
+  }
+}
+
+function openUpdateModal() {
+  const modal = $("#updateModal");
+  if (!modal) return;
+  modal.hidden = false;
+  syncModalOpenClass();
+  renderUpdateApp();
+  renderUpdateFw();
+  $("#btnUpdateClose").focus();
+  checkAppUpdate(true);
+  checkFwUpdate(true);
+}
+
+function closeUpdateModal() {
+  const modal = $("#updateModal");
+  if (!modal || modal.hidden) return;
+  modal.hidden = true;
+  syncModalOpenClass();
+}
+
+async function applyAppUpdate() {
+  const btn = $("#btnUpdateApply");
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+  }
+  const box = $("#updAppProgressBox");
+  const bar = $("#updAppProgressBar");
+  const hint = $("#updAppHint");
+  if (box) box.hidden = false;
+  if (bar) bar.style.width = "0%";
+  if (hint) {
+    hint.hidden = false;
+    hint.textContent = "更新期间请勿关闭程序…";
+  }
+  try {
+    const r = await api("/api/app/update/apply", { method: "POST" });
+    updateState.appTask = r.task;
+    pollAppUpdate(r.task);
+  } catch (e) {
+    // 失败原因 + 错误码 + Release 链接都要给用户（验收 10）。
+    setUpdateError("updAppError", e.payload || null);
+    if (hint) {
+      hint.hidden = false;
+      hint.textContent = "更新失败：" + (e.message || e);
+    }
+    toast("更新失败：" + (e.message || e), "bad");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+    }
+  }
+}
+
+function pollAppUpdate(task) {
+  if (updateState.polling) clearInterval(updateState.polling);
+  const bar = $("#updAppProgressBar");
+  const hint = $("#updAppHint");
+  const phaseText = {
+    starting: "准备中…",
+    downloading: "正在下载新版本…",
+    verifying: "正在校验 SHA256…",
+    installing: "正在替换程序…",
+    restarting: "正在重启，请稍候…",
+  };
+  updateState.polling = setInterval(async () => {
+    try {
+      const p = await api(`/api/app/update/progress?task=${encodeURIComponent(task)}`);
+      if (bar) bar.style.width = (p.percent || 0) + "%";
+      if (hint) {
+        hint.textContent = (phaseText[p.phase] || "正在更新…") + "　更新期间请勿关闭程序";
+      }
+      if (p.phase === "error") {
+        clearInterval(updateState.polling);
+        updateState.polling = null;
+        if (hint) hint.textContent = "更新失败：" + (p.error || "未知错误");
+        toast("更新失败：" + (p.error || "未知错误"), "bad");
+      } else if (p.phase === "restarting") {
+        // 程序即将退出重启：轮询会随进程退出而中断，这里停掉。
+        clearInterval(updateState.polling);
+        updateState.polling = null;
+      }
+    } catch (_) {
+      // 进程正在退出重启，请求失败是预期的。
+      clearInterval(updateState.polling);
+      updateState.polling = null;
+    }
+  }, 500);
+}
+
+async function skipAppUpdate() {
+  const r = updateState.app;
+  if (!r || !r.latest) return;
+  try {
+    await api("/api/app/update/skip", {
+      method: "POST",
+      body: JSON.stringify({ version: r.latest }),
+    });
+    toast(`已跳过 ${fmtVersion(r.latest)}`, "ok");
+    await checkAppUpdate(true);
+  } catch (e) {
+    toast("跳过失败：" + (e.message || e), "bad");
+  }
+}
+
+async function applyFwUpdate() {
+  const sel = selectedDevice();
+  if (!sel) {
+    toast("请先选择设备", "bad");
+    return;
+  }
+  const btn = $("#btnFwApply");
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("loading");
+  }
+  try {
+    const r = await api("/api/firmware/update/apply", {
+      method: "POST",
+      body: JSON.stringify({ dev_id: sel.dev_id }),
+    });
+    updateState.fwTask = sel.dev_id;
+    pollFwUpdate(sel.dev_id);
+    toast("开始推送固件 " + fmtVersion(r.version), "ok");
+  } catch (e) {
+    // 失败原因 + 错误码 + Release 链接都要给用户（验收 10）。
+    setUpdateError("updFwError", e.payload || null);
+    toast("固件升级失败：" + (e.message || e), "bad");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+    }
+  }
+}
+
+/* 固件在线更新的五段进度：后端 phase → 展示阶段名。
+   后端在下载/校验阶段发 starting/downloading/verifying/pushing，推送阶段
+   借用 OTA 窗口的 push/restart/confirm —— 两套名字对不上时 order.indexOf()
+   会返回 -1，五个点全灭（WS-530 评审）。 */
+const FW_STAGE_BY_PHASE = {
+  starting: "download",
+  downloading: "download",
+  download: "download",
+  verifying: "verify",
+  verify: "verify",
+  pushing: "push",
+  push: "push",
+  restart: "restart",
+  confirm: "confirm",
+};
+
+function updateFwStep(phase) {
+  const steps = $("#updFwSteps");
+  if (!steps) return;
+  const order = ["download", "verify", "push", "restart", "confirm"];
+  const finished = phase === "done";
+  const stage = FW_STAGE_BY_PHASE[phase];
+  // 未知阶段（如 error）：保持上一次的高亮，不要把进度清空。
+  if (!finished && !stage) return;
+  const active = finished ? order.length : order.indexOf(stage);
+  steps.querySelectorAll(".ota-step-dot").forEach((dot) => {
+    const idx = order.indexOf(dot.dataset.step);
+    dot.classList.toggle("active", !finished && idx === active);
+    dot.classList.toggle("done", finished || (active >= 0 && idx < active));
+  });
+}
+
+function pollFwUpdate(devId) {
+  if (updateState.polling) clearInterval(updateState.polling);
+  updateState.polling = setInterval(async () => {
+    try {
+      const p = await api(
+        `/api/firmware/update/progress?dev_id=${encodeURIComponent(devId)}`);
+      updateFwStep(p.phase || "download");
+      if (p.phase === "error") {
+        clearInterval(updateState.polling);
+        updateState.polling = null;
+        setUpdateError("updFwError", {
+          error: p.error || "未知错误", error_code: p.error_code || "",
+        });
+        toast("固件升级失败：" + (p.error || "未知错误"), "bad");
+      } else if (p.phase === "done") {
+        clearInterval(updateState.polling);
+        updateState.polling = null;
+        toast("固件升级完成", "ok");
+        await checkFwUpdate(true);
+      }
+    } catch (e) {
+      clearInterval(updateState.polling);
+      updateState.polling = null;
+      setUpdateError("updFwError", { error: e.message || String(e) });
+    }
+  }, 500);
+}
+
+function bindUpdate() {
+  const modal = $("#updateModal");
+  const openBtn = $("#btnUpdate");
+  const closeBtn = $("#btnUpdateClose");
+  if (!modal || !openBtn || !closeBtn) return;
+
+  openBtn.onclick = openUpdateModal;
+  closeBtn.onclick = closeUpdateModal;
+  modal.onclick = (e) => {
+    if (e.target === modal) closeUpdateModal();
+  };
+  document.addEventListener("keydown", (e) => {
+    if (modal.hidden) return;
+    if (e.key === "Tab") {
+      trapFocus(modal, e);
+      return;
+    }
+    if (e.key !== "Escape") return;
+    closeUpdateModal();
+    e.stopImmediatePropagation();
+  });
+
+  const applyBtn = $("#btnUpdateApply");
+  if (applyBtn) applyBtn.onclick = applyAppUpdate;
+  const skipBtn = $("#btnUpdateSkip");
+  if (skipBtn) skipBtn.onclick = skipAppUpdate;
+  const fwCheck = $("#btnFwCheck");
+  if (fwCheck) fwCheck.onclick = () => checkFwUpdate(false);
+  const fwApply = $("#btnFwApply");
+  if (fwApply) fwApply.onclick = applyFwUpdate;
+
+  // 设备页的「固件更新」入口：打开同一个弹窗并直接查固件。
+  const fwBtn = $("#btnFwUpdate");
+  if (fwBtn) {
+    fwBtn.onclick = () => {
+      openUpdateModal();
+      checkFwUpdate(false);
+    };
+  }
 }
 
 init();
