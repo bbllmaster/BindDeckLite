@@ -296,4 +296,6 @@ schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
 
 ## 许可
 
-本仓库目前未随源码分发 `LICENSE` 文件，代码版权归项目作者所有，**保留所有权利**（All rights reserved）。如需在自有产品中分发、修改或商用，请先与作者联系确认授权方式；作者后续添加的 `LICENSE` 文件以该文件条款为准。
+本项目采用 [MIT License](LICENSE)。
+
+Copyright (c) 2026 bbllmaster
