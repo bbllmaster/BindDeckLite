@@ -26,7 +26,18 @@ DEFAULT_LANG = "zh-CN"
 SUPPORTED_LANGS = ("zh-CN", "en-US")
 SYSTEM_PREF = "system"
 
-LOCALES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
+def _locales_dir() -> str:
+    """Where the JSON tables live, source tree and PyInstaller bundle alike.
+
+    Frozen, ``__file__`` points inside the exe's temp bundle, so the tables are
+    shipped as ``datas`` (see ``host/app.spec``) and read from ``sys._MEIPASS``.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(getattr(sys, "_MEIPASS", ""), "locales")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
+
+
+LOCALES_DIR = _locales_dir()
 
 _PLACEHOLDER = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 

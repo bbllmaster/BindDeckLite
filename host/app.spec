@@ -21,6 +21,8 @@ assets = os.path.join(here, "assets")
 datas = [
     (os.path.join(here, "templates"), "templates"),
     (os.path.join(here, "static"), "static"),
+    # WS-529: i18n.py reads the message tables from sys._MEIPASS/locales.
+    (os.path.join(here, "locales"), "locales"),
 ]
 if os.path.isdir(assets):
     datas.append((assets, "assets"))
