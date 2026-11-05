@@ -1,5 +1,35 @@
 # Changelog
 
+## 上位机在线自查更新 + 固件 OTA 在线检测/推送 + 版本源与 update.json — 2026-11-05（WS-523 / WS-526）
+
+以前用户要手动去 GitHub 找包、手动替换 exe、手动选 bin 推 OTA。本期把
+「检查更新 → 下载 → 校验 → 应用 → 重启 → 确认」做成上位机内的闭环。
+
+- **版本源**：新增 `host/_version.py` 作为**唯一**版本源（发布流水线按 tag 注入；
+  开发时可用 `BINDDECKLITE_APP_VERSION` 覆盖占位版）。版本号不再散落在 app.py
+  与前端。Release 新增 `update.json` 清单（app + 三个型号固件的版本、资产名、
+  SHA256、大小），`size`/`sha256` 全部由脚本从**实际发布文件**算出，不手写。
+- **上位机自更新**：顶栏「检查更新」查 GitHub 最新正式 Release（ETag 条件请求，
+  304 沿用缓存不当错误，60 秒防抖，超时 10 秒，支持系统代理与 `HTTP(S)_PROXY`，
+  `GITHUB_TOKEN` 可选且绝不进日志）。下载到 `%LOCALAPPDATA%\BindDeckLite\updates\<版本>\`，
+  边下边算 SHA256 并校验大小 —— 校验不符即删除临时文件、拒绝替换，绝不留下半成品
+  exe。替换用只接受固定路径的临时更新器：等本进程退出 → 旧 exe 备份 `.bak` →
+  覆盖 → 启动新 exe → 等新版本写标记；超时则回滚 `.bak` 并启动旧版。连续失败
+  ≥2 次后暂停自动更新。设备正在 OTA 时拒绝更新（更新要退出上位机 → 会断 BLE）。
+  目标目录不可写（如 Program Files）时提示手动下载并给 Release 链接，不动原 exe。
+- **固件 OTA 在线检测**：设备页「固件更新」按 `chip` + `flash_kb` 判型号
+  （ESP32 / C3 16MB / C3 4MB；`flash_kb=0` 的老固件与 2 MB 板 → 「该型号暂无在线
+  固件」，不猜），下载对应 `ota_*.bin` 并校验后**走现有 `/api/ota/<dev_id>` 通道**推送，
+  复用 `_ota_lock` / `_ota_validate` / `_ota_slot_cap` / `_ota_validate_image` 与现成
+  进度接口；五段进度：下载 → 校验 → 推送 → 设备重启 → 确认版本。远端版本 ≤ 当前
+  版本只报「已是最新」，不降级、不重装。
+- **发布流程**：Release 正文必须含「本次更新」+ 四个小节，缺失时 publish job 直接
+  失败、不发 Release（WS-523 验收 11）。
+- **回归**：`cd host && python -m pytest test_app_update.py test_fw_update.py -q`
+  （import 生产函数 `host/app.py` 与 `host/online_update.py`：版本比较、清单/回退解析、
+  SHA256 不符、ETag 304 与防抖计数、四类型号映射、跳过版本、OTA 锁、回滚计数、
+  更新器脚本只接受固定路径、目录不可写）。
+
 ## 宏停止日志的步号统一为「实际所在的那一步」；停止后按钮不再来回跳 — 2026-11-05（WS-498）
 
 宏被停止时，日志里的「第 k/N 步」只有一种含义：**用户按下停止时正在跑的那一步**。

@@ -30,6 +30,11 @@ hiddenimports = [
     "tkinter.filedialog",
     "pystray._win32",
     "PIL.ImageDraw",
+    # WS-523: the app version lives in host/_version.py, which the release
+    # pipeline rewrites before PyInstaller runs. It is imported inside a
+    # function (frozen path), so list it explicitly — static analysis of the
+    # import inside online_update._load_version_module() is not reliable.
+    "_version",
     # pywebview renders the Web UI in a native window.  The platform backend
     # (winforms / edgechromium / mshtml) is picked lazily at runtime by
     # guilib.initialize(), so static analysis misses it — list them explicitly.
