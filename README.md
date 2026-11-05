@@ -1,22 +1,25 @@
 # BindDeckLite
 
-BindDeckLite 是 [BindDeck](https://github.com/bbllmaster/BindDeck) 的精简版本：**去掉 OLED、去掉菜单键，9 个按键 + EC11 旋转编码器，支持 ESP32 与 ESP32-C3**，并重新设计了上位机。
+BindDeckLite 是一套面向桌面工作流的**实体宏键盘方案**：9 个按键 + 1 个 EC11 旋转编码器（按压作为第 10 个输入），基于 ESP32 / ESP32-C3，通过 BLE HID 直接向电脑发键，目标机器不需要安装驱动或常驻服务。
 
-同一套固件还支持**12 键版本**（无编码器）：把原来编码器的按压 / A / B 三根线各接一个按键，共 12 个输入。切换方式是上位机「设备 → 按键布局」或配网页的「按键布局」，默认仍是 9 键 + 编码器（WS-499）。
+它适合把每天重复的操作——启动程序、打开网址、执行命令、媒体控制、按键宏——放到手边的实体按键上；编码器负责音量、缩放、标签页切换这类连续调节。设备可以完全独立地发 HID 键，也可以叠加运行上位机动作。
+
+同一套固件还支持**12 键布局**：把编码器的按压 / A / B 三根线各接一个按键，共 12 个输入。切换方式是上位机「设备 → 按键布局」或配网页的「按键布局」，默认仍是 9 键 + 编码器（WS-499）。
 
 固件与上位机共用同一套 `CFG:` / `CMD:` 行协议，按键既可以只发 HID（设备独立工作），也可以叠加运行上位机动作（宏、启动程序、执行命令）。
 
-## 与 BindDeck 的差异
+## 特性概览
 
-| 项目 | BindDeck | BindDeckLite |
-|------|----------|--------------|
-| 显示屏 | SSD1306 / SH1106 / SH1107 | **无**（无 I2C、无显示库） |
-| 菜单键 | 独立 GPIO4 | **取消**（编码器长按替代） |
-| 按键 | 8 个 + 编码器按压 | **9 个 + 编码器按压** |
-| 编码器 | EC11（旋转 + 按压） | EC11（旋转 + 按压） |
-| 芯片 | ESP32 / ESP32-C3 | ESP32 / ESP32-C3 |
-| 配置方式 | 上位机 / OLED 菜单 / 配网页面 | **上位机 / 配网页面** |
-| 固件环境 | 5 个（含 3 种屏幕） | **2 个**（`esp32dev` / `esp32c3`） |
+| 项目 | 说明 |
+|------|------|
+| 输入 | 9 个按键 + 编码器按压（第 10 输入）；可切 12 键布局 |
+| 编码器 | EC11，5 种模式：音量 / 缩放 / 标签页 / 撤销重做 / 上位机动作 |
+| 芯片 | 经典 ESP32、ESP32-C3（4 MB 与 16 MB 两种布局） |
+| 连接 | BLE HID（NimBLE），首个订阅 HID 的主机被绑定 |
+| 配置 | 上位机或网页配网，写入 NVS；引脚可改 |
+| 协议 | `CFG:` / `CMD:` / `BTN:` / `ENC:` 行协议，BLE / 串口 / UDP 通用 |
+| 上位机 | Flask + 原生 JS，无构建步骤；支持程序 / 网址 / 命令 / 媒体键 / 宏 |
+| 升级 | 网页 OTA（app-only）与 merged 整片烧录 |
 
 ## 硬件
 
@@ -107,7 +110,7 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 
 ### 配网 / OTA 模式
 
-没有菜单键，进入配网模式有两种方式：
+进入配网模式有两种方式：
 
 1. **上电时按住第 10 个输入**（编码器布局 = 编码器按压键；12 键布局 = 第 10 键）约 0.2 秒；
 2. 正常使用时**在 1.2 秒内连按两次**该键（设备会重启进入配网），或在上位机点「进入配网模式」。
@@ -150,7 +153,7 @@ esptool.py --chip esp32c3 write_flash 0x0 merged_binddecklite_c3_v1.0.0.bin
 
 ## 上位机
 
-`host/` 是重新设计的控制台（Flask + 原生 JS，无构建步骤）：
+`host/` 是配套的上位机控制台（Flask + 原生 JS，无构建步骤）：
 
 ![上位机界面](docs/screenshot.png)
 
@@ -263,9 +266,9 @@ schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
 ├── platformio.ini
 ├── partitions/            # OTA 分区表（ESP32 / C3）
 ├── src/
-│   ├── main.cpp           # Lite 固件：9 键 + EC11，无显示
-│   ├── nimble_hid.*       # NimBLE HID + 唯一身份 / IRK（复用 BindDeck）
-│   └── ble_config.*       # BLE CFG/CMD 服务（复用 BindDeck）
+│   ├── main.cpp           # 主固件：9 键 + EC11
+│   ├── nimble_hid.*       # NimBLE HID + 唯一身份 / IRK
+│   └── ble_config.*       # BLE CFG/CMD 服务
 ├── host/
 │   ├── app.py             # 上位机后端（--desktop 进入托盘模式）
 │   ├── desktop.py         # 托盘图标、控制台隐藏、原生文件对话框
@@ -275,7 +278,7 @@ schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
 │   ├── requirements.txt           # 运行必需（Flask / bleak）
 │   ├── requirements-desktop.txt   # 托盘与文件对话框（pystray / pillow）
 │   ├── requirements-build.txt     # 打包依赖（含 PyInstaller）
-│   ├── ble_link.py        # BLE 扫描 / 多设备连接（复用 BindDeck）
+│   ├── ble_link.py        # BLE 扫描 / 多设备连接
 │   ├── assets/app.ico     # exe / 托盘图标（python tools/make_icon.py 生成）
 │   ├── templates/index.html
 │   └── static/{app.js,style.css}
@@ -286,11 +289,11 @@ schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
 
 ## 版本与发布
 
-固件发布沿用 BindDeck 的做法：项目里单独有一个**滚动固件发布任务**，每个版本的 merged / OTA 包以附件形式追加在该任务下，源码提交与版本说明也记录在那里。
+固件与上位机按版本号发布：每个版本的 merged / OTA 包、SHA256 与版本说明统一记录在项目的**滚动固件发布任务**下，源码提交与版本号一一对应。
 
 - 固件版本：`src/main.cpp` 的 `FW_VERSION`
 - 发布流程：改版本号 → `python tools/build_release.py` → 提交代码 → 把 `dist/` 里的 4 个 bin 追加到发布任务
 
 ## 许可
 
-与上游 BindDeck 保持一致。
+本仓库目前未随源码分发 `LICENSE` 文件，代码版权归项目作者所有，**保留所有权利**（All rights reserved）。如需在自有产品中分发、修改或商用，请先与作者联系确认授权方式；作者后续添加的 `LICENSE` 文件以该文件条款为准。
