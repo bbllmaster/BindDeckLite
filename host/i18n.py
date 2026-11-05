@@ -143,6 +143,25 @@ def messages(lang: str | None = None) -> dict[str, str]:
 # --------------------------------------------------------------------------
 # translate
 # --------------------------------------------------------------------------
+class Message(str):
+    """A rendered string that remembers which key and params produced it.
+
+    ``add_event()`` puts ``code`` / ``params`` on the event alongside the
+    rendered ``text`` so the web UI can re-translate an entry when the language
+    changes, while older consumers (SSE clients, tests) keep reading ``text``.
+    Being a ``str`` subclass means existing ``"..." % x`` / ``+`` / ``in`` uses
+    are untouched.
+    """
+
+    __slots__ = ("code", "params")
+
+    def __new__(cls, text: str, code: str, params: dict) -> "Message":
+        obj = super().__new__(cls, text)
+        obj.code = code
+        obj.params = dict(params)
+        return obj
+
+
 def t(key: str, **params) -> str:
     """Translate ``code`` for the current language, filling ``{name}`` params."""
     _ensure_loaded()
@@ -155,7 +174,7 @@ def t(key: str, **params) -> str:
             if key not in _warned:
                 _warned.add(key)
                 print(f"[i18n] WARNING missing message key: {key}", file=sys.stderr)
-            return key
+            return Message(key, key, params)
         if lang != DEFAULT_LANG and key not in _warned:
             _warned.add(key)
             print(
@@ -164,13 +183,13 @@ def t(key: str, **params) -> str:
                 file=sys.stderr,
             )
     if not params:
-        return text
+        return Message(text, key, {})
 
     def repl(match: re.Match[str]) -> str:
         name = match.group(1)
         return str(params[name]) if name in params else match.group(0)
 
-    return _PLACEHOLDER.sub(repl, text)
+    return Message(_PLACEHOLDER.sub(repl, text), key, params)
 
 
 def has(key: str) -> bool:
