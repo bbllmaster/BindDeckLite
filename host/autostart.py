@@ -25,6 +25,8 @@ import shlex
 import subprocess
 import sys
 
+from i18n import t
+
 APP_NAME = "BindDeckLite"
 VALUE_NAME = "BindDeckLite"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -81,10 +83,10 @@ def _platform() -> str:
 
 def _method_label() -> str:
     if _platform() == "windows":
-        return "注册表 HKCU\\...\\Run"
+        return t("ui.autostart_registry")
     if _platform() == "macos":
         return "LaunchAgent com.binddecklite.host"
-    return "XDG 自启动 ~/.config/autostart"
+    return t("ui.autostart_xdg")
 
 
 def _linux_path() -> str:
@@ -178,8 +180,8 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
 
     def _failed(detail: str) -> tuple[bool, str]:
         if create:
-            return False, f"创建计划任务失败（{detail}），可能需要管理员账户"
-        return False, f"删除计划任务失败（{detail}）"
+            return False, t("error.autostart_create_failed", detail=detail)
+        return False, t("error.autostart_delete_failed", detail=detail)
 
     def _after_timeout() -> tuple[bool, str]:
         """Decide a timed-out elevation by looking at the task store.
@@ -191,13 +193,13 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
         """
         task = _task_query()
         if not task["supported"] or task["error"]:
-            return _failed("等待超时")
+            return _failed(t("error.timeout"))
         if create:
-            return (True, "") if task["exists"] else _failed("等待超时")
-        return (True, "") if not task["exists"] else _failed("等待超时")
+            return (True, "") if task["exists"] else _failed(t("error.timeout"))
+        return (True, "") if not task["exists"] else _failed(t("error.timeout"))
 
     if not sys.platform.startswith("win"):
-        return False, "当前平台不支持 UAC 提权"
+        return False, t("error.uac_unsupported")
     try:
         import ctypes
         from ctypes import wintypes
@@ -246,23 +248,23 @@ def _elevated_schtasks(args: list[str]) -> tuple[bool, str]:
         if not shell_execute(ctypes.byref(info)):
             err = ctypes.get_last_error()
             if err == _ERROR_CANCELLED:
-                return False, "已取消提权"
+                return False, t("error.elevation_cancelled")
             if err == _ERROR_ELEVATION_REQUIRED:
                 # Nothing the user can click: the account cannot elevate while
                 # UAC is off, so say what to fix instead of a bare Win32 code.
-                return _failed("需要管理员权限（740）")
-            return _failed(f"ShellExecuteEx 失败: {err}")
+                return _failed(t("error.elevation_required"))
+            return _failed(t("error.shellexecute_failed", code=err))
         handle = info.hProcess
         if not handle:
-            return _failed("没有取得进程句柄")
+            return _failed(t("error.no_process_handle"))
         try:
             if wait_for(handle, _ELEVATED_TIMEOUT_MS) != _WAIT_OBJECT_0:
                 return _after_timeout()
             code = wintypes.DWORD()
             if not get_exit_code(handle, ctypes.byref(code)):
-                return _failed("无法读取退出码")
+                return _failed(t("error.exit_code_unreadable"))
             if code.value != 0:
-                return _failed(f"退出码 {code.value}")
+                return _failed(t("error.exit_code", code=code.value))
         finally:
             close_handle(handle)
     except Exception as e:  # noqa: BLE001 - ctypes/WinDLL are Windows-only
@@ -349,7 +351,7 @@ def _task_create(command: str) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
     if proc.returncode != 0:
         detail = ((proc.stderr or "") + " " + (proc.stdout or "")).strip()
-        return False, detail or f"schtasks /create 退出码 {proc.returncode}"
+        return False, detail or t("error.schtasks_exit", code=proc.returncode)
     return True, ""
 
 
@@ -446,9 +448,9 @@ def status() -> dict:
                 # The scheduled task is the autostart entry in this mode.
                 info["admin"] = True
                 info["enabled"] = True
-                info["method"] = "计划任务（最高权限）" if task["highest"] else "计划任务"
+                info["method"] = t("ui.autostart_task_admin") if task["highest"] else t("ui.autostart_task")
                 if not value:
-                    info["detail"] = task["command"] or f"计划任务 {TASK_NAME}"
+                    info["detail"] = task["command"] or t("ui.autostart_task_named", name=TASK_NAME)
         elif platform == "macos":
             path = _macos_path()
             info["enabled"] = os.path.exists(path)

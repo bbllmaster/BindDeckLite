@@ -243,6 +243,10 @@ function loadApp(registry) {
 
   const run = (name) => vm.runInContext(
     readFileSync(new URL(name, STATIC_DIR), "utf8"), sandbox, { filename: name });
+  // 生产 i18n + 生产 zh-CN 文案表：断言的仍是生产函数的输出（默认中文）。
+  run("i18n.js");
+  sandbox.i18n.setMessages(
+    JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
   run("keys.js");
