@@ -431,7 +431,7 @@ def _pin_reject_reason(prof: str, btn: str, pin: int,
     are inputs 9..11 rather than an encoder, so using them again is a
     duplicate — the firmware words it the same way.
     """
-    who = t("error.pin_gpio_on_chip") % (btn, pin)
+    who = t("error.pin_gpio_on_chip", btn=btn, pin=pin)
     if prof == "C3":
         if pin > 21:
             return "out_of_range", who + t("error.pin_c3_missing")
@@ -1308,8 +1308,16 @@ def nvs_text(nvs) -> str:
 # rebooted.  A card showing 「0 秒」 would read as "the device just restarted",
 # which is exactly wrong.  We remember the last value per device and, when the
 # new one is clearly below it, say "已运行" relative to this connection instead.
-UPTIME_WRAP_TEXT = t("log.uptime_this_session")
-UPTIME_WRAP_NOTE = t("log.uptime_wrapped")
+
+
+def uptime_wrap_text() -> str:
+    """「本次连接内已运行」— looked up per call, so a language switch applies."""
+    return t("log.uptime_this_session")
+
+
+def uptime_wrap_note() -> str:
+    """「设备计时已回绕」— looked up per call (see ``uptime_wrap_text``)."""
+    return t("log.uptime_wrapped")
 
 
 def uptime_wrapped(dev_id: str, seconds) -> bool:
@@ -1358,7 +1366,7 @@ def sysinfo_view(payload: str, dev_id: str = "") -> dict:
     if flags["heap_low"]:
         notes["heap"] = t("log.device_low_memory")
     if wrapped:
-        notes["uptime_wrap"] = UPTIME_WRAP_NOTE
+        notes["uptime_wrap"] = uptime_wrap_note()
     return {
         "sample": sample,
         "display": {
@@ -1366,8 +1374,9 @@ def sysinfo_view(payload: str, dev_id: str = "") -> dict:
             # app.js renders notes.safe/heap/deepsleep only, so the wrap hint
             # is also carried in the value itself; the plain 「5 秒」 is
             # suppressed because it reads as "just rebooted".
-            "uptime": (f"{UPTIME_WRAP_TEXT}（{UPTIME_WRAP_NOTE}）" if wrapped
-                       else uptime_text(sample["uptime"])),
+            "uptime": (t("log.uptime_wrapped_line",
+                         text=uptime_wrap_text(), note=uptime_wrap_note())
+                       if wrapped else uptime_text(sample["uptime"])),
             "nvs": nvs_text(sample["nvs"]),
             "heap": heap_text(sample["heap"]),
         },
@@ -4676,7 +4685,7 @@ def api_app_update_check():
 
     if online_update.should_skip_version(current, latest, state["skipped_version"]):
         payload["skipped"] = True
-        payload["error"] = t("log.app_update_skipped") % latest
+        payload["error"] = t("log.app_update_skipped", version=latest)
         payload["error_code"] = "E_SKIPPED"
         return jsonify(payload)
 
@@ -4726,10 +4735,11 @@ def api_app_update_apply():
     latest = app_asset["version"]
     state = _update_settings()
     if online_update.should_skip_version(current, latest, state["skipped_version"]):
-        return jsonify({"ok": False, **_err(t("log.app_update_skipped_short") % latest),
+        return jsonify({"ok": False,
+                        **_err(t("log.app_update_skipped_short", version=latest)),
                         "error_code": "E_SKIPPED", "release_url": release_url}), 409
     if not online_update.version_is_newer(latest, current):
-        return jsonify({"ok": False, **_err(t("log.app_up_to_date") % current),
+        return jsonify({"ok": False, **_err(t("log.app_up_to_date", version=current)),
                         "release_url": release_url}), 409
     # min_from 与 check 阶段同一把尺：check 说不能升，apply 也不能升。
     min_from = app_asset.get("min_from") or ""
@@ -4855,7 +4865,7 @@ def _app_update_worker(task_id, info, app_asset, current):
 
         # 退出上位机：脚本等本进程退出后才替换 exe。
         _phase("restarting")
-        add_event("update", t("log.app_update_restarting") % version, level="ok")
+        add_event("update", t("log.app_update_restarting", version=version), level="ok")
         time.sleep(0.6)
         _quit_for_update()
         # 进程通常在 _quit_for_update() 里就退出了；走到这里说明退出被拒，
@@ -4973,7 +4983,7 @@ def _update_after_start():
         _set_update_state(last_update={**last, "status": "done", "result": "ok",
                                         "finished_at": time.time()},
                           update_fail_count=0)
-        add_event("update", t("log.app_updated") % current, level="ok")
+        add_event("update", t("log.app_updated", version=current), level="ok")
         return
     # 回到旧版本 = 更新脚本回滚了。
     fail_count = state["update_fail_count"] + 1
@@ -4981,7 +4991,7 @@ def _update_after_start():
                                     "finished_at": time.time()},
                       update_fail_count=fail_count)
     if fail_count >= online_update.UPDATE_FAIL_LIMIT:
-        add_event("update", t("log.app_update_failed_paused") % fail_count, level="warn")
+        add_event("update", t("log.app_update_failed_paused", count=fail_count), level="warn")
     else:
         add_event("update", t("log.app_update_rolled_back"), level="warn")
 
@@ -5143,7 +5153,8 @@ def api_firmware_update_apply():
                                   % entry.get("asset", "")),
                         "error_code": "E_NO_FW_ASSET", "release_url": release_url}), 409
     if not online_update.version_is_newer(entry["version"], fw.get("version", "")):
-        return jsonify({"ok": False, **_err(t("log.app_up_to_date") % (fw.get("version") or "")),
+        return jsonify({"ok": False,
+                        **_err(t("log.app_up_to_date", version=(fw.get("version") or ""))),
                         "release_url": release_url}), 409
 
     # 只接受 ota_*.bin（app-only），复用现有校验。
@@ -5356,7 +5367,9 @@ def api_desktop():
                 _config["settings"]["start_minimized"] = value
             save_config()
         if "lang" in data:
-            pref = str(data.get("lang") or SYSTEM_PREF)
+            # Only the three known preferences may be persisted: a stray
+            # {"lang": "xx"} used to be written verbatim into config.json.
+            pref = normalize_pref(str(data.get("lang") or SYSTEM_PREF))
             with _lock:
                 _config["lang"] = pref
             save_config()
@@ -5383,7 +5396,7 @@ def api_desktop():
         # 当前条目确实是计划任务时才算「管理员模式」，否则一次只改
         # 「启动时最小化」就会把最高权限的任务静默降级成 Run 键。
         admin_pref = bool(current.get("admin"))
-        messages: list[str] = []
+        notes: list[str] = []
         rewrite = False
         result: dict | None = None
 
@@ -5393,12 +5406,12 @@ def api_desktop():
                 if "admin_autostart" in data:
                     admin_pref = bool(data["admin_autostart"])
                 rewrite = True
-                messages.append(t("log.autostart_admin_on") if admin_pref else t("log.autostart_on"))
+                notes.append(t("log.autostart_admin_on") if admin_pref else t("log.autostart_on"))
             else:
                 result = autostart.disable()
                 if result.get("ok"):
                     admin_pref = False
-                    messages.append(t("log.autostart_off"))
+                    notes.append(t("log.autostart_off"))
         elif "admin_autostart" in data:
             # 提权模式变了：注册表 Run 值与计划任务互斥，重写一次。
             admin_pref = bool(data["admin_autostart"])
@@ -5406,8 +5419,8 @@ def api_desktop():
             # 否则「取消开机自启动」会被这一下顺手打开。
             if admin_pref or enabled:
                 rewrite = True
-                messages.append(t("log.autostart_admin_on") if admin_pref
-                                else t("log.autostart_admin_off"))
+                notes.append(t("log.autostart_admin_on") if admin_pref
+                             else t("log.autostart_admin_off"))
         elif enabled and "start_minimized" in data:
             # 自启动已开、只改了「启动时最小化」：重写条目让它生效。
             rewrite = True
@@ -5424,7 +5437,7 @@ def api_desktop():
             # below would be overwritten by that (usually empty) value and the
             # UI would fall back to the generic "设置失败".
             return jsonify({"ok": False, **desktop_payload(), "error": reason}), 500
-        for message in messages:
+        for message in notes:
             add_event("desktop", message, level="ok")
 
         if rewrite or "autostart" in data or "admin_autostart" in data:
@@ -5443,7 +5456,7 @@ def api_desktop_port_busy():
     instance shows it in its event log and in ``desktopHint``.
     """
     data = request.get_json(silent=True) or {}
-    message = str(data.get("message") or desktop.PORT_BUSY_HINT)
+    message = str(data.get("message") or desktop.port_busy_hint())
     desktop.STATE["error"] = message
     add_event("desktop", message, level="warn")
     return jsonify({"ok": True})

@@ -1795,9 +1795,8 @@ async function applyConfig() {
   // 引脚 / 键码 / 编码器模式 / 休眠，所以先确认一次；取消时一条 CFG: 都不发
   // （在 saveConfigFor / /api/apply 之前 return）。
   if (cfg.trusted === false && !state.sessionRead[devId]) {
-    const go = window.confirm(
-      t("ui.untrusted_confirm_title") +
-      t("ui.untrusted_confirm_body"));
+    // 一句话模板（含换行），不要用两句拼接：英文两句之间要有空格，中文不需要。
+    const go = window.confirm(t("ui.untrusted_confirm"));
     if (!go) return;
   }
   await saveConfigFor(devId, cfg);
@@ -3791,8 +3790,14 @@ function closeUpdateModal() {
 }
 
 /* 上位机更新的确认文案：更新会退出上位机进程，连着的设备会被断开。
-   放在常量里，测试（test_app_update_confirm.mjs）直接断言这一句。 */
-const APP_UPDATE_CONFIRM_TEXT = t("update.confirm_quit");
+
+   必须是函数，不能是 `const ... = t(...)`：脚本解析时 i18n.load() 还没跑完，
+   浏览器分支下 messages 还是空表，常量会把 key 名本身冻在里面（WS-541）。
+   测试（test_app_update_confirm.mjs）在「无 require、后加载语言表」的上下文
+   里断言它不是 key。 */
+function appUpdateConfirmText() {
+  return t("update.confirm_quit");
+}
 
 /** 「立即更新」前要不要先问一句。
 
@@ -3807,7 +3812,7 @@ function appUpdateNeedsConfirm() {
 async function applyAppUpdate() {
   // 确认放在最前面：用户取消时不该看到「更新期间请勿关闭程序」，按钮也不该
   // 被置灰 —— 什么都没发生。
-  if (appUpdateNeedsConfirm() && !window.confirm(APP_UPDATE_CONFIRM_TEXT)) return;
+  if (appUpdateNeedsConfirm() && !window.confirm(appUpdateConfirmText())) return;
   const btn = $("#btnUpdateApply");
   if (btn) {
     btn.disabled = true;

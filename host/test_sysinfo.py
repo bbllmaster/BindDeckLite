@@ -164,10 +164,10 @@ def test_uptime_wrap_says_this_connection():
                                  dev_id=dev)
 
     uptime = view["display"]["uptime"]
-    assert host_app.UPTIME_WRAP_TEXT in uptime
+    assert host_app.uptime_wrap_text() in uptime
     assert "5 秒" not in uptime
     assert view["notes"]["uptime_wrap"] == "设备计时已回绕"
-    assert host_app.UPTIME_WRAP_NOTE in uptime  # app.js does not render this key
+    assert host_app.uptime_wrap_note() in uptime  # app.js does not render this key
 
 
 def test_growing_uptime_keeps_the_normal_display():
@@ -233,7 +233,7 @@ def test_read_sysinfo_detects_wrap_through_the_request_path(monkeypatch):
     second = host_app.read_sysinfo(dev, timeout=0.5)
 
     assert first["display"]["uptime"] == "1176 小时 0 分"
-    assert host_app.UPTIME_WRAP_TEXT in second["display"]["uptime"]
+    assert host_app.uptime_wrap_text() in second["display"]["uptime"]
     assert second["notes"]["uptime_wrap"] == "设备计时已回绕"
 
 

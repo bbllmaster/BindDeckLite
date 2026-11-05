@@ -55,7 +55,13 @@ BROWSE_TIMEOUT = 120  # seconds the dialog child may stay open
 
 # WS-457: 端口 8788 被另一个实例占着时，用户看到的是这句话，而不是
 # "WinError 10048"。提权实例接管端口失败时也用它。
-PORT_BUSY_HINT = t("error.port_busy")
+# Looked up per call (not a module constant): importing this module must not
+# freeze the language chosen at that moment.
+
+
+def port_busy_hint() -> str:
+    return t("error.port_busy")
+
 
 _quit_callback = None
 
@@ -144,7 +150,7 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 
 def port_busy_message(port: int | None = None) -> str:
     """Readable text for "the port is taken by another instance"."""
-    msg = PORT_BUSY_HINT
+    msg = port_busy_hint()
     if port:
         msg += t("error.port_busy_detail", port=port)
     return msg
@@ -154,7 +160,7 @@ def port_bind_error(exc: BaseException, port: int | None = None) -> str:
     """Translate a failed bind into something a user can act on.
 
     ``WinError 10048`` ("only one usage of each socket address") tells the
-    user nothing; ``PORT_BUSY_HINT`` tells them what to do.
+    user nothing; ``port_busy_hint()`` tells them what to do.
     """
     code = getattr(exc, "errno", None)
     if code == errno.EADDRINUSE or code == 10048 or "10048" in str(exc):
@@ -185,7 +191,7 @@ def make_flask_server(flask_app, port: int):
 
 def is_port_busy_error(error: str) -> bool:
     """Whether *error* says "the port is taken by another instance"."""
-    return bool(error) and error.startswith(PORT_BUSY_HINT)
+    return bool(error) and error.startswith(port_busy_hint())
 
 
 def clear_port_busy_error() -> None:

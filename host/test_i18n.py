@@ -195,3 +195,78 @@ def test_api_error_keeps_text_and_exposes_code(client):
     assert body["code"] == "error.ota_no_task"
     assert body["error"]  # rendered sentence, not the key
     assert body["error"] != body["code"]
+
+
+# --------------------------------------------------------------------------
+# WS-541: regressions the first round missed
+# --------------------------------------------------------------------------
+def test_validate_pins_speaks_english_without_crashing(monkeypatch):
+    """EN pin validation used to 500: ``%d`` got the button label string.
+
+    ``error.pin_gpio_on_chip`` is now a named placeholder template, so the
+    real production entry point must render instead of raising TypeError.
+    """
+    monkeypatch.setattr(i18n, "_current_lang", "en-US")
+    errors = app_module.validate_pins([0, 1, 2, 3, 4, 5, 6, 7, 11], "C3")
+    assert errors
+    assert errors[0]["code"] == "reserved"
+    assert errors[0]["message"] == (
+        "GPIO 11 on Button 9 is an internal flash pin on the C3 "
+        "and cannot be used as a button"
+    )
+
+
+def test_api_defaults_validates_pins_in_english(client, monkeypatch):
+    """The page's real request (GET /api/defaults?chip=C3&pins=…) must be 200."""
+    monkeypatch.setattr(i18n, "_current_lang", "en-US")
+    res = client.get("/api/defaults?chip=C3&pins=0,1,2")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["pinErrors"], "the three pins supplied are valid, the rest are empty"
+    assert body["pinErrors"][0]["message"].startswith("Button 4")
+
+
+def test_update_events_carry_named_params():
+    """``app.js`` renders ``t(e.code, e.params)``; a printf row shows ``%s``.
+
+    The event must therefore carry ``{"version": ...}``, not ``{"args": [...]}``.
+    """
+    i18n.set_lang("en-US")
+    item = app_module.add_event("update", i18n.t("log.app_updated", version="v1.4.0"),
+                                level="ok")
+    assert item["text"] == "Host updated to v1.4.0"
+    assert item["code"] == "log.app_updated"
+    assert item["params"] == {"version": "v1.4.0"}
+    assert "%" not in item["text"]
+
+
+def test_uptime_wrap_copy_follows_a_language_switch():
+    """Module-level ``t()`` froze the language at import time (WS-541)."""
+    i18n.set_lang("zh-CN")
+    assert app_module.uptime_wrap_text() == "本次连接内已运行"
+    i18n.set_lang("en-US")
+    assert app_module.uptime_wrap_text() == "Running since this connection"
+    assert app_module.uptime_wrap_note() == "Device uptime counter wrapped"
+
+
+def test_port_busy_message_follows_a_language_switch():
+    import desktop
+
+    i18n.set_lang("zh-CN")
+    assert desktop.port_busy_message().startswith("已有普通权限实例在运行")
+    i18n.set_lang("en-US")
+    message = desktop.port_busy_message(8788)
+    assert message.startswith("An instance is already running")
+    assert "(port 8788 is already in use)" in message
+
+
+def test_api_desktop_normalizes_an_unknown_lang(client, monkeypatch):
+    """``{"lang": "xx"}`` used to be persisted verbatim into config.json."""
+    monkeypatch.setattr(app_module.autostart, "status", lambda: {
+        "enabled": False, "admin": False, "supported": True, "admin_supported": True,
+        "method": "", "detail": "", "error": ""})
+    res = client.post("/api/desktop", json={"lang": "xx"})
+    assert res.status_code == 200
+    assert res.get_json()["lang"] == "system"
+    assert app_module._config["lang"] == "system"
+
