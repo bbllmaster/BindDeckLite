@@ -399,6 +399,95 @@ def pin_rules(chip: str = "", layout: int = LAYOUT_ENCODER) -> dict:
     return rules
 
 
+# --- WS-542: deep-sleep wake inputs ---------------------------------------
+# A key can only wake the deck from deep sleep when its GPIO stays powered by
+# the RTC domain while the rest of the chip is off:
+#   classic ESP32: 0 / 2 / 4 / 12-15 / 25-27 / 32-39
+#   ESP32-C3:      0-5
+# Mirrors isWakeCapablePin() in src/main.cpp. The firmware derives its wake mask
+# from the same rule, so the hint the UI shows and the mask the deck really
+# arms cannot drift apart. This is descriptive only: validate_pins() stays the
+# single authority on whether a pin may be assigned to a button at all.
+WAKE_PINS = {
+    "ESP32": frozenset([0, 2, 4] + list(range(12, 16)) + list(range(25, 28))
+                       + list(range(32, 40))),
+    "C3": frozenset(range(0, 6)),
+}
+# First firmware that derives the wake mask from the live layout (WS-542).
+# Older decks only trusted the encoder push because of the ext0 call, so the
+# host must not promise them a wake-line it cannot keep.
+WAKE_MIN_VERSION = "1.3.9"
+
+
+def _sleep_layout(layout) -> int:
+    """Layout as an int (1 = encoder, 0 = 12-key) from any caller's shape.
+
+    Accepts the numeric form used by the protocol, the names the UI/tests use
+    ("encoder" / "12key") and a device cfg dict (``{"layout": 0}``).
+    """
+    if isinstance(layout, dict):
+        return layout_of(layout)
+    if isinstance(layout, str):
+        text = layout.strip().lower()
+        if text in ("0", "12", "12key", "12-key", "twelve"):
+            return LAYOUT_12KEY
+        return LAYOUT_ENCODER
+    try:
+        return LAYOUT_12KEY if int(layout) == LAYOUT_12KEY else LAYOUT_ENCODER
+    except (TypeError, ValueError):
+        return LAYOUT_ENCODER
+
+
+def _usable_pin(prof: str, pin: int) -> bool:
+    """Same pin exclusions as the firmware's isValidButtonPin().
+
+    A pin rejected here can never be a button, so it is not "non-RTC" - it is
+    simply out of range for this chip.
+    """
+    if prof == "C3":
+        return 0 <= pin <= 21 and not (11 <= pin <= 17)
+    return 0 <= pin <= 39 and not (6 <= pin <= 11) and pin < 34
+
+
+def wake_inputs(chip: str, layout, pins) -> dict:
+    """Which inputs of this deck can wake it from deep sleep (WS-542).
+
+    ``chip`` is the firmware's FW_CHIP ("ESP32" / "C3"), ``layout`` the layout
+    the UI currently shows (see :func:`_sleep_layout`) and ``pins`` the nine
+    editable button pins exactly as the form holds them - ints, numeric
+    strings, ``None`` or garbage. A bad value is reported, never raised: the
+    hint has to keep rendering while the user is still typing. Inputs 9..11
+    are the fixed EC11 lines and need no row in ``pins``.
+
+    Returns ``{"wake": [input index...], "no_wake": [{"index", "pin",
+    "reason"}]}``. Indices are 0-based, the same numbering as
+    ``BTN:<dev>:<index>``. ``reason`` is ``"non-rtc"`` for a usable pin the
+    RTC domain cannot watch, or ``"range"`` for a value this chip could not
+    use as a button at all.
+    """
+    prof = pin_chip(chip)
+    twelve = _sleep_layout(layout) == LAYOUT_12KEY
+    values = list(pins) if isinstance(pins, (list, tuple)) else []
+    enc = ENCODER_PINS[prof]
+    wake, no_wake = [], []
+    count = INPUT_COUNT_12KEY if twelve else INPUT_COUNT_ENCODER
+    for idx in range(count):
+        if idx < PIN_COUNT:
+            ok, pin = _pin_int(values[idx]) if idx < len(values) else (False, 0)
+        elif idx == 9:
+            ok, pin = True, enc["SW"]
+        else:
+            ok, pin = True, enc["CLK"] if idx == 10 else enc["DT"]
+        if not ok or not _usable_pin(prof, pin):
+            no_wake.append({"index": idx, "pin": pin if ok else None,
+                            "reason": "range"})
+        elif pin in WAKE_PINS[prof]:
+            wake.append(idx)
+        else:
+            no_wake.append({"index": idx, "pin": pin, "reason": "non-rtc"})
+    return {"wake": wake, "no_wake": no_wake}
+
+
 def _pin_int(value):
     """Strictly parse one candidate pin. Returns ``(ok, pin)``.
 
@@ -3834,9 +3923,18 @@ def api_defaults():
     payload = new_device_cfg(chip, "")
     payload["layout"] = layout
     payload["pinRules"] = pin_rules(chip, layout)
+    pins = payload["pins"]
     if "pins" in request.args:
-        payload["pinErrors"] = validate_pins(
-            parse_pins_query(request.args.get("pins", "")), chip, layout)
+        pins = parse_pins_query(request.args.get("pins", ""))
+        payload["pinErrors"] = validate_pins(pins, chip, layout)
+    # WS-542: the device page renders "可唤醒输入：…" from this, and the page
+    # passes the firmware version it is looking at so an older deck (< 1.3.9,
+    # which still armed ext0 on the encoder push) hides the line instead of
+    # being promised a wake it does not have.
+    payload["wakeInputs"] = wake_inputs(chip, layout, pins)
+    payload["wakeSupported"] = ("fw" not in request.args
+                                or online_update.version_at_least(
+                                    request.args.get("fw", ""), WAKE_MIN_VERSION))
     return jsonify(payload)
 
 

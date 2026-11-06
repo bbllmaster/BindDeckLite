@@ -28,6 +28,7 @@
 #include <Update.h>
 #include <mbedtls/sha256.h>   // OTA payload integrity (CMD:OTA:<size>:<sha256>)
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>   // rtc_gpio_pullup_en() — wake pins (WS-542)
 #include <esp_timer.h>
 #include <esp_log.h>
 #include <esp_ota_ops.h>   // esp_ota_get_next_update_partition() (WS-378 diag)
@@ -51,7 +52,7 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.8"   // WS-508: 键码 0 = 不发键（此前为 WS-499 CFG:LAYOUT）
+#define FW_VERSION "1.3.9"   // WS-542: 深睡唤醒源按芯片/布局重算
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -824,12 +825,74 @@ static String cfgPage(const KeysForm* form = nullptr) {
   if (sleepOn) h += " checked";
   h += F("> 启用</label> 延时(分钟) <input name='sleeptime' type='number' min='1' value='");
   h += String(sleepMs / 60000);
-  h += F("' style='width:80px'></p><button style='padding:10px 20px'>保存按键配置</button></form>");
+  h += F("' style='width:80px'></p>");
+  // WS-542: the line above the save button states which inputs can wake the
+  // deck. It is rendered by the script below from the current chip + layout +
+  // the pin boxes as they are being edited.
+  h += F("<p id='wakeInfo' style='color:#888;font-size:12px'></p>");
+  h += F("<button style='padding:10px 20px'>保存按键配置</button></form>");
 
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
          "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
          "——编码器布局下是编码器按压，12 键布局下是第 10 键；或上位机点“进入配网模式”）。"
          "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。</p>");
+  // WS-542: deep-sleep wake capability of the inputs, recomputed on every pin
+  // keystroke (no save needed). Same chip rule as isWakeCapablePin() above:
+  // only RTC GPIOs can wake the chip, so the EC11 lines and the 12-key fixed
+  // pins 10-12 never do. This is a description, not a validation - saving is
+  // still governed by /keys.
+  h += F("<script id='wakeinfo'>(function(){"
+         "var el=document.getElementById('wakeInfo');"
+         "if(!el)return;"
+         "var cap=[");
+#ifdef TARGET_ESP32C3
+  h += F("0,1,2,3,4,5");
+#else
+  h += F("0,2,4,12,13,14,15,25,26,27,32,33,34,35,36,37,38,39");
+#endif
+  h += F("],fixed=[");
+  h += String(ENCODER_SW) + "," + String(ENCODER_CLK) + "," + String(ENCODER_DT);
+  h += F("];"
+         "function twelve(){var s=document.querySelector(\"select[name=layout]\");"
+         "return !!(s&&s.value==='0');}"
+         "function label(i){return i<9?'按键 '+(i+1):(i===9&&!twelve()?'编码器按压':'第 '+(i+1)+' 键');}"
+         "function piece(a,b){"
+         "if(a===b)return label(a);"
+         "if(a<9)return '按键 '+(a+1)+'–'+(b+1);"
+         "return '第 '+(a+1)+'–'+(b+1)+' 键';}"
+         "function join(list){"
+         "var out=[],start=-1,prev=-1;"
+         "function flush(){if(start>=0){out.push(piece(start,prev));start=-1;}}"
+         "list.forEach(function(i){"
+         "if(start<0){start=i;prev=i;return;}"
+         "if(i===prev+1){prev=i;return;}"
+         "flush();start=i;prev=i;});"
+         "flush();return out.join('、');}"
+         "function current(){"
+         "var p=[],t=twelve();"
+         "for(var i=0;i<9;i++){"
+         "var n=document.querySelector('input[name=pin'+i+']');"
+         "p.push(n?parseInt(n.value,10):NaN);}"
+         "p.push(fixed[0]);"
+         "if(t){p.push(fixed[1],fixed[2]);}"
+         "return p;}"
+         "function render(){"
+         "var p=current(),wake=[],block=[];"
+         "for(var i=0;i<p.length;i++){"
+         "var v=p[i];"
+         "if(typeof v!=='number'||isNaN(v)||v<0||v>39||cap.indexOf(v)<0)block.push(i);"
+         "else wake.push(i);}"
+         "var text='可唤醒输入：'+(wake.length?join(wake):'无');"
+         "if(block.length)text+='；不可唤醒：'+join(block);"
+         "el.textContent=text;}"
+         "var s=document.querySelector(\"select[name=layout]\");"
+         "if(s)s.onchange=render;"
+         "for(var i=0;i<9;i++){"
+         "var n=document.querySelector('input[name=pin'+i+']');"
+         "if(n)n.addEventListener('input',render);}"
+         "render();"
+         "})();</script>");
+
   // WS-504: self-check poller. Inline on purpose - the portal stays a single
   // response with no external resource. Kept inside the marked <script> block
   // so host/test_portal_selfcheck.mjs can extract and exercise this exact code.
@@ -2576,6 +2639,81 @@ static void applyDeviceIdentity() {
   log_e("[id] %s", g_bleName.c_str());
 }
 
+// === Deep-sleep wake sources (WS-542) =====================================
+// Only pins in the RTC domain can wake the chip from deep sleep: the classic
+// ESP32 has 0/2/4/12-15/25-27/32-39, the C3 has 0-5. Everything else on the
+// deck - the encoder push (GPIO5 on the classic board, GPIO10 on the C3), the
+// EC11 A/B lines (18/19, 20/21) and therefore the 12-key layout's fixed
+// inputs 10-12 - simply cannot wake it. The mask is therefore derived from the
+// *active* inputs of the current layout instead of one hard-coded pin (the old
+// `esp_sleep_enable_ext0_wakeup(ENCODER_SW, 0)` pointed at GPIO5 on the
+// classic board, which is not an RTC GPIO: the deck slept with no wake source
+// at all and never came back).
+static bool isWakeCapablePin(int pin) {
+#ifdef TARGET_ESP32C3
+  return pin >= 0 && pin <= 5;
+#else
+  if (pin < 0) return false;
+  if (pin == 0 || pin == 2 || pin == 4) return true;
+  if (pin >= 12 && pin <= 15) return true;
+  if (pin >= 25 && pin <= 27) return true;
+  return pin >= 32 && pin <= 39;
+#endif
+}
+
+// Bit mask of the wake-capable pins among the inputs the current layout has.
+// 0 means "nothing can wake this deck" - the caller must not sleep.
+static uint64_t wakePinMask() {
+  uint64_t mask = 0;
+  for (int i = 0; i < inputCount(); i++) {
+    int pin = inputPin(i);
+    if (isWakeCapablePin(pin)) mask |= (1ULL << pin);
+  }
+  return mask;
+}
+
+static String wakePinList(uint64_t mask) {
+  String out;
+  for (int pin = 0; pin < 64; pin++) {
+    if (!(mask & (1ULL << pin))) continue;
+    if (out.length()) out += ",";
+    out += String(pin);
+  }
+  return out;
+}
+
+// Which pin woke us. Called at the very top of setup(), before BLE and before
+// any other subsystem can bury the line, so the wake is the first evidence in
+// the serial log after a sleep.
+static void logWakeSource() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) return;  // cold boot or reset
+#ifdef TARGET_ESP32C3
+  if (cause == ESP_SLEEP_WAKEUP_GPIO) {
+    uint64_t status = esp_sleep_get_gpio_wakeup_status();
+    for (int pin = 0; pin < 64; pin++) {
+      if (status & (1ULL << pin)) {
+        log_e("[sleep] wake gpio=%d", pin);
+        return;
+      }
+    }
+  }
+#else
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    uint64_t status = esp_sleep_get_ext1_wakeup_status();
+    for (int pin = 0; pin < 64; pin++) {
+      if (status & (1ULL << pin)) {   // lowest set bit first
+        log_e("[sleep] wake gpio=%d", pin);
+        return;
+      }
+    }
+  }
+#endif
+  // Chip without a per-pin status (or an unexpected cause): the numeric cause
+  // is still enough to tell "ext1/GPIO wake" from "power-on reset".
+  log_e("[sleep] wake cause=%d", (int)cause);
+}
+
 // === setup / loop =========================================================
 void setup() {
   Serial.begin(115200);
@@ -2591,6 +2729,8 @@ void setup() {
   // enumeration: without it the first lines fall into the void on the C3.
   delay(250);
   otaTestOnBoot();
+  // WS-542: report the wake pin right after the probe, well before BLE starts.
+  logWakeSource();
 
   // Config mode: hold the encoder push while powering on (~200 ms stable).
   // WS-499: this is input 9 in both layouts (encoder push / "button 10").
@@ -3019,24 +3159,45 @@ void loop() {
   // ---- deep sleep --------------------------------------------------------
   if (bleKeyboard.isConnected()) g_lastActivity = millis();
   if (!g_configMode && sleepEnabled && (millis() - g_lastActivity >= sleepTimeoutMs)) {
-    log_e("[sleep] idle %lums -> deep sleep", sleepTimeoutMs);
-    delay(100);
-    // WS-499: wake sources are per layout so inputs 9..11 are covered where the
-    // chip allows it. On the C3 only GPIO0-5 can wake from deep sleep, so the
-    // EC11 lines (10/20/21) never qualify there. On the classic ESP32 the ext0
-    // call on ENCODER_SW is unchanged from before this change; note GPIO5 is
-    // not an RTC GPIO (RTC domain is 0/2/4/12-15/25-27/32-39), so that path is
-    // a pre-existing gap, not something the 12-key layout introduced.
+    // WS-542: the wake sources are the RTC-capable pins of the *active* inputs
+    // (see isWakeCapablePin()). Sleeping without a registered wake source is
+    // what bricked the classic board until v1.3.8, so every failure path below
+    // keeps the deck awake and just logs why.
+    uint64_t wakeMask = wakePinMask();
+    if (!wakeMask) {
+      log_e("[sleep] skipped: no wake pin");
+      g_lastActivity = millis();   // retry after another full timeout, no log spam
+    } else {
 #ifdef TARGET_ESP32C3
-    uint64_t mask = 0;
-    for (int i = 0; i < inputCount(); i++) {
-      int pin = inputPin(i);
-      if (pin >= 0 && pin <= 5) mask |= (1ULL << pin);
-    }
-    if (mask) esp_deep_sleep_enable_gpio_wakeup(mask, ESP_GPIO_WAKEUP_GPIO_LOW);
+      esp_err_t rc = esp_deep_sleep_enable_gpio_wakeup(wakeMask, ESP_GPIO_WAKEUP_GPIO_LOW);
 #else
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)ENCODER_SW, 0);
+      // ext1 covers every RTC GPIO at once; ALL_LOW keeps the "press = GND"
+      // wiring of the keys (internal pull-ups are held through deep sleep).
+      esp_err_t rc = esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
 #endif
-    esp_deep_sleep_start();
+      if (rc != ESP_OK) {
+        log_e("[sleep] wake source failed rc=%d", (int)rc);
+        g_lastActivity = millis();
+      } else {
+        // Keep the RTC pull-up enabled on every wake pin: a pressed key pulls
+        // the line to GND and wakes the chip, while a floating line would wake
+        // it immediately (the deck would reboot in a loop, never sleeping).
+        // The classic ESP32 needs this explicitly - its RTC IO owns the pad
+        // while the digital domain is off. The C3's RTC IO has no pull
+        // resistors at all (SOC_RTCIO_INPUT_OUTPUT_SUPPORTED = 0); its keys
+        // keep working through the GPIO configuration the board boots with.
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+        for (int pin = 0; pin < 64; pin++) {
+          if (!(wakeMask & (1ULL << pin))) continue;
+          rtc_gpio_pullup_en((gpio_num_t)pin);
+          rtc_gpio_pulldown_dis((gpio_num_t)pin);
+        }
+#endif
+        log_e("[sleep] enter timeout=%lums wake_gpio=%s",
+              sleepTimeoutMs, wakePinList(wakeMask).c_str());
+        delay(100);
+        esp_deep_sleep_start();
+      }
+    }
   }
 }
