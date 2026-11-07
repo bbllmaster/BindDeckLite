@@ -73,10 +73,10 @@ jobs:
       - name: i18n guard (WS-529)
         run: python tools/check_i18n.py
 
-      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic + WS-420 OTA flash guard + encoder rotation actions + WS-476 pin validation + WS-484 macro summary + WS-495 stop running action + WS-499 12-key layout + WS-508 no-key sentinel + WS-512 device trust + WS-523 online update + WS-529 i18n)
+      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic + WS-420 OTA flash guard + encoder rotation actions + WS-476 pin validation + WS-484 macro summary + WS-495 stop running action + WS-499 12-key layout + WS-508 no-key sentinel + WS-512 device trust + WS-523 online update + WS-529 i18n + WS-546 key modifiers)
         working-directory: host
         run: |
-          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_device_trust.py test_app_update.py test_fw_update.py test_release_pipeline.py test_i18n.py -v
+          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_key_mods.py test_device_trust.py test_app_update.py test_fw_update.py test_release_pipeline.py test_i18n.py -v
 
       # Front-end regression tests (plain node scripts under host/).  All of
       # them are listed explicitly: a test file that is not named here never

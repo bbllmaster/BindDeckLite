@@ -39,14 +39,34 @@ function keyItem(idx) {
   return keys[idx] || null;
 }
 
+/* ---------------- 修饰键（WS-546） ----------------
+ * 顺序、位值和文案都由 /api/keycodes 的 mods 列表给出（Ctrl→Shift→Alt→Win），
+ * 这里只按位过滤 —— 前端不再写第二份顺序规则。 */
+function modDefs() {
+  return Array.isArray(state.modDefs) ? state.modDefs : [];
+}
+
+/** 掩码 → ["Ctrl", "Shift"]（按服务器给的顺序）。 */
+function keyModsText(mask) {
+  const bits = parseInt(mask, 10) || 0;
+  return modDefs().filter((m) => bits & m.bit).map((m) => m.label);
+}
+
+/** 摘要卡上的 HID 文案：Ctrl + Shift + Esc；键码 0 一律「不发键」。 */
+function keyHidText(item) {
+  const code = parseInt(item && item.code, 10);
+  if (code === 0) return t("keys.key_none");
+  const known = state.keycodes.find((k) => k.code === code);
+  const base = (item && item.label) || (known && known.label) || String(code);
+  return keyModsText(item && item.mods).concat([base]).join(" + ");
+}
+
 /** 只改摘要卡上的三处文本，不重建卡片（抽屉与焦点不会被冲掉）。 */
 function refreshKeyCard(idx) {
   const card = $(`.keycard[data-idx="${idx}"]`);
   const item = keyItem(idx);
   if (!card || !item) return;
-  const code = parseInt(item.code, 10);
-  const known = state.keycodes.find((k) => k.code === code);
-  const hid = code === 0 ? t("keys.key_none") : item.label || (known && known.label) || String(code);
+  const hid = keyHidText(item);
   const hidEl = $(".kc-hid", card);
   const actEl = $(".kc-act", card);
   if (hidEl) hidEl.textContent = hid;
@@ -134,6 +154,8 @@ function openKeyDrawer(idx) {
   $("#keyDrawer").classList.add("open");
   $("#keyDrawerBackdrop").hidden = false;
   document.body.classList.add("drawer-open");
+  // WS-546: 修饰键能力还未知时问一次设备（旧固件超时后整行禁用并提示）。
+  if (typeof ensureModsCapability === "function") ensureModsCapability();
   const first = $("#kdHid");
   if (first) first.focus({ preventScroll: true });
 }
@@ -171,11 +193,30 @@ function renderKeyDrawer() {
 
   const action = item.action || { type: "none", value: "", macro: [] };
   title.textContent = inputTitle(idx);
+  // WS-546: 修饰键与键码同卡。旧固件（不支持 CFG:MODS）时整行禁用并说明原因，
+  // 而不是让用户勾完再被静默忽略 —— 也不能只靠版本号判断，能力由
+  // /api/device/<id>/mods 探测后写进 cfg.mods_supported。
+  const mods = modDefs();
+  const mask = parseInt(item.mods, 10) || 0;
+  const modsBlocked = (state.cfg || {}).mods_supported === false;
+  const modsRow = mods.length ? `
+    <div class="kd-field">
+      <span class="field-label">${t("keys.mods_label")}</span>
+      <div class="kd-mods" role="group" aria-label="${t("keys.mods_label")}">
+        ${mods.map((m) => `
+          <label class="kd-mod">
+            <input type="checkbox" id="${m.id}" data-bit="${m.bit}"
+                   ${(mask & m.bit) ? "checked" : ""} ${modsBlocked ? "disabled" : ""}>
+            <span>${escapeHtml(m.label)}</span>
+          </label>`).join("")}
+      </div>
+      ${modsBlocked ? `<p class="muted small" id="kdModsHint">${t("keys.mods_unsupported")}</p>` : ""}
+    </div>` : "";
   body.innerHTML = `
     <div class="kd-field">
       <label class="field-label" for="kdHid">${t("keys.hid_label")}</label>
       <select id="kdHid" class="sel-key">${keyOptions(item.code)}</select>
-    </div>
+    </div>${modsRow}
     <div class="kd-field">
       <label class="field-label" for="kdAct">${t("keys.action_label")}</label>
       <select id="kdAct" class="sel-act">
@@ -198,6 +239,19 @@ function renderKeyDrawer() {
     refreshKeyCard(idx);
     markDirty();
   };
+  // 4 个复选框合成一个 0–15 的掩码：勾/取消只改这一位，其余位保留。
+  const modBoxes = body.querySelectorAll(".kd-mods input[data-bit]");
+  modBoxes.forEach((box) => {
+    box.onchange = () => {
+      let next = 0;
+      modBoxes.forEach((b) => {
+        if (b.checked) next |= parseInt(b.dataset.bit, 10) || 0;
+      });
+      item.mods = next;
+      refreshKeyCard(idx);
+      markDirty();
+    };
+  });
   $("#kdAct").onchange = (e) => {
     item.action = { type: e.target.value, value: "", macro: [] };
     renderKeyDrawer();
