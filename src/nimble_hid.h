@@ -16,6 +16,11 @@
 // --- key codes, identical values to the t-vk library -----------------------
 const uint8_t KEY_LEFT_CTRL  = 0x80;
 const uint8_t KEY_LEFT_SHIFT = 0x81;
+// WS-546: press() treats 0x80..0x87 as modifiers and ORs (1 << (k - 0x80))
+// into the HID report's modifier byte, so these two are all the per-input
+// modifier masks need for Alt / GUI.
+const uint8_t KEY_LEFT_ALT   = 0x82;
+const uint8_t KEY_LEFT_GUI   = 0x83;
 const uint8_t KEY_TAB        = 0xB3;
 const uint8_t KEY_F13        = 0xF0;
 const uint8_t KEY_F14        = 0xF1;

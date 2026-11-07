@@ -1,5 +1,29 @@
 # Changelog
 
+## 每个输入可配修饰键：Ctrl / Shift / Alt / Win 组合键由设备自己发 — 2026-11-07（WS-546）
+
+以前一个输入只存一个键码，组合键只能走上位机宏 `key:ctrl+c` —— 锁屏、登录界面、
+BIOS、游戏全屏，以及「只配对蓝牙、没装上位机」的第二台电脑上完全用不了；设备默认
+的 F13–F22 在多数应用里也没有默认行为。
+
+- **固件**：每个输入新增 4 位修饰键掩码（bit0 Ctrl / bit1 Shift / bit2 Alt / bit3
+  GUI，v1 只发左变体），NVS 键 `mod<i>`，默认 0。`sendKeyForInput()` 先按掩码逐个
+  `press()` 再按主键，8 ms 后统一 `releaseAll()`；主键为「不发键」时连修饰键也不发。
+  新增 `CFG:MODS:<csv>`（个数必须等于当前布局输入数，每个 0–15，非法整条拒绝并保持
+  原值）、`CFG:MODS` 查询（回 `MODS:<csv>`）与 `CMD:GET_CFG` 末尾的 `CFG_MODS:`。
+  旧固件 / 旧上位机两个方向都保持原行为（默认掩码 0）。
+- **上位机**：按键抽屉「HID 键」下方新增 Ctrl / Shift / Alt / Win 四个复选框，与键码
+  同卡、走现有标脏与「应用配置」流程；摘要卡显示 `Ctrl + Shift + Esc`（顺序固定
+  Ctrl→Shift→Alt→Win，键码 0 显示「不发键」）。`/api/apply` 在 `CFG:KEYS:` 之后发
+  `CFG:MODS:`，回读 `CFG_MODS:` 写回 `keys[i].mods` 并参与逐项校验。
+- **能力门控**：抽屉打开时用 `CFG:MODS` 探测能力，旧固件整行禁用并提示「当前固件
+  不支持修饰键，请更新固件」，且不会下发 `CFG:MODS:` —— 不写死版本号。
+- **协议 / 文档**：`docs/protocol.md` 增补 `CFG:MODS:` / `CFG:MODS` / `MODS:` /
+  `CFG_MODS:` 与「每输入修饰键」一节。
+- **回归**：`cd host && python -m pytest test_key_mods.py -q`（import 生产函数，覆盖
+  行拼装与 12 值、越界截断、回读写入、非法回读整条拒绝、旧固件不下发、能力探测、
+  摘要顺序与来源唯一）。
+
 ## 上位机在线自查更新 + 固件 OTA 在线检测/推送 + 版本源与 update.json — 2026-11-05（WS-523 / WS-526）
 
 以前用户要手动去 GitHub 找包、手动替换 exe、手动选 bin 推 OTA。本期把
