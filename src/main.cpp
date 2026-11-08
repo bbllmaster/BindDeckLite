@@ -129,6 +129,7 @@ static const uint8_t DEFAULT_KEYS[NUM_INPUTS_MAX] = {
 #define DOUBLE_CLICK_MS     1200   // second press within this window -> portal
 #define CONFIG_MODE_MS      300000 // portal auto-closes after 5 min
 #define CONFIG_EXIT_MS      1000   // hold the encoder push this long to leave
+#define PORTAL_EXIT_MS      1200   // WS-551: drain the /exit response before reset
 #define DEBOUNCE_MS         25
 
 // === Globals ==============================================================
@@ -315,6 +316,13 @@ static bool g_encSeenIdle = false;
 // preferences access and keeping BLE/notify out of unsafe contexts.
 enum BootReq : uint8_t { BOOT_NONE = 0, BOOT_CFG = 1, BOOT_REBOOT = 2 };
 static BootReq g_bootReq = BOOT_NONE;
+
+// WS-551: portal "退出配网并重启". POST /exit answers immediately and only arms
+// this deadline — the WebServer callback must not reset the chip before the
+// response is on the wire (the user would just see a dead connection). loop()
+// leaves the portal at the deadline and hands the restart to g_bootReq, so the
+// reset still happens on the Arduino task, exactly like CMD:REBOOT. 0 = idle.
+static unsigned long g_portalExitAt = 0;
 
 // === Encoder sampling =====================================================
 static const int8_t ENC_STATES[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
@@ -863,6 +871,19 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += String(sleepMs / 60000);
   h += F("' style='width:80px'></p><button style='padding:10px 20px'>保存按键配置</button></form>");
 
+  // WS-551: finish from the phone. The confirm() is an enhancement only - with
+  // JS disabled the form still POSTs /exit and the deck still leaves the portal
+  // and reboots. Nothing is written to NVS here: this is the same outcome as
+  // the long-press / 5-minute exit, just triggered from the browser.
+  h += F("<hr><h3>完成配置</h3>"
+         "<p style='font-size:14px;margin:0 0 10px'>退出后热点关闭，设备重启并恢复蓝牙。"
+         "未保存的表单修改会丢失。</p>"
+         "<form method='POST' action='/exit' "
+         "onsubmit=\"return confirm('退出配网并重启？未保存的修改会丢失。')\">"
+         "<button style='width:100%;box-sizing:border-box;padding:10px 16px;font:inherit;"
+         "border:0;border-radius:6px;background:#1a73e8;color:#fff;font-size:16px'>"
+         "退出配网并重启</button></form>");
+
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
          "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
          "——编码器布局下是编码器按压，12 键布局下是第 10 键；或上位机点“进入配网模式”）。"
@@ -1038,6 +1059,23 @@ static void setupProvisioning() {
     } else {
       cfgServer.send(400, "text/html; charset=utf-8", cfgPage(&form));
     }
+  });
+
+  // --- WS-551: leave the portal from the phone ---------------------------
+  // POST only. A browser prefetch or a pasted link must never reset the deck,
+  // so GET answers 405 and arms nothing. The 200 goes out first;
+  // the restart is deferred to loop() (g_portalExitAt) so the phone sees the
+  // result page instead of a dropped connection.
+  cfgServer.on("/exit", HTTP_POST, []() {
+    cfgServer.send(200, "text/html; charset=utf-8",
+                   "<meta charset='utf-8'>"
+                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                   "<p>正在退出配网，热点将在几秒内关闭；设备重启后自动恢复蓝牙。</p>");
+    g_portalExitAt = millis() + PORTAL_EXIT_MS;
+    log_e("[cfg] exit requested via portal");
+  });
+  cfgServer.on("/exit", HTTP_GET, []() {
+    cfgServer.send(405, "text/plain", "Method Not Allowed");
   });
 
   // --- WS-504: read-only self-check feed for the portal page ---
@@ -2994,6 +3032,16 @@ void loop() {
   if (g_configMode) {
     cfgServer.handleClient();
     loopWiFi();
+    // WS-551: POST /exit deadline. The 200 is already queued on the socket;
+    // hand the restart to the deferred-boot block above (never restart from
+    // the WebServer callback). Both exits go through g_bootReq, so the deck
+    // reboots with the same "back to BLE" result as the long press, and no NVS
+    // value (WiFi credentials, pins, host binding) is touched.
+    if (g_portalExitAt && (long)(millis() - g_portalExitAt) >= 0) {
+      g_portalExitAt = 0;
+      log_e("[cfg] portal exit -> reboot");
+      g_bootReq = BOOT_REBOOT;
+    }
     static unsigned long exitHold = 0;
     if (digitalRead(ENCODER_SW) == LOW) {
       if (exitHold == 0) {
