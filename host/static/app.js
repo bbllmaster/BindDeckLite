@@ -3615,10 +3615,18 @@ async function cancelOta() {
 const updateState = {
   app: null,        // /api/app/update/check 的结果
   appTask: null,    // 上位机更新任务 id
+  channel: "stable",// 当前更新通道（stable / rolling）
   fw: null,         // /api/firmware/update/check 的结果
   fwTask: null,     // 固件更新设备 id
   polling: null,    // 进度轮询定时器
 };
+
+/** 更新目标的显示文本：滚动通道显示 tag（main-YYYYMMDD-HHMM），正式版显示版本号。 */
+function updateTargetText(r) {
+  if (!r) return "—";
+  if (r.channel === "rolling") return r.tag || "—";
+  return r.latest ? fmtVersion(r.latest) : "—";
+}
 
 /** 失败提示：中文原因 + 可复制错误码 + Release 链接。 */
 function updateErrorText(payload, fallback) {
@@ -3666,7 +3674,23 @@ function renderUpdateApp() {
   const st = $("#updAppState");
   const applyBtn = $("#btnUpdateApply");
   const skipBtn = $("#btnUpdateSkip");
+  const channelSel = $("#updateChannel");
+  const channelInfo = $("#updAppChannelInfo");
+  const rollingWarn = $("#updAppRollingWarn");
   if (!current || !st) return;
+
+  const channel = r && r.channel ? r.channel : updateState.channel;
+  if (channelSel && channel) channelSel.value = channel;
+  if (channelInfo) {
+    channelInfo.hidden = !r;
+    if (!r) channelInfo.textContent = "";
+    else if (channel === "rolling") {
+      channelInfo.textContent = t("update.rolling_target", { tag: r.tag || "—" });
+    } else {
+      channelInfo.textContent = t("update.stable_target");
+    }
+  }
+  if (rollingWarn) rollingWarn.hidden = channel !== "rolling";
 
   if (!r) {
     current.textContent = "—";
@@ -3681,17 +3705,17 @@ function renderUpdateApp() {
   }
 
   current.textContent = fmtVersion(r.current);
-  latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
+  latest.textContent = updateTargetText(r);
   size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
   sha.textContent = r.asset && r.asset.sha256 ? r.asset.sha256.slice(0, 16) + "…" : "—";
   setUpdateNotes("updAppNotesBox", "updAppNotes", r.notes);
   setUpdateError("updAppError", r.ok === false ? r : null);
 
   if (r.has_update) {
-    st.textContent = t("update.new_version", { latest: fmtVersion(r.latest), current: fmtVersion(r.current) });
+    st.textContent = t("update.new_version", { latest: updateTargetText(r), current: fmtVersion(r.current) });
     st.classList.remove("ok");
   } else if (r.skipped) {
-    st.textContent = t("update.skipped_version", { latest: fmtVersion(r.latest) });
+    st.textContent = t("update.skipped_version", { latest: updateTargetText(r) });
     st.classList.remove("ok");
   } else if (r.ok === false) {
     // 说清楚为什么不能升 —— 只写「检查失败」用户会以为是网络问题。
@@ -3771,15 +3795,40 @@ async function checkAppUpdate(quiet) {
     updateState.app = await api("/api/app/update/check");
   } catch (e) {
     updateState.app = {
-      ok: false, has_update: false, current: "", latest: "",
+      ok: false, has_update: false, current: "", latest: "", tag: "",
+      channel: updateState.channel,
       error: t("update.check_failed_detail") + (e.message || e), error_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
   }
+  if (updateState.app && updateState.app.channel) {
+    updateState.channel = updateState.app.channel;
+  }
   renderUpdateApp();
   refreshUpdateDot();
   if (!quiet && updateState.app.has_update) {
-    toast(t("update.found_new_version", { latest: fmtVersion(updateState.app.latest) }), "ok");
+    toast(t("update.found_new_version", { latest: updateTargetText(updateState.app) }), "ok");
+  }
+}
+
+/** 切换更新通道：持久化到 config.json，并立即按新通道重新检查。 */
+async function switchUpdateChannel(channel) {
+  const sel = $("#updateChannel");
+  try {
+    const d = await api("/api/app/update/channel", {
+      method: "POST",
+      body: JSON.stringify({ channel }),
+    });
+    updateState.channel = d.channel || channel;
+    if (sel) sel.value = updateState.channel;
+    toast(t("update.channel_switched", {
+      channel: t("ui.update_channel_" + updateState.channel),
+    }), "ok");
+    await checkAppUpdate(true);
+  } catch (e) {
+    toast(t("update.channel_switch_failed") + (e.message || e), "bad");
+    if (sel) sel.value = updateState.channel;
+    renderUpdateApp();
   }
 }
 
@@ -3925,12 +3974,15 @@ function pollAppUpdate(task) {
 async function skipAppUpdate() {
   const r = updateState.app;
   if (!r || !r.latest) return;
+  // 滚动通道按 tag 跳过：所有 nightly 的 semver 一样，用版本号会把后续
+  // 所有构建一起跳过。
+  const key = r.skip_key || r.latest;
   try {
     await api("/api/app/update/skip", {
       method: "POST",
-      body: JSON.stringify({ version: r.latest }),
+      body: JSON.stringify({ version: key }),
     });
-    toast(t("update.skipped_done", { latest: fmtVersion(r.latest) }), "ok");
+    toast(t("update.skipped_done", { latest: updateTargetText(r) }), "ok");
     await checkAppUpdate(true);
   } catch (e) {
     toast(t("update.skip_failed") + (e.message || e), "bad");
@@ -4054,6 +4106,8 @@ function bindUpdate() {
   if (applyBtn) applyBtn.onclick = applyAppUpdate;
   const skipBtn = $("#btnUpdateSkip");
   if (skipBtn) skipBtn.onclick = skipAppUpdate;
+  const channelSel = $("#updateChannel");
+  if (channelSel) channelSel.onchange = (e) => switchUpdateChannel(e.target.value);
   const fwCheck = $("#btnFwCheck");
   if (fwCheck) fwCheck.onclick = () => checkFwUpdate(false);
   const fwApply = $("#btnFwApply");

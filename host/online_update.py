@@ -8,7 +8,12 @@
 
 * :func:`read_app_version` — 唯一版本源（``_version.py``）。
 * :func:`version_is_newer` — 版本比较（数值元组，不看时间）。
+* :func:`rolling_is_newer` — 滚动通道的构建标识比较（tag 时间戳 / app.build）。
+* :func:`has_app_update` — 按通道判断某个 Release 是否比本地新。
+* :func:`update_target_key` — 本次更新的目标标识（stable = 版本号，rolling = tag）。
 * :func:`fetch_latest_release` — GitHub 正式 Release 查询（ETag / 304 / 60 秒防抖）。
+* :func:`fetch_release_list` — GitHub Release 列表（rolling 通道用）。
+* :func:`pick_rolling_release` — 从列表里选最新的 ``main-YYYYMMDD-HHMM`` 预发布。
 * :func:`resolve_latest_update` — 解析 ``update.json``，缺失时回退到约定解析。
 * :func:`download_to_file` / :func:`finalize_download` — 下载 + 校验（先落
   ``.part``，校验通过才改名，不会留下半成品 exe）。
@@ -29,6 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 from i18n import t
 
@@ -38,7 +44,21 @@ SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 GITHUB_OWNER_REPO = "bbllmaster/BindDeckLite"
 GITHUB_API_LATEST = "https://api.github.com/repos/bbllmaster/BindDeckLite/releases/latest"
+#: 滚动通道：列表接口（``releases/latest`` 按定义排除 prerelease，查不到 nightly）。
+GITHUB_API_RELEASES = ("https://api.github.com/repos/bbllmaster/BindDeckLite/releases"
+                       "?per_page=30")
 RELEASE_PAGE_URL = "https://github.com/bbllmaster/BindDeckLite/releases/latest"
+
+#: 上位机更新通道（WS-557）：正式版 / main 滚动构建。
+UPDATE_CHANNEL_STABLE = "stable"
+UPDATE_CHANNEL_ROLLING = "rolling"
+UPDATE_CHANNELS = (UPDATE_CHANNEL_STABLE, UPDATE_CHANNEL_ROLLING)
+DEFAULT_UPDATE_CHANNEL = UPDATE_CHANNEL_STABLE
+
+#: 滚动构建的 tag 形状（发布流水线按 UTC 生成）：``main-YYYYMMDD-HHMM``。
+ROLLING_TAG_RE = re.compile(r"^main-(\d{8})-(\d{4})$")
+#: 正式版 tag 必须以 ``v<数字>`` 开头；其余（含 main-*）一律不算正式版。
+STABLE_TAG_RE = re.compile(r"^v\d")
 
 #: 上位机发布资产名（与 host/app.spec 的 EXE(name=...) 一致，发布页也是这个名字）。
 APP_ASSET_NAME = "BindDeckLite.exe"
@@ -174,6 +194,22 @@ def version_at_least(version: str, minimum: str) -> bool:
     return version_tuple(version) >= version_tuple(minimum)
 
 
+def same_app_version(current: str, target: str) -> bool:
+    """当前运行的是不是「更新目标那一版」（启动后确认更新成功用）。
+
+    普通版本按 semver 比；**带构建元数据**（``0.0.0+main.<sha>``）时按完整
+    字符串比 —— 两个 nightly 的 semver 元组都是 ``(0, 0, 0, 1)``，按元组比
+    会把「回滚到旧 nightly」误判成更新成功。
+    """
+    current = str(current or "").strip()
+    target = str(target or "").strip()
+    if not target:
+        return False
+    if "+" in current or "+" in target:
+        return current == target
+    return version_tuple(current) == version_tuple(target)
+
+
 def should_skip_version(current: str, latest: str, skipped: str) -> bool:
     """用户跳过的版本不再提示，直到出现更高版本。
 
@@ -184,6 +220,114 @@ def should_skip_version(current: str, latest: str, skipped: str) -> bool:
     if version_is_newer(latest, skipped):
         return False
     return True
+
+
+# --- 更新通道与滚动构建比较（WS-557） ---------------------------------------
+
+def normalize_channel(channel: str | None) -> str:
+    """把配置里的通道值归一成 ``stable`` / ``rolling``（非法值按 stable）。"""
+    value = str(channel or "").strip().lower()
+    return value if value in UPDATE_CHANNELS else DEFAULT_UPDATE_CHANNEL
+
+
+def rolling_tag_time(tag: str) -> int:
+    """``main-20261109-0314`` → ``202611090314``（不可解析返回 0）。
+
+    用整数比较而不是字符串：``20261109-0314`` 与 ``20261109-1314`` 只有
+    按数值比才对；补齐的定长字符串其实也能比，但整数更直观。
+    """
+    match = ROLLING_TAG_RE.match(str(tag or "").strip())
+    if not match:
+        return 0
+    try:
+        return int(match.group(1) + match.group(2))
+    except ValueError:
+        return 0
+
+
+def _iso_timestamp(value) -> float:
+    """``2026-11-09T03:14:00Z`` → epoch 秒（解析不了返回 0）。"""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return 0.0
+    return parsed.replace(tzinfo=timezone.utc).timestamp()
+
+
+def rolling_is_newer(remote_tag: str, remote_build: str = "",
+                     local_tag: str = "", local_build: str = "") -> bool:
+    """滚动通道：远端 Release 是否比本地更新。
+
+    排序依据（不能再用 semver —— 同一 ``APP_VERSION`` 会对应多个 nightly）：
+
+    1. tag 相同 → 不是更新（本地就是这一版）；
+    2. 清单给了 ``app.build`` 且与本地 ``APP_BUILD`` 相同 → 不是更新
+       （同一个提交构建出来的 exe）；
+    3. 两边都能解析出 tag/构建里的时间戳 → 按时间戳比；
+    4. 本地没有可比较的构建标识（老版本、手工构建、只有 sha） → 视为更新：
+       远端是当前最新的滚动构建，先让用户升到它。
+    """
+    remote = str(remote_tag or "").strip()
+    if not remote:
+        return False
+    if remote == str(local_tag or "").strip():
+        return False
+    remote_build = str(remote_build or "").strip()
+    local_build = str(local_build or "").strip()
+    if remote_build and local_build and remote_build == local_build:
+        return False
+    remote_time = rolling_tag_time(remote) or rolling_tag_time(remote_build)
+    local_time = rolling_tag_time(local_tag) or rolling_tag_time(local_build)
+    if remote_time and local_time:
+        return remote_time > local_time
+    return True
+
+
+def has_app_update(channel: str, info: dict, current: str,
+                   local_build: str = "", local_tag: str = "") -> bool:
+    """按通道判断解析出的 Release 是否比本地新。
+
+    * ``stable`` → semver（:func:`version_is_newer`，行为与 WS-523 一致）。
+    * ``rolling`` → 构建标识（:func:`rolling_is_newer`）。
+    """
+    info = info or {}
+    app = info.get("app") or {}
+    if normalize_channel(channel) == UPDATE_CHANNEL_ROLLING:
+        return rolling_is_newer(str(info.get("tag") or ""),
+                                str(app.get("build") or ""),
+                                local_tag, local_build)
+    return version_is_newer(str(app.get("version") or ""), current)
+
+
+def update_target_key(channel: str, info: dict) -> str:
+    """本次更新的目标标识：stable 用版本号，rolling 用 tag。
+
+    跳过某个 nightly 必须按 tag 记 —— 所有 nightly 的 semver 都是
+    ``0.0.0+main.<sha>``，用版本号跳过会把后续每天的构建一起跳过。
+    """
+    info = info or {}
+    if normalize_channel(channel) == UPDATE_CHANNEL_ROLLING:
+        return str(info.get("tag") or "").strip()
+    app = info.get("app") or {}
+    return str(app.get("version") or "").strip()
+
+
+def should_skip_update(channel: str, target_key: str, skipped: str) -> bool:
+    """按通道判断是否跳过本次更新。
+
+    * ``stable`` → 沿用 semver：出现更高版本重新提示。
+    * ``rolling`` → 只按 tag 精确跳过：下一个 nightly 是新 tag，会重新提示。
+    """
+    skipped = str(skipped or "").strip()
+    target = str(target_key or "").strip()
+    if not skipped or not target:
+        return False
+    if normalize_channel(channel) == UPDATE_CHANNEL_ROLLING:
+        return skipped == target
+    return should_skip_version("", target, skipped)
 
 
 # --- GitHub Release ---------------------------------------------------------
@@ -232,12 +376,37 @@ def fetch_latest_release(api_url: str = GITHUB_API_LATEST,
 
     失败时抛 :class:`UpdateError`（带错误码）。
     """
+    data = _fetch_github_json(api_url, timeout, force)
+    return {"release": data["payload"], "from_cache": data["from_cache"],
+            "not_modified": data["not_modified"]}
+
+
+def fetch_release_list(api_url: str = GITHUB_API_RELEASES,
+                       timeout: float = UPDATE_CHECK_TIMEOUT,
+                       force: bool = False) -> dict:
+    """查询 GitHub Release 列表（滚动通道用）。
+
+    返回 ``{"releases": list, "from_cache": bool, "not_modified": bool}``。
+    ETag / 304 / 60 秒防抖与 :func:`fetch_latest_release` 共用同一套缓存。
+    """
+    data = _fetch_github_json(api_url, timeout, force, expect_list=True)
+    return {"releases": data["payload"], "from_cache": data["from_cache"],
+            "not_modified": data["not_modified"]}
+
+
+def _fetch_github_json(api_url: str, timeout: float, force: bool,
+                       expect_list: bool = False) -> dict:
+    """GET 一个 GitHub API 地址 → ``{payload, from_cache, not_modified}``。
+
+    ``payload`` 是已解析的 JSON（``dict`` 或 ``list``）。两个 Release 查询
+    接口共用缓存与错误映射，缓存键是完整 URL（含 ``?per_page=``）。
+    """
     now = time.time()
     if not force:
         with _cache_lock:
             cached = _release_cache.get(api_url)
         if cached and now - cached["at"] < UPDATE_DEBOUNCE_SECONDS:
-            return {"release": cached["release"], "from_cache": True,
+            return {"payload": cached["release"], "from_cache": True,
                     "not_modified": cached.get("not_modified", False)}
 
     headers = {}
@@ -258,7 +427,7 @@ def fetch_latest_release(api_url: str = GITHUB_API_LATEST,
                     cached["at"] = now
                     cached["not_modified"] = True
             if cached:
-                return {"release": cached["release"], "from_cache": True,
+                return {"payload": cached["release"], "from_cache": True,
                         "not_modified": True}
             raise UpdateError(t("error.gh_not_modified"),
                               "E_NO_CACHE")
@@ -276,17 +445,20 @@ def fetch_latest_release(api_url: str = GITHUB_API_LATEST,
         raise UpdateError(t("error.network") % (exc,), "E_NETWORK")
 
     try:
-        release = json.loads(raw)
+        payload = json.loads(raw)
     except ValueError:
         raise UpdateError(t("error.gh_bad_json"), "E_BAD_JSON")
-    if not isinstance(release, dict):
+    if expect_list:
+        if not isinstance(payload, list):
+            raise UpdateError(t("error.gh_bad_release"), "E_BAD_JSON")
+    elif not isinstance(payload, dict):
         raise UpdateError(t("error.gh_bad_release"), "E_BAD_JSON")
 
     with _cache_lock:
-        _release_cache[api_url] = {"release": release, "at": now, "not_modified": False}
+        _release_cache[api_url] = {"release": payload, "at": now, "not_modified": False}
         if new_etag:
             _etag_cache[api_url] = new_etag
-    return {"release": release, "from_cache": False, "not_modified": False}
+    return {"payload": payload, "from_cache": False, "not_modified": False}
 
 
 def fetch_text(url: str, timeout: float = UPDATE_CHECK_TIMEOUT,
@@ -381,6 +553,8 @@ def pick_app_asset(manifest: dict) -> dict | None:
         "sha256": str(app.get("sha256") or "").strip().lower(),
         "size": size,
         "min_from": str(app.get("min_from") or "").strip(),
+        # WS-557: 滚动通道用构建标识比较版本；清单没有这个字段就是空串。
+        "build": str(app.get("build") or "").strip(),
     }
 
 
@@ -522,12 +696,35 @@ def resolve_release_update(release: dict, manifest: dict | None = None,
     }
 
 
-def resolve_latest_update(api_url: str = GITHUB_API_LATEST,
+def resolve_latest_update(api_url: str = "",
                           timeout: float = UPDATE_CHECK_TIMEOUT,
-                          force: bool = False) -> dict:
-    """查询最新正式 Release 并解析成更新信息（清单优先，回退兜底）。"""
-    data = fetch_latest_release(api_url, timeout=timeout, force=force)
-    release = data["release"]
+                          force: bool = False,
+                          channel: str = UPDATE_CHANNEL_STABLE,
+                          releases_api_url: str = "") -> dict:
+    """按通道查询 Release 并解析成更新信息（清单优先，回退兜底）。
+
+    * ``stable`` → ``releases/latest``（GitHub 按定义排除 prerelease）。
+    * ``rolling`` → ``releases?per_page=30`` 里筛 ``main-YYYYMMDD-HHMM``
+      prerelease 取最新一条；找不到抛 ``E_NO_ROLLING``，**不回退 stable**
+      （用户以为在测滚动版却拿到正式版比报错更糟）。
+
+    ``api_url`` / ``releases_api_url`` 留空用模块常量（测试可覆盖常量）。
+    """
+    api_url = api_url or GITHUB_API_LATEST
+    releases_api_url = releases_api_url or GITHUB_API_RELEASES
+    channel = normalize_channel(channel)
+    if channel == UPDATE_CHANNEL_ROLLING:
+        data = fetch_release_list(releases_api_url, timeout=timeout, force=force)
+        release = pick_rolling_release(data["releases"])
+    else:
+        data = fetch_latest_release(api_url, timeout=timeout, force=force)
+        release = data["release"]
+        tag = str(release.get("tag_name") or "").strip()
+        # 正式通道只认 v* 正式发布；万一有人把 main-* 发成非预发布，也不能
+        # 让稳定通道拿到滚动包。
+        if tag and not STABLE_TAG_RE.match(tag):
+            raise UpdateError(t("error.gh_no_stable_release"), "E_NO_STABLE")
+
     assets = release_assets(release)
 
     manifest = None
@@ -548,9 +745,38 @@ def resolve_latest_update(api_url: str = GITHUB_API_LATEST,
                 sums_text = ""
 
     result = resolve_release_update(release, manifest, sums_text)
+    result["channel"] = channel
     result["not_modified"] = data.get("not_modified", False)
     result["from_cache"] = data.get("from_cache", False)
     return result
+
+
+def pick_rolling_release(releases) -> dict:
+    """从 Release 列表里挑最新一条 ``main-YYYYMMDD-HHMM`` 预发布。
+
+    过滤条件：``prerelease == true``、非 draft、tag 严格匹配
+    ``^main-\\d{8}-\\d{4}$``（正式 ``v*`` 与非滚动预发布都不算）。
+    排序按 ``published_at``（缺失时 ``created_at``），再按 tag 时间戳兜底。
+
+    一条都没有 → ``E_NO_ROLLING``（不静默回退 stable）。
+    """
+    best = None
+    best_key = None
+    for item in releases or []:
+        if not isinstance(item, dict) or item.get("draft"):
+            continue
+        if not item.get("prerelease"):
+            continue
+        tag = str(item.get("tag_name") or "").strip()
+        if not ROLLING_TAG_RE.match(tag):
+            continue
+        key = (_iso_timestamp(item.get("published_at") or item.get("created_at")),
+               rolling_tag_time(tag))
+        if best is None or key > best_key:
+            best, best_key = item, key
+    if best is None:
+        raise UpdateError(t("error.gh_no_rolling"), "E_NO_ROLLING")
+    return best
 
 
 # --- 下载与校验 -------------------------------------------------------------

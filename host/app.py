@@ -150,6 +150,8 @@ _config = {"devices": {}, "settings": {
     "skipped_version": "",     # 用户跳过的上位机版本
     "last_update": {},         # {status, from, to, at, result, marker}
     "update_fail_count": 0,    # 连续失败次数，>=2 暂停自动更新
+    # WS-557: 上位机更新通道（stable = 正式 v* Release，rolling = main-* nightly）。
+    "update_channel": online_update.DEFAULT_UPDATE_CHANNEL,
     # WS-529: 界面语言偏好（system / zh-CN / en-US），与上面三个键同层。
     "lang": SYSTEM_PREF,
 }
@@ -1097,6 +1099,10 @@ def load_config():
                 "skipped_version": str(data.get("skipped_version", "") or ""),
                 "last_update": data.get("last_update", {}) or {},
                 "update_fail_count": int(data.get("update_fail_count", 0) or 0),
+                # WS-557: 更新通道（stable / rolling）；旧 config 没有这个键
+                # → stable，不因为升级而改变用户已有的更新来源。
+                "update_channel": online_update.normalize_channel(
+                    data.get("update_channel", online_update.DEFAULT_UPDATE_CHANNEL)),
                 # WS-529: 语言偏好同样在顶层；旧 config 没有这个键时用
                 # system（跟随系统），不因为缺键而改动已有设置。
                 "lang": str(data.get("lang", SYSTEM_PREF) or SYSTEM_PREF),
@@ -1114,6 +1120,9 @@ def load_config():
     # WS-529: 老 config.json 没有 lang，读完后统一补上默认值，
     # 这样调用方拿到的 _config 一定带这个顶层键。
     _config.setdefault("lang", SYSTEM_PREF)
+    # WS-557: 同理，通道也一定存在（缺省 stable）。
+    _config["update_channel"] = online_update.normalize_channel(
+        _config.get("update_channel", online_update.DEFAULT_UPDATE_CHANNEL))
 
 
 def save_config():
@@ -4761,13 +4770,26 @@ _APP_UPDATE_DONE_PHASES = ("error", "restarting", "done")
 
 
 def _update_settings() -> dict:
-    """config.json 里的在线更新状态（顶层三个键）。"""
+    """config.json 里的在线更新状态（顶层键）。"""
     with _lock:
         return {
             "skipped_version": str(_config.get("skipped_version") or ""),
             "last_update": dict(_config.get("last_update") or {}),
             "update_fail_count": int(_config.get("update_fail_count") or 0),
+            "update_channel": online_update.normalize_channel(
+                _config.get("update_channel")),
         }
+
+
+def _local_rolling_tag(state: dict) -> str:
+    """本机上次成功装上的滚动 tag（用于「已是最新」判断）。
+
+    回滚过的更新不算装上了 —— 那个 tag 的 exe 并不在本机。
+    """
+    last = state.get("last_update") or {}
+    if last.get("result") == "rollback":
+        return ""
+    return str(last.get("tag") or "")
 
 
 def _set_update_state(**fields):
@@ -4787,6 +4809,7 @@ def api_app_version():
         "frozen": bool(getattr(sys, "frozen", False)),
         "executable": sys.executable if getattr(sys, "frozen", False) else "",
         "update_fail_count": _update_settings()["update_fail_count"],
+        "update_channel": _update_settings()["update_channel"],
     })
 
 
@@ -4799,22 +4822,44 @@ def _app_version_payload() -> dict:
         "frozen": frozen,
         "executable": sys.executable if frozen else "",
         "update_fail_count": _update_settings()["update_fail_count"],
+        "update_channel": _update_settings()["update_channel"],
     }
+
+
+@app.route("/api/app/update/channel", methods=["POST"])
+def api_app_update_channel():
+    """切换上位机更新通道（stable / rolling），立即持久化。"""
+    data = request.get_json(silent=True) or {}
+    channel = str(data.get("channel") or "").strip().lower()
+    if channel not in online_update.UPDATE_CHANNELS:
+        return jsonify({"ok": False, **_err(t("error.update_channel_invalid"))}), 400
+    _set_update_state(update_channel=channel)
+    add_event("update",
+              t("log.app_update_channel",
+                channel=t("ui.update_channel_" + channel)),
+              level="ok")
+    return jsonify({"ok": True, "channel": channel})
 
 
 @app.route("/api/app/update/check")
 def api_app_update_check():
-    """检查上位机是否有新版本。
+    """检查上位机是否有新版本（按当前通道）。
 
-    返回 ``{current, latest, has_update, notes, published_at, asset, …}``。
+    返回 ``{current, latest, tag, channel, has_update, notes, …}``。
+    ``latest`` 在滚动通道是 tag（``main-YYYYMMDD-HHMM``）；``skip_key`` 是
+    跳过时该记录的标识（stable = 版本号，rolling = tag）。
     失败时返回可读的中文原因 + 可复制错误码 + Release 链接，不静默失败。
     """
     current = online_update.read_app_version()
     state = _update_settings()
+    channel = state["update_channel"]
     payload = {
         "ok": True,
         "current": current,
         "latest": "",
+        "tag": "",
+        "channel": channel,
+        "skip_key": "",
         "has_update": False,
         "notes": "",
         "published_at": "",
@@ -4827,7 +4872,7 @@ def api_app_update_check():
         "error_code": "",
     }
     try:
-        info = online_update.resolve_latest_update()
+        info = online_update.resolve_latest_update(channel=channel)
     except online_update.UpdateError as exc:
         payload["ok"] = False
         payload["error"] = exc.message
@@ -4839,6 +4884,9 @@ def api_app_update_check():
     payload["notes"] = info.get("notes", "")
     payload["published_at"] = info.get("published_at", "")
     payload["release_url"] = info.get("release_url", online_update.RELEASE_PAGE_URL)
+    payload["tag"] = str(info.get("tag") or "")
+    target_key = online_update.update_target_key(channel, info)
+    payload["skip_key"] = target_key
     if not app_asset:
         payload["ok"] = False
         payload["error"] = t("error.app_update_no_asset")
@@ -4846,16 +4894,22 @@ def api_app_update_check():
         return jsonify(payload)
 
     latest = app_asset["version"]
-    payload["latest"] = latest
+    # 滚动通道对用户有意义的是 tag（所有 nightly 的 semver 都一样）。
+    payload["latest"] = payload["tag"] if channel == "rolling" else latest
     payload["asset"] = {
         "name": app_asset["asset"],
         "size": app_asset.get("size", 0),
         "sha256": app_asset.get("sha256", ""),
     }
 
+    has_update = online_update.has_app_update(
+        channel, info, current,
+        local_build=online_update.read_app_build(),
+        local_tag=_local_rolling_tag(state))
+
     # 有新版本时才检查「能不能升」—— 没有新版本就没有「不能升」这回事，
     # 也不该拿 SHA256/资产缺失去打扰已经是最新的用户。
-    if online_update.version_is_newer(latest, current):
+    if has_update:
         # min_from：低于它的版本不能直接自动升级（需要先手动升到中间版本）。
         min_from = app_asset.get("min_from") or ""
         if not online_update.version_at_least(current, min_from):
@@ -4881,13 +4935,14 @@ def api_app_update_check():
             payload["error_code"] = "E_NO_APP_ASSET"
             return jsonify(payload)
 
-    if online_update.should_skip_version(current, latest, state["skipped_version"]):
+    if online_update.should_skip_update(channel, target_key,
+                                        state["skipped_version"]):
         payload["skipped"] = True
         payload["error"] = t("log.app_update_skipped", version=latest)
         payload["error_code"] = "E_SKIPPED"
         return jsonify(payload)
 
-    payload["has_update"] = online_update.version_is_newer(latest, current)
+    payload["has_update"] = has_update
     return jsonify(payload)
 
 
@@ -4908,8 +4963,10 @@ def api_app_update_apply():
                         if v.get("phase") in _APP_UPDATE_DONE_PHASES]:
             _app_update_tasks.pop(task_id, None)
 
+    state = _update_settings()
+    channel = state["update_channel"]
     try:
-        info = online_update.resolve_latest_update()
+        info = online_update.resolve_latest_update(channel=channel)
     except online_update.UpdateError as exc:
         return jsonify({"ok": False, "error": exc.message, "error_code": exc.code,
                         "release_url": online_update.RELEASE_PAGE_URL}), 503
@@ -4931,12 +4988,22 @@ def api_app_update_apply():
 
     current = online_update.read_app_version()
     latest = app_asset["version"]
-    state = _update_settings()
-    if online_update.should_skip_version(current, latest, state["skipped_version"]):
+    tag = str(info.get("tag") or "")
+    target_key = online_update.update_target_key(channel, info)
+    shown = tag if channel == "rolling" else latest
+    if online_update.should_skip_update(channel, target_key,
+                                        state["skipped_version"]):
         return jsonify({"ok": False,
-                        **_err(t("log.app_update_skipped_short", version=latest)),
+                        **_err(t("log.app_update_skipped_short", version=shown)),
                         "error_code": "E_SKIPPED", "release_url": release_url}), 409
-    if not online_update.version_is_newer(latest, current):
+    if not online_update.has_app_update(
+            channel, info, current,
+            local_build=online_update.read_app_build(),
+            local_tag=_local_rolling_tag(state)):
+        if channel == "rolling":
+            return jsonify({"ok": False,
+                            **_err(t("log.app_up_to_date_rolling", tag=tag or current)),
+                            "release_url": release_url}), 409
         return jsonify({"ok": False, **_err(t("log.app_up_to_date", version=current)),
                         "release_url": release_url}), 409
     # min_from 与 check 阶段同一把尺：check 说不能升，apply 也不能升。
@@ -4944,21 +5011,21 @@ def api_app_update_apply():
     if not online_update.version_at_least(current, min_from):
         return jsonify({"ok": False,
                         "error": (t("error.app_update_jump")
-                                  % (current, latest, min_from)),
+                                  % (current, shown, min_from)),
                         "error_code": "E_MIN_FROM", "release_url": release_url}), 409
-    # 回滚失败计数只拦「同一个失败版本」：出现更高版本时放行并重新计数，
-    # 否则 apply 把自己挡死 → 在线更新永久失效。
+    # 回滚失败计数只拦「同一个失败版本 / 同一个 nightly」：出现更高版本或新的
+    # 滚动构建时放行并重新计数，否则 apply 把自己挡死 → 在线更新永久失效。
     fail_count = state["update_fail_count"]
     last_update = state.get("last_update") or {}
-    failed_version = (str(last_update.get("to") or "")
-                      if last_update.get("result") == "rollback" else "")
+    failed_key = (str(last_update.get("target") or last_update.get("to") or "")
+                  if last_update.get("result") == "rollback" else "")
     if fail_count >= online_update.UPDATE_FAIL_LIMIT:
-        if failed_version and online_update.version_is_newer(latest, failed_version):
+        if failed_key and failed_key != target_key:
             _set_update_state(update_fail_count=0)
         else:
             return jsonify({"ok": False,
                             "error": (t("error.app_update_paused")
-                                      % (failed_version or latest, fail_count)),
+                                      % (failed_key or shown, fail_count)),
                             "error_code": "E_UPDATE_PAUSED",
                             "release_url": release_url}), 409
 
@@ -5004,7 +5071,11 @@ def _app_update_worker(task_id, info, app_asset, current):
 
     try:
         version = app_asset["version"]
-        dest_dir = online_update.update_dir(version)
+        channel = online_update.normalize_channel(info.get("channel"))
+        tag = str(info.get("tag") or "")
+        # 滚动通道用 tag 做下载目录：所有 nightly 的 version 都是
+        # 0.0.0+main.<sha>，tag 才是每次构建唯一的名字。
+        dest_dir = online_update.update_dir(tag if channel == "rolling" else version)
         final_path = os.path.join(dest_dir, app_asset["asset"])
 
         _phase("downloading", total=app_asset.get("size", 0))
@@ -5034,11 +5105,15 @@ def _app_update_worker(task_id, info, app_asset, current):
             return
 
         # 先落盘状态：新版本启动后据此写 last_update；失败回滚也能记结果。
+        # ``tag`` / ``target`` 只给滚动通道用（下次检查据此判「已是最新」和
+        # 「同一个 nightly 连续失败」）。
         marker = os.path.join(dest_dir, "updated.marker")
         _set_update_state(last_update={
             "status": "pending",
             "from": current,
             "to": version,
+            "tag": tag,
+            "target": online_update.update_target_key(channel, info),
             "at": time.time(),
             "marker": marker,
         })
@@ -5170,7 +5245,7 @@ def _update_after_start():
     current = online_update.read_app_version()
     target = str(last.get("to") or "")
     marker = str(last.get("marker") or "")
-    if target and online_update.version_tuple(current) == online_update.version_tuple(target):
+    if target and online_update.same_app_version(current, target):
         if marker:
             try:
                 with open(marker, "w", encoding="utf-8") as handle:
