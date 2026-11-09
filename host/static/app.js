@@ -231,7 +231,11 @@ function collectPending() {
   if (!sameJson(cfg.sleep, base.sleep)) {
     out.push({ field: "sleep", label: t("ui.sleep_card"), tab: "device" });
   }
-  if (!sameJson(cfg.enc, base.enc)) {
+  // WS-561：编码器模式在生产配置里是 `encoder.mode`（配置里没有 `enc` 键，
+  // 那是协议/回读字段名）。只比模式：`encoder.actions` 是纯上位机的旋转动作，
+  // 改它不该算「待下发」。取值器与 changedFields 共用同一份实现。
+  const encMode = window.ReconnectSync.encoderMode;
+  if (!sameJson(encMode(cfg), encMode(base))) {
     out.push({ field: "enc", label: t("ui.panel_encoder"), tab: "encoder" });
   }
   return out;
@@ -280,12 +284,8 @@ function updatePendingUi() {
 const RECONNECT_STABLE_MS = window.ReconnectSync.STABLE_MS;
 // 稳定窗口之外再给回读 3 秒上限：链路慢也不能拖住 loadSysinfo / 状态轮询。
 const RECONNECT_READ_TIMEOUT_MS = 3000;
-const SYNC_FIELD_KEYS = {
-  pins: "ui.group_pins",
-  keys: "ui.group_keys",
-  enc: "ui.group_enc",
-  sleep: "ui.group_sleep",
-};
+// 字段 → 组名 i18n key，与日志拼接共用 reconnect_sync.js 的同一张表。
+const SYNC_FIELD_KEYS = window.ReconnectSync.LABEL_KEYS;
 
 /** 该设备这次连接的「有未下发修改」提示；没有则 null。 */
 function reconnectNotice(devId) {
@@ -377,6 +377,11 @@ async function reconcileDeviceConfig(devId) {
 
   // 先记「本周期已对账」：失败也不重试，避免旧固件每次轮询都打一遍。
   state.reconnectSynced[devId] = true;
+  // 挂起的自动保存必须先停掉：它会在 500 ms 后把前端旧副本写回服务端，
+  // 把这次刚读回的设备真值覆盖掉（对照 readDeviceConfig 的同款处理）。
+  // 放弃对账的分支要把用户原本的改动重新挂上，别让编辑丢掉落盘。
+  const wasDirty = state.dirty;
+  cancelPendingSave();
   const before = snapshotCfg(state.cfg);
   const ctrl = typeof AbortController === "function" ? new AbortController() : null;
   const timer = ctrl
@@ -389,6 +394,8 @@ async function reconcileDeviceConfig(devId) {
                   ctrl ? { method: "POST", signal: ctrl.signal }
                        : { method: "POST" });
   } catch (e) {
+    // 放弃这次对账：把用户原本挂着的自动保存还回去。
+    if (wasDirty && state.selected === devId) armPendingSave();
     // 旧后端没有这个端点（404/405）→ 静默跳过；超时 / 断链才 warn 一次。
     const status = Number(e && e.status);
     if (status !== 404 && status !== 405) {
@@ -403,12 +410,14 @@ async function reconcileDeviceConfig(devId) {
   if (state.selected !== devId) return;
   if (!r || !r.ok || !r.cfg) {
     // 旧固件不回完整配置：表单与存档保持原样，只记一行。
+    if (wasDirty) armPendingSave();
     addLocalLog("cfg", "ui.reconnect_sync_incomplete", {}, devId, "warn");
     return;
   }
   // 等回读的这两三秒里用户又开始改了：不能拿设备值覆盖，转为只提示。
   const nowPending = collectPending();
   if (nowPending.length) {
+    if (wasDirty) armPendingSave();
     state.reconnectDirty[devId] = { count: nowPending.length };
     updatePendingUi();
     renderReadStatus();
@@ -447,7 +456,10 @@ function applyReconcileReadback(devId, before, r) {
     renderReadStatus();
   }
 
-  const labels = fields.map((f) => t(SYNC_FIELD_KEYS[f])).join(t("ui.list_comma"));
+  // 日志行的字段串由生产模块拼（同一份 FIELDS 顺序 + 取值器），不再在页面里
+  // 另写一遍 —— `enc` 正是从「测试拼一份、生产拼另一份」那条缝里漏掉的。
+  const labels = window.ReconnectSync.syncSummary(
+    before, after, (f) => t(SYNC_FIELD_KEYS[f]), t("ui.list_comma"));
   if (labels) addLocalLog("cfg", "ui.reconnect_synced", { fields: labels }, devId);
 }
 
