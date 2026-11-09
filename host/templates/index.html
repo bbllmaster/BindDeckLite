@@ -178,7 +178,7 @@
               <span data-i18n="ui.minutes_unit">分钟</span>
             </label>
             <p class="muted small" id="sleepWake" hidden></p>
-            <p class="muted small" data-i18n="ui.sleep_hint">经典 ESP32 只有 RTC GPIO（0、2、4、12–15、25–27、32–39）上的按键能唤醒；ESP32-C3 只有 GPIO0–5 能唤醒。上表中的编码器脚与 12 键布局的第 10–12 键都不在其中。</p>
+            <p class="muted small" data-i18n="ui.sleep_hint">以上面的可唤醒输入为准：经典 ESP32 默认布局下只有第一个可唤醒的按键能单键唤醒，其余 RTC 按键要一起按住才会触发；ESP32-C3 的 GPIO0–5 每个按键都能单键唤醒。</p>
           </div>
           <div class="card" id="sysCard">
             <div class="card-head">

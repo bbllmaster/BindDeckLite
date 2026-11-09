@@ -1696,6 +1696,14 @@ function formatWakeList(indices) {
       prev = i;
       return;
     }
+    // 0–8 与 9+ 是两套命名空间（按键 N / 编码器按压、第 N 键）：跨过 8→9
+    // 必须另起一段，否则 [6,7,8,9] 会被合并成「按键 7–10」这种不存在的叫法。
+    if ((i >= 9) !== (prev >= 9)) {
+      flush();
+      start = i;
+      prev = i;
+      return;
+    }
     if (i === prev + 1) {
       prev = i;
       return;

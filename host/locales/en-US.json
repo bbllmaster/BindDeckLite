@@ -805,7 +805,7 @@
   "ui.sleep_card": "Auto sleep",
   "ui.sleep_delay": "Delay",
   "ui.sleep_enable": "Enter deep sleep when idle",
-  "ui.sleep_hint": "On a classic ESP32 only key 1 wakes the deck on its own (its ext1 wakes only when every selected pin is low at once, so the other keys must be held together); on an ESP32-C3 any key on GPIO0–5 wakes it.",
+  "ui.sleep_hint": "The wake inputs above are authoritative: on a classic ESP32, default layout, only the first wake-capable key wakes the deck on its own and the other RTC keys must be held together (ext1 needs every selected pin low at once); on an ESP32-C3 any key on GPIO0–5 wakes it alone.",
   "ui.sleep_wake_all_low": "Wakes only when held together: {list}",
   "ui.sleep_wake_blocked": "Cannot wake: {list}",
   "ui.sleep_wake_key_n": "Button {n}",

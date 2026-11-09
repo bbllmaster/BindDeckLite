@@ -845,26 +845,33 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "var el=document.getElementById('wakeInfo');"
          "if(!el)return;"
          "var cap=[");
+  // cap = pins that are both a legal button pin and a deep-sleep wake source on
+  // this chip. Classic ESP32: RTC GPIOs 0/2/4/12-15/25-27/32-33 - notch out
+  // GPIO34-39, which are input-only and rejected as buttons by pinRejectReason()
+  // (the portal must not promise a wake the host reports as range).
+  // multiWake: whether several wake pins can only fire together (ext1 ALL_LOW).
+  // The C3 wakes on any single GPIO0-5, so it has no such second tier.
 #ifdef TARGET_ESP32C3
-  h += F("0,1,2,3,4,5");
+  h += F("0,1,2,3,4,5],multiWake=0");
 #else
-  h += F("0,2,4,12,13,14,15,25,26,27,32,33,34,35,36,37,38,39");
+  h += F("0,2,4,12,13,14,15,25,26,27,32,33],multiWake=1");
 #endif
-  h += F("],fixed=[");
+  h += F(",fixed=[");
   h += String(ENCODER_SW) + "," + String(ENCODER_CLK) + "," + String(ENCODER_DT);
   h += F("];"
          "function twelve(){var s=document.querySelector(\"select[name=layout]\");"
          "return !!(s&&s.value==='0');}"
          "function label(i){return i<9?'按键 '+(i+1):(i===9&&!twelve()?'编码器按压':'第 '+(i+1)+' 键');}"
-         "function piece(a,b){"
+         "function piece(a,b,t){"
          "if(a===b)return label(a);"
          "if(a<9)return '按键 '+(a+1)+'–'+(b+1);"
-         "return '第 '+(a+1)+'–'+(b+1)+' 键';}"
+         "return t?'第 '+(a+1)+'–'+(b+1)+' 键':'编码器按压';}"
          "function join(list){"
-         "var out=[],start=-1,prev=-1;"
-         "function flush(){if(start>=0){out.push(piece(start,prev));start=-1;}}"
+         "var out=[],start=-1,prev=-1,t=twelve();"
+         "function flush(){if(start>=0){out.push(piece(start,prev,t));start=-1;}}"
          "list.forEach(function(i){"
          "if(start<0){start=i;prev=i;return;}"
+         "if((i>=9)!==(prev>=9)){flush();start=i;prev=i;return;}"
          "if(i===prev+1){prev=i;return;}"
          "flush();start=i;prev=i;});"
          "flush();return out.join('、');}"
@@ -881,10 +888,11 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "for(var i=0;i<p.length;i++){"
          "var v=p[i];"
          "if(typeof v!=='number'||isNaN(v)||v<0||v>39||cap.indexOf(v)<0){block.push(i);}"
-         // The first RTC-capable input is the ext0 key; the rest can only wake
-         // the chip when they are all low at the same time (ext1 ALL_LOW).
-         "else if(!wake.length){wake.push(i);}"
-         "else{allLow.push(i);}}"
+         // Only the classic ESP32 has the "all of them at once" tier (ext1
+         // ALL_LOW). The C3 wakes on every single GPIO0-5, so its wake pins all
+         // belong in the first list - never in "hold them together".
+         "else if(multiWake&&wake.length){allLow.push(i);}"
+         "else{wake.push(i);}}"
          "var text='可唤醒输入：'+(wake.length?join(wake):'无');"
          "if(allLow.length)text+='；需同时按住才唤醒：'+join(allLow);"
          "if(block.length)text+='；不可唤醒：'+join(block);"
