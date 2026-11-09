@@ -78,6 +78,12 @@ jobs:
         run: |
           python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_key_mods.py test_device_trust.py test_app_update.py test_fw_update.py test_release_pipeline.py test_i18n.py -v
 
+      # WS-558: rolling release notes list only the increment since the
+      # previous main-* tag. Runs from the repo root because the test builds
+      # throwaway git repositories there (tools/test_release_notes.py).
+      - name: Release notes regression (WS-558)
+        run: python -m pytest tools/test_release_notes.py -v
+
       # Front-end regression tests (plain node scripts under host/).  All of
       # them are listed explicitly: a test file that is not named here never
       # runs, so a "local-only" regression test protects nobody (WS-480).

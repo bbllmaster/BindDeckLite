@@ -142,6 +142,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Rolling notes diff HEAD against the previous main-* tag
+          # (git log <since>..HEAD), which a depth-1 clone cannot do: it has
+          # neither the history nor the tags.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -166,11 +172,25 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
+            SINCE=""
           else
             TAG="main-$(date -u +%Y%m%d-%H%M)"
+            # Rolling notes list only what changed since the previous rolling
+            # tag (WS-558). The first rolling falls back to the newest formal
+            # v* tag; a repo with no tags at all starts at the first commit
+            # (the script then ranges over every commit).
+            SINCE="$(git describe --tags --abbrev=0 --match 'main-*' HEAD^ 2>/dev/null || true)"
+            if [[ -z "${SINCE}" ]]; then
+              SINCE="$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)"
+            fi
           fi
           echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
-          python tools/release_notes.py --tag "${TAG}" --out RELEASE_NOTES_BODY.md
+          if [[ -n "${SINCE}" ]]; then
+            echo "==> rolling notes range: ${SINCE}..HEAD"
+            python tools/release_notes.py --tag "${TAG}" --out RELEASE_NOTES_BODY.md --since "${SINCE}"
+          else
+            python tools/release_notes.py --tag "${TAG}" --out RELEASE_NOTES_BODY.md
+          fi
 
       - name: Build update.json manifest
         shell: bash
