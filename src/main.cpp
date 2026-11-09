@@ -877,12 +877,16 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "if(t){p.push(fixed[1],fixed[2]);}"
          "return p;}"
          "function render(){"
-         "var p=current(),wake=[],block=[];"
+         "var p=current(),wake=[],allLow=[],block=[];"
          "for(var i=0;i<p.length;i++){"
          "var v=p[i];"
-         "if(typeof v!=='number'||isNaN(v)||v<0||v>39||cap.indexOf(v)<0)block.push(i);"
-         "else wake.push(i);}"
+         "if(typeof v!=='number'||isNaN(v)||v<0||v>39||cap.indexOf(v)<0){block.push(i);}"
+         // The first RTC-capable input is the ext0 key; the rest can only wake
+         // the chip when they are all low at the same time (ext1 ALL_LOW).
+         "else if(!wake.length){wake.push(i);}"
+         "else{allLow.push(i);}}"
          "var text='可唤醒输入：'+(wake.length?join(wake):'无');"
+         "if(allLow.length)text+='；需同时按住才唤醒：'+join(allLow);"
          "if(block.length)text+='；不可唤醒：'+join(block);"
          "el.textContent=text;}"
          "var s=document.querySelector(\"select[name=layout]\");"
@@ -2649,6 +2653,20 @@ static void applyDeviceIdentity() {
 // `esp_sleep_enable_ext0_wakeup(ENCODER_SW, 0)` pointed at GPIO5 on the
 // classic board, which is not an RTC GPIO: the deck slept with no wake source
 // at all and never came back).
+//
+// Classic ESP32 caveat (why ext1 alone is not enough): this chip's ext1 only
+// offers ANY_HIGH (a pin must go HIGH) and ALL_LOW (EVERY selected pin must be
+// LOW at the same time). There is no ANY_LOW - that arrived with the S2/S3/C6.
+// Our keys are independent switches to GND, so one press only pulls ONE pin
+// low and ext1 stays silent. The deck therefore also arms ext0 - the
+// single-pin source, level-triggered LOW - on the first wake-capable input
+// (key 1 in both default maps); that key is the one that wakes the deck on its
+// own. The ext1 mask stays armed as well, so pressing every wake key at once
+// also wakes it.
+// GPIO the classic board armed with ext0, kept in RTC memory across deep sleep
+// so the wake log can name it (-1 = cold boot / never armed).
+RTC_DATA_ATTR static int g_ext0WakePin = -1;
+
 static bool isWakeCapablePin(int pin) {
 #ifdef TARGET_ESP32C3
   return pin >= 0 && pin <= 5;
@@ -2670,6 +2688,17 @@ static uint64_t wakePinMask() {
     if (isWakeCapablePin(pin)) mask |= (1ULL << pin);
   }
   return mask;
+}
+
+// GPIO of the first active input that can wake the deck (input order, not pin
+// order: key 1 must stay the designated key even though its GPIO is not the
+// lowest one). -1 when the mask holds no input.
+static int firstWakeInputPin(uint64_t mask) {
+  for (int i = 0; i < inputCount(); i++) {
+    int pin = inputPin(i);
+    if (pin >= 0 && (mask & (1ULL << pin))) return pin;
+  }
+  return -1;
 }
 
 static String wakePinList(uint64_t mask) {
@@ -2699,6 +2728,13 @@ static void logWakeSource() {
     }
   }
 #else
+  if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+    // The ext0 pin is the designated key; it survives sleep in RTC memory.
+    if (g_ext0WakePin >= 0) {
+      log_e("[sleep] wake gpio=%d", g_ext0WakePin);
+      return;
+    }
+  }
   if (cause == ESP_SLEEP_WAKEUP_EXT1) {
     uint64_t status = esp_sleep_get_ext1_wakeup_status();
     for (int pin = 0; pin < 64; pin++) {
@@ -2710,7 +2746,7 @@ static void logWakeSource() {
   }
 #endif
   // Chip without a per-pin status (or an unexpected cause): the numeric cause
-  // is still enough to tell "ext1/GPIO wake" from "power-on reset".
+  // is still enough to tell "ext0/ext1/GPIO wake" from "power-on reset".
   log_e("[sleep] wake cause=%d", (int)cause);
 }
 
@@ -3173,7 +3209,16 @@ void loop() {
 #else
       // ext1 covers every RTC GPIO at once; ALL_LOW keeps the "press = GND"
       // wiring of the keys (internal pull-ups are held through deep sleep).
+      // ALL_LOW means *all* of them must be low, so it is armed for the
+      // "press everything" case only - ext0 below is what makes a single key
+      // press wake the deck.
       esp_err_t rc = esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ALL_LOW);
+      int keyPin = firstWakeInputPin(wakeMask);
+      if (rc == ESP_OK && keyPin >= 0) {
+        g_ext0WakePin = keyPin;
+        rc = esp_sleep_enable_ext0_wakeup((gpio_num_t)keyPin, 0);
+        if (rc != ESP_OK) g_ext0WakePin = -1;
+      }
 #endif
       if (rc != ESP_OK) {
         log_e("[sleep] wake source failed rc=%d", (int)rc);
@@ -3195,6 +3240,11 @@ void loop() {
 #endif
         log_e("[sleep] enter timeout=%lums wake_gpio=%s",
               sleepTimeoutMs, wakePinList(wakeMask).c_str());
+#ifndef TARGET_ESP32C3
+        // Name the ext0 key explicitly: on this chip it is the only input that
+        // wakes the deck when pressed alone.
+        log_e("[sleep] single-key wake gpio=%d", g_ext0WakePin);
+#endif
         delay(100);
         esp_deep_sleep_start();
       }

@@ -1657,8 +1657,17 @@ function renderSleepWake() {
     el.textContent = "";
     return;
   }
-  const blocked = (info.no_wake || []).map((x) => x && x.index);
+  const blocked = (info.no_wake || [])
+    .filter((x) => x && x.reason !== "ext1-all-low")
+    .map((x) => x.index);
+  const allLow = (info.no_wake || [])
+    .filter((x) => x && x.reason === "ext1-all-low")
+    .map((x) => x.index);
   let text = t("ui.sleep_wake_line", { list: formatWakeList(info.wake) });
+  if (allLow.length) {
+    text += t("ui.list_separator")
+      + t("ui.sleep_wake_all_low", { list: formatWakeList(allLow) });
+  }
   if (blocked.length) {
     text += t("ui.list_separator")
       + t("ui.sleep_wake_blocked", { list: formatWakeList(blocked) });

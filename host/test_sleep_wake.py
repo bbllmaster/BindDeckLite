@@ -38,27 +38,44 @@ def _no_wake(info):
     return {item["index"]: item for item in info["no_wake"]}
 
 
-def test_esp32_default_all_nine_buttons_wake():
-    """默认经典 ESP32：按键 1–9（GPIO13/12/14/27/32/33/25/26/4）全在 RTC 域。"""
-    info = app.wake_inputs("ESP32", app.LAYOUT_ENCODER, ESP32_DEFAULT)
-    assert _wake(info) == list(range(9))
+def test_esp32_default_only_key1_wakes_alone():
+    """默认经典 ESP32：只有按键 1（GPIO13，ext0 指定键）单键能唤醒。
 
-    # 第 10 输入是编码器按压，接在 GPIO5 —— 非 RTC，唤不醒。
-    blocked = _no_wake(info)
-    assert list(blocked) == [9]
-    assert blocked[9]["pin"] == app.ENCODER_PINS["ESP32"]["SW"] == 5
-    assert blocked[9]["reason"] == "non-rtc"
+    其余 8 个键同样是 RTC 脚，但 ESP32 的 ext1 只有 ALL_LOW（全部选中脚同时
+    为低）——单按一颗不会触发，所以它们是 "ext1-all-low" 而不是 "non-rtc"。
+    """
+    info = app.wake_inputs("ESP32", app.LAYOUT_ENCODER, ESP32_DEFAULT)
+    assert _wake(info) == [0]
+
+    rest = _no_wake(info)
+    assert sorted(rest) == list(range(1, 10))
+    assert [rest[i]["pin"] for i in range(1, 9)] == ESP32_DEFAULT[1:]
+    assert {rest[i]["reason"] for i in range(1, 9)} == {"ext1-all-low"}
+
+    # 第 10 输入是编码器按压，接在 GPIO5 —— 非 RTC，彻底唤不醒。
+    assert rest[9]["pin"] == app.ENCODER_PINS["ESP32"]["SW"] == 5
+    assert rest[9]["reason"] == "non-rtc"
 
 
 def test_esp32_twelve_key_layout_blocks_fixed_pins():
     """12 键布局：第 10–12 键固定在 GPIO5/18/19，三者都不是 RTC。"""
     info = app.wake_inputs("ESP32", app.LAYOUT_12KEY, ESP32_DEFAULT)
-    assert _wake(info) == list(range(9))
+    assert _wake(info) == [0]
 
-    blocked = _no_wake(info)
-    assert sorted(blocked) == [9, 10, 11]
-    assert [blocked[i]["pin"] for i in (9, 10, 11)] == [5, 18, 19]
-    assert {blocked[i]["reason"] for i in (9, 10, 11)} == {"non-rtc"}
+    rest = _no_wake(info)
+    assert sorted(rest) == list(range(1, 12))
+    assert {rest[i]["reason"] for i in range(1, 9)} == {"ext1-all-low"}
+    assert [rest[i]["pin"] for i in (9, 10, 11)] == [5, 18, 19]
+    assert {rest[i]["reason"] for i in (9, 10, 11)} == {"non-rtc"}
+
+
+def test_esp32_designated_key_follows_input_order():
+    """按键 1 改到非 RTC 脚时，ext0 键顺延到第一个 RTC 输入（与固件一致）。"""
+    pins = [18, 12, 14, 27, 32, 33, 25, 26, 4]
+    info = app.wake_inputs("ESP32", app.LAYOUT_ENCODER, pins)
+    assert _wake(info) == [1]          # 按键 2 = GPIO12
+    assert _no_wake(info)[0]["pin"] == 18
+    assert _no_wake(info)[0]["reason"] == "non-rtc"
 
 
 def test_c3_default_first_six_buttons_wake():
@@ -99,14 +116,16 @@ def test_invalid_and_duplicate_pins_do_not_raise():
     messy = [None, "", "abc", -1, 999, 13, 13, 6, 4]
     info = app.wake_inputs("ESP32", app.LAYOUT_ENCODER, messy)
 
-    # 合法的 RTC 脚仍然被认出来；重复的 13 不会抛异常（固件掩码本来就去重）。
-    assert 5 in _wake(info) and 6 in _wake(info)
+    # 合法的 RTC 脚仍然被认出来：第一个能唤醒的输入（按键 6 = GPIO13）当 ext0 键。
+    assert _wake(info) == [5]
 
     blocked = _no_wake(info)
     for idx in (0, 1, 2, 3, 4):
         assert blocked[idx]["reason"] == "range"
     # 6 是 SPI Flash 脚（GPIO6–11）：不是「非 RTC」，而是这块芯片根本不能当按键。
     assert blocked[7]["reason"] == "range"
+    # 重复的 13 不抛异常：第二行只是不再单键唤醒。
+    assert blocked[6]["reason"] == "ext1-all-low"
     # 输入列表短于 9 行时，后面的输入按空值报告，不 IndexError。
     short = app.wake_inputs("C3", app.LAYOUT_ENCODER, [0, 1])
     assert set(_no_wake(short)) == set(range(2, 10))

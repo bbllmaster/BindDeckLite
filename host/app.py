@@ -461,16 +461,29 @@ def wake_inputs(chip: str, layout, pins) -> dict:
 
     Returns ``{"wake": [input index...], "no_wake": [{"index", "pin",
     "reason"}]}``. Indices are 0-based, the same numbering as
-    ``BTN:<dev>:<index>``. ``reason`` is ``"non-rtc"`` for a usable pin the
-    RTC domain cannot watch, or ``"range"`` for a value this chip could not
-    use as a button at all.
+    ``BTN:<dev>:<index>``.
+
+    ``reason`` is one of:
+
+    * ``"range"`` - a value this chip could not use as a button at all;
+    * ``"non-rtc"`` - a usable pin the RTC domain cannot watch, so it cannot
+      wake the chip from deep sleep;
+    * ``"ext1-all-low"`` - a usable RTC pin that is *not* the designated
+      single-key input. Classic ESP32's ext1 has no ANY_LOW mode: it wakes
+      only when every selected pin is low at once, so these keys wake the deck
+      only when held down together. The firmware arms ext0 on the first
+      wake-capable input (input order), which is what ``wake`` reports here.
+
+    The C3 has no such limit: ``esp_deep_sleep_enable_gpio_wakeup`` fires on
+    any single GPIO0-5 at low level, so every RTC pin in ``wake`` wakes alone.
     """
     prof = pin_chip(chip)
     twelve = _sleep_layout(layout) == LAYOUT_12KEY
     values = list(pins) if isinstance(pins, (list, tuple)) else []
     enc = ENCODER_PINS[prof]
-    wake, no_wake = [], []
     count = INPUT_COUNT_12KEY if twelve else INPUT_COUNT_ENCODER
+
+    rows = []   # (index, pin, parsed_ok)
     for idx in range(count):
         if idx < PIN_COUNT:
             ok, pin = _pin_int(values[idx]) if idx < len(values) else (False, 0)
@@ -478,13 +491,29 @@ def wake_inputs(chip: str, layout, pins) -> dict:
             ok, pin = True, enc["SW"]
         else:
             ok, pin = True, enc["CLK"] if idx == 10 else enc["DT"]
+        rows.append((idx, pin, ok))
+
+    # Classic ESP32: only the first wake-capable input is armed with ext0 and
+    # therefore wakes on its own (mirrors firstWakeInputPin() in main.cpp).
+    single_key = None
+    if prof != "C3":
+        for idx, pin, ok in rows:
+            if ok and _usable_pin(prof, pin) and pin in WAKE_PINS[prof]:
+                single_key = idx
+                break
+
+    wake, no_wake = [], []
+    for idx, pin, ok in rows:
         if not ok or not _usable_pin(prof, pin):
             no_wake.append({"index": idx, "pin": pin if ok else None,
                             "reason": "range"})
-        elif pin in WAKE_PINS[prof]:
-            wake.append(idx)
-        else:
+        elif pin not in WAKE_PINS[prof]:
             no_wake.append({"index": idx, "pin": pin, "reason": "non-rtc"})
+        elif prof != "C3" and idx != single_key:
+            no_wake.append({"index": idx, "pin": pin,
+                            "reason": "ext1-all-low"})
+        else:
+            wake.append(idx)
     return {"wake": wake, "no_wake": no_wake}
 
 
