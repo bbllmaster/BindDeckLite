@@ -205,6 +205,17 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px 6px; bor
 .pending-badge:hover { border-color: var(--warn); filter: brightness(1.1); }
 .pending-badge:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 .pending-badge[hidden] { display: none; }
+/* WS-561：设备重连后本机还有未下发的修改。只加 6px 琥珀点，不新增元素、
+   不改内边距与行高，顶栏高度与按钮位置保持原样。 */
+.pending-badge.reconnect-dirty::before {
+  content: "";
+  display: inline-block;
+  width: 6px; height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+  vertical-align: middle;
+}
 
 .dot { width: 9px; height: 9px; border-radius: 50%; background: #3a4356; display: inline-block; flex: none; }
 .dot.ok { background: var(--ok); box-shadow: 0 0 10px rgba(61, 220, 132, 0.65); }

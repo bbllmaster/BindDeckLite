@@ -121,6 +121,14 @@ const state = {
   wakeSupported: true, // WS-542：固件 >= 1.3.9 才显示「可唤醒输入」行
   pinValidateSeq: 0,  // 每次校验自增，丢弃过期响应（防抖 / 快速切换设备时乱序）
   pinValidateTimer: null,
+  // WS-561：每台设备这次「连上」的时刻（ms）。断开即清，重连算新周期。
+  connSince: {},
+  // WS-561：本连接周期已对过账的设备。掉线重连 / 重新选中后重置。
+  reconnectSynced: {},
+  // WS-561：有未下发修改时记 {count}，只提示不覆盖；apply / 手动读取成功后清。
+  reconnectDirty: {},
+  // WS-561：每台设备一条待执行的对账定时器（稳定窗口 2 s）。
+  reconcileTimers: {},
 };
 
 async function api(path, opts = {}) {
@@ -146,6 +154,7 @@ async function api(path, opts = {}) {
     if (code) text += t("ui.error_code_suffix", { code });
     const err = new Error(text);
     err.payload = body || null;
+    err.status = res.status;   // WS-561：旧后端没有 refresh 端点时按 404 静默跳过
     err.error_code = code;
     err.release_url = url;
     throw err;
@@ -230,11 +239,23 @@ function collectPending() {
 
 function updatePendingUi() {
   const items = collectPending();
+  // WS-561：重连后只提示过一次「有未下发修改」，用户把改动撤回到基线后
+  // 这条提示就不成立了，顺手清掉（apply / 手动读取成功另有清除入口）。
+  if (state.selected && state.reconnectDirty[state.selected] && !items.length) {
+    delete state.reconnectDirty[state.selected];
+    renderReadStatus();
+  }
+  const notice = reconnectNotice(state.selected);
   const badge = $("#pendingBadge");
   if (badge) {
     badge.hidden = !items.length;
     badge.textContent = items.length ? t("ui.pending_items", { count: items.length }) : "";
-    badge.title = items.length ? t("ui.pending_jump", { label: items[0].label }) : "";
+    // 琥珀点只是 class，不改顶栏布局；title 换成重连提示时仍可点击跳转。
+    badge.classList.toggle("reconnect-dirty", !!notice && !!items.length);
+    badge.title = items.length
+      ? (notice ? t("ui.reconnect_pending_title", { count: items.length })
+                : t("ui.pending_jump", { label: items[0].label }))
+      : "";
   }
   const apply = $("#btnApply");
   if (apply) {
@@ -243,6 +264,213 @@ function updatePendingUi() {
   }
   state.dirty = !!items.length;
   renderLastApply();
+}
+
+/* ---------------- WS-561 重连自动对账 ----------------
+ *
+ * 手机配网页是引脚 / 编码器模式 / 休眠的正式入口：改完设备重启、BLE 恢复，
+ * 上位机自动重连。以前重连只补运行状态，表单还是本机存档的旧值；用户之后
+ * 点「应用配置」时，全量下发会把手机上的改动静默写回旧值。
+ *
+ * 这里在「断开 → 连接」和「切到已连接设备」两个时机，静默向设备读一次
+ * （复用 WS-409 的 /api/device/<id>/refresh），以设备值为准重绘；有未下发
+ * 修改时只提示、绝不覆盖，也不替用户下发。
+ */
+
+const RECONNECT_STABLE_MS = window.ReconnectSync.STABLE_MS;
+// 稳定窗口之外再给回读 3 秒上限：链路慢也不能拖住 loadSysinfo / 状态轮询。
+const RECONNECT_READ_TIMEOUT_MS = 3000;
+const SYNC_FIELD_KEYS = {
+  pins: "ui.group_pins",
+  keys: "ui.group_keys",
+  enc: "ui.group_enc",
+  sleep: "ui.group_sleep",
+};
+
+/** 该设备这次连接的「有未下发修改」提示；没有则 null。 */
+function reconnectNotice(devId) {
+  return (devId && state.reconnectDirty[devId]) || null;
+}
+
+/** 断开或换连接周期：清计时、已对账标记与提示。 */
+function resetReconnectCycle(devId) {
+  if (!devId) return;
+  delete state.connSince[devId];
+  delete state.reconnectSynced[devId];
+  if (state.reconcileTimers[devId]) {
+    clearTimeout(state.reconcileTimers[devId]);
+    delete state.reconcileTimers[devId];
+  }
+  // 断开后「设备已重新连接」这句话不再成立，提示一起收掉。
+  if (state.reconnectDirty[devId]) {
+    delete state.reconnectDirty[devId];
+    if (state.selected === devId) {
+      updatePendingUi();
+      renderReadStatus();
+    }
+  }
+}
+
+/** 每轮状态轮询更新「这次连接从什么时候开始」，断开即结束本周期。 */
+function syncConnectionCycles(devices) {
+  const now = Date.now();
+  const seen = new Set();
+  (devices || []).forEach((d) => {
+    const id = d.dev_id;
+    if (!id) return;
+    seen.add(id);
+    if (d.connected) {
+      if (!state.connSince[id]) state.connSince[id] = now;
+    } else {
+      resetReconnectCycle(id);
+    }
+  });
+  // 已经从扫描列表里消失的设备也按断开处理，避免内存里留旧周期。
+  Object.keys(state.connSince).forEach((id) => {
+    if (!seen.has(id)) resetReconnectCycle(id);
+  });
+}
+
+/** 设备当前是否已连接（状态轮询的结论）。 */
+function deviceConnected(devId) {
+  const d = state.devices.find((x) => x.dev_id === devId);
+  return !!(d && d.connected);
+}
+
+/** 排一次对账：等本设备连接稳定 2 秒再跑，断开/切设备会取消。 */
+function queueReconcile(devId) {
+  if (!devId) return;
+  if (state.reconcileTimers[devId]) {
+    clearTimeout(state.reconcileTimers[devId]);
+    delete state.reconcileTimers[devId];
+  }
+  if (!state.connSince[devId]) state.connSince[devId] = Date.now();
+  const wait = Math.max(0, RECONNECT_STABLE_MS - (Date.now() - state.connSince[devId]));
+  state.reconcileTimers[devId] = setTimeout(() => {
+    delete state.reconcileTimers[devId];
+    reconcileDeviceConfig(devId);
+  }, wait);
+}
+
+async function reconcileDeviceConfig(devId) {
+  if (!devId || state.preview || state.selected !== devId) return;
+  const dev = state.devices.find((d) => d.dev_id === devId);
+  if (!dev || !dev.connected || !state.cfg) return;
+
+  const pending = collectPending();
+  const verdict = window.ReconnectSync.shouldReconcile({
+    trusted: state.cfg.trusted === true,
+    pendingCount: pending.length,
+    otaBusy: otaBusy(),
+    connectedForMs: Date.now() - (state.connSince[devId] || Date.now()),
+    reconciledThisCycle: !!state.reconnectSynced[devId],
+  });
+  if (!verdict.ok) {
+    // 唯一需要落到界面上的分支：有未下发修改时只提示、不发请求。
+    if (verdict.reason === "pending") {
+      state.reconnectDirty[devId] = { count: pending.length };
+      updatePendingUi();
+      renderReadStatus();
+    }
+    return;
+  }
+
+  // 先记「本周期已对账」：失败也不重试，避免旧固件每次轮询都打一遍。
+  state.reconnectSynced[devId] = true;
+  const before = snapshotCfg(state.cfg);
+  const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = ctrl
+    ? setTimeout(() => ctrl.abort(), RECONNECT_READ_TIMEOUT_MS)
+    : null;
+
+  let r = null;
+  try {
+    r = await api(`/api/device/${encodeURIComponent(devId)}/refresh`,
+                  ctrl ? { method: "POST", signal: ctrl.signal }
+                       : { method: "POST" });
+  } catch (e) {
+    // 旧后端没有这个端点（404/405）→ 静默跳过；超时 / 断链才 warn 一次。
+    const status = Number(e && e.status);
+    if (status !== 404 && status !== 405) {
+      addLocalLog("cfg", "ui.reconnect_sync_incomplete", {}, devId, "warn");
+    }
+    return;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  // 请求期间切到了别的设备：这次结果丢弃（多设备互不串档）。
+  if (state.selected !== devId) return;
+  if (!r || !r.ok || !r.cfg) {
+    // 旧固件不回完整配置：表单与存档保持原样，只记一行。
+    addLocalLog("cfg", "ui.reconnect_sync_incomplete", {}, devId, "warn");
+    return;
+  }
+  // 等回读的这两三秒里用户又开始改了：不能拿设备值覆盖，转为只提示。
+  const nowPending = collectPending();
+  if (nowPending.length) {
+    state.reconnectDirty[devId] = { count: nowPending.length };
+    updatePendingUi();
+    renderReadStatus();
+    return;
+  }
+  applyReconcileReadback(devId, before, r);
+}
+
+/** 用设备回报覆盖本机值，但只重绘真的变了的块（值相同不碰 DOM，避免闪烁）。 */
+function applyReconcileReadback(devId, before, r) {
+  const after = r.cfg;
+  state.readStatus[devId] = { at: r.at, fields: r.fields || {}, ok: true };
+
+  const fields = window.ReconnectSync.changedFields(before, after);
+  const layoutChanged = cfgLayout(before) !== cfgLayout(after);
+  if (!fields.length && !layoutChanged) {
+    // 完全一致：不重绘、不记日志，只把「上次读取」更新成这次的事实。
+    renderReadStatus();
+    return;
+  }
+
+  const b = bucketFor(devId);
+  state.cfg = after;
+  b.cfg = after;
+  b.applied = snapshotCfg(after);
+  b.lastResult = null;
+  // 重算待下发：对账后本机就是设备现状，之前的提示一并清掉。
+  setDirty(false);
+
+  if (layoutChanged || fields.includes("keys")) renderKeys();
+  if (layoutChanged || fields.includes("enc")) renderEncoder();
+  if (layoutChanged || fields.includes("pins")) renderPins();
+  if (layoutChanged || fields.includes("keys") || fields.includes("sleep")) {
+    renderDeviceMeta();
+  } else {
+    renderReadStatus();
+  }
+
+  const labels = fields.map((f) => t(SYNC_FIELD_KEYS[f])).join(t("ui.list_comma"));
+  if (labels) addLocalLog("cfg", "ui.reconnect_synced", { fields: labels }, devId);
+}
+
+/** 记一行本页可见的 cfg 日志：差异是前端算出来的，服务端没有客户端日志端点。
+ *  code / params 与后端事件同构，切语言后 retranslateLog 能把这一行一起换掉。 */
+function addLocalLog(kind, code, params, devId, level = "info") {
+  const list = $("#logList");
+  if (!list) return;
+  const e = {
+    time: fmtClock(Date.now() / 1000),
+    kind,
+    text: t(code, params),
+    code,
+    params: params || {},
+    dev: devId || "",
+    level,
+  };
+  const row = buildLogRow(e, window.LogDevice.showsDeviceTag(logDeviceUnion()));
+  applyLogRowVisibility(row);
+  list.appendChild(row);
+  syncLogDeviceUi();
+  syncLogFilterChrome();
+  if (state.logFollow) stickLogToBottom(list);
 }
 
 function renderLastApply() {
@@ -374,6 +602,9 @@ async function pollStatus() {
   try {
     const s = await api("/api/status");
     state.devices = s.devices || [];
+    // WS-561：先按这一轮的真实连接状态维护「本次连接」的起止，后面的
+    // 重连分支才拿得到正确的稳定时长。
+    syncConnectionCycles(state.devices);
     // 设备列表（id / 名字）变化时重算日志设备下拉与行标签；签名没变就跳过，
     // 免得每 1.2 秒把 300 行都扫一遍。
     const devSig = state.devices.map((d) => `${d.dev_id}:${d.name || ""}`).join("|");
@@ -434,6 +665,8 @@ async function pollStatus() {
     // 重新连上时立刻补一次运行状态（断开期间卡片保留旧值）。
     if (state.selected && !wasConnected && nowConnected) {
       loadSysinfo(state.selected);
+      // WS-561：等链路稳定 2 秒再静默读一次配置，以设备值为准对账。
+      queueReconcile(state.selected);
     }
     state.selectedConnected = nowConnected;
     // WS-512：连接状态变了，「从设备读取」的可用性跟着变。
@@ -647,6 +880,8 @@ async function selectDevice(devId) {
     if (b.lastResult) renderApplyResults(b.lastResult);
     loadSysinfo(devId);
     probeDeviceLayout(devId);
+    // WS-561: 切到一台已连接设备同样对一次账（每台设备每个连接周期一次）。
+    if (deviceConnected(devId)) queueReconcile(devId);
     // WS-546: 顺带确认修饰键能力，抽屉打开时行状态已经是对的。
     ensureModsCapability();
     return;
@@ -677,6 +912,8 @@ async function selectDevice(devId) {
     // 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
     // 12 键选项直接禁用，而不是让用户选完再被后端拒绝。
     probeDeviceLayout(devId);
+    // WS-561: 已连接设备选中即对账（等 2 秒稳定窗口）。
+    if (deviceConnected(devId)) queueReconcile(devId);
     // WS-546: 同上，确认修饰键能力（旧固件不回 MODS: → 禁用整行）。
     ensureModsCapability();
   } catch (e) {
@@ -1991,6 +2228,9 @@ function recordApply(items, allOk) {
   if (allOk) {
     b.applied = snapshotCfg(state.cfg);
     b.lastResult = null;
+    // WS-561：全部生效后本机就是设备现状，重连提示（琥珀点 + 设备页文案）清除。
+    if (state.selected) delete state.reconnectDirty[state.selected];
+    renderReadStatus();
     clearApplyResults();
   } else {
     b.lastResult = items;
@@ -2187,6 +2427,8 @@ function applyReadback(r) {
     b.cfg = state.cfg;
     b.applied = snapshotCfg(state.cfg);
     b.lastResult = null;
+    // WS-561：手动读取成功 = 本机已按设备真值覆盖，重连提示可以清掉。
+    delete state.reconnectDirty[state.selected];
   }
   setDirty(false);
   renderKeys();
@@ -2203,6 +2445,16 @@ function applyReadback(r) {
 function renderReadStatus() {
   const el = $("#cfgReadStatus");
   if (!el) return;
+  // WS-561：重连后本机有未下发修改 → 明确说「显示的不一定是设备值」，
+  // 直到 apply / 手动读取成功才换回普通的「上次读取」文案。
+  const notice = reconnectNotice(state.selected);
+  if (notice) {
+    const text = t("ui.reconnect_pending_note", { count: notice.count });
+    el.textContent = text;
+    el.title = text;
+    return;
+  }
+  el.title = "";
   const st = state.readStatus[state.selected];
   if (!st || !st.at) {
     el.textContent = t("ui.cfg_not_read");
@@ -2580,6 +2832,41 @@ function bindLogFollow() {
   }
 }
 
+/**
+ * 造一行日志（服务端轮询与前端本地事件共用同一份结构）。
+ *
+ * showDev 决定是否给这一行插设备列；行上保留原始 event，复制按钮与设备
+ * 过滤都从这里取。_text 是渲染后的正文，调用方需要 toast 时直接取。
+ */
+function buildLogRow(e, showDev) {
+  const devSpan = showDev ? '<span class="log-dev"></span>' : "";
+  const row = document.createElement("div");
+  row.className = "log-row " + (e.level || "info");
+  // 过滤用的原始字段，不占视觉空间：kind / level 直接来自后端事件。
+  row.dataset.kind = e.kind || "";
+  row.dataset.level = e.level || "info";
+  // 设备归属：空串表示上位机自身事件或无后缀旧固件，这类行不加标签、
+  // 也不参与任何设备过滤。
+  row.dataset.dev = e.dev || "";
+  // 事件带 code/params（WS-529）：优先本地翻译，语言切换后旧行也跟随；
+  // 没有 code 的（设备原始行、旧后端）继续用服务端渲染好的 text。
+  const rowText = e.code ? t(e.code, e.params) : e.text;
+  row._event = e;
+  row._text = rowText;
+  row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(rowText)}</span>`;
+
+  // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
+  // 放进剪贴板，方便贴到 issue / 聊天里。有设备归属时带上 [设备名]。
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "log-copy";
+  copyBtn.textContent = t("ui.copy");
+  copyBtn.title = t("ui.copy_row_title");
+  copyBtn.onclick = () => copyLogLine(window.LogDevice.logCopyText(e, state.devices), copyBtn);
+  row.appendChild(copyBtn);
+  return row;
+}
+
 async function pollLog() {
   try {
     const r = await api(`/api/log?since=${state.logSeq}`);
@@ -2600,39 +2887,15 @@ async function pollLog() {
     // 设备标注只在并集 ≥2 时插列；空 dev 的行也插一个空 span，行与行才对齐。
     // 这一批里新出现的 dev 可能把并集推到 2，追加完由 syncLogDeviceUi 补标签。
     const showDev = window.LogDevice.showsDeviceTag(logDeviceUnion());
-    const devSpan = showDev ? '<span class="log-dev"></span>' : "";
     r.events.forEach((e) => {
-      const row = document.createElement("div");
-      row.className = "log-row " + (e.level || "info");
-      // 过滤用的原始字段，不占视觉空间：kind / level 直接来自后端事件。
-      row.dataset.kind = e.kind || "";
-      row.dataset.level = e.level || "info";
-      // 设备归属：空串表示上位机自身事件或无后缀旧固件，这类行不加标签、
-      // 也不参与任何设备过滤。
-      row.dataset.dev = e.dev || "";
-      // 事件带 code/params（WS-529）：优先本地翻译，语言切换后旧行也跟随；
-      // 没有 code 的（设备原始行、旧后端）继续用服务端渲染好的 text。
-      const rowText = e.code ? t(e.code, e.params) : e.text;
-      row._event = e;
-      row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(rowText)}</span>`;
-
-      // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
-      // 放进剪贴板，方便贴到 issue / 聊天里。有设备归属时带上 [设备名]。
-      const copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "log-copy";
-      copyBtn.textContent = t("ui.copy");
-      copyBtn.title = t("ui.copy_row_title");
-      copyBtn.onclick = () => copyLogLine(window.LogDevice.logCopyText(e, state.devices), copyBtn);
-      row.appendChild(copyBtn);
-
+      const row = buildLogRow(e, showDev);
       applyLogRowVisibility(row);
       if (!row.hidden) visibleNew++;
       list.appendChild(row);
       // Physical-button action failures arrive through the log stream;
       // surface them as a toast so the user sees them immediately.
       if (e.kind === "action" && e.level === "error") {
-        toast(rowText, "bad");
+        toast(row._text, "bad");
       }
     });
 
@@ -2903,6 +3166,8 @@ function retranslateDynamic() {
   renderSysinfo();
   renderDesktop();
   renderReadStatus();
+  // WS-561：待下发徽标（含重连后的琥珀点 title）是 JS 拼的，切语言要重算。
+  updatePendingUi();
   renderUntrustedBanner();
   retranslateLog();
   syncLogFollowUi();
