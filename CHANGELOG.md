@@ -1,6 +1,7 @@
 # Changelog
 
-## 固件 1.3.9：经典 ESP32 深睡后叫不醒（唤醒源原先绑在非 RTC 的 GPIO5）— 2026-11-09（WS-542）
+
+## 固件 1.3.10：经典 ESP32 深睡后叫不醒（唤醒源原先绑在非 RTC 的 GPIO5）— 2026-11-09（WS-542）
 
 经典 ESP32 的入睡分支固定 `esp_sleep_enable_ext0_wakeup(ENCODER_SW, 0)`，而
 `ENCODER_SW` 是 GPIO5 —— 不是 RTC GPIO，返回值又没人检查，于是芯片在**没有任何
@@ -24,6 +25,49 @@
 - **回归**：`cd host && node --test test_portal_wake.mjs`（从 `src/main.cpp` 抽取
   配网页 `wakeinfo` 脚本、从 `static/app.js` 抽取 `formatWakeList` 真跑）与
   `cd host && python -m pytest test_sleep_wake.py -q`（import 生产 `wake_inputs`）。
+
+## 配网页新增「退出配网并重启」：手机上就能结束配网 — 2026-11-08（WS-551）
+
+以前离开配网只有两条路：走到设备旁长按第 10 个输入约 1 秒，或者干等 5 分钟自动
+超时。装进外壳、固定在桌下或线材较紧时很别扭，很多人保存完就直接离开，回来发现
+键盘没反应。
+
+- **固件**：配网页按键表单下方、OTA 链接上方新增「完成配置」区块，说明退出后热点
+  关闭、设备重启、蓝牙恢复，且**未保存的表单修改会丢失**，主按钮「退出配网并重启」
+  带一次 `confirm()` 确认（禁用 JS 时表单直接提交同样生效）。新增 `/exit` 路由：
+  只接受 `POST`（`GET` 回 405，浏览器预取/链接预览不会误重启）；POST 先返回静态
+  结果页「正在退出配网…」，约 1.2 秒后由 `loop()` 置 `g_bootReq = BOOT_REBOOT`
+  走既有延迟重启路径，不在 WebServer 回调里 `ESP.restart()`。
+- **不变**：退出只重启 —— 不写 NVS、不清 WiFi 凭据、不清主机绑定，与长按/超时退出
+  结果一致；5 分钟自动退出与长按 1 秒退出语义不变；按键扫描、HID、OTA 路径不变。
+- **回归**：`node --test host/test_portal_exit.mjs`（从 `src/main.cpp` 原样抽取页面
+  区块与路由注册，断言 `/exit` 只注册 POST + GET 405、页面区块位置与确认文案、
+  回调不直接重启、`loop()` 到点才置 `BOOT_REBOOT`）。
+
+## 每个输入可配修饰键：Ctrl / Shift / Alt / Win 组合键由设备自己发 — 2026-11-07（WS-546）
+
+以前一个输入只存一个键码，组合键只能走上位机宏 `key:ctrl+c` —— 锁屏、登录界面、
+BIOS、游戏全屏，以及「只配对蓝牙、没装上位机」的第二台电脑上完全用不了；设备默认
+的 F13–F22 在多数应用里也没有默认行为。
+
+- **固件**：每个输入新增 4 位修饰键掩码（bit0 Ctrl / bit1 Shift / bit2 Alt / bit3
+  GUI，v1 只发左变体），NVS 键 `mod<i>`，默认 0。`sendKeyForInput()` 先按掩码逐个
+  `press()` 再按主键，8 ms 后统一 `releaseAll()`；主键为「不发键」时连修饰键也不发。
+  新增 `CFG:MODS:<csv>`（个数必须等于当前布局输入数，每个 0–15，非法整条拒绝并保持
+  原值）、`CFG:MODS` 查询（回 `MODS:<csv>`）与 `CMD:GET_CFG` 末尾的 `CFG_MODS:`。
+  旧固件 / 旧上位机两个方向都保持原行为（默认掩码 0）。
+- **上位机**：按键抽屉「HID 键」下方新增 Ctrl / Shift / Alt / Win 四个复选框，与键码
+  同卡、走现有标脏与「应用配置」流程；摘要卡显示 `Ctrl + Shift + Esc`（顺序固定
+  Ctrl→Shift→Alt→Win，键码 0 显示「不发键」）。`/api/apply` 在 `CFG:KEYS:` 之后发
+  `CFG:MODS:`，回读 `CFG_MODS:` 写回 `keys[i].mods` 并参与逐项校验。
+- **能力门控**：抽屉打开时用 `CFG:MODS` 探测能力，旧固件整行禁用并提示「当前固件
+  不支持修饰键，请更新固件」，且不会下发 `CFG:MODS:` —— 不写死版本号。
+- **协议 / 文档**：`docs/protocol.md` 增补 `CFG:MODS:` / `CFG:MODS` / `MODS:` /
+  `CFG_MODS:` 与「每输入修饰键」一节。
+- **回归**：`cd host && python -m pytest test_key_mods.py -q`（import 生产函数，覆盖
+  行拼装与 12 值、越界截断、回读写入、非法回读整条拒绝、旧固件不下发、能力探测、
+  摘要顺序与来源唯一）。
+
 
 ## 上位机在线自查更新 + 固件 OTA 在线检测/推送 + 版本源与 update.json — 2026-11-05（WS-523 / WS-526）
 

@@ -52,7 +52,9 @@
 #endif
 
 // === Identity =============================================================
-#define FW_VERSION "1.3.9"   // WS-542: 深睡唤醒源按芯片/布局重算
+
+#define FW_VERSION "1.3.10"  // WS-546: 每输入修饰键（CFG:MODS）；1.3.9 由 WS-542 深睡修复占用
+
 #define FW_MODEL   "Lite"
 
 #ifdef TARGET_ESP32C3
@@ -112,6 +114,16 @@ static const uint8_t DEFAULT_KEYS[NUM_INPUTS_MAX] = {
   KEY_F23, KEY_F24
 };
 
+// WS-546: per-input modifier mask. One bit per modifier, left-hand variants
+// only in v1; the host sets the mask with CFG:MODS and sendKeyForInput()
+// presses those keys before the main key. 0 (the default) means "no
+// modifier", which is byte-for-byte the pre-WS-546 behaviour.
+#define MOD_CTRL   0x01
+#define MOD_SHIFT  0x02
+#define MOD_ALT    0x04
+#define MOD_GUI    0x08
+#define MOD_MASK   0x0F
+
 // v1.0.1: the old "hold 5 s to open the portal" gesture was the firmware's only
 // automatic ESP.restart() path. A pin that reads LOW (active-high encoder
 // wiring, a stuck switch, or a pin used by something else on the board) turned
@@ -120,6 +132,7 @@ static const uint8_t DEFAULT_KEYS[NUM_INPUTS_MAX] = {
 #define DOUBLE_CLICK_MS     1200   // second press within this window -> portal
 #define CONFIG_MODE_MS      300000 // portal auto-closes after 5 min
 #define CONFIG_EXIT_MS      1000   // hold the encoder push this long to leave
+#define PORTAL_EXIT_MS      1200   // WS-551: drain the /exit response before reset
 #define DEBOUNCE_MS         25
 
 // === Globals ==============================================================
@@ -128,6 +141,10 @@ Preferences preferences;
 
 int buttonPins[NUM_BUTTONS];
 int buttonKeys[NUM_INPUTS_MAX];
+// WS-546: modifier mask per input, same index space as buttonKeys (0..11).
+// Also kept for inputs outside the current layout so a layout switch never
+// truncates or shifts the table.
+uint8_t buttonMods[NUM_INPUTS_MAX];
 int encMode = 0;
 // WS-499: true = encoder layout (10 inputs), false = 12-key layout.
 // Stored as NVS key "encOn", independent of CFG_SCHEMA (see the note above).
@@ -302,6 +319,13 @@ static bool g_encSeenIdle = false;
 // preferences access and keeping BLE/notify out of unsafe contexts.
 enum BootReq : uint8_t { BOOT_NONE = 0, BOOT_CFG = 1, BOOT_REBOOT = 2 };
 static BootReq g_bootReq = BOOT_NONE;
+
+// WS-551: portal "退出配网并重启". POST /exit answers immediately and only arms
+// this deadline — the WebServer callback must not reset the chip before the
+// response is on the wire (the user would just see a dead connection). loop()
+// leaves the portal at the deadline and hands the restart to g_bootReq, so the
+// reset still happens on the Arduino task, exactly like CMD:REBOOT. 0 = idle.
+static unsigned long g_portalExitAt = 0;
 
 // === Encoder sampling =====================================================
 static const int8_t ENC_STATES[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
@@ -506,12 +530,18 @@ static void saveConfig() {
     char k[10];
     snprintf(k, sizeof(k), "key%d", i);
     preferences.putInt(k, buttonKeys[i]);
+    // WS-546: masks live next to the key codes, one NVS key each ("mod0"..).
+    snprintf(k, sizeof(k), "mod%d", i);
+    preferences.putInt(k, buttonMods[i]);
   }
   preferences.end();
 }
 
 static void loadConfig() {
   for (int i = 0; i < NUM_INPUTS_MAX; i++) buttonKeys[i] = DEFAULT_KEYS[i];
+  // WS-546: absent "mod<i>" means 0, so an upgraded deck and a deck that never
+  // heard of CFG:MODS behave exactly the same.
+  for (int i = 0; i < NUM_INPUTS_MAX; i++) buttonMods[i] = 0;
   for (int i = 0; i < NUM_BUTTONS; i++) buttonPins[i] = DEFAULT_BUTTON_PINS[i];
 
   // Open read-write so the namespace is created on a blank device; a read-only
@@ -580,6 +610,14 @@ static void loadConfig() {
     char k[10];
     snprintf(k, sizeof(k), "key%d", i);
     buttonKeys[i] = preferences.getInt(k, DEFAULT_KEYS[i]);
+    // WS-546: masks are independent of CFG_SCHEMA and of the layout flag, so
+    // an OTA / layout switch keeps them; anything outside 0..15 is clamped
+    // instead of leaking into the HID report.
+    snprintf(k, sizeof(k), "mod%d", i);
+    int m = preferences.getInt(k, 0);
+    if (m < 0) m = 0;
+    if (m > MOD_MASK) m = MOD_MASK;
+    buttonMods[i] = (uint8_t)m;
   }
   preferences.end();
   if (staleSchema) {
@@ -612,9 +650,18 @@ static void sendKeyForInput(int idx) {
   if (idx < 0 || idx >= inputCount()) return;
   // WS-508: 键码 0 = 「不发键」—— 这个键只跑上位机动作。直接返回，连一帧
   // 全 0 报告都不发；BLE 连接判断、BTN: 事件与其它输入都不受影响（BTN: 由
-  // 调用方单独发送，不经过这里）。
+  // 调用方单独发送，不经过这里）。WS-546 沿用这一语义：主键不发时连修饰键
+  // 也不发，绝不单独留下一个按下的修饰位。
   if (buttonKeys[idx] <= 0) return;
   if (bleKeyboard.isConnected()) {
+    // WS-546: modifiers first (fixed order Ctrl, Shift, Alt, GUI), then the
+    // main key, then one releaseAll() that clears every bit — a modifier can
+    // never stay stuck when the main key is itself a modifier or a media key.
+    const uint8_t mods = buttonMods[idx] & MOD_MASK;
+    if (mods & MOD_CTRL)  bleKeyboard.press(KEY_LEFT_CTRL);
+    if (mods & MOD_SHIFT) bleKeyboard.press(KEY_LEFT_SHIFT);
+    if (mods & MOD_ALT)   bleKeyboard.press(KEY_LEFT_ALT);
+    if (mods & MOD_GUI)   bleKeyboard.press(KEY_LEFT_GUI);
     bleKeyboard.press(buttonKeys[idx]);
     delay(8);
     bleKeyboard.releaseAll();
@@ -831,6 +878,19 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // the pin boxes as they are being edited.
   h += F("<p id='wakeInfo' style='color:#888;font-size:12px'></p>");
   h += F("<button style='padding:10px 20px'>保存按键配置</button></form>");
+
+  // WS-551: finish from the phone. The confirm() is an enhancement only - with
+  // JS disabled the form still POSTs /exit and the deck still leaves the portal
+  // and reboots. Nothing is written to NVS here: this is the same outcome as
+  // the long-press / 5-minute exit, just triggered from the browser.
+  h += F("<hr><h3>完成配置</h3>"
+         "<p style='font-size:14px;margin:0 0 10px'>退出后热点关闭，设备重启并恢复蓝牙。"
+         "未保存的表单修改会丢失。</p>"
+         "<form method='POST' action='/exit' "
+         "onsubmit=\"return confirm('退出配网并重启？未保存的修改会丢失。')\">"
+         "<button style='width:100%;box-sizing:border-box;padding:10px 16px;font:inherit;"
+         "border:0;border-radius:6px;background:#1a73e8;color:#fff;font-size:16px'>"
+         "退出配网并重启</button></form>");
 
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
          "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
@@ -1076,6 +1136,23 @@ static void setupProvisioning() {
     } else {
       cfgServer.send(400, "text/html; charset=utf-8", cfgPage(&form));
     }
+  });
+
+  // --- WS-551: leave the portal from the phone ---------------------------
+  // POST only. A browser prefetch or a pasted link must never reset the deck,
+  // so GET answers 405 and arms nothing. The 200 goes out first;
+  // the restart is deferred to loop() (g_portalExitAt) so the phone sees the
+  // result page instead of a dropped connection.
+  cfgServer.on("/exit", HTTP_POST, []() {
+    cfgServer.send(200, "text/html; charset=utf-8",
+                   "<meta charset='utf-8'>"
+                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                   "<p>正在退出配网，热点将在几秒内关闭；设备重启后自动恢复蓝牙。</p>");
+    g_portalExitAt = millis() + PORTAL_EXIT_MS;
+    log_e("[cfg] exit requested via portal");
+  });
+  cfgServer.on("/exit", HTTP_GET, []() {
+    cfgServer.send(405, "text/plain", "Method Not Allowed");
   });
 
   // --- WS-504: read-only self-check feed for the portal page ---
@@ -2308,6 +2385,61 @@ static void processCommand(String data) {
       log_e("[cfg] keys REJECTED (need %d values, layout=%s)", need,
             encOn ? "encoder" : "12key");
     }
+  } else if (data.startsWith("CFG:MODS:")) {
+    // CFG:MODS:<mask,...> (WS-546): one mask per input, exactly inputCount()
+    // values, each 0..15 (bit0 Ctrl / bit1 Shift / bit2 Alt / bit3 GUI).
+    // A wrong count or a malformed / out-of-range value rejects the WHOLE
+    // line and keeps the current masks, so a typo can never leave half the
+    // table rewritten. Masks are kept per input index and survive a layout
+    // switch untouched.
+    String payload = data.substring(9);
+    int mods[NUM_INPUTS_MAX];
+    int n = 0;
+    bool ok = true;
+    String badTok = "-";
+    // Consume the payload completely, including a trailing token without a
+    // comma, so a 13th value cannot slip through the NUM_INPUTS_MAX guard.
+    while (payload.length() > 0) {
+      int comma = payload.indexOf(',');
+      String tok = (comma == -1) ? payload : payload.substring(0, comma);
+      payload = (comma == -1) ? String("") : payload.substring(comma + 1);
+      tok.trim();
+      if (n >= NUM_INPUTS_MAX) {
+        ok = false;
+        if (badTok == "-") badTok = tok.length() ? tok : String("(empty)");
+        break;
+      }
+      // String::toInt() maps "x" to 0, which would look like a valid "no
+      // modifier" - hence the explicit digit check.
+      bool digits = tok.length() > 0;
+      for (unsigned int c = 0; c < tok.length(); c++) {
+        if (tok[c] < '0' || tok[c] > '9') digits = false;
+      }
+      int v = digits ? tok.toInt() : -1;
+      if (!digits || v < 0 || v > MOD_MASK) {
+        ok = false;
+        if (badTok == "-") badTok = tok.length() ? tok : String("(empty)");
+      }
+      mods[n++] = v;
+    }
+    const int need = inputCount();
+    if (ok && n == need) {
+      for (int i = 0; i < n; i++) buttonMods[i] = (uint8_t)mods[i];
+      saveConfig();
+      log_e("[cfg] mods applied (%d values)", n);
+    } else {
+      log_e("[cfg] mods REJECTED (got %d, want %d, bad=%s)", n, need, badTok.c_str());
+    }
+  } else if (data == "CFG:MODS") {
+    // Read-back probe (WS-546): MODS:<mask,...>. Old firmware never answers,
+    // which is how the host tells "does not support modifiers" from "no
+    // modifier set" without hard-coding a version number.
+    String mods;
+    for (int i = 0; i < inputCount(); i++) {
+      if (i) mods += ",";
+      mods += String(buttonMods[i]);
+    }
+    sendToHost("MODS:" + mods);
   } else if (data.startsWith("CFG:LAYOUT:")) {
     // WS-499: 1 = encoder layout (10 inputs), 0 = 12-key layout (12 inputs).
     // Applied live; the A/B sampler is stopped/started through esp_timer,
@@ -2393,6 +2525,14 @@ static void processCommand(String data) {
     // WS-499: appended last so the five existing lines keep their order and an
     // old host that stops reading after CFG_TZ is unaffected.
     sendToHost("CFG_LAYOUT:" + String(encOn ? 1 : 0));
+    // WS-546: the very last line, for the same reason. Only the current
+    // layout's inputs are reported (10 or 12), matching CFG_KEYS.
+    String mods;
+    for (int i = 0; i < inputCount(); i++) {
+      if (i) mods += ",";
+      mods += String(buttonMods[i]);
+    }
+    sendToHost("CFG_MODS:" + mods);
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {
@@ -3078,6 +3218,16 @@ void loop() {
   if (g_configMode) {
     cfgServer.handleClient();
     loopWiFi();
+    // WS-551: POST /exit deadline. The 200 is already queued on the socket;
+    // hand the restart to the deferred-boot block above (never restart from
+    // the WebServer callback). Both exits go through g_bootReq, so the deck
+    // reboots with the same "back to BLE" result as the long press, and no NVS
+    // value (WiFi credentials, pins, host binding) is touched.
+    if (g_portalExitAt && (long)(millis() - g_portalExitAt) >= 0) {
+      g_portalExitAt = 0;
+      log_e("[cfg] portal exit -> reboot");
+      g_bootReq = BOOT_REBOOT;
+    }
     static unsigned long exitHold = 0;
     if (digitalRead(ENCODER_SW) == LOW) {
       if (exitHold == 0) {

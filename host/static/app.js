@@ -86,6 +86,8 @@ const state = {
   selectedConnected: false,
   cfg: null,
   keycodes: [],
+  // WS-546: 修饰键定义（bit / id / label），顺序由服务器给出（Ctrl→Shift→Alt→Win）。
+  modDefs: [],
   logSeq: 0,
   logFollow: true,     // 日志是否跟随最新行；上滚即暂停
   logPending: 0,       // 暂停期间新到达、尚未查看的行数
@@ -645,6 +647,8 @@ async function selectDevice(devId) {
     if (b.lastResult) renderApplyResults(b.lastResult);
     loadSysinfo(devId);
     probeDeviceLayout(devId);
+    // WS-546: 顺带确认修饰键能力，抽屉打开时行状态已经是对的。
+    ensureModsCapability();
     return;
   }
 
@@ -673,6 +677,8 @@ async function selectDevice(devId) {
     // 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
     // 12 键选项直接禁用，而不是让用户选完再被后端拒绝。
     probeDeviceLayout(devId);
+    // WS-546: 同上，确认修饰键能力（旧固件不回 MODS: → 禁用整行）。
+    ensureModsCapability();
   } catch (e) {
     toast(t("ui.read_config_failed") + e.message, "bad");
   }
@@ -1356,6 +1362,37 @@ function renderSysinfo() {
   const when = info.at ? t("ui.sampled_at", { time: fmtClock(info.at) }) : "";
   const stale = connected ? "" : t("ui.disconnected_not_live");
   atEl.textContent = when + stale;
+}
+
+/** WS-546：设备是否会收发 CFG:MODS（能力探测，绝不写死版本号）。
+ *  未连接时返回 null 且不记结论；已有 True/False 时直接复用缓存。 */
+const modsProbing = new Set();
+
+async function ensureModsCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return null;
+  if (cfg.mods_supported === true || cfg.mods_supported === false) {
+    return cfg.mods_supported;
+  }
+  if (modsProbing.has(devId)) return null;
+  modsProbing.add(devId);
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/mods`, { method: "POST" });
+    // 期间切了设备：结论只对那台设备有效，不能写到当前 cfg 上。
+    if (state.selected !== devId || state.cfg !== cfg) return null;
+    if (!r.sent) return null;              // 链路不通 = 结论未知，保持现状
+    cfg.mods_supported = r.supported;
+    // 抽屉开着就按新结论重绘（禁用行 / 去掉提示）。
+    if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
+      renderKeyDrawer();
+    }
+    return cfg.mods_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    modsProbing.delete(devId);
+  }
 }
 
 /** 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
@@ -2888,8 +2925,10 @@ async function init() {
   try {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;
+    state.modDefs = k.mods || [];
   } catch (_) {
     state.keycodes = [];
+    state.modDefs = [];
   }
   const remembered = localStorage.getItem("binddecklite.device");
   if (remembered) state.selected = remembered;

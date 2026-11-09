@@ -171,6 +171,32 @@ DEFAULT_KEYS = [0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9,
 DEFAULT_LABELS = ["F13", "F14", "F15", "F16", "F17", "F18", "F19", "F20", "F21",
                   "F22", "F23", "F24"]
 
+# --- WS-546: per-input modifier mask --------------------------------------
+# One bit per modifier, left-hand variants only (same as the firmware's MOD_*):
+# bit0 Ctrl / bit1 Shift / bit2 Alt / bit3 GUI. This list is the single source
+# of the *display order* (Ctrl -> Shift -> Alt -> Win) — the drawer checkboxes
+# and the summary card both read it from /api/keycodes, so no second ordering
+# rule can drift away in JavaScript.
+MOD_MASK = 0x0F
+MOD_DEFS = [
+    {"bit": 0x01, "id": "kdModCtrl",  "key": "keys.mod_ctrl"},
+    {"bit": 0x02, "id": "kdModShift", "key": "keys.mod_shift"},
+    {"bit": 0x04, "id": "kdModAlt",   "key": "keys.mod_alt"},
+    {"bit": 0x08, "id": "kdModWin",   "key": "keys.mod_win"},
+]
+
+
+def _mask_of(item) -> int:
+    """One key item's modifier mask, clamped to the four bits the deck has.
+
+    ``mods`` comes straight from the browser's draft file, so a missing / null
+    / odd value is treated as "no modifier" instead of raising inside an apply.
+    """
+    try:
+        return int((item or {}).get("mods", 0) or 0) & MOD_MASK
+    except (TypeError, ValueError):
+        return 0
+
 # --- WS-499: input layout ------------------------------------------------
 # The firmware reports its layout as ``LAYOUT:<0|1>`` and accepts
 # ``CFG:LAYOUT:<0|1>``. 1 = encoder layout (9 buttons + EC11 = 10 inputs),
@@ -215,7 +241,9 @@ def default_key_item(i: int) -> dict:
     """One ``keys[i]`` entry with the shipped default code and label."""
     code = DEFAULT_KEYS[i] if i < len(DEFAULT_KEYS) else 0
     label = DEFAULT_LABELS[i] if i < len(DEFAULT_LABELS) else str(code)
-    return {"code": code, "label": label,
+    # WS-546: ``mods`` lives next to the code (0 = no modifier), so a config
+    # written before this feature reads exactly like an all-zero deck.
+    return {"code": code, "label": label, "mods": 0,
             "action": {"type": "none", "value": "", "macro": []}}
 
 
@@ -234,6 +262,12 @@ def ensure_key_items(cfg: dict) -> list:
         keys = cfg["keys"] = []
     while len(keys) < INPUT_COUNT_12KEY:
         keys.append(default_key_item(len(keys)))
+    # WS-546: an archive written before modifiers existed has no ``mods`` on
+    # its entries; fill it in (0 = the old behaviour) so the drawer and the
+    # apply step always see the same shape.
+    for item in keys:
+        if isinstance(item, dict):
+            item.setdefault("mods", 0)
     return keys
 
 
@@ -761,6 +795,13 @@ _read_lock = threading.RLock()
 _layout_windows: dict = {}
 _layout_lock = threading.RLock()
 
+# WS-546: one pending CFG:MODS probe per device. Same idea as the layout probe:
+# a deck that answers ``MODS:`` supports per-input modifiers, one that stays
+# silent does not. Capability is decided by this answer, never by a version
+# number (1.3.9 is WS-542's, this feature lands later).
+_mods_windows: dict = {}
+_mods_lock = threading.RLock()
+
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
 # device config so a failed read leaves the stored config untouched.
@@ -830,8 +871,13 @@ _CFG_READBACK_FIELDS = [
 # sends CFG_LAYOUT / LAYOUT, so requiring it would make every apply look
 # half-failed on hardware that works fine. It is merged when it arrives and
 # compared by apply_device() only when that device actually reported it.
+#
+# WS-546: CFG_MODS is optional for the same reason — firmware older than the
+# modifier feature never reports it. Its presence is what marks a deck as
+# modifier-capable (see probe_mods / _apply_cfg_field).
 _CFG_OPTIONAL_FIELDS = [
     ("layout", "LAYOUT", t("ui.layout_label")),
+    ("mods", "MODS", t("keys.mods_label")),
 ]
 _ALL_CFG_FIELDS = _CFG_READBACK_FIELDS + _CFG_OPTIONAL_FIELDS
 
@@ -889,8 +935,10 @@ class ReadWindow:
     by a lock and "everything arrived" is signalled by an event.
 
     Only the four device-managed groups (pins / keys / enc / sleep) decide
-    whether the answer is complete.  ``tz`` is captured as well but stays
-    optional — it is merged when it happens to arrive, never waited for.
+    whether the answer is complete.  ``tz``, ``layout`` and ``mods`` are
+    captured as well but stay optional — a deck older than those features
+    never sends them, so they are merged when they arrive and never waited
+    for (see _CFG_OPTIONAL_FIELDS).
     """
 
     def __init__(self, dev_id: str):
@@ -1042,6 +1090,25 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
             keys[i]["code"] = code
             keys[i]["label"] = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
         return True
+    if field == "mods":
+        # WS-546: ``CFG_MODS:`` / ``MODS:`` — one 0..15 mask per input.
+        vals = [v for v in raw.split(",") if v.strip()]
+        try:
+            masks = [int(v.strip()) for v in vals]
+        except ValueError:
+            return False
+        if (len(masks) > INPUT_COUNT_12KEY
+                or any(m < 0 or m > MOD_MASK for m in masks)):
+            return False
+        keys = cfg.setdefault("keys", [])
+        for i in range(len(keys), min(len(masks), INPUT_COUNT_12KEY)):
+            keys.append(default_key_item(i))
+        for i, mask in enumerate(masks[:INPUT_COUNT_12KEY]):
+            keys[i]["mods"] = mask
+        # The device just told us it speaks modifiers — that is a capability
+        # fact (never inferred from a version number).
+        cfg["mods_supported"] = True
+        return True
     if field == "pins":
         vals = [v for v in raw.split(",") if v.strip()]
         try:
@@ -1086,9 +1153,10 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
 def _split_cfg_line(line: str):
     """Split a ``CFG_<FIELD>:<value>`` line into (field, value).
 
-    All five device-reported groups are recognized.  Only the four tracked
+    Every group in ``_ALL_CFG_FIELDS`` is recognized.  Only the four required
     ones (pins / keys / enc / sleep) decide whether the answer is complete;
-    ``tz`` is captured as well but never waited for.
+    ``tz`` / ``layout`` / ``mods`` are captured when they arrive and never
+    waited for (old firmware does not send them).
     """
     for field, prefix, _ in _ALL_CFG_FIELDS:
         if line.startswith("CFG_" + prefix + ":"):
@@ -1552,6 +1620,18 @@ def _on_line(dev_id: str, line: str):
             box["value"] = cfg["layout"]
             event.set()
         return
+    if line.startswith("MODS:"):
+        # WS-546: answer to the CFG:MODS capability probe. Only the probe
+        # records it — the values are capability evidence, not a config value,
+        # so an untrusted local draft is never overwritten from here.
+        raw = line[len("MODS:"):].strip()
+        with _mods_lock:
+            pending = _mods_windows.get(dev_id)
+        if pending is not None:
+            event, box = pending
+            box["csv"] = raw
+            event.set()
+        return
     if line.startswith("ENC:"):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
@@ -1577,6 +1657,9 @@ def _on_line(dev_id: str, line: str):
                 # the cached verdict (unknown) so the next 12-key apply probes
                 # again instead of inheriting the old answer.
                 cfg["layout_supported"] = None
+                # WS-546: same for modifiers — an OTA can add or remove the
+                # capability, so re-probe instead of trusting the old verdict.
+                cfg["mods_supported"] = None
             cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
@@ -1654,6 +1737,14 @@ def _on_line(dev_id: str, line: str):
         cfg = device_cfg(dev_id)
         with _lock:
             _apply_cfg_field(cfg, "tz", line[len("CFG_TZ:"):])
+            save_config()
+        return
+    if line.startswith("CFG_MODS:"):
+        # WS-546: CMD:GET_CFG tail line. Its mere presence marks the deck as
+        # modifier-capable (see _apply_cfg_field).
+        cfg = device_cfg(dev_id)
+        with _lock:
+            _apply_cfg_field(cfg, "mods", line[len("CFG_MODS:"):])
             save_config()
         return
     # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
@@ -1819,6 +1910,32 @@ def probe_layout(dev_id: str, timeout: float = 1.5) -> dict:
             "layout": box["value"]}
 
 
+def probe_mods(dev_id: str, timeout: float = 1.5) -> dict:
+    """Ask one deck whether it speaks ``CFG:MODS`` (WS-546).
+
+    Returns ``{"sent", "answered"}``. ``answered`` means the deck replied with
+    ``MODS:<csv>`` — i.e. it has per-input modifiers. ``sent`` False means the
+    link was down, which is "unknown", NOT "unsupported". This is the only
+    place capability is decided, so the UI can disable the modifier row for
+    old firmware without hard-coding any version number.
+    """
+    event = threading.Event()
+    box = {"csv": None}
+    with _mods_lock:
+        _mods_windows[dev_id] = (event, box)
+    try:
+        result = send(dev_id, "CFG:MODS")
+        sent = bool((result or {}).get("sent"))
+        if sent:
+            event.wait(timeout)
+    finally:
+        with _mods_lock:
+            _mods_windows.pop(dev_id, None)
+    return {"sent": sent,
+            "answered": box["csv"] is not None,
+            "mods": box["csv"]}
+
+
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
     target_layout = layout_of(cfg)
@@ -1860,6 +1977,18 @@ def apply_device(dev_id: str) -> dict:
     )
     tz_val = cfg.get("tz", "")
 
+    # WS-546: the modifier line is sent only to firmware that speaks it. A
+    # negative verdict (probe timed out on this very deck) means the row is
+    # disabled in the UI and nothing is sent — "checked but never applied"
+    # must not be possible. An unknown verdict only sends when there is
+    # something to send (a non-zero mask): on an old deck an all-zero table is
+    # a no-op, and skipping it keeps the apply result free of a bogus
+    # "mods: not reported" row.
+    mods = ",".join(str(_mask_of(k)) for k in cfg.get("keys", [])[:count])
+    mods_nonzero = any(_mask_of(k) for k in cfg.get("keys", [])[:count])
+    send_mods = (cfg.get("mods_supported") is not False
+                 and (cfg.get("mods_supported") is True or mods_nonzero))
+
     snapshot = {
         "pins": pins,
         "keys": keys,
@@ -1868,6 +1997,8 @@ def apply_device(dev_id: str) -> dict:
         "tz": tz_val,
         "layout": str(target_layout),
     }
+    if send_mods:
+        snapshot["mods"] = mods
 
     # Create the per-device apply window before sending anything.
     window = ApplyWindow(dev_id, snapshot)
@@ -1881,6 +2012,12 @@ def apply_device(dev_id: str) -> dict:
             ("layout", "CFG:LAYOUT:%d" % target_layout),
             ("pins", "CFG:PINS:" + pins),
             ("keys", "CFG:KEYS:" + keys),
+        ]
+        # WS-546: right after CFG:KEYS, so a rejected mask line cannot be
+        # mistaken for a key-code failure. Skipped entirely on old firmware.
+        if send_mods:
+            commands.append(("mods", "CFG:MODS:" + mods))
+        commands += [
             ("enc", "CFG:ENC:" + enc_val),
             ("sleep", "CFG:SLEEP:" + sleep_val),
         ]
@@ -1959,6 +2096,39 @@ def apply_device(dev_id: str) -> dict:
             })
             if not ok_layout:
                 add_event("cfg", t("log.layout_not_applied") + actual_layout, dev_id, "warn")
+
+        # WS-546: the modifier masks are compared only when we actually sent
+        # them. A deck that reports CFG_MODS is modifier-capable from now on;
+        # a negative verdict is only ever set by the CFG:MODS probe, so a
+        # single missed tail line can never disable the row by accident.
+        if "mods" in snapshot:
+            expected = snapshot["mods"]
+            actual = window.readback.get("mods", "")
+            ack_ok = window._ack_ok.get("mods", False)
+            if not ack_ok:
+                status = "unconfirmed"
+                reason = t("log.not_connected") if not any_sent else t("log.connection_lost")
+            elif not actual:
+                status = "unverified"
+                reason = t("log.field_not_reported")
+            elif actual == expected:
+                status = "ok"
+                reason = ""
+            else:
+                status = "rejected"
+                reason = _rejection_reason("mods", expected, actual)
+            items.append({
+                "field": "mods",
+                "label": t("keys.mods_label"),
+                "status": status,
+                "expected": expected,
+                "actual": actual,
+                "reason": reason,
+            })
+            if actual and cfg.get("mods_supported") is not True:
+                with _lock:
+                    cfg["mods_supported"] = True
+                    save_config()
 
         ok_all = all(i["status"] == "ok" for i in items)
         # WS-512: only an apply whose every field read back with the value we
@@ -3987,6 +4157,9 @@ def api_config(dev_id):
         for field in ("pins", "keys", "encoder", "sleep", "tz", "name", "layout"):
             if field in data:
                 cfg[field] = data[field]
+        # WS-546: a draft from an older page has keys without ``mods``; pad /
+        # fill so the entry shape stays uniform (0 = no modifier).
+        ensure_key_items(cfg)
         save_config()
     return jsonify({"ok": True, "config": cfg})
 
@@ -4209,6 +4382,31 @@ def api_device_layout(dev_id):
                    "supported": None if supported is None and not probe["sent"]
                                 else bool(supported),
                    "layout": layout_of(cfg),
+                   "sent": probe["sent"]}
+    return jsonify(payload)
+
+
+@app.route("/api/device/<dev_id>/mods", methods=["POST"])
+def api_device_mods(dev_id):
+    """WS-546: ask the deck whether it supports per-input modifiers.
+
+    The answer is a capability fact, never a version comparison. ``supported``
+    is None only when the link was down (verdict unknown); True / False is
+    cached in the device config so the drawer does not re-probe on every open.
+    """
+    cfg = device_cfg(dev_id)
+    probe = probe_mods(dev_id)
+    with _lock:
+        if probe["sent"] and not probe["answered"]:
+            cfg["mods_supported"] = False
+            save_config()
+        elif probe["answered"]:
+            cfg["mods_supported"] = True
+            save_config()
+        supported = cfg.get("mods_supported")
+        payload = {"dev_id": dev_id,
+                   "supported": None if supported is None and not probe["sent"]
+                                else bool(supported),
                    "sent": probe["sent"]}
     return jsonify(payload)
 
@@ -5721,6 +5919,11 @@ def api_log():
 @app.route("/api/keycodes")
 def api_keycodes():
     return jsonify({"keys": [{"label": l, "code": c} for l, c in KEY_CODES],
+                    # WS-546: modifiers in display order (Ctrl -> Shift -> Alt
+                    # -> Win). The drawer and the summary both render from this
+                    # list, so the order exists exactly once.
+                    "mods": [{"bit": m["bit"], "id": m["id"], "label": t(m["key"])}
+                             for m in MOD_DEFS],
                     "defaults": {"pins": DEFAULT_PINS, "keys": DEFAULT_KEYS}})
 
 

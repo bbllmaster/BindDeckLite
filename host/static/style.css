@@ -555,6 +555,16 @@ textarea:focus-visible {
 
 .kd-field { display: flex; flex-direction: column; gap: 6px; }
 .kd-test-row { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+/* WS-546：修饰键 4 个复选框，与键码同卡。 */
+.kd-mods { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.kd-mod {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); border-radius: var(--r-pill);
+  padding: 4px 10px; min-height: 30px; background: var(--card-2);
+  font-size: var(--fs-cap); cursor: pointer;
+}
+.kd-mod input { margin: 0; accent-color: var(--accent); }
+.kd-mod:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
 
 /* ---------- 宏：结构化 + 纯文本 ---------- */
 .macro-editor {
