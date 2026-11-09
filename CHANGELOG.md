@@ -1,5 +1,31 @@
 # Changelog
 
+
+## 固件 1.3.10：经典 ESP32 深睡后叫不醒（唤醒源原先绑在非 RTC 的 GPIO5）— 2026-11-09（WS-542）
+
+经典 ESP32 的入睡分支固定 `esp_sleep_enable_ext0_wakeup(ENCODER_SW, 0)`，而
+`ENCODER_SW` 是 GPIO5 —— 不是 RTC GPIO，返回值又没人检查，于是芯片在**没有任何
+唤醒源**的情况下入睡：默认 5 分钟自动休眠，关掉上位机后就再也叫不醒。
+
+- **唤醒源按芯片 + 当前布局 + 当前引脚生成**：经典 ESP32 用 `ext1`（`ALL_LOW`）
+  覆盖所有 RTC 可用的活动输入，并把当前布局的**第一个可唤醒输入**（默认按键 1 =
+  GPIO13）加成 `ext0` 单键唤醒；C3 维持 GPIO0–5 单键 GPIO 唤醒。掩码不再写死
+  GPIO5，编码器按压与 12 键布局的第 10–12 键不会被当成唤醒源。
+- **注册失败不睡**：`ext0`/`ext1` 任一返回非 `ESP_OK` 打
+  `[sleep] wake source failed rc=<n>` 并继续主循环；唤醒脚集合为空打
+  `[sleep] skipped: no wake pin`，同样不进入深睡——不再制造「睡过去醒不来」。
+- **RTC 上拉**：睡前对每个唤醒脚 `rtc_gpio_pullup_en` + `rtc_gpio_pulldown_dis`，
+  避免浮空误唤醒或按键无效。
+- **日志**：入睡 `[sleep] enter timeout=<ms> wake_gpio=<list>`、经典另打
+  `[sleep] single-key wake gpio=<n>`；唤醒后（BLE 启动前）打 `[sleep] wake gpio=<n>`。
+- **界面如实分三段**：上位机设备页与配网页都显示「可唤醒输入 / 需同时按住才唤醒 /
+  不可唤醒」，随芯片、布局与（配网页里正在编辑的）引脚实时重算；旧固件
+  （< 1.3.9）不显示该行。区间文案不再把编码器按压写成「按键 10」，配网页也不再
+  把 C3 的按键 2–6 误判成要一起按住。
+- **回归**：`cd host && node --test test_portal_wake.mjs`（从 `src/main.cpp` 抽取
+  配网页 `wakeinfo` 脚本、从 `static/app.js` 抽取 `formatWakeList` 真跑）与
+  `cd host && python -m pytest test_sleep_wake.py -q`（import 生产 `wake_inputs`）。
+
 ## 配网页新增「退出配网并重启」：手机上就能结束配网 — 2026-11-08（WS-551）
 
 以前离开配网只有两条路：走到设备旁长按第 10 个输入约 1 秒，或者干等 5 分钟自动
@@ -41,6 +67,7 @@ BIOS、游戏全屏，以及「只配对蓝牙、没装上位机」的第二台�
 - **回归**：`cd host && python -m pytest test_key_mods.py -q`（import 生产函数，覆盖
   行拼装与 12 值、越界截断、回读写入、非法回读整条拒绝、旧固件不下发、能力探测、
   摘要顺序与来源唯一）。
+
 
 ## 上位机在线自查更新 + 固件 OTA 在线检测/推送 + 版本源与 update.json — 2026-11-05（WS-523 / WS-526）
 

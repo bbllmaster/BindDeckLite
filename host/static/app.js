@@ -117,6 +117,8 @@ const state = {
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
   pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors
   pinRules: null,     // 当前 chip 的引脚规则/提示，来源 /api/defaults 的 pinRules
+  wakeInputs: null,   // WS-542：可唤醒输入，来源 /api/defaults 的 wakeInputs
+  wakeSupported: true, // WS-542：固件 >= 1.3.9 才显示「可唤醒输入」行
   pinValidateSeq: 0,  // 每次校验自增，丢弃过期响应（防抖 / 快速切换设备时乱序）
   pinValidateTimer: null,
 };
@@ -620,6 +622,9 @@ async function selectDevice(devId) {
   if (typeof closeKeyDrawer === "function") closeKeyDrawer(false);
   state.selected = devId;
   state.preview = false;
+  // WS-542：可唤醒输入属于上一台设备的芯片/布局/引脚，先清掉，避免切换瞬间
+  // 把旧设备的结论画到新设备上；本次 validatePins 返回后会重新填。
+  state.wakeInputs = null;
   localStorage.setItem("binddecklite.device", devId);
   renderDevices();
 
@@ -1510,6 +1515,7 @@ function renderDeviceMeta() {
   // 引脚提示文案也来自后端规则（/api/defaults 的 pinRules），避免 JS 里再写一份
   // 与固件可能漂移的引脚限制。
   renderPinHint();
+  renderSleepWake();
   // 设备页的「上次读取」状态行。
   renderReadStatus();
   // 运行状态卡片（采样请求由 selectDevice / 重连 / 刷新 / 打开设备页触发）。
@@ -1611,9 +1617,11 @@ async function validatePins() {
     tokens.push(v === null || v === undefined ? "" : String(v));
   }
   const seq = ++state.pinValidateSeq;
+  const fwVersion = (state.cfg.fw && state.cfg.fw.version) || "";
   const query = `?chip=${encodeURIComponent(state.cfg.chip || "ESP32")}`
     + `&layout=${layoutOf()}`
-    + `&pins=${encodeURIComponent(tokens.join(","))}`;
+    + `&pins=${encodeURIComponent(tokens.join(","))}`
+    + `&fw=${encodeURIComponent(fwVersion)}`;
   let errors;
   try {
     const r = await api("/api/defaults" + query);
@@ -1622,6 +1630,14 @@ async function validatePins() {
       state.pinRules = r.pinRules;
       renderPinHint();
       renderFixedPins();   // keep the fixed rows in sync with the rule
+    }
+    // WS-542: the wake-capability line comes from the same backend call; the
+    // rule itself lives in app.wake_inputs(), the JS only formats it. A stale
+    // response (seq moved on) must not repaint it with older pins.
+    if (seq === state.pinValidateSeq) {
+      state.wakeInputs = r.wakeInputs || null;
+      state.wakeSupported = r.wakeSupported !== false;
+      renderSleepWake();
     }
   } catch (_) {
     // 上位机后端暂时取不到：保留上一次结论，绝不假装全部合法。
@@ -1660,6 +1676,92 @@ function applyPinErrors(errors) {
 function renderPinHint() {
   const el = $("#pinHint");
   if (el && state.pinRules) el.textContent = state.pinRules.hint || "";
+}
+
+/**
+ * 休眠卡里的只读「可唤醒输入：…」行（WS-542）。
+ *
+ * 谁能唤醒由后端 wake_inputs() 决定（芯片 + 当前布局 + 当前引脚），JS 只负责
+ * 把输入号排成「按键 1–9」这种区间文案。固件 < 1.3.9 不显示：那时的固件只有
+ * 编码器按压一条 ext0 唤醒源，承诺不了这一行。
+ */
+function renderSleepWake() {
+  const el = $("#sleepWake");
+  if (!el) return;
+  const info = state.wakeInputs;
+  if (!state.cfg || !info || !state.wakeSupported) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  const blocked = (info.no_wake || [])
+    .filter((x) => x && x.reason !== "ext1-all-low")
+    .map((x) => x.index);
+  const allLow = (info.no_wake || [])
+    .filter((x) => x && x.reason === "ext1-all-low")
+    .map((x) => x.index);
+  let text = t("ui.sleep_wake_line", { list: formatWakeList(info.wake) });
+  if (allLow.length) {
+    text += t("ui.list_separator")
+      + t("ui.sleep_wake_all_low", { list: formatWakeList(allLow) });
+  }
+  if (blocked.length) {
+    text += t("ui.list_separator")
+      + t("ui.sleep_wake_blocked", { list: formatWakeList(blocked) });
+  }
+  el.textContent = text;
+  el.hidden = false;
+}
+
+/** [0,1,2,3,5,9] -> 「按键 1–4、6；第 10 键」的区间文案（输入号为 0 基）。 */
+function formatWakeList(indices) {
+  const list = (indices || [])
+    .filter((i) => Number.isInteger(i) && i >= 0)
+    .sort((a, b) => a - b);
+  if (!list.length) return t("ui.sleep_wake_none");
+  const twelve = is12Key();
+  const parts = [];
+  let start = null;
+  let prev = null;
+  const flush = () => {
+    if (start !== null) parts.push(wakePiece(start, prev, twelve));
+    start = null;
+  };
+  list.forEach((i) => {
+    if (start === null) {
+      start = i;
+      prev = i;
+      return;
+    }
+    // 0–8 与 9+ 是两套命名空间（按键 N / 编码器按压、第 N 键）：跨过 8→9
+    // 必须另起一段，否则 [6,7,8,9] 会被合并成「按键 7–10」这种不存在的叫法。
+    if ((i >= 9) !== (prev >= 9)) {
+      flush();
+      start = i;
+      prev = i;
+      return;
+    }
+    if (i === prev + 1) {
+      prev = i;
+      return;
+    }
+    flush();
+    start = i;
+    prev = i;
+  });
+  flush();
+  return parts.join(t("ui.list_comma"));
+}
+
+/** 一个输入区间/单点：0–8 叫「按键 N」，9 起按布局叫「编码器按压」或「第 N 键」。 */
+function wakePiece(a, b, twelve) {
+  if (a === b) {
+    if (a < 9) return t("ui.input_button_n_js", { n: a + 1 });
+    if (a === 9 && !twelve) return t("ui.input_encoder_press");
+    return t("ui.sleep_wake_key_n", { n: a + 1 });
+  }
+  if (a < 9) return t("ui.sleep_wake_range", { from: a + 1, to: b + 1 });
+  return t("ui.sleep_wake_key_range", { from: a + 1, to: b + 1 });
 }
 
 function renderPinErrorCount() {
