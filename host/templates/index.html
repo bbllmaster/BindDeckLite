@@ -572,12 +572,21 @@ key:enter</pre>
       <section class="update-block" aria-labelledby="updAppTitle">
         <h3 id="updAppTitle" data-i18n="ui.host_update">上位机更新</h3>
         <div class="ota-rows">
+          <span class="k" data-i18n="ui.update_channel">更新通道</span>
+          <span class="v">
+            <select id="updateChannel" class="lang-select">
+              <option value="stable" data-i18n="ui.update_channel_stable">稳定版</option>
+              <option value="rolling" data-i18n="ui.update_channel_rolling">滚动版</option>
+            </select>
+          </span>
           <span class="k" data-i18n="ui.current_version">当前版本</span><span class="v" id="updAppCurrent">—</span>
           <span class="k" data-i18n="ui.latest_version">最新版本</span><span class="v" id="updAppLatest">—</span>
           <span class="k" data-i18n="ui.download_size">下载大小</span><span class="v" id="updAppSize">—</span>
           <span class="k">SHA256</span><span class="v mono" id="updAppSha">—</span>
         </div>
         <p class="update-state" id="updAppState" data-i18n="ui.checking">正在检查…</p>
+        <p class="muted small" id="updAppChannelInfo" hidden></p>
+        <p class="muted small" id="updAppRollingWarn" hidden data-i18n="update.rolling_warning">滚动版为每次 main 提交自动构建，可能不稳定</p>
         <p class="ota-error" id="updAppError" hidden></p>
         <details class="update-notes" id="updAppNotesBox" hidden>
           <summary data-i18n="ui.release_notes">本次更新内容</summary>
