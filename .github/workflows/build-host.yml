@@ -35,6 +35,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
 
+      # WS-569: a duplicate artifact name fails the run with 409 Conflict, so
+      # this runs before the expensive pyinstaller build.
+      - name: Workflow guard (WS-569)
+        run: python -m pytest tools/test_workflows.py -v
+
       - name: Build exe
         working-directory: host
         run: pyinstaller --noconfirm --clean app.spec
@@ -104,13 +109,13 @@ jobs:
         working-directory: host
         run: |
           node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: BindDeckLite-windows
-          path: host/dist/BindDeckLite.exe
-          if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      # WS-569: exactly one upload per artifact name. A second upload of the
+      # same name fails the job with 409 Conflict, which turned every PR into
+      # a red windows-exe regardless of its diff. Guarded by
+      # tools/test_workflows.py.
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
         with:
           name: BindDeckLite-windows
           path: host/dist/BindDeckLite.exe
