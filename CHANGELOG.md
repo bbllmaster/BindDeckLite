@@ -24,8 +24,8 @@
 - **不再闪窗**：启动标志改为 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，
   正常更新不再出现控制台窗口。
 - **回归**：`cd host && python -m pytest test_app_update.py -k "update_script or update_log or rollback_on_start"`；
-  Windows 真机用例 `host/test_update_script_windows.py`（CI `windows-exe` job）
-  实际执行生成的 `.bat`，覆盖正常替换、`NEW` 缺失、目标只读与日志内容。
+  Windows 真机用例 `host/test_update_script_windows.py`（CI `windows-exe` job，
+  两条：正常替换 + `NEW` 缺失）实际执行生成的 `.bat`，断言替换、备份、拉起与日志。
 
 ## 上位机：重连后自动以设备配置为准同步 — 2026-11-09（WS-561）
 

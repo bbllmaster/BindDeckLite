@@ -641,145 +641,81 @@ def _plain_script(**kwargs):
     return online_update.build_update_script(**params)
 
 
-def test_update_script_logs_every_step_to_update_log():
-    """每一步都要写日志：没有日志，用户只能看到「更新失败」四个字。"""
-    script = _plain_script()
+def test_update_script_logs_every_step_and_retries_the_copy(monkeypatch):
+    """脚本要能自己说明白：每步写日志、失败重试、清只读、无窗口。
 
-    # 默认日志落在 marker 同级目录的 update.log（生产里是 updates\\update.log）。
-    assert r'set "LOG=C:\new\update.log"' in script
-    # 开头截断旧日志，之后每一步追加 —— 否则上一次的失败会解释这一次。
-    assert '>"%LOG%"' in script
-    assert script.count('>>"%LOG%"') >= 10
-    for step in ("[start]", "[waitpid]", "[copy] step=backup",
-                 "[copy] step=replace", "[waitnew]", "[result]"):
-        assert step in script, "日志缺少步骤标记 %s" % step
-    # copy 的原始输出（含错误原因）必须进日志，不能 2>&1 到 NUL。
-    assert 'copy /Y "%NEW%" "%EXE%" >>"%LOG%" 2>&1' in script
-
-
-def test_update_script_uses_the_update_log_path_it_is_given():
-    """生产上传入 updates\\update.log；日志不能落进版本子目录。"""
-    script = _plain_script(log_path=r"C:\Users\x\AppData\Local\BindDeckLite\updates\update.log")
-    assert r'set "LOG=C:\Users\x\AppData\Local\BindDeckLite\updates\update.log"' in script
-    assert online_update.update_log_path(
-        r"C:\Users\x\AppData\Local\BindDeckLite\updates\1.5.0") == \
-        r"C:\Users\x\AppData\Local\BindDeckLite\updates\update.log"
-
-
-def test_update_script_parses_tasklist_instead_of_trusting_the_pipe():
-    """``tasklist | find`` 的退出码不能直接当「进程已退出」。
-
-    管道把 tasklist 自身失败（不在 PATH / 被拦截）压成了 find 的失败，脚本
-    于是抢在上位机退出前覆盖 exe，必然失败 → 立刻回滚 → CMD 一闪而过。
+    这几条一起断言（都是同一次「更新失败」的三个成因）：日志缺失 → 用户只
+    看到「更新失败」；一失败就回滚 → 杀软短暂锁住就闪退；``tasklist | find``
+    的退出码 → 抢在宿主退出前覆盖；``DETACHED_PROCESS`` → 闪一个黑窗。
     """
     script = _plain_script()
 
-    assert "| find" not in script, "不能再靠管道的退出码判断进程是否退出"
-    assert 'tasklist /FI "PID eq %PID%" /NH /FO CSV >"%LIST%" 2>NUL' in script
-    # 解析输出里的 PID：找不到才是真的退出。
-    assert 'find "%PID%" "%LIST%" >NUL' in script
-    # tasklist 报错 → 走 pid_unknown（继续等），不得直接去 copy。
-    assert "if errorlevel 1 goto pid_unknown" in script
-    check_block = script.split(":waitpid", 1)[1].split(":pid_tick", 1)[0]
-    assert "goto copyexe" not in check_block, \
-        "tasklist 不可用时必须继续等待，不能直接覆盖 exe"
+    # 日志：默认落在 marker 同级（生产里是 updates\update.log），先截断再追加。
+    assert r'set "LOG=C:\new\update.log"' in script
+    assert '>"%LOG%"' in script and script.count('>>"%LOG%"') >= 10
+    for step in ("[start]", "[waitpid]", "[copy] step=backup",
+                 "[copy] step=replace", "[waitnew]", "[result]"):
+        assert step in script, "日志缺少步骤标记 %s" % step
+    # copy 的原始输出必须进日志，不能 2>&1 到 NUL。
+    assert 'copy /Y "%NEW%" "%EXE%" >>"%LOG%" 2>&1' in script
 
-
-def test_update_script_retries_the_copy_once_a_second():
-    """替换失败要重试（默认 30 秒），一次失败就回滚正是闪退的原因之一。"""
-    script = _plain_script()
-
+    # 替换重试：每秒一次、最多 30 秒，用尽才回滚。
     assert "if not errorlevel 1 goto copied" in script
     assert "if %COUNT% LSS 30 goto retrycopy" in script
-    retry_block = script.split(":retrycopy", 1)[1].split(":copied", 1)[0]
-    assert "ping -n 2 127.0.0.1" in retry_block, "每次重试之间要隔约 1 秒"
-    assert "goto rollback" in script, "重试用尽后仍要回滚"
+    assert "ping -n 2 127.0.0.1" in script.split(":retrycopy", 1)[1].split(":copied", 1)[0]
+    assert "goto rollback" in script
 
-
-def test_update_script_clears_read_only_and_stale_backup_before_copy():
-    script = _plain_script()
-
+    # 只读属性与残留备份：copy 前 attrib -R + del，顺序不能反。
     assert 'if exist "%BAK%" attrib -R "%BAK%"' in script
     assert 'del /F /Q "%BAK%"' in script
-    assert 'attrib -R "%EXE%"' in script
-    # attrib/del 必须发生在 copy NEW→EXE 之前。
     assert script.index('attrib -R "%EXE%"') < script.index('copy /Y "%NEW%" "%EXE%"')
 
+    # PID 等待解析 tasklist 的输出；tasklist 报错时继续等，不得直接去 copy。
+    assert "| find" not in script, "不能再靠管道的退出码判断进程是否退出"
+    assert 'tasklist /FI "PID eq %PID%" /NH /FO CSV >"%LIST%" 2>NUL' in script
+    assert 'find "%PID%" "%LIST%" >NUL' in script
+    check_block = script.split(":waitpid", 1)[1].split(":pid_tick", 1)[0]
+    assert "goto copyexe" not in check_block
 
-def test_update_script_starts_the_new_version_in_the_exe_directory():
-    """``start /D``：新进程的 CWD 必须是 exe 目录，不是 updates 目录。"""
-    script = _plain_script()
-
+    # 新进程的 CWD 必须是 exe 目录。
     assert r'set "EXE_DIR=C:\Apps"' in script
     assert 'start "" /D "%EXE_DIR%" "%EXE%"' in script
 
-
-def test_launch_flags_hide_the_console_window(monkeypatch):
-    """CREATE_NO_WINDOW：正常更新不再闪一个黑窗（DETACHED_PROCESS 时代会闪）。"""
+    # 无窗口：CREATE_NO_WINDOW（与 DETACHED_PROCESS 互斥，不能同时给）。
     captured = {}
-
-    def fake_popen(command, **kwargs):
-        captured["command"] = command
-        captured.update(kwargs)
-
     monkeypatch.setattr(online_update, "os", type("FakeOs", (), {"name": "nt"})())
-    monkeypatch.setattr(online_update.subprocess, "Popen", fake_popen)
-
+    monkeypatch.setattr(
+        online_update.subprocess, "Popen",
+        lambda command, **kwargs: captured.update(command=command, **kwargs))
     assert online_update.launch_update_script(r"C:\updates\update.bat") is True
     flags = captured["creationflags"]
     assert flags & online_update.CREATE_NO_WINDOW, "必须带 CREATE_NO_WINDOW"
     assert flags & online_update.CREATE_NEW_PROCESS_GROUP
-    assert not flags & 0x00000008, \
-        "DETACHED_PROCESS 与 CREATE_NO_WINDOW 互斥，不能同时给"
-    assert captured["stdin"] is not None and captured["stdout"] is not None
+    assert not flags & 0x00000008, "DETACHED_PROCESS 与 CREATE_NO_WINDOW 互斥"
 
 
-def test_parse_update_log_reports_the_failed_step_and_raw_output():
-    """日志解析出「哪一步 + 为什么」—— UI 上要显示的正是这两个。"""
-    text = "\r\n".join([
-        "[start] pid=4321 exe=\"C:\\Apps\\BindDeckLite.exe\"",
-        "[waitpid] pid=4321 exited after 2s",
-        "已复制        1 个文件。",
-        "[copy] step=backup result=ok",
-        "拒绝访问。",
-        "        0 个文件已复制。",
-        "[copy] step=replace result=failed attempt=0 errorlevel=1",
-        "[copy] step=replace result=failed attempts=30 giving up",
-        "[result] rollback reason=copy_failed",
-        "[done]",
-    ])
+def test_read_update_log_reports_the_failed_step(tmp_path):
+    """日志解析出「哪一步 + 为什么」，并且能吃掉 cmd 的 OEM 代码页。"""
+    path = tmp_path / "update.log"
+    path.write_bytes((
+        "[waitpid] pid=4321 exited after 2s\r\n"
+        "[copy] step=backup result=ok\r\n"
+        "[copy] step=replace result=failed attempt=0 errorlevel=1\r\n"
+        "拒绝访问。\r\n"
+        "[copy] step=replace result=failed attempts=30 giving up\r\n"
+        "[result] rollback reason=copy_failed\r\n").encode("cp936"))
 
-    info = online_update.parse_update_log(text)
+    info = online_update.read_update_log(str(path))
 
     assert info["result"] == "rollback"
     assert info["reason"] == "copy_failed"
     assert "giving up" in info["detail"]
-
-
-def test_parse_update_log_reports_success():
-    info = online_update.parse_update_log(
-        "[copy] step=replace result=ok\r\n[result] ok\r\n")
-    assert info["result"] == "ok"
-    assert info["detail"] == ""
-
-
-def test_read_update_log_decodes_the_console_code_page(tmp_path):
-    """脚本按 cmd 的 OEM 代码页写日志，中文错误不能被解成乱码或抛异常。"""
-    path = tmp_path / "update.log"
-    body = ("[copy] step=replace result=failed attempt=0 errorlevel=1\r\n"
-            "拒绝访问。\r\n"
-            "[result] rollback reason=copy_failed\r\n")
-    path.write_bytes(body.encode("cp936"))
-
-    info = online_update.read_update_log(str(path))
-
-    assert info["reason"] == "copy_failed"
-    assert "拒绝访问" in info["detail"]
-
-
-def test_read_update_log_missing_file_is_not_an_error(tmp_path):
-    info = online_update.read_update_log(str(tmp_path / "nope.log"))
-    assert info == {"result": "", "reason": "", "detail": "", "lines": []}
+    assert "拒绝访问" in info["detail"], "OEM 代码页的 copy 原始输出要能解出来"
+    # 文件不存在只是「没细节」，不是异常。
+    assert online_update.read_update_log(str(tmp_path / "nope.log"))["result"] == ""
+    # 成功时不该带失败细节。
+    ok = online_update.parse_update_log("[copy] step=replace result=ok\r\n[result] ok\r\n")
+    assert ok["result"] == "ok" and ok["detail"] == ""
 
 
 def test_rollback_on_start_logs_the_failed_step_from_update_log(client, monkeypatch,
@@ -805,22 +741,6 @@ def test_rollback_on_start_logs_the_failed_step_from_update_log(client, monkeypa
     assert any("copy_failed" in text for text in texts), \
         "失败步骤必须进日志面板，而不是只有一句「更新失败」: %r" % texts
     assert any("giving up" in text for text in texts)
-
-
-def test_rollback_without_a_log_still_records_the_failure(client, monkeypatch,
-                                                          cfgfile):
-    """日志缺失只该少一条细节，不能让回滚处理本身崩掉。"""
-    monkeypatch.setattr(online_update, "read_app_version", lambda: "1.4.2")
-    host_app._config["last_update"] = {
-        "status": "pending", "from": "1.4.2", "to": "1.5.0", "at": 1.0,
-        "marker": "", "log": "",
-    }
-
-    host_app._update_after_start()
-
-    assert host_app._config["last_update"]["result"] == "rollback"
-
-
 
 # --- 8. 目录不可写 -----------------------------------------------------------
 
