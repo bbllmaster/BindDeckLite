@@ -711,6 +711,10 @@ def test_read_update_log_reports_the_failed_step(tmp_path):
     assert info["reason"] == "copy_failed"
     assert "giving up" in info["detail"]
     assert "拒绝访问" in info["detail"], "OEM 代码页的 copy 原始输出要能解出来"
+    # 顺序本身也要守住：oem / mbcs 是单字节页，永不抛错，排在 cp936 前面会
+    # 把中文日志「成功」解成乱码（US runner 的 windows-exe 实测）。
+    order = online_update.UPDATE_LOG_ENCODINGS
+    assert order.index("cp936") < order.index("oem") < order.index("mbcs")
     # 文件不存在只是「没细节」，不是异常。
     assert online_update.read_update_log(str(tmp_path / "nope.log"))["result"] == ""
     # 成功时不该带失败细节。

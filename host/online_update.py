@@ -94,6 +94,14 @@ UPDATE_PID_WAIT_SECONDS = 120
 #: 替换脚本的日志文件名（与版本子目录同级，见 :func:`update_log_path`）。
 UPDATE_LOG_NAME = "update.log"
 
+#: ``update.log`` 的解码候选顺序（见 :func:`read_update_log`）。
+#:
+#: ``oem`` / ``mbcs`` 在 Windows 上是**单字节**代码页（US = cp437 / cp1252），
+#: 对任意字节序列都不会抛 ``UnicodeDecodeError`` —— 排在前面就会把 cp936 的
+#: 中文 ``copy`` 报错「成功」解成 ``ǔ▄ū°█└▒▒íú``，cp936 永远轮不到。所以
+#: 多字节的中文页必须排在单字节兜底页之前（US runner 的 windows-exe 实测）。
+UPDATE_LOG_ENCODINGS = ("utf-8", "cp936", "oem", "mbcs")
+
 #: Windows 进程创建标志：``CREATE_NO_WINDOW`` 让更新脚本没有可见控制台
 #: （用户点「立即更新」不再闪一个黑窗），``CREATE_NEW_PROCESS_GROUP`` 让脚本
 #: 脱离上位机的进程组独立跑完。``DETACHED_PROCESS`` 与 ``CREATE_NO_WINDOW``
@@ -1113,9 +1121,10 @@ def parse_update_log(text: str) -> dict:
 def read_update_log(path: str, limit: int = 4000) -> dict:
     """读并解析 ``update.log``；读不到返回空结论，绝不抛异常。
 
-    脚本按 cmd 的控制台 OEM 代码页写日志（和批处理本身同一个代码页），所以
-    这里按 ``utf-8`` → ``oem`` → ``mbcs`` → ``cp936`` 依次试；全失败就用
-    替换字符兜底 —— 解析日志失败不能再变成一个异常。
+    ``update.log`` 里既有脚本自己写的 ASCII 步骤行，也有 ``cmd`` 按**系统代码
+    页**输出的 ``copy`` 报错（中文 Windows = cp936）。候选顺序见
+    :data:`UPDATE_LOG_ENCODINGS`；全失败就用替换字符兜底 —— 解析日志失败
+    不能再变成一个异常。
     """
     try:
         with open(path, "rb") as handle:
@@ -1123,7 +1132,7 @@ def read_update_log(path: str, limit: int = 4000) -> dict:
     except OSError:
         return {"result": "", "reason": "", "detail": "", "lines": []}
     text = ""
-    for encoding in ("utf-8", "oem", "mbcs", "cp936"):
+    for encoding in UPDATE_LOG_ENCODINGS:
         try:
             text = raw.decode(encoding)
             break
