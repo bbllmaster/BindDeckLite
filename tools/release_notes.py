@@ -321,7 +321,25 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
+def _pin_utf8_output() -> None:
+    """Force stdout/stderr to UTF-8 (WS-566).
+
+    On Windows a piped stdout/stderr falls back to the ANSI code page (cp1252),
+    which cannot encode Chinese: Python then writes ``\\u5347\\u7ea7\\u63d0\\u793a``
+    instead of the text. GitHub Actions and the tests read those streams as
+    UTF-8, so the escaped form breaks them. POSIX already defaults to UTF-8,
+    so this is a no-op there.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            # Not a TextIOWrapper (e.g. replaced by a test harness) — keep it.
+            pass
+
+
 def main():
+    _pin_utf8_output()
     args = _parse_args(sys.argv[1:])
     text = resolve_notes(args.tag, args.notes_dir, args.changelog,
                          since=args.since, repo=args.repo)

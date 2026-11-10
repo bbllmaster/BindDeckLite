@@ -230,14 +230,39 @@ def test_the_cli_writes_only_the_increment(tmp_path):
 def test_the_cli_still_fails_on_incomplete_formal_notes(tmp_path):
     """验收 4 的硬门槛不变：正式 tag 缺小节 → 非零退出，发布 job 失败。"""
     out = tmp_path / "NOTES.md"
+    # WS-566: 双保险 —— 子进程输出默认钉成 UTF-8；外层显式指定了
+    # PYTHONIOENCODING（回归命令用 cp1252 复现 Windows 代码页）时沿用，
+    # 否则这条回归命令会因为自己设的 utf-8 而永远看不出修复前的失败。
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     result = subprocess.run(
         [sys.executable, SCRIPT, "--tag", "v9.9.9", "--out", str(out),
          "--notes-dir", str(tmp_path / "no-notes"),
          "--changelog", str(tmp_path / "no-changelog.md")],
-        capture_output=True, text=True, encoding="utf-8")
+        capture_output=True, text=True, encoding="utf-8", env=env)
 
     assert result.returncode != 0
     assert "升级提示" in result.stderr
+
+
+def test_the_cli_pins_utf8_output_on_a_legacy_code_page(tmp_path):
+    """WS-566：Windows 管道默认 ANSI 代码页，中文会被转义成 ``\\uXXXX``。
+
+    这里强制子进程用 cp1252（与 Windows runner 的默认一致），断言脚本自己
+    把输出流重配成 UTF-8 —— 去掉 ``_pin_utf8_output()`` 这条就红。
+    """
+    out = tmp_path / "NOTES.md"
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "--tag", "v9.9.9", "--out", str(out),
+         "--notes-dir", str(tmp_path / "no-notes"),
+         "--changelog", str(tmp_path / "no-changelog.md")],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+
+    assert result.returncode != 0
+    assert "\\u" not in result.stderr
+    assert "升级提示" in result.stderr
+
 
 
 # --- 流水线接线 --------------------------------------------------------------
