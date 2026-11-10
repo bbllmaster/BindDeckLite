@@ -777,6 +777,11 @@ static String cfgPage(const KeysForm* form = nullptr) {
     "tr.hit{background:#e8f5e9}"
     "tr.hit td:first-child{box-shadow:inset 3px 0 0 0 #188038}"
     "td.tag{width:1%;white-space:nowrap;font-size:12px;color:#188038}"
+    // WS-572: the "unsaved" lines. Amber, wraps on a 320 px screen, and stays
+    // in normal flow so it can never cover the save / exit buttons.
+    ".dbar{background:#fef7e0;border:1px solid #f0c36d;color:#7a4f01;"
+    "padding:8px 10px;border-radius:6px;margin:0 0 12px;font-size:14px;"
+    "line-height:1.4;word-break:break-word}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
     h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
@@ -787,7 +792,11 @@ static String cfgPage(const KeysForm* form = nullptr) {
     }
     h += F("</ul></div>");
   }
-  h += F("<h2>BindDeckLite 配置</h2><p>设备: <b>");
+  // WS-572: one summary line for both forms, right under the title. Default
+  // hidden and filled by <script id='dirty'> at the end of the page, so the
+  // page without JS is byte-for-byte the old behaviour.
+  h += F("<h2>BindDeckLite 配置</h2><div id='dirtyBar' class='dbar' hidden></div>"
+         "<p>设备: <b>");
   h += g_bleName;
   h += F("</b><br>固件: ");
   h += FW_VERSION;
@@ -801,12 +810,16 @@ static String cfgPage(const KeysForm* form = nullptr) {
   } else {
     h += "未配置";
   }
-  h += F("</p><form method='POST' action='/save'>"
+  // WS-572: the onsubmit guard is an enhancement only. With JS disabled the
+  // attribute never runs and the form POSTs exactly as before.
+  h += F("</p><form method='POST' action='/save' id='fWifi' "
+         "onsubmit='return portalDirty.wifi()'>"
          "<p><b>WiFi 名称</b></p><input name='ssid' autocomplete='off' value='");
   h += htmlEsc(ssid);
   h += F("'><p><b>WiFi 密码</b></p><input name='pwd' type='password' value='");
   h += htmlEsc(pwd);
-  h += F("'><p><button style='padding:10px 20px'>保存并连接</button></p></form>");
+  h += F("'><p><button style='padding:10px 20px'>保存并连接</button></p>"
+         "<p id='otherDirtyWifi' class='dbar' hidden></p></form>");
 
   // WS-499: the layout switch lives in the same form as the pin rows, but its
   // own value is only written when the POST actually carries it (see /keys).
@@ -819,7 +832,8 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "按下任意按键开始自检</div>"
          "<div class='hint'>用于确认按键接在哪个 GPIO，不需要连电脑</div>"
          "<div class='note' id='chkNote' hidden></div></div>");
-  h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys'>"
+  h += F("<hr><h3>按键接线</h3><form method='POST' action='/keys' id='fKeys' "
+         "onsubmit='return portalDirty.keys()'>"
          "<p><b>按键布局</b><br><select name='layout'>");
   h += "<option value='1'";
   if (selLayoutEnc) h += " selected";
@@ -877,17 +891,21 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // deck. It is rendered by the script below from the current chip + layout +
   // the pin boxes as they are being edited.
   h += F("<p id='wakeInfo' style='color:#888;font-size:12px'></p>");
-  h += F("<button style='padding:10px 20px'>保存按键配置</button></form>");
+  h += F("<button style='padding:10px 20px'>保存按键配置</button>"
+         "<p id='otherDirtyKeys' class='dbar' hidden></p></form>");
 
   // WS-551: finish from the phone. The confirm() is an enhancement only - with
   // JS disabled the form still POSTs /exit and the deck still leaves the portal
   // and reboots. Nothing is written to NVS here: this is the same outcome as
   // the long-press / 5-minute exit, just triggered from the browser.
+  // WS-572: the wording is now generated from the unsaved state instead of
+  // warning "未保存的修改会丢失" unconditionally - a fixed sentence trains users
+  // to tap through it, so it stopped protecting anyone.
   h += F("<hr><h3>完成配置</h3>"
          "<p style='font-size:14px;margin:0 0 10px'>退出后热点关闭，设备重启并恢复蓝牙。"
          "未保存的表单修改会丢失。</p>"
-         "<form method='POST' action='/exit' "
-         "onsubmit=\"return confirm('退出配网并重启？未保存的修改会丢失。')\">"
+         "<form method='POST' action='/exit' id='fExit' "
+         "onsubmit='return portalDirty.leave()'>"
          "<button style='width:100%;box-sizing:border-box;padding:10px 16px;font:inherit;"
          "border:0;border-radius:6px;background:#1a73e8;color:#fff;font-size:16px'>"
          "退出配网并重启</button></form>");
@@ -1013,6 +1031,73 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "poll();"
          "})();"
          "</script>");
+
+  // WS-572: unsaved-state tracking across the two save forms. The page is one
+  // response with no external resources, so this lives inline in a single
+  // marked block that host/test_portal_dirty.mjs extracts and runs verbatim.
+  //
+  // Baseline = the values the device rendered into the page. Autofill and a
+  // mobile browser restoring form values therefore stay clean: only a real
+  // difference from what the firmware sent counts. No localStorage - the
+  // portal is served from a per-device hotspot at the same 192.168.4.1, so a
+  // draft key there would be shared by every deck configured from that phone.
+  h += F("<script id='dirty'>(function(){"
+         "var FIELDS={wifi:['ssid','pwd'],"
+         "keys:['pin0','pin1','pin2','pin3','pin4','pin5','pin6','pin7','pin8',"
+         "'layout','enc','sleep','sleeptime']};"
+         "var LABEL={wifi:'WiFi',keys:'按键接线'};"
+         "var LOST={wifi:'WiFi 名称 / 密码',keys:'按键接线 / 编码器模式 / 休眠设置'};"
+         "var base={},busy={};"
+         "function field(n){return document.querySelector('[name='+n+']');}"
+         "function value(n){var e=field(n);if(!e)return '';"
+         "if(e.type==='checkbox')return e.checked?'1':'';"
+         "return String(e.value);}"
+         // Only the named fields take part: the read-only 10-12 row of the
+         // 12-key layout has no input at all, so it can never mark the form.
+         "function snapshot(){var g,n,f;"
+         "for(g in FIELDS){f=FIELDS[g];for(n=0;n<f.length;n++)base[f[n]]=value(f[n]);}}"
+         "function changed(g){var f=FIELDS[g],i;"
+         "for(i=0;i<f.length;i++){if(value(f[i])!==base[f[i]])return true;}"
+         "return false;}"
+         "function state(){return {wifi:changed('wifi'),keys:changed('keys')};}"
+         "function joined(d){var out=[];"
+         "if(d.wifi)out.push(LABEL.wifi);"
+         "if(d.keys)out.push(LABEL.keys);"
+         "return out.join(' / ');}"
+         "function show(id,text){var e=document.getElementById(id);if(!e)return;"
+         "e.textContent=text;e.hidden=!text;}"
+         "function refresh(){var d=state(),n=joined(d);"
+         "show('dirtyBar',n?'有未保存的修改：'+n:'');"
+         "show('otherDirtyWifi',d.keys?LOST.keys+'尚未保存，保存 WiFi 会丢弃这些修改':'');"
+         "show('otherDirtyKeys',d.wifi?LOST.wifi+'尚未保存，保存按键接线会丢弃这些修改':'');"
+         "return d;}"
+         // One-shot flag per form: a double tap must not stack two dialogs,
+         // and a cancel clears it so the next tap asks again.
+         "function ask(which){"
+         "var d=refresh();"
+         "if(which==='exit'){"
+         "var g=joined(d);"
+         "if(busy.exit)return true;"
+         "if(!window.confirm('退出配网并重启？'+"
+         "(g?'以下修改尚未保存，会丢失：'+g:'')))return false;"
+         "busy.exit=true;return true;}"
+         "var other=which==='wifi'?'keys':'wifi';"
+         "if(!d[other])return true;"
+         "if(busy[which])return true;"
+         "if(!window.confirm(LOST[other]+'尚未保存，继续保存'+LABEL[which]+"
+         "'会丢弃这些修改。仍要继续？')){busy[which]=false;return false;}"
+         "busy[which]=true;return true;}"
+         "function watch(f){if(!f||!f.addEventListener)return;"
+         "f.addEventListener('input',refresh);f.addEventListener('change',refresh);}"
+         "snapshot();"
+         "watch(document.getElementById('fWifi'));"
+         "watch(document.getElementById('fKeys'));"
+         "refresh();"
+         "window.portalDirty={wifi:function(){return ask('wifi');},"
+         "keys:function(){return ask('keys');},"
+         "leave:function(){return ask('exit');},"
+         "refresh:refresh,state:state};"
+         "})();</script>");
   h += F("</body></html>");
   return h;
 }
