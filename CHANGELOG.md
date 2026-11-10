@@ -1,6 +1,32 @@
 # Changelog
 
 
+## 上位机：自更新下载完成后 CMD 一闪而过、更新失败 — 2026-11-10（WS-570）
+
+点「立即更新」后上位机退出，替换脚本一闪而过，程序还是旧版，也没有任何可查的
+信息。三个各自都能立刻退出的坑：`tasklist | find` 的退出码把 tasklist 自身失败
+当成「进程已退出」（抢在宿主退出前覆盖 → 必然失败）、`copy` 失败一次就回滚、
+失败路径全 `2>&1` 到 NUL。
+
+- **脚本写日志**：每一步（`[start]` / `[waitpid]` / `[copy] step=...` /
+  `[waitnew]` / `[result]`）连同 `errorlevel` 与 `copy` 的原始输出写进
+  `%LOCALAPPDATA%\BindDeckLite\updates\update.log`；每次运行先截断，旧结论不会
+  误导这一次。
+- **回滚后能说清原因**：上位机启动时读该日志，把失败步骤与原始报错写进日志
+  面板（并落到 `host.log`），不再是笼统的「更新失败」。
+- **替换重试**：`copy NEW → EXE` 每秒重试一次、最多 30 秒，扛住杀软 / 索引器
+  的短暂锁定；用尽才回滚。
+- **PID 等待可靠**：改为解析 `tasklist /FI "PID eq %PID%" /NH /FO CSV` 的输出，
+  tasklist 不可用 / 报错时**当作仍在运行**继续等，绝不抢跑覆盖。
+- **清理只读与残留**：copy 前 `attrib -R`、`del /F /Q` 清掉残留 `.bak`，
+  备份删不掉就按失败处理（不会拿旧备份回滚）。
+- **启动参数**：`start "" /D "<exe 目录>" "<exe>"`，新进程 CWD 回到 exe 目录。
+- **不再闪窗**：启动标志改为 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，
+  正常更新不再出现控制台窗口。
+- **回归**：`cd host && python -m pytest test_app_update.py -k "update_script or update_log or rollback_on_start"`；
+  Windows 真机用例 `host/test_update_script_windows.py`（CI `windows-exe` job）
+  实际执行生成的 `.bat`，覆盖正常替换、`NEW` 缺失、目标只读与日志内容。
+
 ## 上位机：重连后自动以设备配置为准同步 — 2026-11-09（WS-561）
 
 手机配网页是引脚、编码器模式与休眠的正式入口。改完保存后设备重启、BLE 恢复，上位机

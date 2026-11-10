@@ -324,6 +324,7 @@
   "log.app_update_failed_paused": "上位机更新未成功（已连续失败 {count} 次），已暂停自动更新",
   "log.app_update_restarting": "上位机正在更新到 {version}，程序即将重启",
   "log.app_update_rolled_back": "上位机更新未成功，已回滚到原版本",
+  "log.app_update_script_failed": "更新器失败：{reason}；{detail}（详情见 update.log）",
   "log.app_update_skipped": "已跳过版本 {version}（如需恢复请重新检查更新）",
   "log.app_update_skipped_short": "已跳过版本 {version}",
   "log.app_updated": "上位机已更新到 {version}",

@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -86,6 +87,19 @@ UPDATE_FAIL_LIMIT = 2
 DOWNLOAD_CHUNK = 64 * 1024
 #: 替换脚本等待新版本启动的秒数。
 UPDATE_RESTART_TIMEOUT = 60
+#: 覆盖 exe 失败时的重试时长（秒，每秒一次）：扛过杀软 / 索引器的短暂锁定。
+UPDATE_COPY_RETRY_SECONDS = 30
+#: 等待上位机进程退出的上限（秒，每秒一次）。
+UPDATE_PID_WAIT_SECONDS = 120
+#: 替换脚本的日志文件名（与版本子目录同级，见 :func:`update_log_path`）。
+UPDATE_LOG_NAME = "update.log"
+
+#: Windows 进程创建标志：``CREATE_NO_WINDOW`` 让更新脚本没有可见控制台
+#: （用户点「立即更新」不再闪一个黑窗），``CREATE_NEW_PROCESS_GROUP`` 让脚本
+#: 脱离上位机的进程组独立跑完。``DETACHED_PROCESS`` 与 ``CREATE_NO_WINDOW``
+#: 互斥，不能一起给。
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 #: 固件型号键 → 清单里 firmware 的 key。
 FIRMWARE_VARIANTS = ("esp32dev", "esp32c3", "esp32c3_16mb")
@@ -1026,23 +1040,127 @@ def stage_update_script(script_path: str, script: str, marker_path: str) -> None
     write_update_script(script_path, script)
 
 
+def update_log_path(dest_dir: str) -> str:
+    """替换脚本的日志路径：``...\\updates\\update.log``。
+
+    放在版本子目录的**同级**：每次更新都覆盖同一份，用户反馈时只要这一个
+    文件；版本子目录里的 ``.part`` / exe 会被清理，日志不该跟着丢。
+    """
+    directory = ntpath.dirname(str(dest_dir or "").rstrip("\\/"))
+    return ntpath.join(directory, UPDATE_LOG_NAME) if directory else UPDATE_LOG_NAME
+
+
+#: ``[result] <ok|fail|rollback> [reason=xxx]`` —— 脚本每次运行的最后结论。
+_LOG_RESULT_RE = re.compile(r"^\[result\]\s+([a-z]+)(?:\s+reason=([\w.-]+))?")
+#: 一行日志里「这是个失败」的迹象（脚本自己写的步骤行都是英文）。
+_LOG_FAILURE_RE = re.compile(
+    r"result=(?:failed|timeout|unknown)|unavailable|failed|refused|denied|cannot",
+    re.IGNORECASE)
+
+
+def _pick_log_detail(lines) -> str:
+    """从日志里挑出最有用的一行失败说明。
+
+    两步摘要（``[copy] step=replace result=failed ...``）与 ``copy`` 的原始
+    输出（``拒绝访问。``）都要给用户看：前者说明哪一步，后者说明为什么。
+
+    脚本自己的步骤行以 ``[`` 开头，``copy`` 的输出不是；所以从末尾往上找，
+    第一条非括号行就是失败那一步的原始输出（copy 失败时它紧挨着摘要）。
+    """
+    summary = ""
+    raw = ""
+    for line in reversed(lines):
+        if line.startswith("[result]"):
+            continue
+        if line.startswith("["):
+            if not summary and _LOG_FAILURE_RE.search(line):
+                summary = line
+        elif not raw:
+            raw = line
+        if summary and raw:
+            break
+    if raw and summary:
+        return "%s (%s)" % (summary, raw)
+    return summary or raw or (lines[-1] if lines else "")
+
+
+def parse_update_log(text: str) -> dict:
+    """解析 ``update.log`` → ``{result, reason, detail, lines}``。
+
+    * ``result``：``ok`` / ``fail`` / ``rollback``；日志被截断或没有结论时为空串；
+    * ``reason``：机器可读的失败原因（``copy_failed`` / ``new_missing`` …）；
+    * ``detail``：失败步骤摘要 + ``copy`` 的原始输出，给用户看；
+    * ``lines``：非空行，调试与测试用。
+
+    失败时**必须有 detail**：这才是本次修复要解决的事 —— 用户以前只看到
+    「更新失败」，现在能看到具体是哪一步、为什么。
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    result = ""
+    reason = ""
+    for line in lines:
+        match = _LOG_RESULT_RE.match(line)
+        if not match:
+            continue
+        result = match.group(1)
+        if result != "ok":
+            reason = match.group(2) or reason
+    detail = "" if result == "ok" else _pick_log_detail(lines)
+    return {"result": result, "reason": reason, "detail": detail, "lines": lines}
+
+
+
+def read_update_log(path: str, limit: int = 4000) -> dict:
+    """读并解析 ``update.log``；读不到返回空结论，绝不抛异常。
+
+    脚本按 cmd 的控制台 OEM 代码页写日志（和批处理本身同一个代码页），所以
+    这里按 ``utf-8`` → ``oem`` → ``mbcs`` → ``cp936`` 依次试；全失败就用
+    替换字符兜底 —— 解析日志失败不能再变成一个异常。
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return {"result": "", "reason": "", "detail": "", "lines": []}
+    text = ""
+    for encoding in ("utf-8", "oem", "mbcs", "cp936"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except (LookupError, UnicodeDecodeError):
+            continue
+    else:
+        text = raw.decode("utf-8", "replace")
+    if limit and len(text) > limit:
+        text = text[-limit:]
+    return parse_update_log(text)
+
+
 def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
                         marker_path: str, pid: int,
-                        wait_seconds: int = UPDATE_RESTART_TIMEOUT) -> str:
+                        wait_seconds: int = UPDATE_RESTART_TIMEOUT,
+                        log_path: str = "",
+                        copy_retry_seconds: int = UPDATE_COPY_RETRY_SECONDS,
+                        pid_wait_seconds: int = UPDATE_PID_WAIT_SECONDS) -> str:
     """生成替换脚本内容（Windows ``.bat``）。
 
-    脚本只接受本次下载的固定路径（当前 exe / 新 exe / 备份 / 标记 / PID），
-    **不接受任意命令**。流程：
+    脚本只接受本次下载的固定路径（当前 exe / 新 exe / 备份 / 标记 / PID /
+    日志），**不接受任意命令**。流程：
 
-    1. 等当前进程（PID）退出（运行中的 exe 不能被覆盖）；
-    2. 旧 exe 备份为 ``*.bak``；
-    3. 新 exe 覆盖旧 exe；
-    4. 启动新 exe；
-    5. 等标记文件出现（最多 ``wait_seconds`` 秒）—— 出现即新版本已启动，
-       脚本退出；
-    6. 超时则回滚 ``*.bak`` 并启动旧版。
+    1. 等当前进程（PID）退出（解析 ``tasklist /NH /FO CSV`` 的输出，
+       ``tasklist`` 自己报错时**当作仍在运行**继续等，绝不抢跑覆盖）；
+    2. 清掉只读属性与残留备份，把旧 exe 备份为 ``*.bak``；
+    3. 新 exe 覆盖旧 exe，失败时每秒重试，最多 ``copy_retry_seconds`` 秒
+       （杀软 / 索引器常把 exe 短暂锁住）；
+    4. ``start /D <exe 目录>`` 启动新 exe；
+    5. 等标记文件出现（最多 ``wait_seconds`` 秒）—— 出现即成功；
+    6. 超时或替换失败才回滚 ``*.bak`` 并启动旧版。
 
-    只用 ``cmd`` 内建命令与 ``ping`` 延时，不依赖 PowerShell。
+    每一步都写 ``log_path``（含 ``errorlevel`` 与 ``copy`` 原始输出），上位机
+    重启后读它给用户看具体失败步骤（WS-570）。
+
+    只用 ``cmd`` 内建命令与 ``tasklist`` / ``find`` / ``ping``，不依赖
+    PowerShell。
 
     脚本正文**只用 ASCII**（注释也是）：路径是唯一可能含非 ASCII 的部分，
     它按 cmd 的代码页落盘（见 :func:`write_update_script`）。脚本里出现
@@ -1052,69 +1170,156 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
     new = _bat_quote(new_exe)
     backup = _bat_quote(backup_exe)
     marker = _bat_quote(marker_path)
+    log = _bat_quote(log_path or ntpath.join(
+        ntpath.dirname(marker_path), UPDATE_LOG_NAME))
+    exe_dir = ntpath.dirname(exe_path) or "."
     pid_text = str(int(pid))
+    retries = max(1, int(copy_retry_seconds))
+    pid_waits = max(1, int(pid_wait_seconds))
     return "\r\n".join([
         "@echo off",
         "rem BindDeckLite self-update script (generated by the host, fixed paths only)",
+        "rem Every step is appended to LOG; the host reads it back after restart.",
         "setlocal",
         'set "EXE=%s"' % exe,
+        'set "EXE_DIR=%s"' % exe_dir,
         'set "NEW=%s"' % new,
         'set "BAK=%s"' % backup,
         'set "MARKER=%s"' % marker,
+        'set "LOG=%s"' % log,
+        'set "LIST=%LOG%.tasklist"',
         'set "PID=%s"' % pid_text,
         "set COUNT=0",
         "",
-        "rem 1. wait for the host process to exit -- a running exe cannot be overwritten.",
-        "rem    (no parenthesis block: %COUNT% inside one is not re-expanded)",
+        "rem 1. start a fresh log -- a stale one must never explain this run.",
+        'echo [start] pid=%PID% exe="%EXE%" >"%LOG%"',
+        'echo [start] new="%NEW%" bak="%BAK%" >>"%LOG%"',
+        "",
+        "rem 2. wait for the host process to exit -- a running exe cannot be",
+        "rem    overwritten. tasklist's own failure is NOT proof of exit: it used",
+        "rem    to be read as 'process gone', so the script copied too early and",
+        "rem    rolled back. Parse the PID column, and on any doubt keep waiting.",
         ":waitpid",
-        'tasklist /FI "PID eq %PID%" 2>NUL | find "%PID%" >NUL',
-        "if errorlevel 1 goto copyexe",
+        'tasklist /FI "PID eq %PID%" /NH /FO CSV >"%LIST%" 2>NUL',
+        "if errorlevel 1 goto pid_unknown",
+        'find "%PID%" "%LIST%" >NUL',
+        "if errorlevel 1 goto pid_gone",
+        "goto pid_tick",
+        "",
+        ":pid_unknown",
+        'echo [waitpid] tasklist unavailable, assume pid=%PID% still runs >>"%LOG%"',
+        ":pid_tick",
         "ping -n 2 127.0.0.1 >NUL",
         "set /a COUNT+=1",
-        "if %COUNT% LSS 120 goto waitpid",
+        "if %COUNT% LSS " + str(pid_waits) + " goto waitpid",
+        'echo [waitpid] timeout after %COUNT%s, continue anyway >>"%LOG%"',
+        "goto copyexe",
         "",
-        "rem 2. back up the old exe, then overwrite it.",
+        ":pid_gone",
+        'echo [waitpid] pid=%PID% exited after %COUNT%s >>"%LOG%"',
+        "",
+        "rem 3. drop the read-only flag and any stale backup, then back up.",
         ":copyexe",
-        'if not exist "%NEW%" goto fail',
-        'copy /Y "%EXE%" "%BAK%" >NUL 2>&1',
-        "if errorlevel 1 goto fail",
-        'copy /Y "%NEW%" "%EXE%" >NUL 2>&1',
-        "if errorlevel 1 goto rollback",
-        'start "" "%EXE%"',
+        'if not exist "%NEW%" goto fail_new',
+        'if exist "%BAK%" attrib -R "%BAK%" >>"%LOG%" 2>&1',
+        'if exist "%BAK%" del /F /Q "%BAK%" >>"%LOG%" 2>&1',
+        'if exist "%BAK%" goto fail_backup',
+        'attrib -R "%EXE%" >>"%LOG%" 2>&1',
+        'copy /Y "%EXE%" "%BAK%" >>"%LOG%" 2>&1',
+        "if errorlevel 1 goto fail_backup",
+        'echo [copy] step=backup result=ok >>"%LOG%"',
         "",
-        "rem 3. wait for the marker the new version writes -- it means it started.",
+        "rem 4. replace the exe, retrying once a second: antivirus / the indexer",
+        "rem    can hold it for a few seconds right after the host exits.",
+        "set COUNT=0",
+        ":retrycopy",
+        'attrib -R "%EXE%" >>"%LOG%" 2>&1',
+        'copy /Y "%NEW%" "%EXE%" >>"%LOG%" 2>&1',
+        "if not errorlevel 1 goto copied",
+        'echo [copy] step=replace result=failed attempt=%COUNT% errorlevel=%ERRORLEVEL% >>"%LOG%"',
+        "ping -n 2 127.0.0.1 >NUL",
+        "set /a COUNT+=1",
+        "if %COUNT% LSS " + str(retries) + " goto retrycopy",
+        'echo [copy] step=replace result=failed attempts=%COUNT% giving up >>"%LOG%"',
+        'echo [result] rollback reason=copy_failed >>"%LOG%"',
+        "goto rollback",
+        "",
+        ":copied",
+        'echo [copy] step=replace result=ok attempts=%COUNT% >>"%LOG%"',
+        "rem 5. start the new version with the exe directory as its CWD: relative",
+        "rem    paths must not resolve inside the updates directory.",
+        'start "" /D "%EXE_DIR%" "%EXE%"',
+        "if errorlevel 1 goto fail_start",
+        'echo [start] new version launched >>"%LOG%"',
+        "",
+        "rem 6. wait for the marker the new version writes -- it means it started.",
         "set COUNT=0",
         ":waitnew",
-        'if exist "%MARKER%" goto done',
+        'if not exist "%MARKER%" goto waitnew_tick',
+        'echo [waitnew] marker seen after %COUNT%s >>"%LOG%"',
+        'echo [result] ok >>"%LOG%"',
+        "goto done",
+        ":waitnew_tick",
         "ping -n 2 127.0.0.1 >NUL",
         "set /a COUNT+=1",
         "if %COUNT% LSS " + str(int(wait_seconds)) + " goto waitnew",
+        'echo [waitnew] result=timeout after %COUNT%s >>"%LOG%"',
+        'echo [result] rollback reason=new_start_timeout >>"%LOG%"',
         "",
-        "rem 4. timed out: roll back to the .bak and start the old version.",
+        "rem 7. roll back to the .bak and start the old version.",
         ":rollback",
-        'copy /Y "%BAK%" "%EXE%" >NUL 2>&1',
-        'start "" "%EXE%"',
+        'if not exist "%BAK%" goto rollback_start',
+        'attrib -R "%EXE%" >>"%LOG%" 2>&1',
+        'copy /Y "%BAK%" "%EXE%" >>"%LOG%" 2>&1',
+        'if errorlevel 1 echo [rollback] copy failed, exe may still be the new build >>"%LOG%"',
+        ":rollback_start",
+        'del /F /Q "%LIST%" >>"%LOG%" 2>&1',
+        'start "" /D "%EXE_DIR%" "%EXE%"',
         "goto done",
         "",
         "rem Failed before the swap: the old exe is still in place -- start it again,",
         "rem otherwise the user is left with no program at all.",
-        ":fail",
-        'start "" "%EXE%"',
+        ":fail_new",
+        'echo [copy] step=check result=failed reason=new_missing >>"%LOG%"',
+        'echo [result] fail reason=new_missing >>"%LOG%"',
+        "goto restart_old",
+        "",
+        ":fail_backup",
+        'echo [copy] step=backup result=failed: cannot back up or clear the old exe >>"%LOG%"',
+        'echo [result] fail reason=backup_failed >>"%LOG%"',
+        "goto restart_old",
+        "",
+        ":fail_start",
+        'echo [start] step=launch result=failed >>"%LOG%"',
+        'echo [result] fail reason=new_start_failed >>"%LOG%"',
+        "",
+        ":restart_old",
+        'del /F /Q "%LIST%" >>"%LOG%" 2>&1',
+        'start "" /D "%EXE_DIR%" "%EXE%"',
         "",
         ":done",
+        'echo [done] log="%LOG%" >>"%LOG%"',
         "endlocal",
         "",
     ])
 
 
 def launch_update_script(script_path: str) -> bool:
-    """后台启动替换脚本（脱离当前进程的生命周期）。"""
+    """后台启动替换脚本（脱离当前进程的生命周期）。
+
+    Windows 上用 ``CREATE_NO_WINDOW``：``DETACHED_PROCESS`` 时代用户会看到
+    一个一闪而过的 CMD 窗口，失败信息全被吞掉（WS-570）。现在脚本没有可见
+    控制台，诊断信息只走 ``update.log`` + 上位机日志。
+
+    三个标准流全部指向 NUL：上位机退出后原句柄已失效，脚本不能再往里写。
+    """
     try:
         kwargs = {"close_fds": True}
         if os.name == "nt":
-            flags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
-            kwargs["creationflags"] = flags
+            kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            kwargs["stdin"] = subprocess.DEVNULL
+            kwargs["stdout"] = subprocess.DEVNULL
+            kwargs["stderr"] = subprocess.DEVNULL
             command = ["cmd", "/c", script_path]
         else:
             kwargs["start_new_session"] = True
@@ -1123,3 +1328,4 @@ def launch_update_script(script_path: str) -> bool:
         return True
     except OSError:
         return False
+
