@@ -5235,6 +5235,9 @@ def _app_update_worker(task_id, info, app_asset, current):
         # ``tag`` / ``target`` 只给滚动通道用（下次检查据此判「已是最新」和
         # 「同一个 nightly 连续失败」）。
         marker = os.path.join(dest_dir, "updated.marker")
+        # WS-570: 替换脚本的日志。回滚后启动的旧版本读它，才能告诉用户
+        # 具体卡在哪一步，而不是只有一句「更新失败」。
+        log_path = online_update.update_log_path(dest_dir)
         _set_update_state(last_update={
             "status": "pending",
             "from": current,
@@ -5243,6 +5246,7 @@ def _app_update_worker(task_id, info, app_asset, current):
             "target": online_update.update_target_key(channel, info),
             "at": time.time(),
             "marker": marker,
+            "log": log_path,
         })
 
         _phase("installing")
@@ -5250,7 +5254,8 @@ def _app_update_worker(task_id, info, app_asset, current):
         backup_path = exe_path + ".bak"
         script_path = os.path.join(dest_dir, "update.bat")
         script = online_update.build_update_script(exe_path, final_path, backup_path,
-                                                   marker, os.getpid())
+                                                   marker, os.getpid(),
+                                                   log_path=log_path)
         # 上一次失败留下的 marker 会让脚本 ``if exist "%MARKER%"`` 立刻判成功、
         # 跳过回滚等待 —— 生成脚本前先清掉。
         try:
@@ -5357,6 +5362,23 @@ def _ota_busy_reason() -> str:
     return ""
 
 
+def _update_failure_detail(last: dict) -> dict:
+    """读上次更新脚本写的 ``update.log``（WS-570）。
+
+    脚本在旧版本被拉起来之前就把每一步写进了日志，所以这里是唯一还能拿到
+    「为什么失败」的地方。``last_update.log`` 是本次写入的路径；老配置没有
+    这个键时按 marker 的上级目录推（``updates/update.log``）。
+    """
+    log_path = str(last.get("log") or "")
+    if not log_path:
+        marker_dir = os.path.dirname(str(last.get("marker") or ""))
+        if marker_dir:
+            log_path = online_update.update_log_path(marker_dir)
+    if not log_path:
+        return {"result": "", "reason": "", "detail": "", "lines": []}
+    return online_update.read_update_log(log_path)
+
+
 def _update_after_start():
     """启动后处理上次自更新的结果（WS-523）。
 
@@ -5364,6 +5386,8 @@ def _update_after_start():
       更新脚本看到它就确认成功；同时把 last_update.result 记为 ok。
     * 首次启动的是**旧版本**（更新脚本回滚了 .bak）→ 结果记为 rollback，
       连续失败计数 +1；连续失败 >= 2 次后暂停自动更新。
+    * WS-570：回滚时再读 ``update.log``，把失败步骤与原始输出写进日志面板 ——
+      用户以前只看到「更新失败」，完全无从排查。
     """
     state = _update_settings()
     last = state["last_update"]
@@ -5394,6 +5418,19 @@ def _update_after_start():
         add_event("update", t("log.app_update_failed_paused", count=fail_count), level="warn")
     else:
         add_event("update", t("log.app_update_rolled_back"), level="warn")
+    # 具体失败步骤：脚本日志里最后一条失败行（含 copy 的原始输出）。
+    info = _update_failure_detail(last)
+    if info.get("reason") or info.get("detail"):
+        detail = str(info.get("detail") or "")[:300]
+        reason = str(info.get("reason") or info.get("result") or "-")
+        message = t("log.app_update_script_failed", reason=reason, detail=detail)
+        add_event("update", message, level="error")
+        # 冻结的 exe 里 stdout 就是 host.log（desktop.setup_stdio），
+        # 用户反馈时能直接从 host.log 拿到同一行。
+        try:
+            print("[update] %s" % message)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @app.route("/api/app/update/progress")

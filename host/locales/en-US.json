@@ -324,6 +324,7 @@
   "log.app_update_failed_paused": "The host update failed ({count} times in a row); automatic updates are paused",
   "log.app_update_restarting": "Updating the host to {version}; the app will restart",
   "log.app_update_rolled_back": "The host update failed and was rolled back to the previous version",
+  "log.app_update_script_failed": "Updater failed: {reason}; {detail} (see update.log for details)",
   "log.app_update_skipped": "Skipped version {version} (check for updates again to undo)",
   "log.app_update_skipped_short": "Skipped version {version}",
   "log.app_updated": "Host updated to {version}",
