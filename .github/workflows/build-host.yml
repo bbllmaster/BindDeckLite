@@ -98,10 +98,12 @@ jobs:
       #   test_log_device.mjs        WS-537 log device tag / filter / copy
       #   test_portal_wake.mjs       WS-542 portal/host wake-input wording
       #   test_portal_exit.mjs       WS-551 portal exit / restart route
+      #   test_reconnect_sync.mjs    WS-561 reconnect config reconcile
+      #   test_reconnect_pending.mjs WS-565 encoder-mode dirty check on reconnect
       - name: Front-end regression tests (node --test)
         working-directory: host
         run: |
-          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: BindDeckLite-windows

@@ -139,6 +139,7 @@ function loadApp() {
     JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
+  run("reconnect_sync.js");
   run("keys.js");
 
   // app.js 的顶层绑定是词法作用域，追加一段把它暴露出来（不改生产代码）。

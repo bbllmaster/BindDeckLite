@@ -249,6 +249,7 @@ function loadApp(registry) {
     JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
+  run("reconnect_sync.js");
   run("keys.js");
 
   const appSrc = readFileSync(new URL("app.js", STATIC_DIR), "utf8");
