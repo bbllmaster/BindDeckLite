@@ -36,7 +36,7 @@ assert.ok(LOOP_START >= 0, "src/main.cpp 里找不到 loop()");
 const LOOP = SRC.slice(LOOP_START);
 
 test("页面有「退出配网并重启」表单，位置在按键表单之后、OTA 链接之前", () => {
-  const keysFormEnd = CFG_PAGE.indexOf("保存按键配置</button></form>");
+  const keysFormEnd = CFG_PAGE.indexOf("保存按键配置</button>");
   const exitForm = CFG_PAGE.indexOf("action='/exit'");
   const otaLink = CFG_PAGE.indexOf("href='/update'");
   assert.ok(keysFormEnd >= 0, "找不到按键表单的提交按钮");
@@ -51,11 +51,16 @@ test("页面有「退出配网并重启」表单，位置在按键表单之后�
 });
 
 test("确认框文案写明未保存的修改会丢失", () => {
-  const at = CFG_PAGE.indexOf("onsubmit=");
-  assert.ok(at >= 0, "退出表单没有确认框");
-  const handler = CFG_PAGE.slice(at, CFG_PAGE.indexOf(">", CFG_PAGE.indexOf("button", at)));
-  assert.match(handler, /confirm\(/, "确认框必须用 confirm()，禁用 JS 时表单仍可提交");
-  assert.match(handler, /未保存的修改会丢失/, "确认文案必须提示未保存的修改会丢失");
+  // WS-572: the wording is generated from the unsaved state now, so the exit
+  // form points at the guard instead of carrying a fixed sentence. The
+  // sentence itself is asserted against the dirty script below (and exercised
+  // for real by host/test_portal_dirty.mjs).
+  const exitForm = CFG_PAGE.indexOf("action='/exit'");
+  assert.ok(exitForm >= 0, "配网页里没有 action='/exit' 的表单");
+  const handler = CFG_PAGE.slice(exitForm, CFG_PAGE.indexOf(">", CFG_PAGE.indexOf("button", exitForm)));
+  assert.match(handler, /portalDirty\.leave\(\)/, "退出必须走动态确认（portalDirty.leave）");
+  assert.match(CFG_PAGE, /退出配网并重启？/, "缺少退出确认的主文案");
+  assert.match(CFG_PAGE, /以下修改尚未保存，会丢失：/, "缺少「未保存会丢失」的动态点名");
 });
 
 test("320 px 下不横向溢出：按钮撑满且计入内边距", () => {
