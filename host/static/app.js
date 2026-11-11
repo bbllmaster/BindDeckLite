@@ -92,6 +92,7 @@ const state = {
   logFollow: true,     // 日志是否跟随最新行；上滚即暂停
   logPending: 0,       // 暂停期间新到达、尚未查看的行数
   logFilter: { kind: "", level: "", q: "", dev: "" }, // 日志页的客户端过滤（不影响轮询与 seq）
+  logMoreOpen: false, // WS-587：二级过滤（类型 / 设备）折叠区是否展开
   dirty: false,
   saveTimer: null,
   preview: false,
@@ -2904,17 +2905,28 @@ function syncLogDeviceUi() {
 
   Array.from(list.children).forEach((row) => {
     const dev = row.dataset.dev || "";
-    let span = row.querySelector(".log-dev");
+    const more = row.querySelector(".log-more");
+    // WS-587：「查看更多」只在多设备、且本行确有设备归属时出现，避免每行
+    // 都挂一个点开是空的链接。设备名不再是常驻的一列。
+    if (more) more.hidden = !show || !dev;
     if (!show) {
-      if (span) span.remove();
+      // 没有 .log-more 的行（旧结构 / 最小 DOM 桩）沿用原来的收起方式。
+      if (!more) {
+        const orphan = row.querySelector(".log-dev");
+        if (orphan) orphan.remove();
+      }
       return;
     }
     const text = window.LogDevice.rowDeviceLabel(dev, state.devices, union);
+    let span = row.querySelector(".log-dev");
     if (!span) {
       span = document.createElement("span");
       span.className = "log-dev";
-      const kind = row.querySelector(".log-kind");
-      row.insertBefore(span, kind ? kind.nextSibling : row.children[2] || null);
+      if (more) more.appendChild(span);
+      else {
+        const kind = row.querySelector(".log-kind");
+        row.insertBefore(span, kind ? kind.nextSibling : row.children[2] || null);
+      }
     }
     if (span.textContent !== text) span.textContent = text;
     if (span.title !== text) span.title = text;
@@ -2922,6 +2934,35 @@ function syncLogDeviceUi() {
 
   // 设备项被清掉后，之前生效的设备过滤要跟着失效并重算可见性。
   if (changed) applyLogFilter();
+}
+
+/** WS-587：二级过滤（类型 / 设备）展开 / 收起；状态记在 state 里便于测试与恢复。 */
+function setLogMoreFiltersOpen(open) {
+  state.logMoreOpen = !!open;
+  const panel = $("#logMoreFilters");
+  const btn = $("#btnLogMoreFilters");
+  if (panel) panel.hidden = !state.logMoreOpen;
+  if (btn) btn.setAttribute("aria-expanded", state.logMoreOpen ? "true" : "false");
+}
+
+/** 清空全部过滤（主行 + 二级）：折叠区「清除过滤」与空态「清除全部过滤」共用。 */
+function resetLogFilters() {
+  state.logFilter = { kind: "", level: "", q: "", dev: "" };
+  const dev = $("#logDev");
+  const kind = $("#logKind");
+  const search = $("#logSearch");
+  const chips = $("#logLevelChips");
+  if (dev) dev.value = "";
+  if (kind) kind.value = "";
+  if (search) search.value = "";
+  if (chips) {
+    $$(".log-chip", chips).forEach((b) => {
+      const on = !b.dataset.level;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+  applyLogFilter();
 }
 
 /** 只有过滤生效且有内容但全被隐藏时，才显示「没有匹配的日志」。 */
@@ -2934,6 +2975,12 @@ function syncLogFilterChrome() {
   }
   const reset = $("#btnLogFilterReset");
   if (reset) reset.hidden = !logFilterActive();
+  // 折叠区收起时，开关自身要标出「里面还有生效的筛选」。
+  const moreBtn = $("#btnLogMoreFilters");
+  if (moreBtn) {
+    const f = state.logFilter;
+    moreBtn.classList.toggle("active", !!(f && (f.kind || f.dev)));
+  }
 }
 
 function applyLogFilter() {
@@ -2950,6 +2997,8 @@ function bindLogFilters() {
   const search = $("#logSearch");
   const chips = $("#logLevelChips");
   const reset = $("#btnLogFilterReset");
+  const emptyReset = $("#btnLogEmptyReset");
+  const moreBtn = $("#btnLogMoreFilters");
 
   if (dev) {
     dev.onchange = () => {
@@ -2982,22 +3031,13 @@ function bindLogFilters() {
       applyLogFilter();
     };
   }
-  if (reset) {
-    reset.onclick = () => {
-      state.logFilter = { kind: "", level: "", q: "", dev: "" };
-      if (dev) dev.value = "";
-      if (kind) kind.value = "";
-      if (search) search.value = "";
-      if (chips) {
-        $$(".log-chip", chips).forEach((b) => {
-          const on = !b.dataset.level;
-          b.classList.toggle("active", on);
-          b.setAttribute("aria-pressed", on ? "true" : "false");
-        });
-      }
-      applyLogFilter();
-    };
+  if (reset) reset.onclick = resetLogFilters;
+  if (emptyReset) emptyReset.onclick = resetLogFilters;
+  if (moreBtn) {
+    moreBtn.onclick = () => setLogMoreFiltersOpen(!state.logMoreOpen);
   }
+  setLogMoreFiltersOpen(state.logMoreOpen);
+  syncLogFilterChrome();
   // 初始化时按当前设备并集决定「设备」下拉是否出现（日志页刚打开时通常
   // 还没有行，等 pollLog 追加完会再同步一次）。
   syncLogDeviceUi();
@@ -3033,7 +3073,6 @@ function bindLogFollow() {
  * 过滤都从这里取。_text 是渲染后的正文，调用方需要 toast 时直接取。
  */
 function buildLogRow(e, showDev) {
-  const devSpan = showDev ? '<span class="log-dev"></span>' : "";
   const row = document.createElement("div");
   row.className = "log-row " + (e.level || "info");
   // 过滤用的原始字段，不占视觉空间：kind / level 直接来自后端事件。
@@ -3047,7 +3086,17 @@ function buildLogRow(e, showDev) {
   const rowText = e.code ? t(e.code, e.params) : e.text;
   row._event = e;
   row._text = rowText;
-  row.innerHTML = `<span class="log-time">${e.time}</span><span class="log-kind">${e.kind}</span>${devSpan}<span class="log-text">${escapeHtml(rowText)}</span>`;
+  // WS-587：3 列（时间 / 内容 / 复制）。类型改徽标放进 .log-body，设备归属
+  // 放进「查看更多」<details>；行节点不重建，syncLogDeviceUi 只切换显隐。
+  row.innerHTML = `<span class="log-time">${e.time}</span>` +
+    `<div class="log-body">` +
+      `<span class="log-kind">${e.kind}</span>` +
+      `<span class="log-text">${escapeHtml(rowText)}</span>` +
+      `<details class="log-more"${showDev ? "" : " hidden"}>` +
+        `<summary>${escapeHtml(t("ui.log_view_more"))}</summary>` +
+        `<span class="log-dev"></span>` +
+      `</details>` +
+    `</div>`;
 
   // 每行右侧的「复制」按钮：把这一行的完整文本（时间 + 类型 + 内容）
   // 放进剪贴板，方便贴到 issue / 聊天里。有设备归属时带上 [设备名]。
@@ -3250,17 +3299,39 @@ function trapFocus(container, e) {
   }
 }
 
+/** WS-587：帮助搜索 —— 按段落标题（h3）过滤章节，目录项与被隐藏分组同步。 */
+function filterHelp(query) {
+  const q = String(query || "").trim().toLowerCase();
+  $$(".help-section").forEach((sec) => {
+    const title = $$("h3", sec).map((h) => (h.textContent || "").toLowerCase()).join(" ");
+    sec.hidden = !!q && !title.includes(q);
+  });
+  const toc = $("#helpToc");
+  if (toc) {
+    $$(".help-toc-link", toc).forEach((link) => {
+      const id = (link.getAttribute("href") || "").replace(/^#/, "");
+      const sec = id ? document.getElementById(id) : null;
+      link.hidden = !!(sec && sec.hidden);
+    });
+  }
+}
+
 /* 帮助浮层：说明宏语法、键名对照、登录示例与常见错误。纯前端开关，
-   不请求后端，关掉后页面状态完全不变。 */
+   不请求后端，关掉后页面状态完全不变。WS-587 起带目录锚点与标题搜索。 */
 function bindHelp() {
   const modal = $("#helpModal");
   const openBtn = $("#btnHelp");
   const closeBtn = $("#btnHelpClose");
+  const search = $("#helpSearch");
+  const toc = $("#helpToc");
   if (!modal || !openBtn || !closeBtn) return;
 
   const open = () => {
     modal.hidden = false;
     syncModalOpenClass();
+    // 每次打开重置搜索，避免上一次的关键词把内容悄悄过滤掉。
+    if (search) search.value = "";
+    filterHelp("");
     closeBtn.focus();
   };
   const close = () => {
@@ -3271,6 +3342,18 @@ function bindHelp() {
 
   openBtn.onclick = open;
   closeBtn.onclick = close;
+  if (search) search.oninput = () => filterHelp(search.value);
+  if (toc) {
+    toc.onclick = (e) => {
+      const link = e.target.closest(".help-toc-link");
+      if (!link) return;
+      e.preventDefault(); // 只滚右侧内容，不改地址栏的 hash
+      $$(".help-toc-link", toc).forEach((a) => a.classList.toggle("active", a === link));
+      const id = (link.getAttribute("href") || "").replace(/^#/, "");
+      const target = id ? document.getElementById(id) : null;
+      if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" });
+    };
+  }
   // 点击遮罩关闭，点击卡片内部不关闭。
   modal.onclick = (e) => {
     if (e.target === modal) close();
@@ -3345,6 +3428,11 @@ function retranslateLog() {
     const textEl = row.querySelector(".log-text");
     if (!e || !textEl) return;
     textEl.textContent = e.code ? t(e.code, e.params) : e.text;
+  });
+  // WS-587：「查看更多」的 summary 是 buildLogRow 拼出来的，没有 data-i18n，
+  // 切语言要跟着换，否则中文界面切到英文后还留着中文链接。
+  $$("#logList .log-more summary").forEach((s) => {
+    s.textContent = t("ui.log_view_more");
   });
 }
 
