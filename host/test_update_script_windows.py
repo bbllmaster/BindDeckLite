@@ -48,11 +48,16 @@ def _stub(path: Path, tag: str, host_marker: Path) -> None:
     启动逻辑与真实 exe 完全一致。同时把自己看到的
     ``PYINSTALLER_RESET_ENVIRONMENT`` 落盘 —— 这是 WS-576 的关键：新版本
     必须看到 ``1``，否则 PyInstaller 会按旧 onefile 父 PID 校验并拒绝启动。
+
+    ``>`` 前面那个空格是必须的（WS-588）：cmd 先展开 ``%%VAR%%`` 再解析重定向，
+    没有空格时 ``echo 1>"file"`` 里的 ``1>`` 会被当成「重定向文件描述符 1」，
+    于是 echo 没有参数、文件里写进 ``ECHO is off.``。值后面的尾随空格由
+    断言侧的 ``.strip()`` 去掉。
     """
     text = "\r\n".join([
         "@echo off",
         'echo %s>"%%~dp0started-%s.txt"' % (tag, tag),
-        'echo %%PYINSTALLER_RESET_ENVIRONMENT%%>"%%~dp0pyi-reset-%s.txt"' % tag,
+        'echo %%PYINSTALLER_RESET_ENVIRONMENT%% >"%%~dp0pyi-reset-%s.txt"' % tag,
         'echo started>"%s"' % host_marker,
         "exit /b 0",
         "",
