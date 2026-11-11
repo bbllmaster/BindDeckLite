@@ -127,7 +127,16 @@ async function testKeyAction(item, idx, card) {
   }
 }
 
-/* ---------------- 抽屉 ---------------- */
+/* ---------------- 抽屉 / 检查器 ---------------- */
+
+/** 在键位列表里标出正在编辑的那一行；宽屏检查器与窄屏抽屉共用同一个下标。 */
+function syncKeySelection() {
+  const idx = state.editingKey;
+  $$(".keycard").forEach((card) => {
+    card.classList.toggle(
+      "selected", idx !== null && parseInt(card.dataset.idx, 10) === idx);
+  });
+}
 
 function bindKeyDrawer() {
   const drawer = $("#keyDrawer");
@@ -151,6 +160,7 @@ function openKeyDrawer(idx) {
   state.editingKey = idx;
   state.macroView = "steps";
   renderKeyDrawer();
+  syncKeySelection();
   $("#keyDrawer").classList.add("open");
   $("#keyDrawerBackdrop").hidden = false;
   document.body.classList.add("drawer-open");
@@ -168,6 +178,7 @@ function closeKeyDrawer(restoreFocus = true) {
     ? state.keyDrawerReturn : fallback;
   state.editingKey = null;
   state.keyDrawerReturn = null;
+  syncKeySelection();
   $("#keyDrawer").classList.remove("open");
   $("#keyDrawerBackdrop").hidden = true;
   document.body.classList.remove("drawer-open");
@@ -303,12 +314,12 @@ function syncKeyDrawerRunning() {
     if (stopping) {
       btn.disabled = true;
       btn.textContent = t("ui.stopping");
-      btn.title = STOPPING_BTN_TITLE;
+      btn.title = stoppingBtnTitle();   // WS-585：旧常量已随 WS-498 改成函数
     } else {
       btn.disabled = false;
       btn.textContent = t("ui.stop");
       btn.classList.add("danger");
-      btn.title = STOP_BTN_TITLE;
+      btn.title = stopBtnTitle();
     }
     if (hint) hint.textContent = t("keys.running_hint");
     return;
@@ -317,7 +328,7 @@ function syncKeyDrawerRunning() {
   btn.textContent = t("ui.test_action");
   btn.title = noAction
     ? t("ui.test_none")
-    : TEST_BTN_IDLE_TITLE;
+    : testBtnIdleTitle();
   if (hint) {
     hint.textContent = noAction
       ? t("keys.hid_only_hint")
@@ -531,7 +542,9 @@ const MACRO_STEP_DEFAULTS = {
   app: () => ({ type: "app", value: "" }),
 };
 
-const MACRO_QUICK_INSERTS = [
+// 函数而不是常量：模块加载时文案表还是空的，const 会把按钮文字冻成
+// 「+ ui.tab_keys」这样的 key（与 macroStepOptions 同理）。
+const macroQuickInserts = () => [
   ["key", t("ui.tab_keys")],
   ["delay", t("keys.kind_wait")],
   ["text", t("keys.kind_text")],
@@ -685,7 +698,7 @@ function mountMacroEditor(holder, action) {
     });
   }
 
-  MACRO_QUICK_INSERTS.forEach(([type, label]) => {
+  macroQuickInserts().forEach(([type, label]) => {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn sm";

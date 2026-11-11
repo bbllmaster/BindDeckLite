@@ -98,10 +98,23 @@
         </div>
         <span class="hint" id="keyHint" data-i18n="ui.input_count_10">共 10 个输入</span>
       </div>
-      <div class="status-line" id="keysActionsHint" role="status" data-i18n="ui.actions_reading">上位机动作状态读取中…</div>
+      <!-- WS-585：≥1280px 是「键位列表 + 常驻检查器」，两者同屏；窄屏列表变 2 列卡，
+           同一个 #keyDrawer 收成浮层抽屉 —— 只有一套 DOM，所以不会出现两处内容同时可见。
+           顶部的「上位机动作」状态行移进检查器：它只影响动作编辑，不影响 HID 键码。 -->
       <div class="keys-layout">
-        <div class="key-grid" id="keyGrid"></div>
+        <div class="key-list">
+          <!-- 列头只在宽屏的键位行形态下出现（卡片形态是自带标题的自解释单元）。 -->
+          <div class="key-head" aria-hidden="true">
+            <span>#</span>
+            <span data-i18n="ui.key_col_name">键名</span>
+            <span data-i18n="keys.hid_label">HID 键</span>
+            <span data-i18n="ui.card_action_tag">动作</span>
+            <span></span>
+          </div>
+          <div class="key-grid" id="keyGrid"></div>
+        </div>
         <aside class="key-drawer" id="keyDrawer" aria-labelledby="keyDrawerTitle">
+          <div class="status-line" id="keysActionsHint" role="status" data-i18n="ui.actions_reading">上位机动作状态读取中…</div>
           <div class="drawer-head">
             <h3 id="keyDrawerTitle" data-i18n="ui.key_editor">按键编辑</h3>
             <button class="icon-btn" id="btnKeyDrawerClose" type="button"
