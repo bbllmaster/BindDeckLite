@@ -14,18 +14,22 @@ import vm from "node:vm";
 
 const HOST_DIR = new URL("./", import.meta.url);
 const STATIC_DIR = new URL("./static/", import.meta.url);
+// CI 在 windows-latest 上跑（core.autocrlf=true），文本文件会以 CRLF 落盘。结构 / 逐字
+// 断言都以仓库里的 LF 原文为基准，读入时先归一化，避免同一份内容因平台换行判定不同。
+const normalizeEol = (text) => text.replace(/\r\n/g, "\n");
+const readText = (rel) => normalizeEol(readFileSync(new URL(rel, HOST_DIR), "utf8"));
 // 拆分前没有 help.html：容错读取，让本文件在「修复前」的 worktree 上也能加载，
 // 由具体断言报出缺失的项（而不是整个文件在 import 阶段就崩掉）。
 const readIfExists = (rel) => {
-  try { return readFileSync(new URL(rel, HOST_DIR), "utf8"); } catch (_) { return ""; }
+  try { return readText(rel); } catch (_) { return ""; }
 };
-const INDEX_HTML = readFileSync(new URL("templates/index.html", HOST_DIR), "utf8");
+const INDEX_HTML = readText("templates/index.html");
 const HELP_HTML = readIfExists("templates/help.html");
-const STYLE_CSS = readFileSync(new URL("static/style.css", HOST_DIR), "utf8")
+const STYLE_CSS = readText("static/style.css")
   .replace(/\/\*[\s\S]*?\*\//g, "");
 const LOCALES = JSON.parse(readFileSync(new URL("locales/zh-CN.json", HOST_DIR), "utf8"));
 
-const read = (rel) => readFileSync(new URL(rel, HOST_DIR), "utf8");
+const read = (rel) => readText(rel);
 const count = (text, re) => (text.match(re) || []).length;
 
 /* ---------------- 最小 DOM 桩 ---------------- */
