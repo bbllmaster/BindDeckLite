@@ -69,10 +69,17 @@ def test_the_host_job_injects_the_version_before_pyinstaller():
 
 
 def test_the_publish_job_reuses_the_exe_version():
-    """update.json 里的版本必须与 exe 里的同源 —— 不能各算各的。"""
+    """update.json 里的版本必须与 exe 里的同源 —— 不能各算各的。
+
+    WS-571 把版本改成两步传递：发布 job 先由 ``needs.host.outputs.version``
+    （host 没重建时退回上一版 ``update.json`` 的 ``app.version``）解析出
+    ``steps.appver.outputs.APP_VERSION``，manifest 与 Release 都用它。链路的
+    起点仍然是 exe 那一份版本号，所以两段都要断言。
+    """
     text = _read(RELEASE_YML)
     assert "version: ${{ steps.version.outputs.VERSION }}" in text
-    assert "APP_VERSION: ${{ needs.host.outputs.version }}" in text
+    assert "HOST_VERSION: ${{ needs.host.outputs.version }}" in text
+    assert "APP_VERSION: ${{ steps.appver.outputs.APP_VERSION }}" in text
 
 
 def test_the_manifest_is_built_from_the_published_files():
