@@ -68,8 +68,8 @@
         <p class="untrusted-extra" id="untrustedExtra" hidden></p>
       </div>
       <div class="untrusted-actions">
-        <button class="btn primary small-btn" id="btnUntrustedRead" data-i18n="ui.read_from_device">从设备读取</button>
-        <button class="btn ghost small-btn" id="btnUntrustedIgnore" data-i18n="ui.ignore_for_now">先忽略</button>
+        <button class="btn primary sm" id="btnUntrustedRead" data-i18n="ui.read_from_device">从设备读取</button>
+        <button class="btn ghost sm" id="btnUntrustedIgnore" data-i18n="ui.ignore_for_now">先忽略</button>
       </div>
     </div>
 
@@ -125,7 +125,7 @@
           <p data-i18n="ui.device_intro">引脚按实际接线调整；应用后立即生效并写入设备 NVS。</p>
         </div>
         <!-- 页面级操作只留刷新（OTA 入口移入下方概览 hero） -->
-        <button class="btn secondary small-btn" id="btnSysRefresh" title="重新读取运行状态" data-i18n-title="ui.reload_status" data-i18n="ui.refresh">刷新</button>
+        <button class="btn secondary sm" id="btnSysRefresh" title="重新读取运行状态" data-i18n-title="ui.reload_status" data-i18n="ui.refresh">刷新</button>
       </div>
 
       <!-- 概览 hero：设备名为主信息，芯片 / 固件为次行；右侧布局与 OTA -->
@@ -137,8 +137,8 @@
         <div class="hero-side">
           <span class="hero-layout" id="devLayout">—</span>
           <!-- WS-523: 在线固件更新入口（检测 GitHub 上的对应型号固件并推送）。 -->
-          <button class="btn secondary small-btn" id="btnFwUpdate" title="检查并升级在线固件" data-i18n-title="ui.fw_update_title" data-i18n="ui.fw_update">固件更新</button>
-          <button class="btn primary small-btn" id="btnOta" title="打开 OTA 升级向导" data-i18n-title="ui.ota_wizard_title" data-i18n="ui.ota_upgrade">OTA 升级</button>
+          <button class="btn secondary sm" id="btnFwUpdate" title="检查并升级在线固件" data-i18n-title="ui.fw_update_title" data-i18n="ui.fw_update">固件更新</button>
+          <button class="btn primary sm" id="btnOta" title="打开 OTA 升级向导" data-i18n-title="ui.ota_wizard_title" data-i18n="ui.ota_upgrade">OTA 升级</button>
         </div>
       </section>
 
@@ -226,9 +226,9 @@
             </label>
             <p class="muted small" id="desktopHint" data-i18n="ui.reading">读取中…</p>
             <div class="btn-row">
-              <button class="btn secondary small-btn" id="btnShowWindow" hidden data-i18n="tray.show_window">显示窗口</button>
-              <button class="btn secondary small-btn" id="btnRestartAdmin" hidden data-i18n="ui.restart_admin">立即以管理员身份重启</button>
-              <button class="btn danger small-btn" id="btnQuitHost" hidden data-i18n="ui.quit_host">退出上位机</button>
+              <button class="btn secondary sm" id="btnShowWindow" hidden data-i18n="tray.show_window">显示窗口</button>
+              <button class="btn secondary sm" id="btnRestartAdmin" hidden data-i18n="ui.restart_admin">立即以管理员身份重启</button>
+              <button class="btn danger sm" id="btnQuitHost" hidden data-i18n="ui.quit_host">退出上位机</button>
             </div>
           </div>
 
@@ -266,7 +266,7 @@
             <h3 data-i18n="ui.bond_card">主机绑定</h3>
             <div id="bondStatus"><span class="muted" data-i18n="ui.reading">读取中…</span></div>
             <div class="btn-row">
-              <button class="btn danger small-btn" id="btnClearBond" hidden data-i18n="ui.clear_bond">清除主机绑定</button>
+              <button class="btn danger sm" id="btnClearBond" hidden data-i18n="ui.clear_bond">清除主机绑定</button>
               <span class="muted small" id="bondHint"></span>
             </div>
           </div>
@@ -291,7 +291,7 @@
         </div>
         <div class="log-actions">
           <span class="log-paused-tag" id="logPausedTag" hidden data-i18n="ui.log_paused">已暂停</span>
-          <button class="btn small-btn" id="btnClearLog" data-i18n="ui.clear">清空</button>
+          <button class="btn sm" id="btnClearLog" data-i18n="ui.clear">清空</button>
         </div>
       </div>
       <div class="log-filters" role="search" aria-label="日志过滤" data-i18n-aria-label="ui.log_filters">
@@ -324,7 +324,7 @@
           <button type="button" class="log-chip" data-level="error" aria-pressed="false" data-i18n="ui.level_error">错误</button>
         </div>
         <input type="search" id="logSearch" class="log-search" placeholder="搜索日志内容…" aria-label="搜索日志内容" data-i18n-placeholder="ui.search_log" data-i18n-aria-label="ui.search_log">
-        <button type="button" class="btn tiny" id="btnLogFilterReset" hidden data-i18n="ui.clear_filters">清除过滤</button>
+        <button type="button" class="btn sm" id="btnLogFilterReset" hidden data-i18n="ui.clear_filters">清除过滤</button>
       </div>
       <div class="log-wrap">
         <div class="log" id="logList"></div>
@@ -588,7 +588,7 @@ key:enter</pre>
           <span class="k upd-app-asset">SHA256</span>
           <span class="v upd-app-asset upd-sha-row">
             <span class="mono upd-sha" id="updAppSha">—</span>
-            <button class="btn secondary tiny upd-copy" id="btnAppShaCopy" hidden data-i18n="ui.copy">复制</button>
+            <button class="btn secondary sm upd-copy" id="btnAppShaCopy" hidden data-i18n="ui.copy">复制</button>
           </span>
         </div>
         <p class="update-state" id="updAppState" data-i18n="ui.checking">正在检查…</p>
@@ -622,7 +622,7 @@ key:enter</pre>
           <span class="k upd-fw-asset">SHA256</span>
           <span class="v upd-fw-asset upd-sha-row">
             <span class="mono upd-sha" id="updFwSha">—</span>
-            <button class="btn secondary tiny upd-copy" id="btnFwShaCopy" hidden data-i18n="ui.copy">复制</button>
+            <button class="btn secondary sm upd-copy" id="btnFwShaCopy" hidden data-i18n="ui.copy">复制</button>
           </span>
         </div>
         <p class="update-state" id="updFwState" data-i18n="ui.pick_device_to_check">选择设备后可检查在线固件</p>

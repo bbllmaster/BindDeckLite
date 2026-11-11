@@ -975,8 +975,8 @@ function renderKeys() {
         <div class="kc-line"><span class="kc-tag">${t("ui.card_action_tag")}</span><b class="kc-act"></b></div>
       </div>
       <div class="kc-actions">
-        <button type="button" class="btn tiny edit">${t("ui.card_edit")}</button>
-        <button type="button" class="btn tiny test">${t("ui.card_test")}</button>
+        <button type="button" class="btn sm edit">${t("ui.card_edit")}</button>
+        <button type="button" class="btn sm test">${t("ui.card_test")}</button>
       </div>`;
     grid.appendChild(card);
 
@@ -1210,7 +1210,7 @@ function renderActionInput(holder, item, card) {
 
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = "btn tiny browse";
+  btn.className = "btn sm browse";
   btn.textContent = t("ui.browse");
   btn.title = t("ui.browse_title");
   btn.onclick = async () => {
@@ -1403,10 +1403,10 @@ function renderEncoderActions() {
       <span class="enc-dir-label">${label}</span>
       <select class="sel-enc-act">
         ${ACTION_TYPES.map((a) =>
-          `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${a.name}</option>`).join("")}
+          `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${actionName(a)}</option>`).join("")}
       </select>
       <div class="enc-act-input"></div>
-      <button class="btn tiny test">${t("ui.test_action")}</button>`;
+      <button class="btn sm test">${t("ui.test_action")}</button>`;
     card.appendChild(row);
 
     const sel = row.querySelector("select");
@@ -2323,7 +2323,7 @@ function renderApplyResults(items) {
     }
 
     const actionBtn = (item.status !== "ok")
-      ? `<button class="btn tiny secondary accept-device-value" onclick="acceptDeviceValue('${item.field}')">${t("ui.accept_device_value")}</button>`
+      ? `<button class="btn sm secondary accept-device-value" onclick="acceptDeviceValue('${item.field}')">${t("ui.accept_device_value")}</button>`
       : "";
 
     row.innerHTML = `

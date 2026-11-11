@@ -228,7 +228,7 @@ function renderKeyDrawer() {
       <div class="act-input" id="kdValueBox"></div>
     </div>
     <div class="kd-test-row">
-      <button type="button" class="btn secondary small-btn" id="kdTest">${t("ui.test_action")}</button>
+      <button type="button" class="btn secondary sm" id="kdTest">${t("ui.test_action")}</button>
       <span class="muted small" id="kdTestHint"></span>
     </div>`;
 
@@ -631,9 +631,9 @@ function mountMacroEditor(holder, action) {
           ? `<span class="macro-sensitive" title="${t("keys.text_body_hint")}">${t("keys.log_not_echoed")}</span>`
           : ""}
         <span class="ms-move">
-          <button type="button" class="btn tiny ms-up" title="${t("keys.move_up")}" ${i === 0 ? "disabled" : ""}>↑</button>
-          <button type="button" class="btn tiny ms-down" title="${t("keys.move_down")}" ${i === steps.length - 1 ? "disabled" : ""}>↓</button>
-          <button type="button" class="btn tiny ms-del" title="${t("keys.delete_step")}">✕</button>
+          <button type="button" class="btn sm ms-up" title="${t("keys.move_up")}" ${i === 0 ? "disabled" : ""}>↑</button>
+          <button type="button" class="btn sm ms-down" title="${t("keys.move_down")}" ${i === steps.length - 1 ? "disabled" : ""}>↓</button>
+          <button type="button" class="btn sm ms-del" title="${t("keys.delete_step")}">✕</button>
         </span>
         <p class="ms-error"></p>`;
       list.appendChild(row);
@@ -688,7 +688,7 @@ function mountMacroEditor(holder, action) {
   MACRO_QUICK_INSERTS.forEach(([type, label]) => {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "btn tiny";
+    btn.className = "btn sm";
     btn.textContent = "+ " + label;
     btn.onclick = () => {
       steps.push(MACRO_STEP_DEFAULTS[type]());

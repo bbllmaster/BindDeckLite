@@ -46,6 +46,14 @@ jobs:
       - name: CSS variable guard (WS-578)
         run: python -m pytest tools/test_css_vars.py -v
 
+      # WS-581: spacing values must come from the --sp-* scale. Bare px in
+      # padding/margin/gap/offsets drift per component (6px here, 8px there)
+      # and cannot be retuned in one place. Only 1px hairlines may stay.
+      # The baseline checks pin the rest of the consistency pass: one font
+      # ladder, one compact button tier, solid primary fill, --z-* ladder.
+      - name: CSS baseline guards (WS-581)
+        run: python -m pytest tools/test_css_spacing.py tools/test_css_baseline.py -v
+
       - name: Build exe
         working-directory: host
         run: pyinstaller --noconfirm --clean app.spec
