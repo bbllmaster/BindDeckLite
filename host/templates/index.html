@@ -574,28 +574,34 @@ key:enter</pre>
         <h3 id="updAppTitle" data-i18n="ui.host_update">上位机更新</h3>
         <div class="ota-rows">
           <span class="k" data-i18n="ui.update_channel">更新通道</span>
-          <span class="v">
+          <span class="v upd-channel-cell">
             <select id="updateChannel" class="lang-select">
               <option value="stable" data-i18n="ui.update_channel_stable">稳定版</option>
               <option value="rolling" data-i18n="ui.update_channel_rolling">滚动版</option>
             </select>
+            <!-- 滚动版警告紧跟通道选择器（WS-577 验收 12）。 -->
+            <span class="upd-rolling-warn" id="updAppRollingWarn" hidden data-i18n="update.rolling_warning">滚动版为每次 main 提交自动构建，可能不稳定</span>
           </span>
           <span class="k" data-i18n="ui.current_version">当前版本</span><span class="v" id="updAppCurrent">—</span>
           <span class="k" data-i18n="ui.latest_version">最新版本</span><span class="v" id="updAppLatest">—</span>
-          <span class="k" data-i18n="ui.download_size">下载大小</span><span class="v" id="updAppSize">—</span>
-          <span class="k">SHA256</span><span class="v mono" id="updAppSha">—</span>
+          <span class="k upd-app-asset" data-i18n="ui.download_size">下载大小</span><span class="v upd-app-asset" id="updAppSize">—</span>
+          <span class="k upd-app-asset">SHA256</span>
+          <span class="v upd-app-asset upd-sha-row">
+            <span class="mono upd-sha" id="updAppSha">—</span>
+            <button class="btn secondary tiny upd-copy" id="btnAppShaCopy" hidden data-i18n="ui.copy">复制</button>
+          </span>
         </div>
         <p class="update-state" id="updAppState" data-i18n="ui.checking">正在检查…</p>
-        <p class="muted small" id="updAppChannelInfo" hidden></p>
-        <p class="muted small" id="updAppRollingWarn" hidden data-i18n="update.rolling_warning">滚动版为每次 main 提交自动构建，可能不稳定</p>
         <p class="ota-error" id="updAppError" hidden></p>
         <details class="update-notes" id="updAppNotesBox" hidden>
-          <summary data-i18n="ui.release_notes">本次更新内容</summary>
+          <summary id="updAppNotesTitle" data-i18n="update.app_notes_title">上位机更新内容</summary>
           <pre class="update-notes-body" id="updAppNotes"></pre>
         </details>
         <div class="progress" id="updAppProgressBox" hidden><div class="progress-bar" id="updAppProgressBar" style="width:0%"></div></div>
         <p class="muted small" id="updAppHint" hidden></p>
-        <div class="btn-row">
+        <p class="muted small update-checked-at" id="updAppCheckedAt" hidden></p>
+        <div class="btn-row update-actions">
+          <button class="btn secondary" id="btnAppCheck" data-i18n="update.recheck">重新检查</button>
           <button class="btn secondary" id="btnUpdateSkip" hidden data-i18n="ui.skip_version">跳过此版本</button>
           <button class="btn primary" id="btnUpdateApply" hidden data-i18n="ui.update_now">立即更新</button>
         </div>
@@ -604,29 +610,39 @@ key:enter</pre>
       <!-- 固件更新 -->
       <section class="update-block" aria-labelledby="updFwTitle">
         <h3 id="updFwTitle" data-i18n="ui.fw_update">固件更新</h3>
+        <!-- 固件始终走稳定通道，别让用户误以为跟随上面的滚动通道（WS-577 验收 14）。 -->
+        <p class="muted small upd-channel-note" data-i18n="update.fw_channel_note">固件固定使用稳定版</p>
         <div class="ota-rows">
           <span class="k" data-i18n="ui.target_device">目标设备</span><span class="v" id="updFwDevice">—</span>
+          <span class="k upd-fw-devstate" data-i18n="ui.device_status">设备状态</span><span class="v upd-fw-devstate"><span class="upd-dev-state" id="updFwDeviceState">—</span></span>
           <span class="k" data-i18n="ui.device_model">设备型号</span><span class="v" id="updFwVariant">—</span>
           <span class="k" data-i18n="ui.current_firmware">当前固件</span><span class="v" id="updFwCurrent">—</span>
           <span class="k" data-i18n="ui.latest_firmware">最新固件</span><span class="v" id="updFwLatest">—</span>
-          <span class="k" data-i18n="ui.download_size">下载大小</span><span class="v" id="updFwSize">—</span>
-          <span class="k">SHA256</span><span class="v mono" id="updFwSha">—</span>
+          <span class="k upd-fw-asset" data-i18n="ui.download_size">下载大小</span><span class="v upd-fw-asset" id="updFwSize">—</span>
+          <span class="k upd-fw-asset">SHA256</span>
+          <span class="v upd-fw-asset upd-sha-row">
+            <span class="mono upd-sha" id="updFwSha">—</span>
+            <button class="btn secondary tiny upd-copy" id="btnFwShaCopy" hidden data-i18n="ui.copy">复制</button>
+          </span>
         </div>
         <p class="update-state" id="updFwState" data-i18n="ui.pick_device_to_check">选择设备后可检查在线固件</p>
         <p class="ota-error" id="updFwError" hidden></p>
-        <div class="ota-steps" id="updFwSteps" aria-hidden="true">
+        <!-- 五步条只在升级进行中显示（WS-577 验收 4）。 -->
+        <div class="ota-steps" id="updFwSteps" aria-hidden="true" hidden>
           <span class="ota-step-dot" data-step="download"><i>1</i><span data-i18n="ui.step_download">下载</span></span>
           <span class="ota-step-dot" data-step="verify"><i>2</i><span data-i18n="ui.step_verify">校验</span></span>
           <span class="ota-step-dot" data-step="push"><i>3</i><span data-i18n="ui.step_push">推送</span></span>
           <span class="ota-step-dot" data-step="restart"><i>4</i><span data-i18n="ui.step_restart">重启</span></span>
           <span class="ota-step-dot" data-step="confirm"><i>5</i><span data-i18n="ui.step_confirm_version">确认版本</span></span>
         </div>
+        <p class="muted small" id="updFwHint" hidden></p>
+        <p class="muted small update-checked-at" id="updFwCheckedAt" hidden></p>
         <details class="update-notes" id="updFwNotesBox" hidden>
-          <summary data-i18n="ui.release_notes">本次更新内容</summary>
+          <summary id="updFwNotesTitle" data-i18n="update.fw_notes_title">固件更新内容</summary>
           <pre class="update-notes-body" id="updFwNotes"></pre>
         </details>
-        <div class="btn-row">
-          <button class="btn secondary" id="btnFwCheck" hidden data-i18n="ui.check_fw_update">检查固件更新</button>
+        <div class="btn-row update-actions">
+          <button class="btn secondary" id="btnFwCheck" data-i18n="ui.check_fw_update">检查固件更新</button>
           <button class="btn primary" id="btnFwApply" hidden data-i18n="ui.update_fw_now">立即升级固件</button>
         </div>
       </section>

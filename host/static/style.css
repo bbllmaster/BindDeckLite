@@ -1381,6 +1381,9 @@ body.modal-open .main { overflow: hidden; }
 .update-modal { width: min(680px, 100%); }
 .update-body { padding: var(--sp-4) var(--sp-5) var(--sp-6); }
 .update-block { margin-bottom: var(--sp-5); }
+/* 行内自定义 display（如 .upd-sha-row 的 flex）会盖过 [hidden] 的 UA 样式，
+   这里统一兜底，保证「已是最新」时包信息真的收起。 */
+.update-block [hidden] { display: none !important; }
 .update-block:last-child { margin-bottom: 0; }
 .update-block h3 { margin-top: 0; }
 .update-state {
@@ -1388,6 +1391,28 @@ body.modal-open .main { overflow: hidden; }
   font-size: var(--fs-sm); color: var(--text);
 }
 .update-state.ok { color: var(--ok); }
+/* WS-577：通道选择器 + 滚动版警告同格显示，警告紧贴选择器下方。 */
+.upd-channel-cell { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.upd-rolling-warn {
+  color: var(--state-warn-fg);
+  font-size: var(--fs-cap); line-height: 1.5;
+}
+.upd-rolling-warn[hidden] { display: none; }
+.upd-channel-note { margin: 0 0 var(--sp-2); }
+/* SHA256 行：截断显示 + hover 全文（title）+ 复制按钮。 */
+.upd-sha-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.upd-sha { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
+.upd-copy { flex: none; }
+.update-checked-at { margin: 0 0 var(--sp-2); }
+.update-checked-at[hidden] { display: none; }
+.update-actions { margin-top: var(--sp-3); }
+/* 固件区块里的五步条：复用 OTA 样式，但去掉为向导留的横向内边距。 */
+.update-block .ota-steps { padding: var(--sp-2) 0; margin-top: var(--sp-2); border-bottom: 0; }
+.update-block .ota-steps[hidden] { display: none; }
+.upd-dev-state { font-size: var(--fs-sm); color: var(--muted); }
+.upd-dev-state.ok { color: var(--ok); }
+.upd-dev-state.bad { color: var(--danger); }
+.upd-dev-state.warn { color: var(--warn); }
 .update-notes {
   margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--line); border-radius: var(--r-control);

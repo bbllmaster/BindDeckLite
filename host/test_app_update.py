@@ -352,6 +352,34 @@ def test_check_endpoint_reports_skipped(client, monkeypatch, clean_caches):
     assert body["error_code"] == "E_SKIPPED"
 
 
+def test_check_payload_exposes_rolling_build_identity(client, monkeypatch,
+                                                      clean_caches):
+    """WS-577：滚动版弹窗用 latest_version/local_tag 拼「构建 sha · 时间」。
+
+    这两个字段删掉后前端只能退回显示 tag / ``v0.0.0+main.``，所以接口层
+    也要有断言，不能只靠前端桩数据。
+    """
+    monkeypatch.setattr(online_update, "read_app_version",
+                        lambda: "0.0.0+main.aaaaaaa")
+    monkeypatch.setattr(online_update, "read_app_build", lambda: "")
+    monkeypatch.setattr(
+        online_update, "resolve_latest_update",
+        lambda *a, **k: online_update.resolve_release_update(
+            _release_json(), online_update.parse_manifest(json.dumps(_manifest()))))
+    host_app._config["update_channel"] = "rolling"
+    host_app._config["last_update"] = {
+        "result": "ok", "tag": "main-20261110-1642",
+    }
+
+    body = client.get("/api/app/update/check").get_json()
+
+    assert body["latest_version"] == "1.5.0"
+    assert body["local_tag"] == "main-20261110-1642"
+    # 正式渠道不该带本地滚动 tag，避免前端把稳定版也当成 nightly。
+    host_app._config["update_channel"] = "stable"
+    assert client.get("/api/app/update/check").get_json()["local_tag"] == ""
+
+
 # --- 6. 回滚计数 -------------------------------------------------------------
 
 def test_two_consecutive_failures_pause_the_auto_update():

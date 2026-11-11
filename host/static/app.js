@@ -714,6 +714,9 @@ async function pollStatus() {
     highlightKeys(s.last_press || {});
     applyRunningState();
     applyEncoderRunningState();
+    // 弹窗开着时，连接/OTA 状态变化要实时反映到固件区块（WS-577 验收 9）。
+    const updateModal = $("#updateModal");
+    if (updateModal && !updateModal.hidden) renderUpdateFw();
   } catch (e) {
     $("#statusDot").className = "dot bad";
     $("#statusText").textContent = t("ui.host_not_ready");
@@ -3510,9 +3513,18 @@ function selectedDevice() {
   return state.devices.find((d) => d.dev_id === state.selected) || null;
 }
 
+/** 滚动构建的版本号（``0.0.0+main.<sha>``）→ 7 位提交号；正式版返回 ""。
+    滚动版的 semver 对用户没有意义，统一用提交号标识（WS-577 验收 3）。 */
+function rollingSha(v) {
+  const m = /^0\.0\.0\+main\.([0-9a-f]{7,40})$/i.exec(String(v || "").trim());
+  return m ? m[1].slice(0, 7) : "";
+}
+
 function fmtVersion(v) {
   if (!v) return t("ui.unknown");
   const s = String(v);
+  const sha = rollingSha(s);
+  if (sha) return t("update.nightly_version", { sha });
   return /^v/i.test(s) ? s : "v" + s;
 }
 
@@ -3994,17 +4006,86 @@ async function cancelOta() {
 const updateState = {
   app: null,        // /api/app/update/check 的结果
   appTask: null,    // 上位机更新任务 id
+  appChecking: false, // 重新检查中：保留旧结果，只换状态行
+  appCheckedAt: null, // 上一次检查完成的时间
   channel: "stable",// 当前更新通道（stable / rolling）
   fw: null,         // /api/firmware/update/check 的结果
   fwTask: null,     // 固件更新设备 id
+  fwChecking: false,
+  fwCheckedAt: null,
+  fwRunning: false, // 固件升级进行中：只有这时显示五步条
   polling: null,    // 进度轮询定时器
 };
 
-/** 更新目标的显示文本：滚动通道显示 tag（main-YYYYMMDD-HHMM），正式版显示版本号。 */
+/** 滚动构建 tag（``main-YYYYMMDD-HHMM``）→ Date（UTC）；解析不了返回 null。 */
+function rollingTagDate(tag) {
+  const m = /^main-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})$/.exec(String(tag || "").trim());
+  if (!m) return null;
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));
+}
+
+/** ISO 时间 → Date；空值/非法值返回 null。 */
+function isoDate(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const d = new Date(text);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** ``YYYY-MM-DD HH:MM``（本地时区）。tag 是 UTC，按本地时区展示给用户。 */
+function formatBuildTime(date) {
+  if (!date || typeof date.getTime !== "function" || isNaN(date.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} `
+    + `${p(date.getHours())}:${p(date.getMinutes())}`;
+}
+
+/** ``HH:MM:SS``（本地时区），用于「上次检查」与「检查于」。 */
+function formatClock(date) {
+  if (!date || typeof date.getTime !== "function" || isNaN(date.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}
+
+/** 滚动版统一标识：``构建 <sha7> · YYYY-MM-DD HH:MM``；拿不到时间时只显示构建号。 */
+function rollingBuildLabel(sha, date) {
+  const time = formatBuildTime(date);
+  return time
+    ? t("update.build_label", { sha, time })
+    : t("update.build_label_no_time", { sha });
+}
+
+/** 滚动版 Release 的时间：优先用 tag 里的 UTC 时间，其次用 published_at。 */
+function rollingReleaseDate(r) {
+  return rollingTagDate(r && r.tag) || isoDate(r && r.published_at);
+}
+
+/** 更新目标的显示文本：滚动版统一「构建 sha · 时间」，正式版显示 vX.Y.Z。 */
 function updateTargetText(r) {
   if (!r) return "—";
-  if (r.channel === "rolling") return r.tag || "—";
+  if (r.channel === "rolling") {
+    const sha = rollingSha(r.latest_version) || rollingSha(r.build)
+      || rollingSha(r.current);
+    if (sha) return rollingBuildLabel(sha, rollingReleaseDate(r));
+    return r.tag || "—";
+  }
   return r.latest ? fmtVersion(r.latest) : "—";
+}
+
+/** 当前版本显示：滚动版用构建号，和「最新版本」同一种写法。 */
+function updateCurrentText(r) {
+  if (!r) return "—";
+  if (r.channel === "rolling") {
+    const sha = rollingSha(r.current);
+    if (!sha) return fmtVersion(r.current);
+    // 本机装过的滚动版记着 tag，可以直接给出构建时间；没记录时只有
+    // 「本地就是最新构建」才能借用 Release 的时间，否则宁可不写时间。
+    const latestSha = rollingSha(r.latest_version) || rollingSha(r.build);
+    const date = rollingTagDate(r.local_tag)
+      || (sha === latestSha ? rollingReleaseDate(r) : null);
+    return rollingBuildLabel(sha, date);
+  }
+  return fmtVersion(r.current);
 }
 
 /** 失败提示：中文原因 + 可复制错误码 + Release 链接。 */
@@ -4030,8 +4111,15 @@ function setUpdateError(id, payload, fallback) {
   box.textContent = updateErrorText(payload, fallback);
 }
 
-function setUpdateNotes(boxId, bodyId, notes) {
+/** 显示/隐藏一组成对的表格行（.k 标签 + .v 值）。 */
+function setRowsHidden(selector, hidden) {
+  $$(selector).forEach((el) => { el.hidden = !!hidden; });
+}
+
+/** 更新内容折叠块：标题随场景变化（本次更新 / 当前版本更新）。 */
+function setUpdateNotes(boxId, titleId, bodyId, notes, title) {
   const box = $("#" + boxId);
+  const titleEl = $("#" + titleId);
   const body = $("#" + bodyId);
   if (!box || !body) return;
   const text = String(notes || "").trim();
@@ -4040,8 +4128,54 @@ function setUpdateNotes(boxId, bodyId, notes) {
     body.textContent = "";
     return;
   }
+  if (titleEl && title) titleEl.textContent = title;
   body.textContent = text;
   box.hidden = false;
+}
+
+/** 「上次检查 HH:MM:SS」：只在这一轮检查完成后显示。 */
+function renderCheckedAt(id, date) {
+  const el = $("#" + id);
+  if (!el) return;
+  el.hidden = !date;
+  el.textContent = date ? t("update.last_checked", { time: formatClock(date) }) : "";
+}
+
+/** SHA256 展示：截断 + hover 全文 + 复制按钮。 */
+function renderSha(shaId, copyId, sha, visible) {
+  const el = $("#" + shaId);
+  const btn = $("#" + copyId);
+  const text = String(sha || "");
+  if (el) {
+    el.textContent = text ? text.slice(0, 16) + "…" : "—";
+    el.title = text;
+  }
+  if (btn) btn.hidden = !(visible && text);
+}
+
+/** 复制 SHA256：优先 Clipboard API，老浏览器/桌面壳回退到隐藏 textarea。 */
+async function copySha(kind) {
+  const r = kind === "app" ? updateState.app : updateState.fw;
+  const sha = (r && r.asset && r.asset.sha256) || "";
+  if (!sha) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(sha);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = sha;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand("copy");
+      document.body.removeChild(area);
+    }
+    toast(t("update.sha_copied"), "ok");
+  } catch (e) {
+    toast(t("update.copy_failed") + (e && e.message ? e.message : e), "bad");
+  }
 }
 
 function renderUpdateApp() {
@@ -4049,49 +4183,72 @@ function renderUpdateApp() {
   const current = $("#updAppCurrent");
   const latest = $("#updAppLatest");
   const size = $("#updAppSize");
-  const sha = $("#updAppSha");
   const st = $("#updAppState");
   const applyBtn = $("#btnUpdateApply");
   const skipBtn = $("#btnUpdateSkip");
+  const checkBtn = $("#btnAppCheck");
   const channelSel = $("#updateChannel");
-  const channelInfo = $("#updAppChannelInfo");
   const rollingWarn = $("#updAppRollingWarn");
   if (!current || !st) return;
 
-  const channel = r && r.channel ? r.channel : updateState.channel;
+  // 通道以 updateState 为准：切换请求还没回来时，旧结果里的 channel
+  // 还是上一个通道，不能拿它把用户刚选的值顶回去（验收 8）。
+  if (r && r.channel && !updateState.appChecking) updateState.channel = r.channel;
+  const channel = updateState.channel;
   if (channelSel && channel) channelSel.value = channel;
-  if (channelInfo) {
-    channelInfo.hidden = !r;
-    if (!r) channelInfo.textContent = "";
-    else if (channel === "rolling") {
-      channelInfo.textContent = t("update.rolling_target", { tag: r.tag || "—" });
-    } else {
-      channelInfo.textContent = t("update.stable_target");
-    }
-  }
   if (rollingWarn) rollingWarn.hidden = channel !== "rolling";
+
+  const checking = !!updateState.appChecking;
+  if (checkBtn) {
+    checkBtn.disabled = checking;
+    checkBtn.classList.toggle("loading", checking);
+  }
+  renderCheckedAt("updAppCheckedAt", updateState.appCheckedAt);
 
   if (!r) {
     current.textContent = "—";
     latest.textContent = "—";
     size.textContent = "—";
-    sha.textContent = "—";
+    setRowsHidden(".upd-app-asset", true);
+    renderSha("updAppSha", "btnAppShaCopy", "", false);
+    setUpdateNotes("updAppNotesBox", "updAppNotesTitle", "updAppNotes", "");
     st.textContent = t("update.checking");
     st.classList.remove("ok");
+    setUpdateError("updAppError", null);
     if (applyBtn) applyBtn.hidden = true;
     if (skipBtn) skipBtn.hidden = true;
     return;
   }
 
-  current.textContent = fmtVersion(r.current);
+  current.textContent = updateCurrentText(r);
   latest.textContent = updateTargetText(r);
+  // 无更新时不显示下载大小/SHA/更新内容：那些字段只对「要下载的东西」有意义。
+  const showAssets = !!r.has_update;
+  setRowsHidden(".upd-app-asset", !showAssets);
   size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
-  sha.textContent = r.asset && r.asset.sha256 ? r.asset.sha256.slice(0, 16) + "…" : "—";
-  setUpdateNotes("updAppNotesBox", "updAppNotes", r.notes);
+  renderSha("updAppSha", "btnAppShaCopy", r.asset && r.asset.sha256, showAssets);
   setUpdateError("updAppError", r.ok === false ? r : null);
 
-  if (r.has_update) {
-    st.textContent = t("update.new_version", { latest: updateTargetText(r), current: fmtVersion(r.current) });
+  const notes = String(r.notes || "").trim();
+  if (notes && r.ok !== false) {
+    if (r.has_update) {
+      setUpdateNotes("updAppNotesBox", "updAppNotesTitle", "updAppNotes",
+        notes, t("update.app_notes_title"));
+    } else {
+      // 已是最新：release notes 说的就是当前版本，标清标题避免误读（验收 13）。
+      setUpdateNotes("updAppNotesBox", "updAppNotesTitle", "updAppNotes",
+        notes, t("update.current_notes_title", { version: fmtVersion(r.current) }));
+    }
+  } else {
+    setUpdateNotes("updAppNotesBox", "updAppNotesTitle", "updAppNotes", "");
+  }
+
+  if (checking) {
+    // 请求期间保留旧结果，只把状态行换成 loading（验收 8）。
+    st.textContent = t("update.rechecking");
+    st.classList.remove("ok");
+  } else if (r.has_update) {
+    st.textContent = t("update.new_version", { latest: updateTargetText(r), current: updateCurrentText(r) });
     st.classList.remove("ok");
   } else if (r.skipped) {
     st.textContent = t("update.skipped_version", { latest: updateTargetText(r) });
@@ -4101,39 +4258,113 @@ function renderUpdateApp() {
     st.textContent = r.error || t("update.check_failed");
     st.classList.remove("ok");
   } else {
-    st.textContent = t("update.up_to_date", { current: fmtVersion(r.current) });
+    st.textContent = t("update.up_to_date", { time: formatClock(updateState.appCheckedAt) });
     st.classList.add("ok");
   }
-  if (applyBtn) applyBtn.hidden = !r.has_update;
-  if (skipBtn) skipBtn.hidden = !r.has_update;
+  if (applyBtn) {
+    applyBtn.hidden = !r.has_update;
+    applyBtn.disabled = checking;
+  }
+  if (skipBtn) {
+    skipBtn.hidden = !r.has_update;
+    skipBtn.disabled = checking;
+  }
+}
+
+/** 固件区块的设备连接状态。 */
+function fwDeviceInfo(sel) {
+  if (!sel) return { key: "update.fw_state_none", cls: "" };
+  if (otaBusy()) return { key: "update.fw_state_busy", cls: "warn" };
+  return sel.connected
+    ? { key: "update.fw_state_online", cls: "ok" }
+    : { key: "update.fw_state_offline", cls: "bad" };
+}
+
+/** 固件检查/升级按钮为什么不能用；能用时返回 ""。 */
+function fwBlockedReason(sel) {
+  if (!sel) return t("update.fw_need_device");
+  if (otaBusy()) return t("update.fw_ota_busy");
+  if (!sel.connected) return t("update.fw_need_connected");
+  return "";
+}
+
+/** 五步条只在固件升级进行中显示（验收 4）。 */
+function setFwStepsVisible(visible) {
+  const steps = $("#updFwSteps");
+  if (!steps) return;
+  steps.hidden = !visible;
+}
+
+/** 新一轮升级开始时清空上一轮的进度高亮。 */
+function resetFwSteps() {
+  const steps = $("#updFwSteps");
+  if (!steps) return;
+  steps.querySelectorAll(".ota-step-dot").forEach((dot) => {
+    dot.classList.remove("active");
+    dot.classList.remove("done");
+  });
 }
 
 function renderUpdateFw() {
+  const sel = selectedDevice();
+  // 换了设备（或设备没了）就别再展示上一台的固件检查结果。
+  if (updateState.fw && updateState.fw.dev_id
+      && (!sel || updateState.fw.dev_id !== sel.dev_id)) {
+    updateState.fw = null;
+    updateState.fwCheckedAt = null;
+  }
   const r = updateState.fw;
   const dev = $("#updFwDevice");
+  const devState = $("#updFwDeviceState");
   const variant = $("#updFwVariant");
   const current = $("#updFwCurrent");
   const latest = $("#updFwLatest");
   const size = $("#updFwSize");
-  const sha = $("#updFwSha");
   const st = $("#updFwState");
+  const hint = $("#updFwHint");
   const checkBtn = $("#btnFwCheck");
   const applyBtn = $("#btnFwApply");
   if (!st) return;
 
-  const sel = selectedDevice();
   if (dev) dev.textContent = sel ? sel.name || sel.dev_id : t("update.no_device");
+
+  const info = fwDeviceInfo(sel);
+  // 没有选中设备时「目标设备」已经写了未选择，状态行不必再重复一遍。
+  setRowsHidden(".upd-fw-devstate", !sel);
+  if (devState) {
+    devState.textContent = t(info.key);
+    devState.className = "upd-dev-state" + (info.cls ? " " + info.cls : "");
+  }
+
+  const blocked = fwBlockedReason(sel);
+  const checking = !!updateState.fwChecking;
+  // 未连接/OTA 中时按钮禁用，并把原因写清楚（验收 9）。
+  if (hint) {
+    hint.hidden = !(sel && blocked);
+    hint.textContent = sel && blocked ? blocked : "";
+  }
+  if (checkBtn) {
+    checkBtn.hidden = false;
+    checkBtn.disabled = !!blocked || checking;
+    checkBtn.classList.toggle("loading", checking);
+    checkBtn.title = blocked;
+  }
+  renderCheckedAt("updFwCheckedAt", updateState.fwCheckedAt);
+  setFwStepsVisible(!!updateState.fwRunning);
+
   if (!r) {
     if (variant) variant.textContent = "—";
     if (current) current.textContent = "—";
     if (latest) latest.textContent = "—";
     if (size) size.textContent = "—";
-    if (sha) sha.textContent = "—";
-    st.textContent = sel ? t("update.check_fw_hint") : t("update.pick_device_hint");
+    setRowsHidden(".upd-fw-asset", true);
+    renderSha("updFwSha", "btnFwShaCopy", "", false);
+    st.textContent = checking
+      ? t("update.rechecking")
+      : (sel ? t("update.check_fw_hint") : t("update.pick_device_hint"));
     st.classList.remove("ok");
     setUpdateError("updFwError", null);
-    setUpdateNotes("updFwNotesBox", "updFwNotes", "");
-    if (checkBtn) checkBtn.hidden = !sel;
+    setUpdateNotes("updFwNotesBox", "updFwNotesTitle", "updFwNotes", "");
     if (applyBtn) applyBtn.hidden = true;
     return;
   }
@@ -4141,23 +4372,43 @@ function renderUpdateFw() {
   if (variant) variant.textContent = r.device_variant || t("ui.unknown");
   if (current) current.textContent = fmtVersion(r.current);
   if (latest) latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
+  const showAssets = !!r.has_update;
+  setRowsHidden(".upd-fw-asset", !showAssets);
   if (size) size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
-  if (sha) sha.textContent = r.asset && r.asset.sha256 ? r.asset.sha256.slice(0, 16) + "…" : "—";
-  setUpdateNotes("updFwNotesBox", "updFwNotes", r.notes);
+  renderSha("updFwSha", "btnFwShaCopy", r.asset && r.asset.sha256, showAssets);
   setUpdateError("updFwError", r.reason ? r : null);
 
-  if (r.has_update) {
+  const notes = String(r.notes || "").trim();
+  if (notes && !r.reason) {
+    if (r.has_update) {
+      setUpdateNotes("updFwNotesBox", "updFwNotesTitle", "updFwNotes",
+        notes, t("update.fw_notes_title"));
+    } else {
+      setUpdateNotes("updFwNotesBox", "updFwNotesTitle", "updFwNotes",
+        notes, t("update.current_notes_title", { version: fmtVersion(r.current) }));
+    }
+  } else {
+    setUpdateNotes("updFwNotesBox", "updFwNotesTitle", "updFwNotes", "");
+  }
+
+  if (checking) {
+    st.textContent = t("update.rechecking");
+    st.classList.remove("ok");
+  } else if (r.has_update) {
     st.textContent = t("update.new_firmware", { latest: fmtVersion(r.latest), current: fmtVersion(r.current) });
     st.classList.remove("ok");
   } else if (r.reason) {
     st.textContent = r.reason;
     st.classList.remove("ok");
   } else {
-    st.textContent = t("update.fw_up_to_date", { current: fmtVersion(r.current) });
+    st.textContent = t("update.fw_up_to_date", { time: formatClock(updateState.fwCheckedAt) });
     st.classList.add("ok");
   }
-  if (checkBtn) checkBtn.hidden = false;
-  if (applyBtn) applyBtn.hidden = !r.has_update;
+  if (applyBtn) {
+    applyBtn.hidden = !r.has_update;
+    applyBtn.disabled = !!blocked || checking;
+    applyBtn.title = blocked;
+  }
 }
 
 /** 顶栏红点：有新版本时提示。 */
@@ -4170,16 +4421,21 @@ function refreshUpdateDot() {
 }
 
 async function checkAppUpdate(quiet) {
+  // 保留上一次结果，请求期间只显示 loading（验收 8）。
+  updateState.appChecking = true;
+  renderUpdateApp();
   try {
     updateState.app = await api("/api/app/update/check");
   } catch (e) {
     updateState.app = {
-      ok: false, has_update: false, current: "", latest: "", tag: "",
-      channel: updateState.channel,
+      ok: false, has_update: false, current: "", latest: "", latest_version: "",
+      tag: "", channel: updateState.channel,
       error: t("update.check_failed_detail") + (e.message || e), error_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
   }
+  updateState.appChecking = false;
+  updateState.appCheckedAt = new Date();
   if (updateState.app && updateState.app.channel) {
     updateState.channel = updateState.app.channel;
   }
@@ -4190,9 +4446,26 @@ async function checkAppUpdate(quiet) {
   }
 }
 
-/** 切换更新通道：持久化到 config.json，并立即按新通道重新检查。 */
+/** 切换更新通道：先确认，再持久化并立即按新通道重新检查。 */
 async function switchUpdateChannel(channel) {
   const sel = $("#updateChannel");
+  const prev = updateState.channel;
+  if (channel === prev) {
+    renderUpdateApp();
+    return;
+  }
+  // 滚动版是每次 main 提交的自动构建，切换前确认一次（验收 12）。
+  if (!window.confirm(t("update.channel_switch_confirm", {
+    channel: t("ui.update_channel_" + channel),
+  }))) {
+    if (sel) sel.value = prev;
+    return;
+  }
+  updateState.channel = channel;
+  if (sel) sel.value = channel;
+  // 旧结果先留着，POST 与重新检查期间都显示 loading。
+  updateState.appChecking = true;
+  renderUpdateApp();
   try {
     const d = await api("/api/app/update/channel", {
       method: "POST",
@@ -4203,12 +4476,15 @@ async function switchUpdateChannel(channel) {
     toast(t("update.channel_switched", {
       channel: t("ui.update_channel_" + updateState.channel),
     }), "ok");
-    await checkAppUpdate(true);
   } catch (e) {
+    updateState.appChecking = false;
+    updateState.channel = prev;
+    if (sel) sel.value = prev;
     toast(t("update.channel_switch_failed") + (e.message || e), "bad");
-    if (sel) sel.value = updateState.channel;
     renderUpdateApp();
+    return;
   }
+  await checkAppUpdate(true);
 }
 
 async function checkFwUpdate(quiet) {
@@ -4220,22 +4496,36 @@ async function checkFwUpdate(quiet) {
     if (!quiet) toast(t("update.pick_device_first"), "bad");
     return;
   }
+  // 未连接/OTA 中时不发请求，也不清掉上一次结果，只把原因说清楚（验收 9）。
+  const blocked = fwBlockedReason(sel);
+  if (blocked) {
+    updateState.fwChecking = false;
+    renderUpdateFw();
+    if (!quiet) toast(blocked, "bad");
+    return;
+  }
+  updateState.fwChecking = true;
+  renderUpdateFw();
   try {
     updateState.fw = await api(
       `/api/firmware/update/check?dev_id=${encodeURIComponent(sel.dev_id)}`);
   } catch (e) {
     updateState.fw = {
+      dev_id: sel.dev_id,
       has_update: false, device_variant: "", current: "", latest: "",
       reason: t("update.check_failed_detail") + (e.message || e), reason_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
   }
+  updateState.fwChecking = false;
+  updateState.fwCheckedAt = new Date();
   renderUpdateFw();
   refreshUpdateDot();
   if (!quiet && updateState.fw.has_update) {
     toast(t("update.found_new_firmware", { latest: fmtVersion(updateState.fw.latest) }), "ok");
   }
 }
+
 
 function openUpdateModal() {
   const modal = $("#updateModal");
@@ -4374,6 +4664,11 @@ async function applyFwUpdate() {
     toast(t("update.pick_device_first"), "bad");
     return;
   }
+  const blocked = fwBlockedReason(sel);
+  if (blocked) {
+    toast(blocked, "bad");
+    return;
+  }
   const btn = $("#btnFwApply");
   if (btn) {
     btn.disabled = true;
@@ -4385,6 +4680,10 @@ async function applyFwUpdate() {
       body: JSON.stringify({ dev_id: sel.dev_id }),
     });
     updateState.fwTask = sel.dev_id;
+    // 升级真正开始后才显示五步条（验收 4）。
+    updateState.fwRunning = true;
+    setFwStepsVisible(true);
+    resetFwSteps();
     pollFwUpdate(sel.dev_id);
     toast(t("update.fw_pushing") + fmtVersion(r.version), "ok");
   } catch (e) {
@@ -4441,6 +4740,8 @@ function pollFwUpdate(devId) {
       if (p.phase === "error") {
         clearInterval(updateState.polling);
         updateState.polling = null;
+        updateState.fwRunning = false;
+        setFwStepsVisible(false);
         setUpdateError("updFwError", {
           error: p.error || t("ui.unknown_error"), error_code: p.error_code || "",
         });
@@ -4448,6 +4749,8 @@ function pollFwUpdate(devId) {
       } else if (p.phase === "done") {
         clearInterval(updateState.polling);
         updateState.polling = null;
+        updateState.fwRunning = false;
+        setFwStepsVisible(false);
         toast(t("update.fw_done"), "ok");
         await checkFwUpdate(true);
       }
@@ -4485,6 +4788,12 @@ function bindUpdate() {
   if (applyBtn) applyBtn.onclick = applyAppUpdate;
   const skipBtn = $("#btnUpdateSkip");
   if (skipBtn) skipBtn.onclick = skipAppUpdate;
+  const appCheck = $("#btnAppCheck");
+  if (appCheck) appCheck.onclick = () => checkAppUpdate(false);
+  const appCopy = $("#btnAppShaCopy");
+  if (appCopy) appCopy.onclick = () => copySha("app");
+  const fwCopy = $("#btnFwShaCopy");
+  if (fwCopy) fwCopy.onclick = () => copySha("fw");
   const channelSel = $("#updateChannel");
   if (channelSel) channelSel.onchange = (e) => switchUpdateChannel(e.target.value);
   const fwCheck = $("#btnFwCheck");

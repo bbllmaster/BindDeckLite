@@ -4984,6 +4984,9 @@ def api_app_update_check():
         "ok": True,
         "current": current,
         "latest": "",
+        "latest_version": "",
+        "build": "",
+        "local_tag": "",
         "tag": "",
         "channel": channel,
         "skip_key": "",
@@ -5023,6 +5026,13 @@ def api_app_update_check():
     latest = app_asset["version"]
     # 滚动通道对用户有意义的是 tag（所有 nightly 的 semver 都一样）。
     payload["latest"] = payload["tag"] if channel == "rolling" else latest
+    # WS-577：滚动版 UI 用「构建 <sha> · 时间」统一标识，前端需要原始版本号
+    # 和清单里的 build 字段来取短 sha；正式版不使用这两个字段。
+    payload["latest_version"] = latest
+    payload["build"] = str(app_asset.get("build") or "")
+    # 本机上次装上的滚动 tag：前端据此给「当前版本」也显示构建时间。
+    payload["local_tag"] = (_local_rolling_tag(state)
+                            if channel == "rolling" else "")
     payload["asset"] = {
         "name": app_asset["asset"],
         "size": app_asset.get("size", 0),
