@@ -40,6 +40,12 @@ jobs:
       - name: Workflow guard (WS-569)
         run: python -m pytest tools/test_workflows.py -v
 
+      # WS-578: a var(--x) with no definition and no fallback drops the whole
+      # declaration instead of the single value, so a missing spacing step made
+      # the update dialog lose all padding. Static guard over the real CSS.
+      - name: CSS variable guard (WS-578)
+        run: python -m pytest tools/test_css_vars.py -v
+
       - name: Build exe
         working-directory: host
         run: pyinstaller --noconfirm --clean app.spec
