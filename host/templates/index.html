@@ -329,41 +329,52 @@
           <button class="btn sm" id="btnClearLog" data-i18n="ui.clear">清空</button>
         </div>
       </div>
+      <!-- WS-587：两级过滤。主行只有级别胶囊 + 搜索 + 「更多筛选」；类型 / 设备
+           收进折叠区，窄屏不再把 5 组控件折成 3 行平铺。 -->
       <div class="log-filters" role="search" aria-label="日志过滤" data-i18n-aria-label="ui.log_filters">
-        <!-- 设备下拉：只有设备并集 ≥ 2 时才出现（单设备时界面与以前一致）。 -->
-        <label class="log-filter-label" id="logDevLabel" for="logDev" hidden data-i18n="ui.devices">设备</label>
-        <select id="logDev" class="log-select" aria-label="按设备过滤" data-i18n-aria-label="ui.filter_by_device" hidden></select>
-        <label class="log-filter-label" for="logKind" data-i18n="ui.kind">类型</label>
-        <select id="logKind" class="log-select" aria-label="按日志类型过滤" data-i18n-aria-label="ui.filter_by_kind">
-          <option value="" data-i18n="ui.kind_all">全部类型</option>
-          <option value="cfg" data-i18n="ui.kind_cfg">配置 cfg</option>
-          <option value="key" data-i18n="ui.kind_key">按键 key</option>
-          <option value="enc" data-i18n="ui.kind_enc">编码器 enc</option>
-          <option value="action" data-i18n="ui.kind_action">动作 action</option>
-          <option value="device" data-i18n="ui.kind_device">设备 device</option>
-          <option value="ble" data-i18n="ui.kind_ble">蓝牙 ble</option>
-          <option value="ota" data-i18n="ui.kind_ota">升级 ota</option>
-          <option value="desktop" data-i18n="ui.kind_desktop">桌面 desktop</option>
-          <option value="tx" data-i18n="ui.kind_tx">下发 tx</option>
-          <option value="ack" data-i18n="ui.kind_ack">确认 ack</option>
-          <option value="pong" data-i18n="ui.kind_pong">响应 pong</option>
-          <option value="line" data-i18n="ui.kind_line">原始 line</option>
-          <option value="warn" data-i18n="ui.kind_warn">警告 warn</option>
-          <option value="error" data-i18n="ui.kind_error">错误 error</option>
-        </select>
-        <div class="log-level-chips" id="logLevelChips" role="group" aria-label="按日志级别过滤" data-i18n-aria-label="ui.filter_by_level">
-          <button type="button" class="log-chip active" data-level="" aria-pressed="true" data-i18n="ui.level_all">全部</button>
-          <button type="button" class="log-chip" data-level="info" aria-pressed="false" data-i18n="ui.level_info">信息</button>
-          <button type="button" class="log-chip" data-level="ok" aria-pressed="false" data-i18n="ui.level_ok">成功</button>
-          <button type="button" class="log-chip" data-level="warn" aria-pressed="false" data-i18n="ui.level_warn">警告</button>
-          <button type="button" class="log-chip" data-level="error" aria-pressed="false" data-i18n="ui.level_error">错误</button>
+        <div class="log-filter-main">
+          <div class="log-level-chips" id="logLevelChips" role="group" aria-label="按日志级别过滤" data-i18n-aria-label="ui.filter_by_level">
+            <button type="button" class="log-chip active" data-level="" aria-pressed="true" data-i18n="ui.level_all">全部</button>
+            <button type="button" class="log-chip" data-level="info" aria-pressed="false" data-i18n="ui.level_info">信息</button>
+            <button type="button" class="log-chip" data-level="ok" aria-pressed="false" data-i18n="ui.level_ok">成功</button>
+            <button type="button" class="log-chip" data-level="warn" aria-pressed="false" data-i18n="ui.level_warn">警告</button>
+            <button type="button" class="log-chip" data-level="error" aria-pressed="false" data-i18n="ui.level_error">错误</button>
+          </div>
+          <input type="search" id="logSearch" class="log-search" placeholder="搜索日志内容…" aria-label="搜索日志内容" data-i18n-placeholder="ui.search_log" data-i18n-aria-label="ui.search_log">
+          <button type="button" class="btn sm log-more-filter-btn" id="btnLogMoreFilters"
+                  aria-expanded="false" aria-controls="logMoreFilters" data-i18n="ui.more_filters">更多筛选</button>
         </div>
-        <input type="search" id="logSearch" class="log-search" placeholder="搜索日志内容…" aria-label="搜索日志内容" data-i18n-placeholder="ui.search_log" data-i18n-aria-label="ui.search_log">
-        <button type="button" class="btn sm" id="btnLogFilterReset" hidden data-i18n="ui.clear_filters">清除过滤</button>
+        <div class="log-filter-more" id="logMoreFilters" hidden>
+          <label class="log-filter-label" for="logKind" data-i18n="ui.kind">类型</label>
+          <select id="logKind" class="log-select" aria-label="按日志类型过滤" data-i18n-aria-label="ui.filter_by_kind">
+            <option value="" data-i18n="ui.kind_all">全部类型</option>
+            <option value="cfg" data-i18n="ui.kind_cfg">配置 cfg</option>
+            <option value="key" data-i18n="ui.kind_key">按键 key</option>
+            <option value="enc" data-i18n="ui.kind_enc">编码器 enc</option>
+            <option value="action" data-i18n="ui.kind_action">动作 action</option>
+            <option value="device" data-i18n="ui.kind_device">设备 device</option>
+            <option value="ble" data-i18n="ui.kind_ble">蓝牙 ble</option>
+            <option value="ota" data-i18n="ui.kind_ota">升级 ota</option>
+            <option value="desktop" data-i18n="ui.kind_desktop">桌面 desktop</option>
+            <option value="tx" data-i18n="ui.kind_tx">下发 tx</option>
+            <option value="ack" data-i18n="ui.kind_ack">确认 ack</option>
+            <option value="pong" data-i18n="ui.kind_pong">响应 pong</option>
+            <option value="line" data-i18n="ui.kind_line">原始 line</option>
+            <option value="warn" data-i18n="ui.kind_warn">警告 warn</option>
+            <option value="error" data-i18n="ui.kind_error">错误 error</option>
+          </select>
+          <!-- 设备下拉：只有设备并集 ≥ 2 时才出现（单设备时界面与以前一致）。 -->
+          <label class="log-filter-label" id="logDevLabel" for="logDev" hidden data-i18n="ui.devices">设备</label>
+          <select id="logDev" class="log-select" aria-label="按设备过滤" data-i18n-aria-label="ui.filter_by_device" hidden></select>
+          <button type="button" class="btn sm" id="btnLogFilterReset" hidden data-i18n="ui.clear_filters">清除过滤</button>
+        </div>
       </div>
       <div class="log-wrap">
         <div class="log" id="logList"></div>
-        <p class="log-empty" id="logEmpty" hidden data-i18n="ui.log_empty">没有匹配的日志</p>
+        <div class="log-empty" id="logEmpty" hidden>
+          <p data-i18n="ui.log_empty">没有匹配的日志</p>
+          <button type="button" class="btn sm" id="btnLogEmptyReset" data-i18n="ui.clear_all_filters">清除全部过滤</button>
+        </div>
         <!-- 暂停跟随时浮在底部的胶囊：N 为暂停后新到达的行数 -->
         <div class="log-new" id="logNew" hidden>
           <button type="button" class="log-new-btn" id="btnLogJump">
@@ -377,143 +388,16 @@
 
 <!-- ================= HELP ================= -->
 <div class="modal" id="helpModal" hidden>
-  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
-    <div class="modal-head">
+  <div class="modal-card help-modal" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+    <div class="modal-head help-head">
       <h2 id="helpTitle" data-i18n="help.title">宏与动作帮助</h2>
-      <button class="icon-btn" id="btnHelpClose" title="关闭（Esc）" data-i18n-title="ui.close_esc">✕</button>
+      <div class="help-head-tools">
+        <input type="search" id="helpSearch" class="help-search" placeholder="搜索帮助…" aria-label="搜索帮助" data-i18n-placeholder="help.search" data-i18n-aria-label="help.search">
+        <button class="icon-btn" id="btnHelpClose" title="关闭（Esc）" data-i18n-title="ui.close_esc">✕</button>
+      </div>
     </div>
-    <div class="modal-body">
-      <h3 data-i18n="help.h_macro">宏怎么用</h3>
-      <p data-i18n-html="help.macro_1">按键的「上位机动作」选 <code>宏</code>，文本框里一行写一步，按顺序执行；改完点右上角「应用配置」下发。宏只在主机侧执行，设备本身仍会照常发送上面的 HID 键（除非该键的 HID 键设为「不发键」）。</p>
-      <table class="help-table">
-        <thead><tr><th data-i18n-html="help.macro_2">写法</th><th data-i18n-html="help.macro_3">作用</th></tr></thead>
-        <tbody>
-          <tr><td><code>key:Tab</code></td><td data-i18n-html="help.macro_4">发送一个按键或组合键；修饰键用 <code>+</code> 连接，如 <code>key:ctrl+alt+t</code></td></tr>
-          <tr><td><code>text:hello</code></td><td data-i18n-html="help.macro_5">逐字符模拟输入文本，默认每个字符间隔 20 毫秒</td></tr>
-          <tr><td><code>text!80:pass123</code></td><td data-i18n-html="help.macro_6">同上，但把逐字符间隔改为 80 毫秒（<code>text!</code> 后接毫秒数）；字符丢失时调大</td></tr>
-          <tr><td><code>paste:mypassword</code></td><td data-i18n-html="help.macro_7">把文本放进剪贴板并发送 <code>Ctrl+V</code>（macOS 为 <code>Cmd+V</code>）：中文、特殊符号、密码框等 <code>text:</code> 输不进去的场景优先用它</td></tr>
-          <tr><td><code>wait:500</code></td><td data-i18n-html="help.macro_8">等待 500 毫秒（单位毫秒）</td></tr>
-          <tr><td><code>browser:chrome</code></td><td data-i18n-html="help.macro_9">指定后续 <code>url:</code> 用哪个浏览器打开：<code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>（不区分大小写）；浏览器未安装时自动回退默认浏览器</td></tr>
-          <tr><td><code>url:https://example.com</code></td><td data-i18n-html="help.macro_10">打开网址：上面有 <code>browser:</code> 用指定浏览器，否则用默认浏览器；打开后会等待浏览器窗口到前台（Windows 最多 3 秒，macOS/Linux 不等待）再执行下一步</td></tr>
-          <tr><td><code>app:C:\path\app.exe --arg</code></td><td data-i18n-html="help.macro_11">启动桌面应用程序（可执行文件路径，可带参数；含空格的路径或参数用引号包裹，引号可写在参数任意位置，如 <code>--title="My App"</code>）；支持 PATH 程序名（如 <code>app:notepad</code>）与环境变量写法（如 <code>app:%LOCALAPPDATA%\App\app.exe</code>）；Windows 启动后会等待应用窗口到前台（最多 3 秒）再执行下一步，macOS/Linux 不等待，后续 <code>text:</code> / <code>key:</code> / <code>paste:</code> 直接打进去</td></tr>
-          <tr><td data-i18n-html="help.macro_12">无前缀行</td><td data-i18n-html="help.macro_13">按 <code>key:</code> 处理，例如单独一行 <code>enter</code></td></tr>
-        </tbody>
-      </table>
-
-      <p data-i18n-html="help.macro_14">日志只记录宏的步骤类型，不记录 <code>text:</code> / <code>paste:</code> 的正文。</p>
-
-      <h3 data-i18n="help.h_keys">键名对照表</h3>
-      <p data-i18n-html="help.keys_1">键名不区分大小写，写界面上显示的名字即可（<code>PageUp</code> 与 <code>pageup</code> 等价）。</p>
-      <table class="help-table">
-        <thead><tr><th data-i18n-html="help.keys_2">宏里写</th><th data-i18n-html="help.keys_3">实际按键</th></tr></thead>
-        <tbody>
-          <tr><td><code>Tab</code> <code>Enter</code> <code>Esc</code> <code>Space</code></td><td data-i18n-html="help.keys_4">Tab、回车、Esc、空格</td></tr>
-          <tr><td><code>Backspace</code> <code>Insert</code> <code>Delete</code></td><td data-i18n-html="help.keys_5">退格、插入、删除</td></tr>
-          <tr><td><code>Home</code> <code>End</code> <code>PageUp</code> <code>PageDown</code></td><td data-i18n-html="help.keys_6">行首、行尾、上翻页、下翻页</td></tr>
-          <tr><td><code>Left</code> <code>Right</code> <code>Up</code> <code>Down</code></td><td data-i18n-html="help.keys_7">方向键</td></tr>
-          <tr><td><code>LCtrl</code> / <code>RCtrl</code></td><td data-i18n-html="help.keys_8">左 / 右 Ctrl（<code>ctrl</code> 等同左 Ctrl）</td></tr>
-          <tr><td><code>LShift</code> / <code>RShift</code></td><td data-i18n-html="help.keys_9">左 / 右 Shift</td></tr>
-          <tr><td><code>LAlt</code> / <code>RAlt</code></td><td data-i18n-html="help.keys_10">左 / 右 Alt</td></tr>
-          <tr><td><code>LWin</code> / <code>RWin</code></td><td data-i18n-html="help.keys_11">左 / 右 Win</td></tr>
-          <tr><td><code>F1</code>–<code>F12</code></td><td data-i18n-html="help.keys_12">功能键</td></tr>
-          <tr><td><code>F13</code>–<code>F24</code></td><td data-i18n-html="help.keys_13">原样传给 keyboard 库（设备默认键码即 F13–F22）</td></tr>
-          <tr><td><code>A</code>–<code>Z</code> / <code>0</code>–<code>9</code></td><td data-i18n-html="help.keys_14">单个字母 / 数字</td></tr>
-        </tbody>
-      </table>
-
-      <h3 data-i18n="help.h_example_browser">完整示例：用 Chrome 打开页面并登录</h3>
-      <pre class="help-code">browser:chrome
-url:https://example.com/login
-wait:1500
-key:tab
-paste:my-user
-key:tab
-paste:my-password
-key:enter</pre>
-      <p data-i18n-html="help.example_browser_1"><code>browser:</code> 只影响它后面的 <code>url:</code> 步骤，可以写在宏的任意位置；不写就用系统默认浏览器。先等页面加载完再发键，否则按键会落到地址栏或别的窗口。</p>
-
-      <h3 data-i18n="help.h_example_app">完整示例：启动桌面应用并自动输入</h3>
-      <pre class="help-code">app:"C:\Program Files\MyApp\myapp.exe" --new-session
-text:hello world
-key:enter</pre>
-      <p data-i18n-html="help.example_app_1"><code>app:</code> 启动桌面应用后会自动等待窗口获得焦点（Windows 最多 3 秒，macOS/Linux 不等待），再执行后面的 <code>text:</code> / <code>key:</code> / <code>paste:</code>。应用启动较慢时，可用 <code>wait:</code> 手动兜底；可执行文件不存在时，日志会写「app: 未找到可执行文件」并跳过本步，宏继续执行后续步骤。</p>
-      <p data-i18n-html="help.example_app_2">参数里的引号可以写在任意位置（<code>app:C:\app.exe --title="My App"</code> 是一个参数 <code>--title=My App</code>），单引号也可以（<code>app:'/usr/bin/foo'</code>）。引号没配对时不会启动任何程序，日志会写「app: 命令行引号不配对」并跳过本步。</p>
-
-      <h3 data-i18n="help.h_password">密码框输入无效怎么办</h3>
-      <p data-i18n-html="help.password_1">密码框（以及登录页的邮箱框）是最容易「发得出按键、打不进字」的地方。宏本身不会失败，所以先判断属于下面哪一种情况，再换写法。</p>
-      <table class="help-table">
-        <thead><tr><th data-i18n-html="help.password_2">原因</th><th data-i18n-html="help.password_3">典型表现</th><th data-i18n-html="help.password_4">处理办法</th></tr></thead>
-        <tbody>
-          <tr>
-            <td data-i18n-html="help.password_5">逐字符速度太快</td>
-            <td data-i18n-html="help.password_6">只进去几个字符、顺序错乱，日志显示动作成功</td>
-            <td data-i18n-html="help.password_7">改用 <code>text!80:密码</code> 放慢速度，或直接用 <code>paste:密码</code></td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_8">焦点不在输入框</td>
-            <td data-i18n-html="help.password_9">字打进了地址栏、搜索框或别的窗口</td>
-            <td data-i18n-html="help.password_10">先 <code>wait:1500</code> 等页面加载，再用 <code>key:tab</code> 逐个聚焦；<code>url:</code> 后会自动等浏览器窗口到前台（最多 3 秒）</td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_11">输入法 / 键盘布局</td>
-            <td data-i18n-html="help.password_12">中文、emoji、<code>@ # ¥</code> 之类的符号变成别的字符或丢失</td>
-            <td data-i18n-html="help.password_13">改用 <code>paste:</code>（剪贴板不经过键盘布局）。<code>text:</code> 前先切到英文输入法</td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_14">目标程序以管理员权限运行</td>
-            <td data-i18n-html="help.password_15">整个宏对别的程序有效，只对这个程序完全没反应</td>
-            <td data-i18n-html="help.password_16">Windows UIPI 会丢弃低权限进程的合成输入，代码层面绕不过：<b>以管理员身份运行上位机</b>（右键 <code>BindDeckLite.exe</code> → 以管理员身份运行）</td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_17">程序主动拦截合成按键</td>
-            <td data-i18n-html="help.password_18">按键、<code>text:</code> 都没反应，但手工输入正常</td>
-            <td data-i18n-html="help.password_19">程序在检测 <code>LLKHF_INJECTED</code> 标记。先试 <code>paste:</code>（它只发一次 Ctrl+V，很多程序放行）；仍不行就是硬限制</td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_20">macOS 安全键盘输入</td>
-            <td data-i18n-html="help.password_21">只在密码框里无效，普通输入框正常</td>
-            <td data-i18n-html="help.password_22">「安全键盘输入」会屏蔽合成按键。用 <code>paste:</code>，或临时在输入法菜单里关闭安全键盘输入</td>
-          </tr>
-          <tr>
-            <td data-i18n-html="help.password_23">浏览器密码框未渲染完</td>
-            <td data-i18n-html="help.password_24">前几次按键丢失，之后才正常</td>
-            <td data-i18n-html="help.password_25">把 <code>wait:</code> 调到 2000 以上；必要时重复 <code>key:tab</code></td>
-          </tr>
-        </tbody>
-      </table>
-      <p data-i18n-html="help.password_26"><b>推荐写法</b>：先 <code>wait:</code>，再 <code>key:tab</code> 聚焦，账号和密码都用 <code>paste:</code>。</p>
-      <pre class="help-code">browser:chrome
-url:https://example.com/login
-wait:2000
-key:tab
-paste:my-user
-key:tab
-paste:my-password
-key:enter</pre>
-      <ul>
-        <li data-i18n-html="help.password_27"><b>管理员程序</b>：只要目标程序是「以管理员身份运行」的（任务管理器、部分网银/游戏客户端），上位机也必须以管理员身份运行，否则任何按键方案都无效。</li>
-        <li data-i18n-html="help.password_28"><b>无法绕过的场景</b>：银行安全控件、远程桌面/虚拟机里对合成输入的过滤、带反作弊或主动防御的客户端、UAC 提权弹窗本身。这些场景请改用设备直接发 HID 键，或手动输入。</li>
-        <li data-i18n-html="help.password_29"><b>剪贴板</b>：<code>paste:</code> 会先把原剪贴板里的<b>文本</b>保存下来，粘贴后约 0.4 秒再恢复（只恢复文本，图片等其它内容无法恢复）。这段时间内密码会短暂留在剪贴板里；<code>paste:</code> 不可用时日志会写「剪贴板不可用」，并自动回退成逐字符输入，宏不会中断。</li>
-        <li data-i18n-html="help.password_30"><b>Linux / macOS</b>：macOS 用系统自带的 <code>pbcopy</code>；Linux 优先 <code>xclip</code> / <code>xsel</code>（X11）或 <code>wl-copy</code>（Wayland），都没装时回退 tkinter，此时需要图形界面（<code>DISPLAY</code>）。</li>
-      </ul>
-
-      <h3 data-i18n="help.h_errors">常见错误排查</h3>
-      <ul>
-        <li data-i18n-html="help.errors_1"><b>报错 <code>key:xxx is not mapped to any known key</code></b>：键名不在上面的对照表里。核对拼写（对照表已不区分大小写），组合键用 <code>+</code> 连接。</li>
-        <li data-i18n-html="help.errors_2"><b>按了没反应，但卡片在呼吸</b>：这条动作还在执行（卡片边框变亮、「测试动作」变成红色的「停止」），期间重复按下会被忽略，日志里只有一条「动作跳过」。宏结束时会自动恢复；执行期间可点卡片上的「停止」，会在当前步骤结束后退出；<b>已经发出的按键不会撤回</b>。</li>
-        <li data-i18n-html="help.errors_3"><b>宏完全没反应</b>：宏需要 <code>keyboard</code> 库（<code>pip install keyboard</code>，Windows 打包版已内置）；确认「设备 → 上位机与系统 → 上位机动作」已开启，动作类型选的是「宏」且点过「应用配置」。</li>
-        <li data-i18n-html="help.errors_4"><b>组合键不生效</b>：用 <code>+</code> 连接，<code>key:ctrl+shift+t</code>；不要写成 <code>key:ctrl shift t</code> 或 <code>key:ctrl+alt t</code>。</li>
-        <li data-i18n-html="help.errors_5"><b>输入跑到了别的位置</b>：页面还没加载完，把 <code>wait:</code> 调大（如 <code>wait:2000</code>）。</li>
-        <li data-i18n-html="help.errors_6"><b>目标程序收不到按键</b>：目标程序以管理员身份运行时，上位机也要以管理员身份运行。</li>
-        <li data-i18n-html="help.errors_7"><b>Linux / macOS 下按键无效</b>：<code>keyboard</code> 需要 root 权限（<code>sudo python app.py</code>）；不便提权时改用「执行命令」。</li>
-        <li data-i18n-html="help.errors_8"><b>网址没打开</b>：<code>url:</code> 后面必须带 <code>http://</code> 或 <code>https://</code>。</li>
-        <li data-i18n-html="help.errors_9"><b>指定的浏览器没生效</b>：<code>browser:</code> 只认 <code>chrome</code> / <code>firefox</code> / <code>edge</code> / <code>safari</code> / <code>default</code>；未安装或名字不认识时日志里会记录原因，并按默认浏览器打开，宏继续执行。</li>
-        <li data-i18n-html="help.errors_10"><b><code>text:</code> 输出了奇怪字符</b>：受当前输入法影响，执行前先切到英文输入法；中文或符号改用 <code>paste:</code>。</li>
-        <li data-i18n-html="help.errors_11"><b><code>paste:</code> 没反应或只粘贴了旧内容</b>：看日志有没有「剪贴板不可用，paste 步骤跳过」；Linux 需安装 <code>xclip</code>（X11）或 <code>wl-copy</code>（Wayland），或用图形界面下的 tkinter 回退。密码框里仍无效时按上面「密码框输入无效怎么办」逐条排查。</li>
-        <li data-i18n-html="help.errors_12"><b><code>app:</code> 启动后字打到了别的窗口</b>：桌面应用启动比浏览器慢，<code>app:</code> 后的 3 秒内（Windows）可能还没抢到焦点。把后面的 <code>text:</code> / <code>key:</code> 前面加一行 <code>wait:1000</code> 手动兜底；仍无效则目标程序可能在后台打开或被 UAC 拦截。macOS/Linux 下 <code>app:</code> 不做自动等待，建议一律加 <code>wait:</code>。</li>
-        <li data-i18n-html="help.errors_13"><b><code>app:</code> 报「未找到可执行文件」</b>：路径写错了，或 exe 不在指定位置。含空格的路径用引号包裹，如 <code>app:"C:\Program Files\App\app.exe"</code>；只写程序名（如 <code>app:notepad</code>）时确保它在系统 PATH 里；环境变量写法如 <code>app:%LOCALAPPDATA%\App\app.exe</code>。</li>
-        <li data-i18n-html="help.errors_14"><b><code>app:</code> 报「命令行引号不配对」</b>：命令里的引号没成对（多了一个 <code>"</code> 或 <code>'</code>）。此时不会启动任何程序，本步跳过、后续步骤照常执行。检查路径或参数里的引号数量，例如 <code>app:"C:\Program Files\App\app.exe" --title="My App"</code>。</li>
-      </ul>
+    <div class="modal-body help-body">
+      {% include "help.html" %}
     </div>
   </div>
 </div>
@@ -607,6 +491,19 @@ key:enter</pre>
       <!-- 上位机更新 -->
       <section class="update-block" aria-labelledby="updAppTitle">
         <h3 id="updAppTitle" data-i18n="ui.host_update">上位机更新</h3>
+        <!-- WS-587：「当前 → 目标」对比行。#updAppCurrent / #updAppLatest 保留，
+             滚动通道沿用「构建 <sha7> · 时间」格式，由 renderUpdateApp 写入。 -->
+        <div class="upd-version-line">
+          <span class="upd-version-cell">
+            <span class="upd-version-cap" data-i18n="ui.current_version">当前版本</span>
+            <span class="upd-version-val" id="updAppCurrent">—</span>
+          </span>
+          <span class="upd-version-arrow" aria-hidden="true">→</span>
+          <span class="upd-version-cell">
+            <span class="upd-version-cap" data-i18n="ui.latest_version">最新版本</span>
+            <span class="upd-version-val" id="updAppLatest">—</span>
+          </span>
+        </div>
         <div class="ota-rows">
           <span class="k" data-i18n="ui.update_channel">更新通道</span>
           <span class="v upd-channel-cell">
@@ -617,28 +514,29 @@ key:enter</pre>
             <!-- 滚动版警告紧跟通道选择器（WS-577 验收 12）。 -->
             <span class="upd-rolling-warn" id="updAppRollingWarn" hidden data-i18n="update.rolling_warning">滚动版为每次 main 提交自动构建，可能不稳定</span>
           </span>
-          <span class="k" data-i18n="ui.current_version">当前版本</span><span class="v" id="updAppCurrent">—</span>
-          <span class="k" data-i18n="ui.latest_version">最新版本</span><span class="v" id="updAppLatest">—</span>
           <span class="k upd-app-asset" data-i18n="ui.download_size">下载大小</span><span class="v upd-app-asset" id="updAppSize">—</span>
           <span class="k upd-app-asset">SHA256</span>
           <span class="v upd-app-asset upd-sha-row">
-            <span class="mono upd-sha" id="updAppSha">—</span>
+            <span class="upd-sha" id="updAppSha">—</span>
             <button class="btn secondary sm upd-copy" id="btnAppShaCopy" hidden data-i18n="ui.copy">复制</button>
           </span>
         </div>
-        <p class="update-state" id="updAppState" data-i18n="ui.checking">正在检查…</p>
-        <p class="ota-error" id="updAppError" hidden></p>
-        <details class="update-notes" id="updAppNotesBox" hidden>
-          <summary id="updAppNotesTitle" data-i18n="update.app_notes_title">上位机更新内容</summary>
-          <pre class="update-notes-body" id="updAppNotes"></pre>
-        </details>
-        <div class="progress" id="updAppProgressBox" hidden><div class="progress-bar" id="updAppProgressBar" style="width:0%"></div></div>
-        <p class="muted small" id="updAppHint" hidden></p>
-        <p class="muted small update-checked-at" id="updAppCheckedAt" hidden></p>
-        <div class="btn-row update-actions">
-          <button class="btn secondary" id="btnAppCheck" data-i18n="update.recheck">重新检查</button>
-          <button class="btn secondary" id="btnUpdateSkip" hidden data-i18n="ui.skip_version">跳过此版本</button>
-          <button class="btn primary" id="btnUpdateApply" hidden data-i18n="ui.update_now">立即更新</button>
+        <!-- WS-587：状态 / 错误 / 进度 / 按钮固定块底，切换状态时不跳动。 -->
+        <div class="update-foot">
+          <p class="update-state" id="updAppState" data-i18n="ui.checking">正在检查…</p>
+          <p class="ota-error update-error" id="updAppError" role="alert" hidden></p>
+          <div class="upd-progress-slot"><div class="progress" id="updAppProgressBox" hidden><div class="progress-bar" id="updAppProgressBar" style="width:0%"></div></div></div>
+          <p class="muted small" id="updAppHint" hidden></p>
+          <p class="muted small update-checked-at" id="updAppCheckedAt" hidden></p>
+          <details class="update-notes" id="updAppNotesBox" hidden>
+            <summary id="updAppNotesTitle" data-i18n="update.app_notes_title">上位机更新内容</summary>
+            <pre class="update-notes-body" id="updAppNotes"></pre>
+          </details>
+          <div class="btn-row update-actions">
+            <button class="btn secondary" id="btnAppCheck" data-i18n="update.recheck">重新检查</button>
+            <button class="btn secondary" id="btnUpdateSkip" hidden data-i18n="ui.skip_version">跳过此版本</button>
+            <button class="btn primary" id="btnUpdateApply" hidden data-i18n="ui.update_now">立即更新</button>
+          </div>
         </div>
       </section>
 
@@ -659,38 +557,49 @@ key:enter</pre>
         <div id="fwOnlinePane">
         <!-- 固件始终走稳定通道，别让用户误以为跟随上面的滚动通道（WS-577 验收 14）。 -->
         <p class="muted small upd-channel-note" data-i18n="update.fw_channel_note">固件固定使用稳定版</p>
+        <div class="upd-version-line">
+          <span class="upd-version-cell">
+            <span class="upd-version-cap" data-i18n="ui.current_firmware">当前固件</span>
+            <span class="upd-version-val" id="updFwCurrent">—</span>
+          </span>
+          <span class="upd-version-arrow" aria-hidden="true">→</span>
+          <span class="upd-version-cell">
+            <span class="upd-version-cap" data-i18n="ui.latest_firmware">最新固件</span>
+            <span class="upd-version-val" id="updFwLatest">—</span>
+          </span>
+        </div>
         <div class="ota-rows">
           <span class="k" data-i18n="ui.target_device">目标设备</span><span class="v" id="updFwDevice">—</span>
           <span class="k upd-fw-devstate" data-i18n="ui.device_status">设备状态</span><span class="v upd-fw-devstate"><span class="upd-dev-state" id="updFwDeviceState">—</span></span>
           <span class="k" data-i18n="ui.device_model">设备型号</span><span class="v" id="updFwVariant">—</span>
-          <span class="k" data-i18n="ui.current_firmware">当前固件</span><span class="v" id="updFwCurrent">—</span>
-          <span class="k" data-i18n="ui.latest_firmware">最新固件</span><span class="v" id="updFwLatest">—</span>
           <span class="k upd-fw-asset" data-i18n="ui.download_size">下载大小</span><span class="v upd-fw-asset" id="updFwSize">—</span>
           <span class="k upd-fw-asset">SHA256</span>
           <span class="v upd-fw-asset upd-sha-row">
-            <span class="mono upd-sha" id="updFwSha">—</span>
+            <span class="upd-sha" id="updFwSha">—</span>
             <button class="btn secondary sm upd-copy" id="btnFwShaCopy" hidden data-i18n="ui.copy">复制</button>
           </span>
         </div>
-        <p class="update-state" id="updFwState" data-i18n="ui.pick_device_to_check">选择设备后可检查在线固件</p>
-        <p class="ota-error" id="updFwError" hidden></p>
-        <!-- 五步条只在升级进行中显示（WS-577 验收 4）。 -->
-        <div class="ota-steps" id="updFwSteps" aria-hidden="true" hidden>
-          <span class="ota-step-dot" data-step="download"><i>1</i><span data-i18n="ui.step_download">下载</span></span>
-          <span class="ota-step-dot" data-step="verify"><i>2</i><span data-i18n="ui.step_verify">校验</span></span>
-          <span class="ota-step-dot" data-step="push"><i>3</i><span data-i18n="ui.step_push">推送</span></span>
-          <span class="ota-step-dot" data-step="restart"><i>4</i><span data-i18n="ui.step_restart">重启</span></span>
-          <span class="ota-step-dot" data-step="confirm"><i>5</i><span data-i18n="ui.step_confirm_version">确认版本</span></span>
-        </div>
-        <p class="muted small" id="updFwHint" hidden></p>
-        <p class="muted small update-checked-at" id="updFwCheckedAt" hidden></p>
-        <details class="update-notes" id="updFwNotesBox" hidden>
-          <summary id="updFwNotesTitle" data-i18n="update.fw_notes_title">固件更新内容</summary>
-          <pre class="update-notes-body" id="updFwNotes"></pre>
-        </details>
-        <div class="btn-row update-actions">
-          <button class="btn secondary" id="btnFwCheck" data-i18n="ui.check_fw_update">检查固件更新</button>
-          <button class="btn primary" id="btnFwApply" hidden data-i18n="ui.update_fw_now">立即升级固件</button>
+        <div class="update-foot">
+          <p class="update-state" id="updFwState" data-i18n="ui.pick_device_to_check">选择设备后可检查在线固件</p>
+          <p class="ota-error update-error" id="updFwError" role="alert" hidden></p>
+          <!-- 五步条只在升级进行中显示（WS-577 验收 4）。 -->
+          <div class="ota-steps" id="updFwSteps" aria-hidden="true" hidden>
+            <span class="ota-step-dot" data-step="download"><i>1</i><span data-i18n="ui.step_download">下载</span></span>
+            <span class="ota-step-dot" data-step="verify"><i>2</i><span data-i18n="ui.step_verify">校验</span></span>
+            <span class="ota-step-dot" data-step="push"><i>3</i><span data-i18n="ui.step_push">推送</span></span>
+            <span class="ota-step-dot" data-step="restart"><i>4</i><span data-i18n="ui.step_restart">重启</span></span>
+            <span class="ota-step-dot" data-step="confirm"><i>5</i><span data-i18n="ui.step_confirm_version">确认版本</span></span>
+          </div>
+          <p class="muted small" id="updFwHint" hidden></p>
+          <p class="muted small update-checked-at" id="updFwCheckedAt" hidden></p>
+          <details class="update-notes" id="updFwNotesBox" hidden>
+            <summary id="updFwNotesTitle" data-i18n="update.fw_notes_title">固件更新内容</summary>
+            <pre class="update-notes-body" id="updFwNotes"></pre>
+          </details>
+          <div class="btn-row update-actions">
+            <button class="btn secondary" id="btnFwCheck" data-i18n="ui.check_fw_update">检查固件更新</button>
+            <button class="btn primary" id="btnFwApply" hidden data-i18n="ui.update_fw_now">立即升级固件</button>
+          </div>
         </div>
         </div>
 

@@ -1332,17 +1332,28 @@ input.short { width: 80px; }
 .btn-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 
 /* ---------- log ---------- */
-/* 过滤条：类型下拉 + 级别胶囊 + 搜索，纯客户端过滤。 */
+/* WS-587：两级过滤。主行只放级别胶囊 + 搜索 + 「更多筛选」，一行放得下；
+   类型 / 设备收进折叠区，窄屏不再把 5 组控件折成 3 行平铺。 */
 .log-filters {
-  display: flex; flex-wrap: wrap; align-items: center;
+  display: flex; flex-direction: column; align-items: stretch;
   gap: var(--sp-2); margin-bottom: var(--sp-3);
 }
-.log-filter-label { color: var(--muted); font-size: var(--fs-cap); }
+.log-filter-main {
+  display: flex; flex-wrap: nowrap; align-items: center;
+  gap: var(--sp-2); min-width: 0;
+}
+.log-filter-label { color: var(--muted); font-size: var(--fs-cap); white-space: nowrap; }
 .log-select { width: auto; min-width: 122px; min-height: var(--ctl-h-sm); }
 /* 「设备」下拉与标签只在设备并集 ≥ 2 时出现，其余情况保持原样。 */
 .log-select[hidden], .log-filter-label[hidden] { display: none; }
-.log-level-chips { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+/* 胶囊组不换行：内部横向滚动，主行在任何断点都保持一行。 */
+.log-level-chips {
+  display: flex; flex-wrap: nowrap; flex: 0 1 auto; min-width: 0;
+  gap: var(--sp-1); overflow-x: auto; scrollbar-width: none;
+}
+.log-level-chips::-webkit-scrollbar { display: none; }
 .log-chip {
+  flex: none;
   min-height: var(--ctl-h-sm); padding: var(--sp-1) var(--sp-3);
   border: 1px solid var(--line); border-radius: var(--r-pill);
   background: var(--card-2); color: var(--muted);
@@ -1353,19 +1364,37 @@ input.short { width: 80px; }
   color: var(--accent); border-color: rgba(53, 224, 194, 0.45);
   background: rgba(53, 224, 194, 0.08);
 }
-.log-search { flex: 1 1 180px; min-width: 140px; min-height: var(--ctl-h-sm); }
+.log-search { flex: 1 1 140px; min-width: 120px; min-height: var(--ctl-h-sm); }
+.log-more-filter-btn { flex: none; }
+/* 二级过滤生效时给开关一个明确标记，折叠后也不会忘记还有筛选条件。 */
+.log-more-filter-btn.active {
+  color: var(--accent); border-color: rgba(53, 224, 194, 0.45);
+  background: rgba(53, 224, 194, 0.08);
+}
+.log-filter-more {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line); border-radius: var(--r-control);
+  background: var(--surface-sunken);
+}
+.log-filter-more[hidden] { display: none; }
 .log-empty {
   color: var(--muted); font-size: var(--fs-sm);
   padding: var(--sp-4) 0; text-align: center;
+  pointer-events: none;
 }
 .log-empty[hidden] { display: none; }
+.log-empty p { margin: 0 0 var(--sp-3); }
+/* 覆盖层本身不拦截点击，但「清除全部过滤」按钮必须能点。 */
+.log-empty .btn { pointer-events: auto; }
 
 .log-wrap { position: relative; }
 /* 日志区由 flex 占满剩余高度后，「没有匹配的日志」不能再排在容器下方，
    改成覆盖在日志区内居中显示（不拦截点击）。 */
 #tab-log .log-empty {
   position: absolute; inset: 0;
-  display: grid; place-items: center;
+  display: grid; place-items: center; align-content: center; gap: var(--sp-2);
   padding: 0; pointer-events: none;
 }
 #tab-log .log-empty[hidden] { display: none; }
@@ -1405,31 +1434,56 @@ input.short { width: 80px; }
   /* 裁剪由 script 自己补偿 scrollTop，关掉浏览器的滚动锚定避免补偿两次 */
   overflow-anchor: none;
 }
-/* 时间/类型两列用 em（跟着日志字号走）而不是裸 px：每一行都是独立的 grid
-   容器，auto/max-content 会让列宽随内容跳动、行与行错位；em 既保持行间对齐，
-   又在用户调大字号或换字体时按同一比例放大（WS-581）。 */
-.log-row { display: grid; grid-template-columns: 5.2em 5.5em 1fr auto; gap: var(--sp-3); padding: var(--sp-1) 0; border-bottom: 1px solid rgba(36, 44, 61, 0.5); }
-/* 双设备及以上多一列设备名：时间 / 类型 / 设备 / 正文 / 复制。
-   设备列固定宽度，所有行对齐；名字超长省略，靠 title 看全文。 */
-.log.show-dev .log-row { grid-template-columns: 5.2em 5.5em 11em 1fr auto; }
-.log-dev {
-  color: var(--accent);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* WS-587：日志行 3 列（时间 62px / 内容 / 复制）。时间列固定像素宽度，
+   所有行严格对齐；类型列改成徽标放进内容区，设备归属收进「查看更多」，
+   不再为设备单开一列，窄屏也不需要第三行。 */
+.log-row {
+  display: grid; grid-template-columns: 62px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--sp-3); padding: var(--sp-1) 0;
+  border-bottom: 1px solid rgba(36, 44, 61, 0.5);
+}
+.log-body {
   min-width: 0;
-  padding-top: 1px;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2);
 }
 /* 过滤隐藏的行不占高度；用 hidden 属性而不是移除节点，轮询追加与裁剪补偿不受影响。 */
 .log-row[hidden] { display: none; }
 .log-time { color: var(--muted); }
-.log-kind { color: var(--violet); text-transform: uppercase; font-size: var(--fs-cap); padding-top: 1px; }
-.log-text { color: #c2ccdd; word-break: break-all; }
-.log-row.ok .log-kind { color: var(--accent); }
-.log-row.warn .log-kind, .log-row.warn .log-text { color: var(--warn); }
+/* 类型改徽标：胶囊底 + 等宽小字，级别语义色只改文字 / 描边，不再是一列裸文本。 */
+.log-kind {
+  flex: none;
+  display: inline-block;
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--state-info-bd); border-radius: var(--r-pill);
+  background: var(--state-info-bg); color: var(--state-info-fg);
+  font-size: var(--fs-cap); line-height: 1.6;
+  text-transform: uppercase; white-space: nowrap;
+}
+.log-row.ok .log-kind { color: var(--accent); border-color: var(--state-ok-bd); background: var(--state-ok-bg); }
+.log-row.warn .log-kind { color: var(--warn); border-color: var(--state-warn-bd); background: var(--state-warn-bg); }
+.log-row.error .log-kind { color: var(--danger); border-color: var(--state-danger-bd); background: var(--state-danger-bg); }
+.log-text { flex: 1 1 12em; min-width: 0; color: #c2ccdd; word-break: break-all; }
+.log-row.warn .log-text { color: var(--warn); }
 .log-row.error .log-text { color: var(--danger); }
+/* 「查看更多」：默认只露出一个小链接，展开才显示设备归属，不占常驻列宽。 */
+.log-more { flex: none; font-size: var(--fs-cap); }
+.log-more[hidden] { display: none; }
+.log-more summary {
+  display: inline; list-style: none; cursor: pointer;
+  color: var(--muted); text-decoration: underline dotted;
+}
+.log-more summary::-webkit-details-marker { display: none; }
+.log-more summary:hover { color: var(--accent); }
+.log-more summary:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.log-dev {
+  display: inline-block; max-width: 14em; margin-left: var(--sp-2);
+  color: var(--accent);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  vertical-align: bottom;
+}
 
-/* 每行日志右侧的复制按钮：常驻但低调，悬停时高亮。 */
+/* 每行日志右侧的复制按钮：常驻且对比度达标（opacity 1.0，6.2:1），热区 32px。 */
 .log-copy {
   align-self: start;
   flex: none;
@@ -1440,39 +1494,20 @@ input.short { width: 80px; }
   font-size: var(--fs-cap);
   line-height: 1.6;
   padding: var(--sp-1) var(--sp-2);
-  min-height: 28px;
+  min-height: 32px;
   border-radius: var(--r-control);
   cursor: pointer;
-  opacity: 0.75;
+  opacity: 1;
   transition: 0.15s;
 }
-.log-row:hover .log-copy, .log-copy:focus-visible { opacity: 1; border-color: var(--line); color: var(--muted); }
+.log-row:hover .log-copy, .log-copy:focus-visible { border-color: var(--line); color: var(--text); }
 .log-copy:hover { color: var(--accent); border-color: var(--accent-dim); }
-.log-copy.copied { opacity: 1; color: var(--ok); border-color: rgba(61, 220, 132, 0.4); }
+.log-copy.copied { color: var(--ok); border-color: rgba(61, 220, 132, 0.4); }
 
-/* 窄屏日志行两行式：时间 / 类型 / 复制占首行，正文独占第二行。
-   只改布局，行高由内容自然撑开，不影响 log_follow 的高度测量与裁剪补偿。 */
+/* 窄屏只收紧间距：3 列结构在任何断点都不变，正文由 .log-body 自己换行。 */
 @media (max-width: 720px) {
-  .log-row {
-    grid-template-columns: auto 1fr auto;
-    grid-template-areas:
-      "time kind copy"
-      "text text text";
-    row-gap: var(--sp-1);
-  }
-  .log-time { grid-area: time; }
-  .log-kind { grid-area: kind; }
-  .log-copy { grid-area: copy; }
-  .log-text { grid-area: text; }
-  /* 双设备时设备名挤进首行类型之后，正文仍独占第二行（不新增第三行）。 */
-  .log.show-dev .log-row {
-    grid-template-columns: auto auto minmax(0, 1fr) auto;
-    grid-template-areas:
-      "time kind dev copy"
-      "text text text text";
-  }
-  .log.show-dev .log-dev { grid-area: dev; }
-  .log-search { flex-basis: 100%; }
+  .log-row { gap: var(--sp-2); }
+  .log-search { flex-basis: 120px; }
 }
 
 /* ---------- help modal ---------- */
@@ -1489,7 +1524,8 @@ input.short { width: 80px; }
 }
 .modal[hidden] { display: none; }
 .modal-card {
-  width: min(760px, 100%);
+  /* WS-587：帮助弹窗改两栏（固定目录 + 内容），760 → 900。其它弹窗各自覆盖。 */
+  width: min(900px, 100%);
   max-height: min(84vh, 760px);
   display: flex;
   flex-direction: column;
@@ -1532,6 +1568,48 @@ input.short { width: 80px; }
   font-size: var(--fs-cap);
   line-height: 1.7;
   color: #c2ccdd;
+}
+
+/* ---------- help modal (WS-587): 目录 + 搜索 + 两栏 ---------- */
+.help-modal { max-height: min(88vh, 860px); }
+.help-head-tools { display: flex; align-items: center; gap: var(--sp-3); }
+.help-search { width: 220px; min-height: var(--ctl-h-sm); }
+/* 两栏：左侧目录 sticky 固定，右侧内容随 .modal-body 整体滚动。 */
+.help-body { padding: 0; }
+.help-layout {
+  display: grid; grid-template-columns: 168px minmax(0, 1fr);
+  gap: var(--sp-4);
+}
+.help-toc {
+  position: sticky; top: 0; align-self: start;
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  padding: var(--sp-4) var(--sp-3);
+  border-right: 1px solid var(--line);
+}
+.help-toc-title {
+  margin: 0 0 var(--sp-2); color: var(--muted);
+  font-size: var(--fs-cap); text-transform: uppercase; letter-spacing: 0.8px;
+}
+.help-toc-link {
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--r-control);
+  color: var(--muted); font-size: var(--fs-sm); line-height: 1.5;
+  text-decoration: none; cursor: pointer;
+}
+.help-toc-link:hover { color: var(--text); background: var(--card-2); }
+.help-toc-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.help-toc-link.active {
+  color: var(--accent); background: rgba(53, 224, 194, 0.08);
+  border-left: 2px solid var(--accent);
+}
+.help-toc-link[hidden] { display: none; }
+.help-content { min-width: 0; padding: var(--sp-4) var(--sp-6) var(--sp-6) 0; }
+.help-section[hidden] { display: none; }
+.help-content h3 { scroll-margin-top: var(--sp-4); }
+@media (max-width: 720px) {
+  .help-layout { grid-template-columns: 140px minmax(0, 1fr); gap: var(--sp-2); }
+  .help-toc { padding: var(--sp-3) var(--sp-2); }
+  .help-content { padding: var(--sp-3) var(--sp-3) var(--sp-4) 0; }
+  .help-search { width: 140px; }
 }
 /* 弹窗打开时 body 已不滚，还要锁住唯一滚动容器 .main。 */
 body.modal-open { overflow: hidden; }
@@ -1774,20 +1852,56 @@ body.modal-open .main { overflow: hidden; }
 
 /* ---------- online update (WS-523) ---------- */
 /* 检查更新弹窗：上位机更新 + 固件更新两块。 */
-.update-modal { width: min(680px, 100%); }
+/* WS-587：两块 + 固定底部 foot 比原来高，留出足够高度，避免最后一个动作
+   按钮在 84vh 时被裁在弹窗下沿（680 窄屏尤其明显）。 */
+.update-modal { width: min(680px, 100%); max-height: min(92vh, 860px); }
 /* WS-578：左右 20px、底部 24px，保证文字与折叠块不贴弹窗边框。 */
 .update-body { padding: var(--sp-4) var(--sp-5) var(--sp-6); }
-.update-block { margin-bottom: var(--sp-5); }
+/* WS-587：两块用 --sp-6 间距 + 1px 分隔线；每块是 flex 列，尾部 .update-foot
+   用 margin-top:auto 固定在块底，状态 / 错误 / 进度切换时按钮不跳动。 */
+.update-block {
+  display: flex; flex-direction: column;
+  min-height: 240px;
+  padding-bottom: var(--sp-6); margin-bottom: var(--sp-6);
+  border-bottom: 1px solid var(--line);
+}
 /* 行内自定义 display（如 .upd-sha-row 的 flex）会盖过 [hidden] 的 UA 样式，
    这里统一兜底，保证「已是最新」时包信息真的收起。 */
 .update-block [hidden] { display: none !important; }
-.update-block:last-child { margin-bottom: 0; }
+.update-block:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: 0; }
 .update-block h3 { margin-top: 0; }
+.update-foot { margin-top: auto; display: flex; flex-direction: column; }
+/* 进度条预留固定槽位：显示 / 隐藏不再把下方文字与按钮往下推。 */
+.upd-progress-slot { min-height: var(--sp-2); }
+.update-block .ota-rows { margin-top: var(--sp-3); }
 .update-state {
   margin: var(--sp-2) 0 var(--sp-1);
   font-size: var(--fs-sm); color: var(--text);
 }
 .update-state.ok { color: var(--ok); }
+/* WS-587：错误文案改带 role="alert" 的行内块，不让一整段空白撑开布局。 */
+.update-error {
+  display: inline-block; align-self: flex-start;
+  margin: 0 0 var(--sp-1);
+}
+/* WS-587：「当前 → 目标」对比行；两个值节点 ID 不变，仍由 renderUpdate* 写入。 */
+.upd-version-line {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line); border-radius: var(--r-control);
+  background: var(--surface-sunken);
+}
+.upd-version-cell {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  flex: 1 1 0; min-width: 0;
+}
+.upd-version-cap { color: var(--muted); font-size: var(--fs-cap); }
+.upd-version-val {
+  min-width: 0; overflow-wrap: anywhere;
+  font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-sm);
+  color: var(--text);
+}
+.upd-version-arrow { flex: none; color: var(--accent); font-size: var(--fs-title); }
 /* WS-577：通道选择器 + 滚动版警告同格显示，警告紧贴选择器下方。 */
 .upd-channel-cell { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-1); }
 /* WS-578：全局 select 是 width:100%，通道下拉会铺满整行、贴住右边框；
@@ -1799,9 +1913,14 @@ body.modal-open .main { overflow: hidden; }
 }
 .upd-rolling-warn[hidden] { display: none; }
 .upd-channel-note { margin: 0 0 var(--sp-2); }
-/* SHA256 行：截断显示 + hover 全文（title）+ 复制按钮。 */
+/* SHA256 行：截断显示 + hover 全文（title）+ 复制按钮（WS-577 行为不变）。
+   WS-587：SHA 用 mono 12px，便于核对字符。 */
 .upd-sha-row { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
-.upd-sha { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help; }
+.upd-sha {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: help;
+  font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-sm);
+}
 .upd-copy { flex: none; }
 .update-checked-at { margin: 0 0 var(--sp-2); }
 .update-checked-at[hidden] { display: none; }
