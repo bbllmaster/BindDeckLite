@@ -708,20 +708,32 @@ textarea:focus-visible {
 }
 
 /* 行尾「测试」：默认藏起来，hover / 键盘 focus / 选中 / 执行中才显形。
-   文本仍是可访问名（读屏与既有断言都读 textContent），视觉只留 11px 图标 ——
-   font-size: 0 是图标按钮的标准写法，不是把内容删掉。 */
+   文本仍是可访问名（读屏与既有断言都读 textContent），视觉只留一个图标：
+   负缩进把文本移出 28px 可视框，图标由绝对定位的 ::before 画在正中。
+   （不写 font-size: 0 —— 字号必须来自 --fs-* 阶梯，tools/test_css_baseline.py 会拦。） */
 .kc-test {
+  position: relative;
   flex: none;
   width: 28px; height: 28px;
   display: inline-grid; place-items: center;
   padding: 0;
   border: 1px solid transparent; border-radius: var(--r-control);
   background: transparent; color: var(--muted);
-  font-size: 0; cursor: pointer;
+  font-size: var(--fs-sm);
+  text-indent: -999px;
+  overflow: hidden;
+  cursor: pointer;
   opacity: 0;
   transition: opacity 0.12s, color 0.12s, border-color 0.12s, background 0.12s;
 }
-.kc-test::before { content: "▶"; font-size: 11px; line-height: 1; }
+.kc-test::before {
+  content: "▶";
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  text-indent: 0;
+  font-size: var(--fs-cap);
+  line-height: 1;
+}
 .kc-test:hover { color: var(--text); border-color: var(--line); background: var(--card-2); }
 .kc-test:focus-visible { opacity: 1; outline: none; box-shadow: var(--focus-ring); }
 .keycard:hover .kc-test,
@@ -730,7 +742,7 @@ textarea:focus-visible {
 /* 执行中（可点即停止）/ 已请求停止：图标换成方块，常驻显示。 */
 .keycard.running .kc-test { opacity: 1; }
 .kc-test.danger { color: var(--danger); border-color: rgba(255, 107, 107, 0.35); }
-.kc-test.danger::before { content: "■"; font-size: 10px; }
+.kc-test.danger::before { content: "■"; }
 /* 仅 HID 的键没有可测试的动作：连 hover 也不出现，避免点出一句假成功。
    （按钮仍在 DOM 里，setCardRunning / 停止态照旧按 .test 定位。） */
 .keycard .kc-test:disabled { opacity: 0; cursor: not-allowed; pointer-events: none; }
