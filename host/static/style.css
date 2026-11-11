@@ -629,48 +629,126 @@ textarea:focus-visible {
 .panel-head p { color: var(--muted); font-size: var(--fs-sm); line-height: 1.6; }
 .hint { color: var(--muted); font-size: var(--fs-cap); border: 1px solid var(--line); padding: var(--sp-1) var(--sp-3); border-radius: var(--r-pill); white-space: nowrap; }
 
-/* ---------- key grid ---------- */
+/* ---------- keys：键位列表 + 常驻检查器（WS-585） ----------
+   同一份 DOM 两种形态：
+     ≥1280px  键位行（编号 | 键名 | HID 胶囊 | 动作摘要 | 状态点 + 行尾测试 icon），
+     <1280px  2 列卡，检查器收成右侧浮层抽屉。
+   行形态的单行高 44px：10 行 440px，加列头约 480px —— 1440px 下能把
+   10 个输入和检查器同时放进一屏。 */
+.key-list { min-width: 0; }
 .key-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--sp-3);
 }
+/* 列头只在行形态下出现：卡片形态每张卡自带标题，列头没有意义。 */
+.key-head { display: none; }
 
 .keycard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--sp-2);
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: var(--sp-3);
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 .keycard.encoder-push { border-style: dashed; }
 /* 12 键布局下第 11、12 个输入是「扩展」按键（原编码器 A/B 相）。 */
 .keycard.extended .kc-title { color: var(--accent); }
 .keycard.extended .kc-num { opacity: 0.8; }
-.keycard.press {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), 0 10px 30px rgba(53, 224, 194, 0.18);
-  transform: translateY(-1px);
-}
 
-.kc-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-1); }
+/* 整行 / 整卡就是编辑入口：一个按钮，Tab 一拍即到，读屏读到
+   「1 按键 1 F13 仅 HID」这样的完整描述（不靠 title 兜底）。 */
+.kc-main {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 8px;
+  grid-template-areas:
+    "num title dot"
+    "hid hid hid"
+    "act act act";
+  align-items: center;
+  gap: var(--sp-1) var(--sp-2);
+  width: 100%; min-width: 0;
+  padding: 0;
+  border: 0; background: none; color: inherit;
+  font: inherit; text-align: left;
+  border-radius: var(--r-control);
+  cursor: pointer;
+}
+.kc-main:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
 .kc-num {
+  grid-area: num;
   width: 24px; height: 24px; border-radius: var(--r-control);
   display: grid; place-items: center;
   background: #0e1420; border: 1px solid var(--line);
   font-size: var(--fs-cap); color: var(--accent); font-weight: 700;
 }
-.kc-title { font-size: var(--fs-sm); font-weight: 600; flex: 1; }
-.kc-live { width: 6px; height: 6px; border-radius: 50%; background: #2a3245; }
+.kc-title { grid-area: title; font-size: var(--fs-sm); font-weight: 600; min-width: 0; }
+.kc-live { grid-area: dot; width: 8px; height: 8px; border-radius: 50%; background: #2a3245; }
+/* HID 键码是这一行的主信息：用 <kbd> 胶囊包起来，等宽字便于逐字核对。 */
+.kc-hid {
+  grid-area: hid;
+  justify-self: start;
+  max-width: 100%;
+  padding: 1px var(--sp-2);
+  border: 1px solid var(--line); border-radius: var(--r-control);
+  background: #0e1420; color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--fs-sm); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kc-act {
+  grid-area: act;
+  color: var(--muted); font-size: var(--fs-sm);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 行尾「测试」：默认藏起来，hover / 键盘 focus / 选中 / 执行中才显形。
+   文本仍是可访问名（读屏与既有断言都读 textContent），视觉只留 11px 图标 ——
+   font-size: 0 是图标按钮的标准写法，不是把内容删掉。 */
+.kc-test {
+  flex: none;
+  width: 28px; height: 28px;
+  display: inline-grid; place-items: center;
+  padding: 0;
+  border: 1px solid transparent; border-radius: var(--r-control);
+  background: transparent; color: var(--muted);
+  font-size: 0; cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s, border-color 0.12s, background 0.12s;
+}
+.kc-test::before { content: "▶"; font-size: 11px; line-height: 1; }
+.kc-test:hover { color: var(--text); border-color: var(--line); background: var(--card-2); }
+.kc-test:focus-visible { opacity: 1; outline: none; box-shadow: var(--focus-ring); }
+.keycard:hover .kc-test,
+.keycard:focus-within .kc-test,
+.keycard.selected .kc-test { opacity: 1; }
+/* 执行中（可点即停止）/ 已请求停止：图标换成方块，常驻显示。 */
+.keycard.running .kc-test { opacity: 1; }
+.kc-test.danger { color: var(--danger); border-color: rgba(255, 107, 107, 0.35); }
+.kc-test.danger::before { content: "■"; font-size: 10px; }
+/* 仅 HID 的键没有可测试的动作：连 hover 也不出现，避免点出一句假成功。
+   （按钮仍在 DOM 里，setCardRunning / 停止态照旧按 .test 定位。） */
+.keycard .kc-test:disabled { opacity: 0; cursor: not-allowed; pointer-events: none; }
+
+.keycard.press {
+  border-color: var(--accent);
+  background: rgba(53, 224, 194, 0.08);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .keycard.press .kc-live { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+/* 检查器里正在编辑的那一行：左侧常驻色条，列表与检查器一眼对得上。 */
+.keycard.selected { box-shadow: inset 3px 0 0 var(--accent); }
 
 /* 上位机动作执行中。只动颜色 / 阴影 / 透明度，不产生布局位移。 */
 .keycard.running {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent-dim), 0 10px 30px rgba(53, 224, 194, 0.12);
+  box-shadow: inset 3px 0 0 var(--accent-dim);
 }
 .keycard.running .kc-live {
   background: var(--accent);
@@ -688,52 +766,87 @@ textarea:focus-visible {
     box-shadow: 0 0 8px var(--accent);
   }
 }
-.keycard .test:disabled { opacity: 0.55; cursor: not-allowed; }
-.keycard.running .test:disabled { opacity: 0.7; cursor: progress; }
 
-/* ---------- keys：摘要卡 ---------- */
-.kc-sum { display: flex; flex-direction: column; gap: var(--sp-1); flex: 1; min-width: 0; }
-.kc-line { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
-.kc-tag {
-  flex: none; width: 30px; font-size: var(--fs-cap);
-  letter-spacing: 0.6px; color: var(--muted);
-}
-.kc-hid, .kc-act {
-  font-size: var(--fs-sm); font-weight: 600; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.kc-hid { color: var(--text); }
-.kc-act { color: var(--muted); }
-.kc-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-1); }
-.kc-actions .btn { flex: 1; }
-
-/* ---------- keys：编辑抽屉 ---------- */
+/* ---------- keys：检查器 / 窄屏抽屉 ---------- */
 .keys-layout { display: block; }
 .key-drawer {
   display: flex; flex-direction: column; gap: var(--sp-3);
   background: var(--card); border: 1px solid var(--line);
   border-radius: var(--radius); padding: var(--sp-4);
+  min-width: 0;
 }
+/* 状态行进检查器：它只影响动作编辑，不影响 HID 键码，所以不再占页面顶部。 */
+.key-drawer .status-line { margin-bottom: 0; }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
-.drawer-head h3 { font-size: var(--fs-title); }
-.drawer-body { display: flex; flex-direction: column; gap: var(--sp-3); }
+.drawer-head h3 { font-size: var(--fs-title); min-width: 0; overflow-wrap: anywhere; }
+.drawer-body { display: flex; flex-direction: column; gap: var(--sp-3); min-height: 0; }
 .drawer-backdrop { position: fixed; inset: 0; z-index: var(--z-drawer-backdrop); background: rgba(4, 8, 15, 0.62); }
 .drawer-backdrop[hidden] { display: none; }
 
-@media (min-width: 1100px) {
+/* ≥1280：列表 + 常驻检查器同屏。断点选 1280 是因为再窄 380px 检查器
+   会把键名列压到读不全；1280 以下改用卡片 + 抽屉，信息密度让位给可读性。 */
+@media (min-width: 1280px) {
   .keys-layout {
-    display: grid; grid-template-columns: minmax(0, 1fr) 400px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 380px;
     gap: var(--sp-4); align-items: start;
   }
-  /* 抽屉已在 .main 内部，sticky 偏移基于主内容滚动区，不再叠加顶栏高度。 */
+  /* 列头与行共用同一套列宽：行的 fr 分配只取决于行宽，所有行等宽即自然对齐。 */
+  .key-head {
+    display: grid;
+    grid-template-columns: 28px 168px minmax(0, 1.25fr) minmax(0, 1fr) 8px;
+    gap: var(--sp-2);
+    /* 右侧让出行尾 28px 图标与 8px 间距，列宽才能和行严格对齐。 */
+    padding: 0 calc(var(--sp-2) * 2 + 28px) 0 var(--sp-3);
+    margin-bottom: var(--sp-2);
+    color: var(--muted); font-size: var(--fs-cap);
+    letter-spacing: 0.6px; text-transform: uppercase;
+  }
+  .key-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .keycard {
+    min-height: 44px;
+    align-items: center;
+    padding: 0 var(--sp-2) 0 var(--sp-3);
+    border: 0;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .keycard:last-child { border-bottom: 0; }
+  .keycard:hover { background: rgba(26, 32, 48, 0.55); }
+  /* 行形态下位移高亮会破坏 44px 行高，只用左侧色条 + 底色。 */
+  .keycard.press { background: rgba(53, 224, 194, 0.08); box-shadow: inset 3px 0 0 var(--accent); }
+  .keycard.selected { background: var(--card-2); box-shadow: inset 3px 0 0 var(--accent); }
+  .keycard.running { background: rgba(53, 224, 194, 0.04); box-shadow: inset 3px 0 0 var(--accent-dim); }
+  .kc-main {
+    grid-template-columns: 28px 168px minmax(0, 1.25fr) minmax(0, 1fr) 8px;
+    grid-template-areas: "num title hid act dot";
+    gap: var(--sp-2);
+  }
+  .kc-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 检查器吸顶，只有表单本体滚动；「测试动作 / 停止」钉在底部，始终可点。 */
   .key-drawer {
     position: sticky; top: var(--sp-3);
     max-height: calc(100vh - var(--topbar-h) - var(--sp-6));
-    overflow-y: auto;
+  }
+  .key-drawer .drawer-body { overflow-y: auto; padding-right: var(--sp-1); }
+  .kd-test-row {
+    position: sticky; bottom: 0;
+    padding: var(--sp-2) 0;
+    background: var(--card);
+    border-top: 1px solid var(--line);
   }
   #keyDrawerBackdrop { display: none !important; }
 }
-@media (max-width: 1099px) {
+@media (max-width: 1279px) {
   .key-drawer {
     display: none; position: fixed; top: 0; right: 0; bottom: 0;
     width: min(420px, 100vw); z-index: var(--z-drawer); border: none;
@@ -746,6 +859,10 @@ textarea:focus-visible {
   body.drawer-open { overflow: hidden; }
   body.drawer-open .main,
   body.drawer-open .sidebar { overflow: hidden; }
+}
+/* 2 列卡在 680px 仍成立（单卡约 300px）；再窄就单列，避免键名与动作被压爆。 */
+@media (max-width: 640px) {
+  .key-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 .kd-field { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -1626,7 +1743,6 @@ body.modal-open .main { overflow: hidden; }
 .lang-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .btn { max-width: 100%; white-space: normal; text-align: center; }
 .tab { white-space: normal; }
-.kc-tag { width: auto; min-width: 30px; white-space: nowrap; }
 .ms-type { width: auto; min-width: 132px; }
 .hint { white-space: normal; }
 .panel-head { flex-wrap: wrap; }

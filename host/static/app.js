@@ -1157,20 +1157,19 @@ function renderKeys() {
     const extended = is12Key() && i >= 9;
     card.className = "keycard" + (i === 9 ? " encoder-push" : "") + (extended ? " extended" : "");
     card.dataset.idx = i;
+    // WS-585：一行一个输入（编号 | 键名 | HID 胶囊 | 动作摘要 | 状态点），
+    // 整行是一个按钮 —— 编辑入口不再是一颗常驻的「编辑」按钮。
+    // 「测试」降为行尾 icon（CSS 默认透明，hover / 键盘 focus 显形），
+    // 类名仍是 .test：setCardRunning / 停止态与既有回归用例都按它定位。
     card.innerHTML = `
-      <div class="kc-head">
+      <button type="button" class="kc-main edit">
         <span class="kc-num">${i === 9 && !is12Key() ? "⏻" : i + 1}</span>
         <span class="kc-title">${inputTitle(i)}</span>
-        <span class="kc-live"></span>
-      </div>
-      <div class="kc-sum">
-        <div class="kc-line"><span class="kc-tag">HID</span><b class="kc-hid"></b></div>
-        <div class="kc-line"><span class="kc-tag">${t("ui.card_action_tag")}</span><b class="kc-act"></b></div>
-      </div>
-      <div class="kc-actions">
-        <button type="button" class="btn sm edit">${t("ui.card_edit")}</button>
-        <button type="button" class="btn sm test">${t("ui.card_test")}</button>
-      </div>`;
+        <kbd class="kc-hid"></kbd>
+        <span class="kc-act"></span>
+        <span class="kc-live" aria-hidden="true"></span>
+      </button>
+      <button type="button" class="kc-test test">${t("ui.card_test")}</button>`;
     grid.appendChild(card);
 
     // 摘要文本、测试按钮的可用态都由 keys.js 统一刷新。
@@ -1182,6 +1181,7 @@ function renderKeys() {
   if (state.editingKey !== null && state.editingKey >= total && typeof closeKeyDrawer === "function") {
     closeKeyDrawer(false);
   }
+  if (typeof syncKeySelection === "function") syncKeySelection();
   applyRunningState();
 }
 
@@ -3330,6 +3330,9 @@ function retranslateDynamic() {
   renderReadStatus();
   // WS-561/WS-584：顶栏三态徽标与 popover 的文案都是 JS 拼的，切语言要重算。
   updatePendingUi();
+  // WS-585：检查器是常驻的，它的标题 / 空态提示 / 字段标签都由 keys.js 拼，
+  // 不重绘就会停在切换前的语言上（列表已翻译、检查器还是旧语言）。
+  if (typeof renderKeyDrawer === "function") renderKeyDrawer();
   retranslateLog();
   syncLogFollowUi();
   renderOta();
