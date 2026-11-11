@@ -26,8 +26,35 @@
           <div class="status-sub" id="statusSub">BLE</div>
         </div>
       </div>
-      <span class="last-apply" id="lastApplyInfo" hidden></span>
-      <button class="pending-badge" id="pendingBadge" type="button" hidden></button>
+      <!-- WS-584：配置状态只有一个出口。三态徽标（已同步 / 有未下发修改 /
+           配置来源未确认）点击展开 popover，细节都在里面；不再有 last-apply
+           胶囊、pendingBadge 与顶部 untrusted 横幅。 -->
+      <div class="cfg-status-wrap">
+        <button class="cfg-status" id="cfgStatus" type="button" data-state="synced"
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="cfgPopover" hidden>
+          <span class="cfg-status-icon" aria-hidden="true"></span>
+          <span class="cfg-status-text" id="cfgStatusText" data-i18n="ui.cfg_state_synced">已同步</span>
+        </button>
+        <div class="cfg-popover" id="cfgPopover" role="dialog" tabindex="-1"
+             aria-labelledby="cfgStatusTitle" hidden>
+          <div class="cfg-popover-head">
+            <p class="cfg-popover-title" id="cfgStatusTitle" data-i18n="ui.cfg_status_title">配置状态</p>
+            <button class="cfg-popover-close" id="cfgPopoverClose" type="button"
+                    aria-label="关闭" data-i18n-aria-label="ui.cfg_close">×</button>
+          </div>
+          <p class="cfg-popover-msg" id="cfgStatusMsg"></p>
+          <p class="cfg-popover-sub" id="cfgStatusSub" hidden></p>
+          <p class="cfg-popover-extra" id="cfgStatusExtra" hidden></p>
+          <div class="cfg-popover-block" id="cfgPendingBlock" hidden>
+            <p class="cfg-popover-label" id="cfgPendingLabel"></p>
+            <ul class="cfg-pending-list" id="cfgPendingList"></ul>
+          </div>
+          <p class="cfg-popover-last" id="cfgLastApplyText"></p>
+          <div class="cfg-popover-actions" id="cfgUntrustedActions" hidden>
+            <button class="btn primary sm" id="btnUntrustedRead" data-i18n="ui.read_from_device">从设备读取</button>
+          </div>
+        </div>
+      </div>
       <button class="btn ghost" id="btnHelp" title="宏语法、键名对照与常见错误" data-i18n-title="ui.help_title" data-i18n="ui.help">帮助</button>
       <!-- WS-523: 在线更新入口。有新版本时按钮带红点。 -->
       <button class="btn ghost update-btn" id="btnUpdate" title="检查上位机与固件更新" data-i18n-title="ui.check_updates">
@@ -59,19 +86,8 @@
       <button class="tab" id="tabbtn-log" data-tab="log" role="tab" aria-selected="false" aria-controls="tab-log" tabindex="-1" data-i18n="ui.tab_log">日志</button>
     </nav>
 
-    <!-- WS-512: 本机没有这台设备的存档时，先声明「显示的是默认值」。
-         静态文档流，位于页签下方、面板上方，切页签不消失。 -->
-    <div class="untrusted-banner" id="untrustedBanner" role="status" aria-live="polite" hidden>
-      <div class="untrusted-copy">
-        <p class="untrusted-title"><span data-i18n="ui.untrusted_title">本机没有这台设备的配置存档 · 现在显示的是默认值</span><span id="untrustedLayoutNote"></span></p>
-        <p class="untrusted-sub" data-i18n="ui.untrusted_sub">引脚 / 键码 / 编码器模式 / 休眠以本机默认值显示，直接下发会覆盖设备当前配置。</p>
-        <p class="untrusted-extra" id="untrustedExtra" hidden></p>
-      </div>
-      <div class="untrusted-actions">
-        <button class="btn primary sm" id="btnUntrustedRead" data-i18n="ui.read_from_device">从设备读取</button>
-        <button class="btn ghost sm" id="btnUntrustedIgnore" data-i18n="ui.ignore_for_now">先忽略</button>
-      </div>
-    </div>
+    <!-- WS-584: 「本机没有这台设备的存档」不再占一条横幅，改为顶栏三态徽标
+         的 untrusted 态 + popover 内的说明与「从设备读取」。 -->
 
     <!-- ================= KEYS ================= -->
     <section class="panel active" id="tab-keys" role="tabpanel" aria-labelledby="tabbtn-keys">
@@ -656,6 +672,7 @@ key:enter</pre>
 <script src="/static/log_follow.js"></script>
 <script src="/static/log_device.js"></script>
 <script src="/static/reconnect_sync.js"></script>
+<script src="/static/cfg_status.js"></script>
 <script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
 </body>

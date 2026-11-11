@@ -203,40 +203,197 @@ code { background: #0d1119; border: 1px solid var(--line); padding: 1px var(--sp
 .status-main { font-size: var(--fs-body); font-weight: 600; }
 .status-sub { font-size: var(--fs-cap); color: var(--muted); margin-top: var(--sp-1); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 顶栏常驻的上次下发结论；失败时变成可点击的入口。 */
-.last-apply {
-  max-width: 230px; padding: var(--sp-1) var(--sp-3);
-  border: 1px solid var(--state-ok-bd); border-radius: var(--r-pill);
-  background: var(--state-ok-bg); color: var(--state-ok-fg);
-  font-size: var(--fs-cap); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.last-apply[hidden] { display: none; }
-.last-apply.bad {
-  border-color: var(--state-danger-bd); background: var(--state-danger-bg);
-  color: var(--danger); cursor: pointer;
-}
-.last-apply.bad:hover { filter: brightness(1.1); }
+/* ---------- 配置状态（WS-584） ----------
+   顶栏唯一的「配置是否与设备同步」出口：三态徽标 + 点击展开的 popover。
+   重构前这里是 last-apply 胶囊与 pending-badge 两个元素，外加页面顶部一条
+   untrusted 横幅，同一个事实三处判断；现在状态只有一个来源（cfg_status.js）。
 
-/* 脏标记：可读的「待下发 N 项」，点击跳到第一处改动。 */
-.pending-badge {
-  padding: var(--sp-2) var(--sp-3); border: 1px solid var(--state-warn-bd); border-radius: var(--r-pill);
-  background: var(--state-warn-bg); color: var(--state-warn-fg);
-  font-family: inherit; font-size: var(--fs-sm); font-weight: 600; cursor: pointer;
+   三态不只靠颜色区分：已同步 = 勾 + 灰字；待下发 = ↑ + 琥珀；未确认 = ?
+   + 靛蓝。图标和文案都变，色觉障碍与灰度截图下同样可读。 */
+.cfg-status-wrap { display: flex; align-items: center; }
+
+.cfg-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  max-width: 260px;
+  min-height: var(--ctl-h-sm);
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--card-2);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
   transition: 0.15s;
 }
-.pending-badge:hover { border-color: var(--warn); filter: brightness(1.1); }
-.pending-badge:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-.pending-badge[hidden] { display: none; }
-/* WS-561：设备重连后本机还有未下发的修改。只加 6px 琥珀点，不新增元素、
-   不改内边距与行高，顶栏高度与按钮位置保持原样。 */
-.pending-badge.reconnect-dirty::before {
+.cfg-status[hidden] { display: none; }
+.cfg-status:hover { filter: brightness(1.1); }
+.cfg-status:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cfg-status-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-size: var(--fs-cap);
+  font-weight: 700;
+  line-height: 1;
+}
+.cfg-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 已同步：退化成顶栏里一行安静的文字，不占按钮位。 */
+.cfg-status[data-state="synced"] {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 500;
+}
+.cfg-status[data-state="synced"] .cfg-status-icon {
+  border: 1px solid var(--state-ok-bd);
+  background: var(--state-ok-bg);
+  color: var(--state-ok-fg);
+}
+.cfg-status[data-state="synced"] .cfg-status-icon::before { content: "✓"; }
+
+/* 有未下发修改：与「应用配置」的 dirty 语义同一套琥珀色。 */
+.cfg-status[data-state="pending"] {
+  border-color: var(--state-warn-bd);
+  background: var(--state-warn-bg);
+  color: var(--state-warn-fg);
+}
+.cfg-status[data-state="pending"] .cfg-status-icon {
+  border: 1px solid var(--state-warn-bd);
+  color: var(--state-warn-fg);
+}
+.cfg-status[data-state="pending"] .cfg-status-icon::before { content: "↑"; }
+
+/* 配置来源未确认：靛蓝 + 问号。它压过 pending —— 连设备现状都不确定。 */
+.cfg-status[data-state="untrusted"] {
+  border-color: var(--state-info-bd);
+  background: var(--state-info-bg);
+  color: var(--state-info-fg);
+}
+.cfg-status[data-state="untrusted"] .cfg-status-icon {
+  border: 1px solid var(--state-info-bd);
+  color: var(--state-info-fg);
+}
+.cfg-status[data-state="untrusted"] .cfg-status-icon::before { content: "?"; }
+
+/* WS-561：设备重连后本机还有未下发的修改。只加一个 6px 点，不改行高。 */
+.cfg-status.reconnect-dirty .cfg-status-text::before {
   content: "";
   display: inline-block;
-  width: 6px; height: 6px;
+  width: 6px;
+  height: 6px;
   margin-right: var(--sp-2);
   border-radius: 50%;
-  background: var(--warn);
+  background: var(--state-warn-fg);
   vertical-align: middle;
+}
+
+/* popover 定位在顶栏下沿：.topbar 是 position: sticky，本身就是包含块，
+   因此窄屏换行、按钮换位都不会把浮层推出视口。 */
+.cfg-popover {
+  position: absolute;
+  top: 100%;
+  right: var(--sp-6);
+  z-index: var(--z-popover);
+  width: min(360px, calc(100vw - 32px));
+  margin-top: var(--sp-2);
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  animation: fade 0.15s ease;
+}
+.cfg-popover[hidden] { display: none; }
+/* 打开时焦点落在浮层本身（tabindex="-1"），键盘用户 Tab 一下就到关闭按钮。
+   默认 UA 焦点框是白线，和深色主题不搭，这里换成统一的 accent 环。 */
+.cfg-popover:focus { outline: none; }
+.cfg-popover:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.cfg-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.cfg-popover-title { font-size: var(--fs-body); font-weight: 600; color: var(--text); }
+.cfg-popover-close {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-title);
+  line-height: 1;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.cfg-popover-close:hover { color: var(--text); border-color: var(--line); background: var(--card-2); }
+.cfg-popover-close:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cfg-popover-msg { margin-top: var(--sp-2); color: var(--text); }
+.cfg-popover-sub { margin-top: var(--sp-1); color: var(--muted); }
+.cfg-popover-extra { margin-top: var(--sp-1); color: var(--state-warn-fg); }
+.cfg-popover [hidden] { display: none; }
+.cfg-popover-block {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+.cfg-popover-label { color: var(--muted); font-size: var(--fs-cap); }
+.cfg-pending-list {
+  list-style: none;
+  margin: var(--sp-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+/* 每一项就是跳到对应改动处的入口，所以是可聚焦的按钮而不是纯文本。 */
+.cfg-pending-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-control);
+  background: var(--card-2);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.cfg-pending-item::after { content: "›"; color: var(--muted); }
+.cfg-pending-item:hover { border-color: var(--state-warn-bd); }
+.cfg-pending-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cfg-popover-last {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--fs-cap);
+}
+.cfg-popover-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
 }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; background: #3a4356; display: inline-block; flex: none; }
@@ -433,7 +590,6 @@ textarea:focus-visible {
   /* 不再限宽：铺满设备栏右侧的可用宽度，滚动条随内容列贴到可见区域右边缘。 */
 }
 .main > .tabs,
-.main > .untrusted-banner,
 .main > .panel { flex: none; }
 
 /* ---------- tabs ---------- */
@@ -725,38 +881,16 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   line-height: 1.7;
 }
 
-/* ---------- 无存档提示条（WS-512） ----------
-   琥珀色描边/浅底，和灰色说明、蓝色 .note 明确区分；静态流，不 fixed，
-   因此不会遮住页签，也不会随页签切换消失。窄屏按钮整行换行。 */
-.untrusted-banner {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--sp-3);
-  margin: 0 0 var(--sp-4);
-  padding: var(--sp-3) var(--sp-4);
-  border: 1px solid var(--state-warn-bd);
-  border-left: 3px solid var(--warn);
-  border-radius: var(--r-card);
-  background: var(--state-warn-bg);
-  font-size: var(--fs-sm);
-  line-height: 1.7;
-}
-.untrusted-banner[hidden] { display: none; }
-.untrusted-copy { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
-.untrusted-title { font-weight: 600; color: var(--state-warn-fg); }
-.untrusted-sub { margin-top: var(--sp-1); color: var(--text); opacity: 0.85; }
-.untrusted-extra { margin-top: var(--sp-1); color: var(--state-warn-fg); }
-.untrusted-extra[hidden] { display: none; }
-.untrusted-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+/* ---------- 无存档提示（WS-512 → WS-584 收敛到顶栏） ----------
+   「本机没有这台设备的存档」不再占一条横幅，状态与「从设备读取」都在顶栏
+   .cfg-status 的 untrusted 态 + .cfg-popover 里。这里只留下与它同断点的
+   通用窄屏规则。 */
 @media (max-width: 520px) {
-  .untrusted-actions { width: 100%; }
-  .untrusted-actions .btn { flex: 1 1 120px; }
   /* 窄屏下标题与右侧胶囊改为上下排列：.hint 默认 nowrap，遇到「共 12 个输入 ·
      12 键布局 …」这类长文案会把整页撑出横向滚动条，提示条就跟着被推到屏外。 */
   .panel-head { flex-wrap: wrap; }
   .panel-head .hint { white-space: normal; }
+  .cfg-popover-actions .btn { flex: 1 1 120px; }
 }
 
 /* ---------- encoder rotation actions ---------- */
@@ -1410,6 +1544,8 @@ body.modal-open .main { overflow: hidden; }
   /* 窄屏（含 390 px 验收）下右侧状态/按钮换行，整页不出现横向滚动。 */
   .topbar-inner { padding-inline: var(--sp-4); }
   .topbar-right { flex-wrap: wrap; justify-content: flex-end; row-gap: var(--sp-2); }
+  /* 顶栏此时用 16px 内边距，浮层跟着对齐，仍在视口内。 */
+  .cfg-popover { right: var(--sp-4); }
   .main { padding: var(--sp-4); }
 }
 

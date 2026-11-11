@@ -107,9 +107,6 @@ const state = {
   scan: null,          // 最近一次扫描的结论，来源 /api/status
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段
-  // WS-512：本机没有存档（cfg.trusted === false）时，用户点了「先忽略」的设备。
-  // 只作用于本次会话，不写 config、不清 trusted、不影响下发确认。
-  untrustedIgnored: {},
   // WS-512：本次会话里成功从设备读取过的设备。下发确认用它避免重复骚扰；
   // 它不同于 trusted（trusted 会落盘，会话读取只活在内存）。
   sessionRead: {},
@@ -249,25 +246,14 @@ function updatePendingUi() {
     delete state.reconnectDirty[state.selected];
     renderReadStatus();
   }
-  const notice = reconnectNotice(state.selected);
-  const badge = $("#pendingBadge");
-  if (badge) {
-    badge.hidden = !items.length;
-    badge.textContent = items.length ? t("ui.pending_items", { count: items.length }) : "";
-    // 琥珀点只是 class，不改顶栏布局；title 换成重连提示时仍可点击跳转。
-    badge.classList.toggle("reconnect-dirty", !!notice && !!items.length);
-    badge.title = items.length
-      ? (notice ? t("ui.reconnect_pending_title", { count: items.length })
-                : t("ui.pending_jump", { label: items[0].label }))
-      : "";
-  }
   const apply = $("#btnApply");
   if (apply) {
     apply.textContent = t("ui.apply_config");
     apply.classList.toggle("dirty", !!items.length);
   }
   state.dirty = !!items.length;
-  renderLastApply();
+  // 顶栏徽标与 popover 都只渲染这一份结论（WS-584）。
+  renderCfgStatus();
 }
 
 /* ---------------- WS-561 重连自动对账 ----------------
@@ -485,27 +471,231 @@ function addLocalLog(kind, code, params, devId, level = "info") {
   if (state.logFollow) stickLogToBottom(list);
 }
 
-function renderLastApply() {
-  const el = $("#lastApplyInfo");
-  if (!el) return;
-  const b = state.selected ? state.buckets.get(state.selected) : null;
-  const la = b && b.lastApply;
-  if (!la) {
-    el.hidden = true;
-    el.textContent = "";
-    el.title = "";
-    el.onclick = null;
-    el.classList.remove("bad");
+/** popover 内容的最后一次渲染签名：轮询每秒调用 renderCfgStatus，内容没变
+ * 就不重建 DOM，避免把用户正在聚焦的按钮焦点一起换掉。 */
+let cfgPopoverSig = "";
+
+function renderCfgStatus() {
+  const btn = $("#cfgStatus");
+  if (!btn) return;
+  const view = cfgStatusView();
+  const label = window.CfgStatus.describe(view, (at) => fmtClock(at));
+
+  btn.hidden = view.state === window.CfgStatus.STATES.NONE;
+  if (btn.hidden) {
+    closeCfgPopover(false);
     return;
   }
-  el.hidden = false;
-  el.textContent = t("ui.last_apply_line", {
-    time: fmtClock(la.at),
-    result: la.failed ? t("ui.items_failed", { count: la.failed }) : t("ui.all_applied_short"),
+  btn.dataset.state = view.state;
+  // WS-561：设备重连后本机还有未下发的修改 —— 只加一个 class（琥珀点），
+  // 提示语义仍在 reconnectDirty 里，不在这里重新判断。
+  const reconnect = view.reconnect && view.state === window.CfgStatus.STATES.PENDING;
+  btn.classList.toggle("reconnect-dirty", reconnect);
+  // 重连提示的 title 沿用 WS-561 的原文（重连对账的回归用例断言的就是这条）；
+  // 其余状态统一提示「点开看详情」，不再让用户猜这个徽标能不能点。
+  btn.title = reconnect
+    ? t("ui.reconnect_pending_title", { count: view.pendingCount })
+    : t("ui.cfg_status_open");
+
+  const text = $("#cfgStatusText");
+  if (text) {
+    text.textContent = t(label.key, label.params);
+    // 后续 i18n.apply()（例如切语言前的一次全量重绘）按同一个 key 取词，
+    // 不会因为 data-i18n 还停在「已同步」而闪回旧文案。
+    if (label.key) text.setAttribute("data-i18n", label.key);
+  }
+  renderCfgPopover(view);
+}
+
+/* ---------------- 顶栏配置状态 popover（WS-584） ----------------
+ *
+ * 状态本身由 cfg_status.js 判定（纯函数，Node 测试直接 import）；这里只负责
+ * 把同一份结论摊开：上次下发结论、待下发字段、untrusted 的原因与「从设备
+ * 读取」。popover 关着时不重建内容 —— 轮询每 1.2 秒会调 renderCfgStatus，
+ * 打开状态下无谓的 innerHTML 重建会把用户正在聚焦的按钮焦点弄丢。
+ */
+
+function cfgStatusView() {
+  const b = state.selected ? bucketFor(state.selected) : null;
+  return window.CfgStatus.derive({
+    selected: state.selected,
+    preview: state.preview,
+    trusted: (state.cfg || {}).trusted,
+    pendingCount: collectPending().length,
+    reconnect: !!reconnectNotice(state.selected),
+    lastApply: (b && b.lastApply) || null,
   });
-  el.classList.toggle("bad", !!la.failed);
-  el.title = la.failed ? t("ui.view_pending_items") : t("ui.all_applied");
-  el.onclick = la.failed && b.lastResult ? () => renderApplyResults(b.lastResult) : null;
+}
+
+/** popover 内容的可比较快照：内容和上次一样就不动 DOM。 */
+function cfgPopoverData(view) {
+  const devId = state.selected;
+  const cfg = state.cfg || {};
+  const items = view.pendingCount > 0 ? collectPending() : [];
+  const la = view.lastApply;
+  const st = devId ? state.readStatus[devId] : null;
+  const missing = st && st.at ? READ_FIELDS.filter((k) => !(st.fields || {})[k]) : [];
+  const partiallyRead = missing.length > 0 && missing.length < READ_FIELDS.length;
+
+  let msg = "";
+  let sub = "";
+  let extra = "";
+  if (view.state === window.CfgStatus.STATES.UNTRUSTED) {
+    // 原文案逐句保留：缺存档的后果、缺哪几组、布局是不是刚读过。
+    msg = t("ui.untrusted_title");
+    sub = t("ui.untrusted_sub");
+    const bits = [];
+    if (cfg.layout_supported === true) bits.push(t("ui.layout_read_note"));
+    if (partiallyRead) {
+      bits.push(t("ui.read_incomplete") +
+        missing.map((k) => READ_FIELD_LABELS[k]()).join(t("ui.list_comma")));
+    }
+    extra = bits.join(" ");
+  } else if (view.state === window.CfgStatus.STATES.PENDING) {
+    msg = t("ui.cfg_pending_msg");
+    sub = view.reconnect
+      ? t("ui.reconnect_pending_note", { count: view.pendingCount })
+      : "";
+  } else {
+    msg = t("ui.cfg_synced_msg");
+  }
+
+  const connected = !!state.selectedConnected;
+  const locked = otaBusy();
+  return {
+    state: view.state,
+    msg,
+    sub,
+    extra,
+    items: items.map((i) => ({ field: i.field, label: i.label, tab: i.tab, index: i.index })),
+    last: la
+      ? t("ui.last_apply_line", {
+          time: fmtClock(la.at),
+          result: la.failed
+            ? t("ui.items_failed", { count: la.failed })
+            : t("ui.all_applied_short"),
+        })
+      : t("ui.cfg_never_applied"),
+    showRead: view.state === window.CfgStatus.STATES.UNTRUSTED,
+    readDisabled: !connected || locked,
+    readTitle: !connected ? t("ui.read_offline")
+      : locked ? t("ui.read_locked_ota")
+        : t("ui.read_btn_title"),
+  };
+}
+
+function renderCfgPopover(view) {
+  const pop = $("#cfgPopover");
+  if (!pop || pop.hidden) return;
+  const d = cfgPopoverData(view);
+  const sig = JSON.stringify(d);
+  if (sig === cfgPopoverSig) return;
+  cfgPopoverSig = sig;
+
+  const msgEl = $("#cfgStatusMsg");
+  if (!msgEl) return;
+  msgEl.textContent = d.msg;
+  const subEl = $("#cfgStatusSub");
+  if (subEl) { subEl.hidden = !d.sub; subEl.textContent = d.sub; }
+  const extraEl = $("#cfgStatusExtra");
+  if (extraEl) { extraEl.hidden = !d.extra; extraEl.textContent = d.extra; }
+  const lastEl = $("#cfgLastApplyText");
+  if (lastEl) lastEl.textContent = d.last;
+
+  const block = $("#cfgPendingBlock");
+  if (block) block.hidden = !d.items.length;
+  if (d.items.length) {
+    const labelEl = $("#cfgPendingLabel");
+    if (labelEl) labelEl.textContent = t("ui.cfg_pending_label");
+    const list = $("#cfgPendingList");
+    if (list) {
+      list.innerHTML = "";
+      d.items.forEach((item) => {
+        const li = document.createElement("li");
+        const jump = document.createElement("button");
+        jump.type = "button";
+        jump.className = "cfg-pending-item";
+        jump.textContent = item.label;
+        jump.title = t("ui.cfg_pending_jump");
+        jump.onclick = () => {
+          closeCfgPopover(false);
+          focusPendingItem(item);
+        };
+        li.appendChild(jump);
+        list.appendChild(li);
+      });
+    }
+  }
+
+  const actions = $("#cfgUntrustedActions");
+  if (actions) actions.hidden = !d.showRead;
+  const read = $("#btnUntrustedRead");
+  if (read) {
+    read.disabled = d.readDisabled;
+    read.title = d.readTitle;
+  }
+}
+
+function openCfgPopover() {
+  const pop = $("#cfgPopover");
+  const btn = $("#cfgStatus");
+  if (!pop || !btn || btn.hidden) return;
+  // 结果浮层与 popover 都挂在顶栏右下方同一块位置；popover 承载的正是同一份
+  // 状态（哪些还没生效、点进去改），打开它就没有理由让旧浮层压在下面。
+  clearApplyResults();
+  pop.hidden = false;
+  btn.setAttribute("aria-expanded", "true");
+  cfgPopoverSig = "";   // 打开时一定重新填一次，轮询期间的签名不作数
+  renderCfgPopover(cfgStatusView());
+  if (pop.focus) pop.focus();
+}
+
+function closeCfgPopover(restoreFocus) {
+  const pop = $("#cfgPopover");
+  const btn = $("#cfgStatus");
+  if (!pop || pop.hidden) return;
+  pop.hidden = true;
+  cfgPopoverSig = "";
+  if (btn) btn.setAttribute("aria-expanded", "false");
+  if (restoreFocus && btn && !btn.hidden && btn.focus) btn.focus();
+}
+
+function toggleCfgPopover() {
+  const pop = $("#cfgPopover");
+  if (!pop) return;
+  if (pop.hidden) openCfgPopover();
+  else closeCfgPopover(true);
+}
+
+/** 徽标是 popover 的触发器；点空白处、按 Esc 关闭，和原生 popover 一致。 */
+function bindCfgStatus() {
+  const btn = $("#cfgStatus");
+  if (btn) {
+    btn.onclick = (e) => {
+      if (e && e.stopPropagation) e.stopPropagation();
+      toggleCfgPopover();
+    };
+  }
+  const close = $("#cfgPopoverClose");
+  if (close) close.onclick = () => closeCfgPopover(true);
+  // 浮层内部的点击（例如「从设备读取」）不触发"点外面关闭"。
+  const pop = $("#cfgPopover");
+  if (pop && pop.addEventListener) {
+    pop.addEventListener("click", (e) => { if (e && e.stopPropagation) e.stopPropagation(); });
+  }
+  document.addEventListener("click", () => closeCfgPopover(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const p = $("#cfgPopover");
+    if (!p || p.hidden) return;
+    // 模态弹窗自己处理 Esc；不要在同一次按键里连带关掉浮层。
+    const help = $("#helpModal");
+    const ota = $("#otaModal");
+    const update = $("#updateModal");
+    if ((help && !help.hidden) || (ota && !ota.hidden) || (update && !update.hidden)) return;
+    if (e.stopPropagation) e.stopPropagation();
+    closeCfgPopover(true);
+  });
 }
 
 function renderActionsState() {
@@ -527,9 +717,9 @@ function renderActionsState() {
   }
 }
 
-/** 点击「待下发 N 项」：切到对应页签并聚焦第一处改动。 */
-function focusPendingItem() {
-  const item = collectPending()[0];
+/** 点击 popover 里的某一项：切到对应页签并聚焦这处改动；不传则取第一处。 */
+function focusPendingItem(target) {
+  const item = (target && target.field) ? target : collectPending()[0];
   if (!item) return;
   const tab = document.querySelector(`.tab[data-tab="${item.tab}"]`);
   if (tab && !tab.classList.contains("active")) tab.click();
@@ -656,8 +846,8 @@ async function pollStatus() {
             renderEncoder();
             renderPins();
             renderDeviceMeta();
-            // WS-512：预览模式没有「这台设备」，不显示无存档提示条。
-            renderUntrustedBanner();
+            // 预览模式没有「这台设备」，顶栏徽标不显示（state=preview）。
+            renderCfgStatus();
           } catch (_) {
             /* ignore */
           }
@@ -682,7 +872,7 @@ async function pollStatus() {
     }
     state.selectedConnected = nowConnected;
     // WS-512：连接状态变了，「从设备读取」的可用性跟着变。
-    renderUntrustedBanner();
+    renderCfgStatus();
     // 连接状态变化时重绘卡片：断开后必须出现「已断开，非实时」。
     if (state.selected && wasConnected !== nowConnected) renderSysinfo();
     const connected = state.devices.filter((d) => d.connected).length;
@@ -864,6 +1054,8 @@ async function selectDevice(devId) {
   // 切换设备：先保存上一台的草稿 / 待下发基线 / 下发结果 / OTA 状态。
   saveCurrentBucket();
   clearApplyResults();
+  // 浮层里是上一台设备的状态，切设备即收起。
+  closeCfgPopover(false);
   closeOtaWizard();
   // 抽屉绑定的是上一台设备的 key 下标；切设备时直接收起，不还焦点
   // （焦点要落在新设备的 DOM 上，由后续渲染决定）。
@@ -891,8 +1083,9 @@ async function selectDevice(devId) {
     if (!b.applied) b.applied = snapshotCfg(state.cfg);
     updatePendingUi();
     renderOta();
-    renderUntrustedBanner();
-    if (b.lastResult) renderApplyResults(b.lastResult);
+    renderCfgStatus();
+    // WS-584：结果浮层是一次性反馈，不再跟着设备切换复活 —— 当前状态由顶栏
+    // 徽标负责，失败项仍算「未下发」，徽标里点得到。
     loadSysinfo(devId);
     probeDeviceLayout(devId);
     // WS-561: 切到一台已连接设备同样对一次账（每台设备每个连接周期一次）。
@@ -921,7 +1114,7 @@ async function selectDevice(devId) {
     bucket.lastResult = null;
     setDirty(false);
     renderOta();
-    renderUntrustedBanner();
+    renderCfgStatus();
     // 切换设备后按设备各自采样，不与上一台的缓存混用。
     loadSysinfo(devId);
     // 问一次设备的布局。旧固件不回 LAYOUT: → 「固件不支持」，
@@ -1671,9 +1864,9 @@ async function probeDeviceLayout(devId) {
       }
     }
     updatePendingUi();
-    // 布局探测只更新布局（绝不置 trusted）；提示条里的「按键布局已从设备读取」
+    // 布局探测只更新布局（绝不置 trusted）；popover 里的「按键布局已从设备读取」
     // 依赖 layout_supported，所以重绘一次。
-    renderUntrustedBanner();
+    renderCfgStatus();
   } catch (_) {
     /* 旧后端或链路异常：布局维持本地配置，不影响其他功能 */
   }
@@ -2209,7 +2402,7 @@ async function applyConfig() {
         // WS-512：全部字段回读生效 = 本机存档就是设备现状，提示条可以收起了。
         cfg.trusted = true;
         state.sessionRead[devId] = true;
-        renderUntrustedBanner();
+        renderCfgStatus();
       }
       recordApply(r.items, allOk);
       if (allOk) {
@@ -2414,8 +2607,8 @@ async function readDeviceConfig(devId) {
     if (state.selected !== devId) return null;
     state.readStatus[devId] = { at: r.at, fields: r.fields || {}, ok: !!r.ok };
     renderReadStatus();
-    // WS-512：读失败 / 只回部分字段时提示条不动，但可能要把「缺少 xx」写出来。
-    renderUntrustedBanner();
+    // WS-512：读失败 / 只回部分字段时状态不变，但 popover 里可能要写「缺少 xx」。
+    renderCfgStatus();
     if (!r.ok) {
       // 表单与本地配置都不动，但用户原本的修改仍要能存下去。
       if (wasDirty) armPendingSave();
@@ -2451,7 +2644,7 @@ function applyReadback(r) {
   renderPins();
   renderDeviceMeta();
   renderReadStatus();
-  renderUntrustedBanner();
+  renderCfgStatus();
   const got = readFieldCount(r.fields);
   toast(t("ui.read_done", { time: fmtClock(r.at), got, total: READ_FIELDS.length }), "ok");
 }
@@ -2485,51 +2678,6 @@ function renderReadStatus() {
     text += t("ui.list_separator") + missing.map((k) => t("ui.field_not_reported", { field: READ_FIELD_LABELS[k]() })).join(t("ui.list_comma"));
   }
   el.textContent = text;
-}
-
-/**
- * WS-512：本机没有这台设备的配置存档时，在页签下方常驻一条琥珀色提示。
- *
- * 判据只看设备自己的 `trusted` 字段（服务端决定）：新条目为 false，读取成功
- * 或下发全部生效后才是 true；旧 config.json 没有该字段 → undefined，按可信
- * 处理，不打扰存量用户。预览模式（未选中设备）不显示。
- */
-function renderUntrustedBanner() {
-  const el = $("#untrustedBanner");
-  if (!el) return;
-  const devId = state.selected;
-  const cfg = state.cfg || {};
-  const show = !!(devId && !state.preview && cfg.trusted === false &&
-    !state.untrustedIgnored[devId]);
-  el.hidden = !show;
-  if (!show) return;
-
-  // 布局是唯一一项从设备读回来的字段（WS-499 探测）；探测确实回了才这么说，
-  // 不回就老实承认布局也是本机默认值。
-  const note = $("#untrustedLayoutNote");
-  if (note) note.textContent = cfg.layout_supported === true ? t("ui.layout_read_note") : "";
-
-  // 旧固件只回部分字段：读取状态里缺哪几组就点名，并说明表单仍是默认值。
-  const st = state.readStatus[devId];
-  const extra = $("#untrustedExtra");
-  const missing = st && st.at ? READ_FIELDS.filter((k) => !(st.fields || {})[k]) : [];
-  if (extra) {
-    const partial = missing.length > 0 && missing.length < READ_FIELDS.length;
-    extra.hidden = !partial;
-    extra.textContent = partial
-      ? t("ui.read_incomplete") + missing.map((k) => READ_FIELD_LABELS[k]()).join(t("ui.list_comma"))
-      : "";
-  }
-
-  // 未连接 / OTA 中都不能读；title 说明原因，而不是给一个点了没反应的按钮。
-  const read = $("#btnUntrustedRead");
-  if (read) {
-    const connected = !!state.selectedConnected;
-    read.disabled = !connected || otaBusy();
-    read.title = !connected ? t("ui.read_offline")
-      : otaBusy() ? t("ui.read_locked_ota")
-        : t("ui.read_btn_title");
-  }
 }
 
 /**
@@ -3173,7 +3321,6 @@ function retranslateLog() {
 function retranslateDynamic() {
   renderDevices();
   renderActionsState();
-  renderLastApply();
   renderKeys();
   renderEncoder();
   renderDeviceMeta();
@@ -3181,9 +3328,8 @@ function retranslateDynamic() {
   renderSysinfo();
   renderDesktop();
   renderReadStatus();
-  // WS-561：待下发徽标（含重连后的琥珀点 title）是 JS 拼的，切语言要重算。
+  // WS-561/WS-584：顶栏三态徽标与 popover 的文案都是 JS 拼的，切语言要重算。
   updatePendingUi();
-  renderUntrustedBanner();
   retranslateLog();
   syncLogFollowUi();
   renderOta();
@@ -3201,6 +3347,7 @@ async function init() {
   bindKeyDrawer();
   bindLogFilters();
   bindLogFollow();
+  bindCfgStatus();
   syncLogFollowUi();
   try {
     const k = await api("/api/keycodes");
@@ -3253,7 +3400,6 @@ async function init() {
     }
   };
   $("#btnApply").onclick = applyConfig;
-  $("#pendingBadge").onclick = focusPendingItem;
   $("#btnClearLog").onclick = () => {
     $("#logList").innerHTML = "";
     // 清空后没有可读的旧行，强制回跟随。
@@ -3440,15 +3586,12 @@ async function init() {
   };
   // 「读取设备配置」等设备回报后再回填表单；dirty 时先确认。
   $("#btnRefresh").onclick = () => readDeviceConfig(state.selected);
-  // WS-512：提示条上的「从设备读取」复用同一条回读路径 —— OTA 锁与「有未下发
-  // 修改」的确认都在 readDeviceConfig 里，不另起一套。
-  $("#btnUntrustedRead").onclick = () => readDeviceConfig(state.selected);
-  // 「先忽略」只关掉本次会话的提示条：不写 config、不清 trusted、也不解除
-  // 「应用配置」前的覆盖确认（那条判断看的是 trusted 与 sessionRead）。
-  $("#btnUntrustedIgnore").onclick = () => {
-    if (!state.selected) return;
-    state.untrustedIgnored[state.selected] = true;
-    renderUntrustedBanner();
+  // WS-512/WS-584：popover 里的「从设备读取」复用同一条回读路径 —— OTA 锁与
+  // 「有未下发修改」的确认都在 readDeviceConfig 里，不另起一套。读成功后浮层
+  // 收起来：徽标已经变成「已同步」，没有继续摊开的理由。
+  $("#btnUntrustedRead").onclick = async () => {
+    const r = await readDeviceConfig(state.selected);
+    if (r && r.ok) closeCfgPopover(true);
   };
   $("#btnPortal").onclick = () => devAction(
     "portal",
@@ -3709,7 +3852,7 @@ function applyOtaLock() {
     el.disabled = busy;
   });
   // WS-512：提示条的「从设备读取」自己判断连接/OTA，这里只让它重算一次状态。
-  renderUntrustedBanner();
+  renderCfgStatus();
 }
 
 async function pollOta() {

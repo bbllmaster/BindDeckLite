@@ -106,7 +106,7 @@ function realCfg() {
 function loadApp() {
   const registry = {
     "#logList": [makeEl("#logList")],
-    "#pendingBadge": [makeEl("#pendingBadge")],
+    "#cfgStatus": [makeEl("#cfgStatus")],
     "#cfgReadStatus": [makeEl("#cfgReadStatus")],
     "#btnApply": [makeEl("#btnApply")],
     "#logEmpty": [makeEl("#logEmpty")],
@@ -158,6 +158,8 @@ function loadApp() {
   run("log_follow.js");
   run("log_device.js");
   run("reconnect_sync.js");
+  // WS-584：顶栏三态徽标的判定模块，app.js 的 renderCfgStatus 依赖它。
+  run("cfg_status.js");
   run("keys.js");
 
   const appSrc = readFileSync(new URL("app.js", STATIC_DIR), "utf8");
@@ -224,10 +226,12 @@ test("有未下发的编码器模式 → 不发 refresh，出琥珀点与状态�
   await host.reconcileDeviceConfig("t1");
 
   assert.equal(server.calls.length, 0, "有未下发修改时绝不能发 refresh");
-  const badge = registry["#pendingBadge"][0];
-  assert.equal(badge.hidden, false);
-  assert.equal(badge.classList.contains("reconnect-dirty"), true, "琥珀点没出现");
-  assert.equal(badge.title, "设备已重新连接，本机有 1 项修改未下发");
+  const chip = registry["#cfgStatus"][0];
+  assert.equal(chip.hidden, false);
+  assert.equal(chip.classList.contains("reconnect-dirty"), true, "琥珀点没出现");
+  // WS-584：同一个徽标现在承载三态，重连提示落在 pending 态上。
+  assert.equal(chip.dataset.state, "pending", "顶栏徽标没进入待下发态");
+  assert.equal(chip.title, "设备已重新连接，本机有 1 项修改未下发");
   assert.equal(
     registry["#cfgReadStatus"][0].textContent,
     "设备已重新连接 · 本机有 1 项修改未下发 · 可能与设备当前值不同"
@@ -253,7 +257,7 @@ test("无未下发修改、设备回报 encoder.mode=2 → 按设备值重绘并
   const rows = registry["#logList"][0].children;
   const texts = rows.map((r) => r._text);
   assert.deepEqual(texts, ["已按设备同步：编码器模式"]);
-  assert.equal(registry["#pendingBadge"][0].classList.contains("reconnect-dirty"), false);
+  assert.equal(registry["#cfgStatus"][0].classList.contains("reconnect-dirty"), false);
 });
 
 test("四组值完全一致 → 不重绘、不新增 sync 行", async () => {
