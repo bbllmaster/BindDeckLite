@@ -14,9 +14,46 @@ on:
 # on the tag. Keeping the build inside one workflow lets the publish job fetch
 # the artifacts with a plain needs()-dependent download - no cross-workflow
 # polling, no race between sibling workflows.
+#
+# WS-571: a push that only touches host/ does not rebuild the firmware (and
+# vice versa). The publish job then copies the other half's assets from the
+# previous release, so the new release is still self-contained and update.json
+# always carries the app + all three firmware variants.
 jobs:
+  # WS-571: 按变更路径裁剪构建。只改上位机就不再重编三个固件环境，只改
+  # 固件就不再重打 exe；正式 tag 仍然全量重建（tag 必须可复现）。
+  # 路径集合的唯一来源是 tools/release_changes.py（可被测试直接 import）。
+  changes:
+    name: release / changes
+    runs-on: ubuntu-latest
+    outputs:
+      firmware: ${{ steps.diff.outputs.firmware }}
+      host: ${{ steps.diff.outputs.host }}
+      docs: ${{ steps.diff.outputs.docs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要 before..sha 的历史：depth-1 克隆拿不到被比较的提交。
+          fetch-depth: 0
+
+      - name: Decide which halves to rebuild
+        id: diff
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python tools/release_changes.py --ref "$REF" --before "$BEFORE" \
+            --sha "$SHA" --list | tee -a "$GITHUB_OUTPUT"
+
   firmware:
     name: release / firmware
+    needs: [changes]
+    # 正式 tag 无条件重建；否则看 changes 的判定。
+    if: needs.changes.outputs.firmware == 'true' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -61,6 +98,8 @@ jobs:
 
   host:
     name: release / host-exe
+    needs: [changes]
+    if: needs.changes.outputs.host == 'true' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     outputs:
       # The app version baked into the exe. The publish job reuses it verbatim
@@ -135,7 +174,15 @@ jobs:
 
   release:
     name: release / publish
-    needs: [firmware, host]
+    needs: [changes, firmware, host]
+    # firmware / host 可能被 changes 裁剪成 skipped：那不算失败，publish 仍要
+    # 跑（用上一版的产物补齐另一半）。既没有固件也没有上位机改动（纯文档）
+    # 时不发布，避免产生内容不变的 Release。
+    if: >-
+      always() && !failure() && !cancelled() &&
+      (needs.changes.outputs.firmware == 'true' ||
+       needs.changes.outputs.host == 'true' ||
+       startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -149,11 +196,92 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Download build artifacts
+      # 两个 artifact 分开下载：某个 job 被跳过时，按名字下载不存在的东西
+      # 会让 download-artifact 直接报错。
+      - name: Download firmware artifacts
+        if: needs.firmware.result == 'success'
         uses: actions/download-artifact@v4
         with:
+          name: release-firmware
           path: artifacts
           merge-multiple: true
+
+      - name: Download exe artifact
+        if: needs.host.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-exe
+          path: artifacts
+          merge-multiple: true
+
+      # 本次没有重建的那一半，从上一版 Release 取回同名资产重新上传。
+      # 必须是「拷贝到本 Release」而不是「链接到旧 Release」：rolling 只保留
+      # 最新 1 个，旧 Release 随时会被删，链接过去就会 404。
+      - name: Reuse unchanged half from the previous release
+        if: needs.firmware.result == 'skipped' || needs.host.result == 'skipped'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          # 挑最新的、资产齐全（1 个 exe + 3 个 ota bin + update.json）的
+          # 非 draft Release：缺资产的（例如早期实验性发布）直接跳过。
+          prev=""
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            mapfile -t names < <(gh release view "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" --json assets \
+              --jq '.assets[].name')
+            bins=$(printf '%s\n' "${names[@]}" | grep -cE '^ota_binddecklite_.+\.bin$' || true)
+            exe=$(printf '%s\n' "${names[@]}" | grep -cx 'BindDeckLite.exe' || true)
+            manifest=$(printf '%s\n' "${names[@]}" | grep -cx 'update.json' || true)
+            if [[ "${bins}" -ge 3 && "${exe}" -eq 1 && "${manifest}" -eq 1 ]]; then
+              prev="${tag}"
+              break
+            fi
+            echo "==> skip ${tag} (bins=${bins} exe=${exe} manifest=${manifest})"
+          done < <(gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 \
+                     --json tagName,isDraft,createdAt \
+                     --jq 'map(select(.isDraft | not)) | sort_by(.createdAt) | reverse | .[].tagName')
+
+          if [[ -z "${prev}" ]]; then
+            echo "no previous release carries a complete asset set" >&2
+            exit 1
+          fi
+          echo "==> reusing assets from ${prev}"
+
+          if [[ "${{ needs.firmware.result }}" == "skipped" ]]; then
+            gh release download "${prev}" --repo "${GITHUB_REPOSITORY}" \
+              --dir artifacts --pattern '*.bin' --clobber
+          fi
+          if [[ "${{ needs.host.result }}" == "skipped" ]]; then
+            gh release download "${prev}" --repo "${GITHUB_REPOSITORY}" \
+              --dir artifacts --pattern 'BindDeckLite.exe' --clobber
+            # 沿用的 exe 版本号就是这个 manifest 里的 app.version。
+            gh release download "${prev}" --repo "${GITHUB_REPOSITORY}" \
+              --dir artifacts --pattern 'update.json' --clobber
+          fi
+          ls -lh artifacts/
+
+      # host 跑过就用它刚算出的版本号；跳过了就沿用上一版 update.json 里
+      # 的 app.version —— 沿用的 exe 与 manifest 必须说的是同一个版本。
+      - name: Resolve app version
+        id: appver
+        shell: bash
+        env:
+          HOST_VERSION: ${{ needs.host.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${HOST_VERSION}" ]]; then
+            version="${HOST_VERSION}"
+          else
+            version="$(jq -r '.app.version' artifacts/update.json)"
+          fi
+          [[ -n "${version}" ]] || { echo "empty app version"; exit 1; }
+          echo "APP_VERSION=${version}" >> "$GITHUB_OUTPUT"
+          echo "==> app version: ${version}"
 
       - name: SHA256 sums
         shell: bash
@@ -195,7 +323,7 @@ jobs:
       - name: Build update.json manifest
         shell: bash
         env:
-          APP_VERSION: ${{ needs.host.outputs.version }}
+          APP_VERSION: ${{ steps.appver.outputs.APP_VERSION }}
         run: |
           set -euo pipefail
           python tools/build_manifest.py \
@@ -210,11 +338,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APP_VERSION: ${{ needs.host.outputs.version }}
+          APP_VERSION: ${{ steps.appver.outputs.APP_VERSION }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           FILES=(artifacts/*.bin artifacts/BindDeckLite.exe artifacts/update.json artifacts/SHA256SUMS.txt)
+
+          # 本次重建了哪一半（WS-571）：写进正文，读 Release 的人能一眼看出
+          # 哪些资产是新编的、哪些是沿用上一版的。
+          FW="${{ needs.firmware.result }}"
+          HOST="${{ needs.host.result }}"
+          if [[ "${FW}" == "success" && "${HOST}" == "success" ]]; then
+            SCOPE="上位机 + 固件（全部重新构建）"
+          elif [[ "${FW}" == "success" ]]; then
+            SCOPE="仅固件（上位机沿用上一版 exe）"
+          else
+            SCOPE="仅上位机（固件沿用上一版 bin）"
+          fi
 
           # Tag push -> formal release on that tag; main push -> rolling
           # pre-release tagged main-<utc> (never collides, recreated per run).
@@ -239,6 +379,8 @@ jobs:
             echo
             echo "${CHANNEL} of the BindDeckLite firmware (merged + app-only OTA"
             echo "images) and the Windows host executable."
+            echo
+            echo "本次发布：${SCOPE}"
             echo
             # The "本次更新" section is mandatory (WS-523 验收 11); its content
             # is identical to update.json.notes.
