@@ -733,7 +733,8 @@ function focusPendingItem(target) {
     if (item.field === "pins") {
       target = $$("#pinGrid .pin input")[item.index || 0] || null;
     } else if (item.field === "enc") {
-      target = document.querySelector(".mode-card");
+      // WS-586：模式卡已改成分段控件，跳转目标跟着换成容器本身。
+      target = $("#encoderModes");
     } else if (item.field === "sleep") {
       target = $("#sleepEnabled");
     } else if (item.field === "layout") {
@@ -1450,18 +1451,24 @@ function highlightKeys(lastPress) {
 /* ---------------- encoder ---------------- */
 
 function renderEncoder() {
-  const grid = $("#encoderModes");
-  grid.innerHTML = "";
+  const box = $("#encoderModes");
+  box.innerHTML = "";
   if (!state.cfg) return;
   const disabled = is12Key();
+  box.classList.toggle("locked", disabled);
   const note = $("#encoderDisabledNote");
   if (note) note.hidden = !disabled;
   const mode = state.cfg.encoder ? state.cfg.encoder.mode : 0;
+  // 一行 5 段的分段控件：选中态用 .active + aria-checked，锁定态用 .locked
+  // + disabled（样式用 --surface-sunken，不再靠 opacity 降低可读性）。
   ENCODER_MODES.forEach((m) => {
     const el = document.createElement("button");
-    el.className = "mode-card" + (m.id === mode ? " active" : "") + (disabled ? " locked" : "");
+    el.type = "button";
+    el.className = "enc-seg" + (m.id === mode ? " active" : "") + (disabled ? " locked" : "");
     el.disabled = disabled;
-    el.innerHTML = `<b>${modeName(m)}</b><span>${modeDesc(m)}</span>`;
+    el.setAttribute("role", "radio");
+    el.setAttribute("aria-checked", m.id === mode ? "true" : "false");
+    el.textContent = modeName(m);
     el.onclick = () => {
       if (disabled) {
         toast(t("ui.encoder_12key_unavailable"), "warn");
@@ -1472,8 +1479,17 @@ function renderEncoder() {
       renderEncoder();
       markDirty();
     };
-    grid.appendChild(el);
+    box.appendChild(el);
   });
+  // 5 段放不下一行两行描述：只显示当前选中模式的说明。
+  const descEl = $("#encoderModeDesc");
+  if (descEl) {
+    const active = ENCODER_MODES.find((m) => m.id === mode) || ENCODER_MODES[0];
+    descEl.textContent = t("ui.enc_mode_current", {
+      name: modeName(active),
+      desc: modeDesc(active),
+    });
+  }
   // the rotation-action card depends on the active mode, so redraw it
   // whenever the mode grid is (re)rendered.
   renderEncoderActions();
@@ -1577,6 +1593,15 @@ function renderEncoderActions() {
   };
   refreshStatus();
   card.appendChild(statusEl);
+
+  // 两行动作表的列头：方向 / 动作 / 参数（测试按钮已是行尾约定，不重复标题）。
+  const head = document.createElement("div");
+  head.className = "enc-action-head";
+  head.setAttribute("aria-hidden", "true");
+  head.innerHTML = `<span>${t("ui.direction")}</span>` +
+    `<span>${t("ui.card_action_tag")}</span>` +
+    `<span>${t("keys.action_params")}</span>`;
+  card.appendChild(head);
 
   const dirs = [
     { dir: "CW", label: t("ui.clockwise") },
@@ -1722,17 +1747,22 @@ async function loadSysinfo(devId) {
   return sysinfoFor(devId);
 }
 
-/** 首屏状态条：连接 / 运行时长 / 可用空间；完整字段仍看下方「运行状态」卡片。 */
+/** 首屏状态条：连接 / 运行时长 / 可用堆 / 固件版本，固定 4 项、唯一事实源。
+ *  完整字段（复位原因 / NVS / 地址 / 采样时间 / 告警）在下方「详细信息」里。 */
 function renderStatusStrip() {
   const conn = $("#stripConn");
   if (!conn) return;
   const uptime = $("#stripUptime");
   const heap = $("#stripHeap");
+  const fw = $("#stripFw");
   const devId = state.selected;
   const dev = devId ? state.devices.find((d) => d.dev_id === devId) : null;
   const connected = !!(devId && dev && dev.connected);
   conn.textContent = !devId || state.preview ? t("ui.not_selected") : connected ? t("ui.connected") : t("ui.disconnected");
   conn.className = connected ? "" : "bad";
+  // 固件版本是设备身份的一部分：预览/未选设备时也照配置显示，读不到就是 —。
+  const version = state.cfg && state.cfg.fw && state.cfg.fw.version;
+  if (fw) fw.textContent = version || "—";
   if (otaBusy()) {
     uptime.textContent = t("ui.ota_running_badge");
     heap.textContent = "—";
@@ -1790,11 +1820,12 @@ function renderSysinfo() {
   const notes = info.notes || {};
   const resetNote = notes.deepsleep
     ? `<span class="muted small"> · ${escapeHtml(notes.deepsleep)}</span>` : "";
+  // 连接 / 运行时长 / 可用堆 / 固件版本只在状态条出现一次；这里只放
+  // 状态条没有的完整字段（复位原因、NVS、设备地址、采样时间、告警）。
   const rows = [
     [t("ui.last_reset"), escapeHtml(d.reset || t("log.reset_unknown")) + resetNote, flags.deepsleep ? "warn" : ""],
-    [t("ui.strip_uptime"), escapeHtml(d.uptime || t("log.reset_unknown")), ""],
     ["NVS", escapeHtml(d.nvs || t("log.reset_unknown")), flags.nvs_bad ? "bad" : ""],
-    [t("ui.free_heap"), escapeHtml(d.heap || t("log.reset_unknown")), flags.heap_low ? "warn" : ""],
+    [t("ui.device_address"), escapeHtml((dev && dev.address) || "—"), ""],
   ];
   const extraNotes = [];
   if (notes.safe) extraNotes.push(`<li>${escapeHtml(notes.safe)}</li>`);
@@ -4033,7 +4064,6 @@ function bindOtaWizard() {
     input.click();
   };
 
-  $("#btnOta").onclick = openOtaWizard;
   closeBtn.onclick = () => closeOtaWizard();
   $("#btnOtaPick").onclick = pick;
   $("#btnOtaRepick").onclick = pick;
@@ -4677,12 +4707,30 @@ function openUpdateModal() {
   const modal = $("#updateModal");
   if (!modal) return;
   modal.hidden = false;
+  // 每次打开都回到「在线更新」：本地文件走的是另一个向导，不能让上一次的
+  // 选择把下次打开的默认入口换掉。
+  setFwMethod("online");
   syncModalOpenClass();
   renderUpdateApp();
   renderUpdateFw();
   $("#btnUpdateClose").focus();
   checkAppUpdate(true);
   checkFwUpdate(true);
+}
+
+/** 固件更新弹窗里的「在线 / 本地文件」二选一。两种方式共用一个入口按钮，
+ *  选中本地时收起在线检查结果（避免两个流程的按钮同时出现在一个面板里）。 */
+function setFwMethod(method) {
+  const local = method === "local";
+  const onlinePane = $("#fwOnlinePane");
+  const localPane = $("#fwLocalPane");
+  if (onlinePane) onlinePane.hidden = local;
+  if (localPane) localPane.hidden = !local;
+  $$("#fwMethod .fw-method-btn").forEach((btn) => {
+    const on = btn.dataset.method === method;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-checked", on ? "true" : "false");
+  });
 }
 
 function closeUpdateModal() {
@@ -4946,6 +4994,21 @@ function bindUpdate() {
   if (fwCheck) fwCheck.onclick = () => checkFwUpdate(false);
   const fwApply = $("#btnFwApply");
   if (fwApply) fwApply.onclick = applyFwUpdate;
+
+  // 在线 / 本地文件两种升级方式（WS-586：合并成一个入口）。
+  const fwOnline = $("#fwMethodOnline");
+  if (fwOnline) fwOnline.onclick = () => setFwMethod("online");
+  const fwLocal = $("#fwMethodLocal");
+  if (fwLocal) fwLocal.onclick = () => setFwMethod("local");
+  const fwLocalPick = $("#btnFwLocal");
+  if (fwLocalPick) {
+    fwLocalPick.onclick = () => {
+      // 关掉更新弹窗再开 OTA 向导：两个 modal 叠在一起会抢 Esc / 焦点。
+      closeUpdateModal();
+      setFwMethod("online");
+      openOtaWizard();
+    };
+  }
 
   // 设备页的「固件更新」入口：打开同一个弹窗并直接查固件。
   const fwBtn = $("#btnFwUpdate");

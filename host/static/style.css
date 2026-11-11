@@ -57,6 +57,9 @@
   --z-modal: 60;          /* 模态弹窗：帮助 / OTA / 更新 */
   --z-toast: 100;         /* 通知中心 */
 
+  /* 输入框 / 代码块 / 锁定控件用的下沉表面（比 --card 更暗）。 */
+  --surface-sunken: #0e131d;
+
   /* 状态色三件套：文字 / 底色 / 描边 */
   --state-ok-fg: #3ddc84;
   --state-ok-bg: rgba(61, 220, 132, 0.1);
@@ -975,29 +978,74 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   margin-left: var(--sp-2); vertical-align: middle;
 }
 
-/* ---------- encoder modes ---------- */
-.mode-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: var(--sp-3); }
-.mode-card {
-  text-align: left;
-  background: var(--card);
+/* ---------- segmented control（编码器模式 / 固件升级方式） ----------
+   WS-586：5 张模式卡收敛成一行分段控件，视觉规格与 .log-chip 一致
+   （紧凑高度 + pill），全站只有「按钮」与「分段选择」两种可点形态。
+   锁定态用 --surface-sunken + 文字说明，不用 opacity —— 被锁的分段里
+   正是「为什么不可用」的语境，降低透明度会连带压掉可读性（B11）。 */
+.enc-segmented,
+.fw-method {
+  display: flex; gap: var(--sp-1);
+  padding: var(--sp-1);
+  background: var(--card-2);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: var(--sp-4);
-  color: var(--text);
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-2);
-  font-family: inherit;
-  transition: 0.15s;
+  border-radius: var(--r-pill);
 }
-.mode-card b { font-size: var(--fs-body); }
-.mode-card span { color: var(--muted); font-size: var(--fs-cap); }
-.mode-card:hover { border-color: #38445c; }
-/* 12 键布局没有旋转编码器，模式卡整体锁定。 */
-.mode-card.locked { opacity: 0.45; cursor: not-allowed; }
-.mode-card.locked:hover { border-color: var(--line); }
-.mode-card.active { border-color: var(--accent); background: linear-gradient(160deg, rgba(53, 224, 194, 0.12), var(--card)); }
+.enc-segmented { margin-bottom: var(--sp-2); }
+.enc-segmented.locked { background: var(--surface-sunken); }
+.fw-method { width: fit-content; margin-bottom: var(--sp-3); }
+
+.enc-seg,
+.fw-method-btn {
+  flex: 1 1 0; min-width: 0;
+  min-height: var(--ctl-h-sm);
+  padding: var(--sp-1) var(--sp-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit; font-size: var(--fs-sm); line-height: 1.25;
+  text-align: center; white-space: normal; overflow-wrap: anywhere;
+  cursor: pointer; transition: 0.15s;
+}
+.fw-method .fw-method-btn { flex: 0 1 auto; min-width: 104px; }
+.enc-seg:hover,
+.fw-method-btn:hover { color: var(--text); }
+.enc-seg:focus-visible,
+.fw-method-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.enc-seg.active,
+.fw-method-btn.active {
+  color: var(--accent);
+  background: var(--card);
+  border-color: var(--line);
+  font-weight: 600;
+}
+/* 12 键布局没有编码器：所有分段保持可读的中性色，选中位置不喧宾夺主。 */
+.enc-seg.locked,
+.enc-seg:disabled { background: transparent; color: var(--muted); cursor: not-allowed; }
+.enc-segmented.locked .enc-seg.active {
+  color: var(--muted); background: transparent; border-color: transparent; font-weight: 500;
+}
+
+/* 当前模式的说明：5 段只放名字，描述集中在这里读。 */
+.enc-mode-desc {
+  margin: 0 0 var(--sp-4);
+  color: var(--muted); font-size: var(--fs-sm); line-height: 1.6;
+  min-height: 1.6em; overflow-wrap: anywhere;
+}
+
+/* 「提示」折叠：默认收起，需要时展开，不占首屏高度。 */
+.enc-note {
+  margin-top: var(--sp-6);
+  border: 1px solid var(--state-info-bd);
+  background: var(--state-info-bg);
+  border-radius: var(--r-card);
+  padding: var(--sp-3) var(--sp-4);
+  color: #c7cdff; font-size: var(--fs-sm);
+}
+.enc-note > summary { cursor: pointer; font-weight: 600; }
+.enc-note > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.enc-note p { margin-top: var(--sp-2); line-height: 1.7; }
 
 .note {
   margin-top: var(--sp-6);
@@ -1009,6 +1057,8 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   font-size: var(--fs-sm);
   line-height: 1.7;
 }
+/* 「编码器不可用」是加粗标题，后面紧跟说明；没有间隔会连成一串。 */
+.note b { margin-right: var(--sp-2); }
 
 /* ---------- 无存档提示（WS-512 → WS-584 收敛到顶栏） ----------
    「本机没有这台设备的存档」不再占一条横幅，状态与「从设备读取」都在顶栏
@@ -1033,9 +1083,10 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   flex-direction: column;
   gap: var(--sp-1);
 }
-/* 其他 4 个模式下整卡置灰，仅可查看。 */
+/* 其他 4 个模式下整卡置灰，仅可查看：用下沉表面而不是 opacity，
+   否则「切到上位机动作模式后可配置」这句说明会一起变淡（B11）。 */
 .enc-action-card.disabled {
-  opacity: 0.5;
+  background: var(--surface-sunken);
 }
 .enc-action-status {
   font-size: var(--fs-cap);
@@ -1043,6 +1094,16 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   margin: 0 0 var(--sp-3);
   line-height: 1.6;
 }
+/* 两行动作表的列头：宽度与 .enc-dir-label / .sel-enc-act 对齐。 */
+.enc-action-head {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: 0 0 var(--sp-2);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted); font-size: var(--fs-cap);
+}
+.enc-action-head span:nth-child(1) { flex: none; width: 56px; }
+.enc-action-head span:nth-child(2) { flex: none; width: 124px; }
+.enc-action-head span:nth-child(3) { flex: 1; min-width: 0; }
 .enc-action-row {
   display: flex;
   align-items: center;
@@ -1076,6 +1137,8 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
 @media (max-width: 860px) {
   .enc-dir-label { width: 48px; }
   .enc-action-row .sel-enc-act { width: 104px; }
+  .enc-action-head span:nth-child(1) { width: 48px; }
+  .enc-action-head span:nth-child(2) { width: 104px; }
 }
 
 /* ---------- device ---------- */
@@ -1160,23 +1223,48 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   border-radius: var(--r-pill); padding: var(--sp-1) var(--sp-3); white-space: nowrap;
 }
 
-/* 首屏状态条：连接 / 运行时长 / 可用空间；完整字段在下方运行状态卡片。 */
+/* 首屏状态条：连接 / 运行时长 / 可用堆 / 固件版本，唯一事实源。
+   值列 1fr、允许换行 —— 英文标签更长，截断会让「固件版本」这类关键值消失。 */
 .dev-status-strip {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 1px; background: var(--line);
-  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
-  margin-bottom: var(--sp-6);
+  border: 1px solid var(--line); border-radius: var(--radius) var(--radius) 0 0; overflow: hidden;
+  margin-bottom: 0;
 }
 .dev-status-strip > div {
   background: var(--card); padding: var(--sp-3) var(--sp-4);
-  display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0;
+  display: flex; align-items: baseline; flex-wrap: wrap; row-gap: var(--sp-1);
+  gap: var(--sp-2); min-width: 0;
 }
 .dev-status-strip span { flex: none; color: var(--muted); font-size: var(--fs-cap); }
-.dev-status-strip b { font-size: var(--fs-body); font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.dev-status-strip b {
+  font-size: var(--fs-body); font-weight: 600; min-width: 0;
+  white-space: normal; overflow-wrap: anywhere;
+}
 .dev-status-strip b.bad { color: var(--warn); }
 @media (max-width: 520px) {
   .dev-status-strip { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* 「详细信息」贴着状态条下沿：只在需要时展开，不重复状态条里的四项。 */
+.dev-detail {
+  margin: 0 0 var(--sp-6);
+  border: 1px solid var(--line); border-top: 0;
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: rgba(17, 21, 31, 0.5);
+}
+.dev-detail > summary {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  color: var(--muted); font-size: var(--fs-sm); font-weight: 600;
+  cursor: pointer; list-style: none; user-select: none;
+}
+.dev-detail > summary::-webkit-details-marker { display: none; }
+.dev-detail > summary::before { content: "▸"; color: var(--muted); }
+.dev-detail[open] > summary::before { content: "▾"; }
+.dev-detail > summary:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.dev-detail-body { padding: 0 var(--sp-4) var(--sp-4); }
+.dev-detail .sys-grid .k { white-space: nowrap; }
 
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-cap) !important; }
 
@@ -1193,6 +1281,12 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   gap: var(--sp-3); margin-bottom: var(--sp-3);
 }
 .card-head h3 { margin-bottom: 0; }
+/* 卡内分节（WS-586：上位机动作并入桌面应用卡）：细线分隔，不增加第四层卡片。 */
+.card-divider {
+  margin-top: var(--sp-4); padding-top: var(--sp-4);
+  border-top: 1px solid var(--line);
+}
+.card-divider .card-head { margin-bottom: 0; }
 
 /* 运行状态：固定两列标签/值，窄屏下值换行而不是横向溢出。 */
 .sys-grid {
@@ -1758,5 +1852,6 @@ body.modal-open .main { overflow: hidden; }
 .ms-type { width: auto; min-width: 132px; }
 .hint { white-space: normal; }
 .panel-head { flex-wrap: wrap; }
+/* WS-586：状态条的值在英文下换行，不再用 ellipsis 截断关键信息。 */
 .dev-status-strip > div { min-width: 0; }
-.dev-status-strip b { overflow: hidden; text-overflow: ellipsis; }
+.dev-status-strip b { overflow-wrap: anywhere; }
