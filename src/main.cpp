@@ -806,7 +806,27 @@ static String cfgPage(const KeysForm* form = nullptr) {
   if (WiFi.status() == WL_CONNECTED) {
     h += "已连接 <b>" + htmlEsc(WiFi.SSID()) + "</b> · IP " + WiFi.localIP().toString();
   } else if (ssid.length()) {
-    h += "未连接，已保存 <b>" + htmlEsc(ssid) + "</b>";
+    // WS-590: the stored password is no longer echoed into the page, so
+    // "not connected" alone would leave the user guessing. Map the WiFi state
+    // to a readable reason instead.
+    switch (WiFi.status()) {
+      case WL_NO_SSID_AVAIL:
+        h += "未连接，找不到该 WiFi（确认是 2.4 GHz 且名称无误）";
+        break;
+      case WL_CONNECT_FAILED:
+        h += "未连接，无法连接，密码可能不对";
+        break;
+      case WL_DISCONNECTED:
+        h += "未连接，正在连接…";
+        break;
+      case WL_IDLE_STATUS:
+        h += "未连接，尚未开始连接";
+        break;
+      default:
+        h += "未连接";
+        break;
+    }
+    h += "，已保存 <b>" + htmlEsc(ssid) + "</b>";
   } else {
     h += "未配置";
   }
@@ -816,9 +836,22 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "onsubmit='return portalDirty.wifi()'>"
          "<p><b>WiFi 名称</b></p><input name='ssid' autocomplete='off' value='");
   h += htmlEsc(ssid);
-  h += F("'><p><b>WiFi 密码</b></p><input name='pwd' type='password' value='");
-  h += htmlEsc(pwd);
-  h += F("'><p><button style='padding:10px 20px'>保存并连接</button></p>"
+  // WS-590: never render the stored password. The portal is served on an open
+  // hotspot with no authentication, so any client could read the plaintext out
+  // of the HTML source. An empty box means "keep the stored password" (see
+  // /save); typing a new one replaces it.
+  h += F("'><p><b>WiFi 密码</b></p>");
+  if (pwd.length()) {
+    h += F("<input name='pwd' type='password' autocomplete='new-password' "
+           "placeholder='已保存，留空则不修改'>"
+           "<p style='color:#5f6368;font-size:12px;margin:4px 0 0'>"
+           "已保存（不显示）</p>");
+  } else {
+    h += F("<input name='pwd' type='password' autocomplete='new-password'>");
+  }
+  h += F("<p style='color:#5f6368;font-size:12px;margin:4px 0 0'>"
+         "密码保存后不再显示；忘记就重新输入一次</p>");
+  h += F("<p><button style='padding:10px 20px'>保存并连接</button></p>"
          "<p id='otherDirtyWifi' class='dbar' hidden></p></form>");
 
   // WS-499: the layout switch lives in the same form as the pin rows, but its
@@ -1134,6 +1167,16 @@ static void setupProvisioning() {
       cfgServer.send(400, "text/html; charset=utf-8",
                      "<meta charset='utf-8'><p>WiFi 名称不能为空。<a href='/'>返回</a></p>");
       return;
+    }
+    // WS-590: the page never carries the stored password, so an empty box
+    // means "keep the one in NVS" for the same SSID. A different SSID with an
+    // empty box is an open network and is stored as such. Resolve that here
+    // explicitly: saveWifiCreds() writes whatever it is given, empty included.
+    String oldSsid, oldPwd;
+    loadWifiCreds(oldSsid, oldPwd);
+    bool sameSsid = (ssid == oldSsid);
+    if (!pwd.length() && sameSsid) {
+      pwd = oldPwd;
     }
     saveWifiCreds(ssid, pwd);
     WiFi.disconnect(true, true);
