@@ -139,11 +139,15 @@
       <div class="note" id="encoderDisabledNote" hidden>
         <b data-i18n="ui.encoder_unavailable">编码器不可用</b><span data-i18n="ui.encoder_unavailable_body">当前为 12 键布局：旋转编码器已被三个按键取代，切换回「编码器」布局并应用后恢复。</span>
       </div>
-      <div class="mode-grid" id="encoderModes"></div>
+      <!-- WS-586：5 张模式卡收敛成一行分段控件；描述只显示当前选中项，避免 5 段都塞两行。 -->
+      <div class="enc-segmented" id="encoderModes" role="radiogroup"
+           aria-label="编码器模式" data-i18n-aria-label="ui.encoder_mode_label"></div>
+      <p class="enc-mode-desc" id="encoderModeDesc"></p>
       <div id="encoderActions"></div>
-      <div class="note">
-        <b data-i18n="ui.note">提示</b><span data-i18n="ui.encoder_note_body">1.2 秒内连按两次第 10 个输入（编码器按压 / 12 键布局的第 10 键）会重启并进入 WiFi 配网 / OTA 模式（无菜单键时的入口）。</span>
-      </div>
+      <details class="enc-note">
+        <summary data-i18n="ui.note">提示</summary>
+        <p data-i18n="ui.encoder_note_body">1.2 秒内连按两次第 10 个输入（编码器按压 / 12 键布局的第 10 键）会重启并进入 WiFi 配网 / OTA 模式（无菜单键时的入口）。</p>
+      </details>
     </section>
 
     <!-- ================= DEVICE ================= -->
@@ -153,11 +157,10 @@
           <h2 data-i18n="ui.tab_device">设备</h2>
           <p data-i18n="ui.device_intro">引脚按实际接线调整；应用后立即生效并写入设备 NVS。</p>
         </div>
-        <!-- 页面级操作只留刷新（OTA 入口移入下方概览 hero） -->
-        <button class="btn secondary sm" id="btnSysRefresh" title="重新读取运行状态" data-i18n-title="ui.reload_status" data-i18n="ui.refresh">刷新</button>
       </div>
 
-      <!-- 概览 hero：设备名为主信息，芯片 / 固件为次行；右侧布局与 OTA -->
+      <!-- 概览 hero：设备名为主信息，芯片 / 固件为次行；右侧布局 + 两个动作
+           （刷新 / 固件更新）。页内不再有 primary ——「应用配置」只在顶栏。 -->
       <section class="dev-hero" aria-labelledby="devOverviewTitle">
         <div class="hero-main">
           <h3 class="hero-name" id="devOverviewTitle"><span id="devName">—</span></h3>
@@ -165,20 +168,32 @@
         </div>
         <div class="hero-side">
           <span class="hero-layout" id="devLayout">—</span>
-          <!-- WS-523: 在线固件更新入口（检测 GitHub 上的对应型号固件并推送）。 -->
-          <button class="btn secondary sm" id="btnFwUpdate" title="检查并升级在线固件" data-i18n-title="ui.fw_update_title" data-i18n="ui.fw_update">固件更新</button>
-          <button class="btn primary sm" id="btnOta" title="打开 OTA 升级向导" data-i18n-title="ui.ota_wizard_title" data-i18n="ui.ota_upgrade">OTA 升级</button>
+          <button class="btn secondary sm" id="btnSysRefresh" title="重新读取运行状态" data-i18n-title="ui.reload_status" data-i18n="ui.refresh">刷新</button>
+          <!-- WS-586：固件更新只有一个入口。在线检查与本地文件升级是同一弹窗里的
+               两种方式（#fwMethod），不再在页面上并排两个按钮。 -->
+          <button class="btn secondary sm" id="btnFwUpdate" title="在线检查或选择本地固件升级" data-i18n-title="ui.fw_update_title" data-i18n="ui.fw_update">固件更新</button>
         </div>
       </section>
 
-      <!-- 首屏运行状态条：只放最常看的 3 项，完整字段在下方「运行状态」卡片 -->
+      <!-- 首屏状态条：唯一事实源，固定 4 项。完整字段收进下方「详细信息」。 -->
       <div class="dev-status-strip" id="devStatusStrip">
         <div><span data-i18n="ui.strip_connection">连接</span><b id="stripConn">—</b></div>
         <div><span data-i18n="ui.strip_uptime">运行时长</span><b id="stripUptime">—</b></div>
         <div><span data-i18n="ui.strip_heap">可用空间</span><b id="stripHeap">—</b></div>
+        <div><span data-i18n="ui.firmware_version">固件版本</span><b id="stripFw">—</b></div>
       </div>
 
-      <!-- 设备设置：6 张卡放在同一个网格里，2 / 3 / 1 列都能整行填满，不留落单空格 -->
+      <!-- 详细信息：只放状态条之外的完整字段（复位原因 / NVS / 地址 / 采样时间 /
+           告警），不再重复连接、运行时长、可用堆与固件版本。 -->
+      <details class="dev-detail" id="sysDetail">
+        <summary><span data-i18n="ui.details">详细信息</span></summary>
+        <div class="dev-detail-body">
+          <div class="sys-grid" id="sysInfo"><span class="muted" data-i18n="ui.reading">读取中…</span></div>
+          <p class="muted small" id="sysSampleAt"></p>
+        </div>
+      </details>
+
+      <!-- 设备设置：4 张卡（布局 / 休眠 / 通信 / 上位机与桌面），2 / 3 / 1 列都能整行填满 -->
       <section class="dev-section" aria-labelledby="devSetupTitle">
         <div class="section-head"><h3 id="devSetupTitle" data-i18n="ui.device_and_host">设备与上位机</h3></div>
         <div class="card-grid">
@@ -209,14 +224,6 @@
             <p class="muted small" id="sleepWake" hidden></p>
             <p class="muted small" data-i18n="ui.sleep_hint">以上面的可唤醒输入为准：经典 ESP32 默认布局下只有第一个可唤醒的按键能单键唤醒，其余 RTC 按键要一起按住才会触发；ESP32-C3 的 GPIO0–5 每个按键都能单键唤醒。</p>
           </div>
-          <div class="card" id="sysCard">
-            <div class="card-head">
-              <h3 data-i18n="ui.sys_card">运行状态</h3>
-            </div>
-            <div class="sys-grid" id="sysInfo"><span class="muted" data-i18n="ui.reading">读取中…</span></div>
-            <p class="muted small" id="sysSampleAt"></p>
-          </div>
-
           <div class="card">
             <h3 data-i18n="ui.comm_card">通信与配置</h3>
             <div class="btn-row">
@@ -259,19 +266,18 @@
               <button class="btn secondary sm" id="btnRestartAdmin" hidden data-i18n="ui.restart_admin">立即以管理员身份重启</button>
               <button class="btn danger sm" id="btnQuitHost" hidden data-i18n="ui.quit_host">退出上位机</button>
             </div>
-          </div>
-
-          <!-- 下沉到本区最后一张卡：次要开关，不与运行状态抢首屏 -->
-          <div class="card">
-            <div class="card-head">
-              <h3 data-i18n="ui.host_actions">上位机动作</h3>
-              <label class="switch" title="按下按键时执行上位机动作（宏 / 启动程序 / 命令）" data-i18n-title="ui.host_actions_title">
-                <input type="checkbox" id="actionsToggle">
-                <span class="slider"></span>
-                <span class="switch-label" data-i18n="ui.enabled">启用</span>
-              </label>
+            <!-- WS-586：原「上位机动作」单卡并入本卡，设备页从 6 张卡收敛到 4 张。 -->
+            <div class="card-divider">
+              <div class="card-head">
+                <h3 data-i18n="ui.host_actions">上位机动作</h3>
+                <label class="switch" title="按下按键时执行上位机动作（宏 / 启动程序 / 命令）" data-i18n-title="ui.host_actions_title">
+                  <input type="checkbox" id="actionsToggle">
+                  <span class="slider"></span>
+                  <span class="switch-label" data-i18n="ui.enabled">启用</span>
+                </label>
+              </div>
+              <p class="muted small" id="actionsStateHint" data-i18n="ui.reading">读取中…</p>
             </div>
-            <p class="muted small" id="actionsStateHint" data-i18n="ui.reading">读取中…</p>
           </div>
         </div>
       </section>
@@ -639,6 +645,18 @@ key:enter</pre>
       <!-- 固件更新 -->
       <section class="update-block" aria-labelledby="updFwTitle">
         <h3 id="updFwTitle" data-i18n="ui.fw_update">固件更新</h3>
+        <!-- WS-586：一个入口 + 选择方式。在线检查与本地文件升级不再各占一个页面按钮。 -->
+        <div class="fw-method" id="fwMethod" role="radiogroup"
+             aria-label="升级方式" data-i18n-aria-label="ui.fw_method_label">
+          <button type="button" class="fw-method-btn active" id="fwMethodOnline"
+                  data-method="online" role="radio" aria-checked="true"
+                  data-i18n="ui.fw_method_online">在线更新</button>
+          <button type="button" class="fw-method-btn" id="fwMethodLocal"
+                  data-method="local" role="radio" aria-checked="false"
+                  data-i18n="ui.fw_method_local">本地文件</button>
+        </div>
+
+        <div id="fwOnlinePane">
         <!-- 固件始终走稳定通道，别让用户误以为跟随上面的滚动通道（WS-577 验收 14）。 -->
         <p class="muted small upd-channel-note" data-i18n="update.fw_channel_note">固件固定使用稳定版</p>
         <div class="ota-rows">
@@ -673,6 +691,15 @@ key:enter</pre>
         <div class="btn-row update-actions">
           <button class="btn secondary" id="btnFwCheck" data-i18n="ui.check_fw_update">检查固件更新</button>
           <button class="btn primary" id="btnFwApply" hidden data-i18n="ui.update_fw_now">立即升级固件</button>
+        </div>
+        </div>
+
+        <!-- 本地文件：走原有的 OTA 向导（选文件 → 校验 → 确认 → 上传）。 -->
+        <div id="fwLocalPane" hidden>
+          <p class="muted small" data-i18n="ui.fw_local_hint">从本机选择 app-only 固件（ota_*.bin）升级。适用于设备连不上 GitHub，或已经下载好发布包的情况。</p>
+          <div class="btn-row update-actions">
+            <button class="btn secondary" id="btnFwLocal" data-i18n="ui.fw_local_open">选择本地固件…</button>
+          </div>
         </div>
       </section>
 
