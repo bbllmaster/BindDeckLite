@@ -121,10 +121,11 @@ jobs:
       #   test_reconnect_pending.mjs WS-565 encoder-mode dirty check on reconnect
       #   test_portal_dirty.mjs      WS-572 portal unsaved state / cross-form guard
       #   test_update_popup.mjs      WS-577 update popup info levels / recheck / copy
+      #   test_cfg_status.mjs        WS-584 top-bar config status tri-state
       - name: Front-end regression tests (node --test)
         working-directory: host
         run: |
-          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs
 
       # WS-569: exactly one upload per artifact name. A second upload of the
       # same name fails the job with 409 Conflict, which turned every PR into
