@@ -5960,8 +5960,15 @@ def api_desktop_restart_admin():
     args = _elevated_argv()
     params = subprocess.list2cmdline(args)
     try:
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, params, None, 1)
+        # WS-576: ShellExecuteW has no environment parameter, so the elevated
+        # copy inherits ours - including the _PYI_* of the onefile instance it
+        # was started from. PyInstaller >= 6.22 validates the parent PID found
+        # in those variables and refuses to start when the parent is gone, the
+        # very failure the self-update restart hit. Strip them for the call and
+        # restore them afterwards (a declined UAC keeps this process running).
+        with online_update.pyinstaller_reset_scope():
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1)
     except Exception as e:  # noqa: BLE001
         return jsonify({"ok": False, **_err(t("error.elevate_start_failed", name=type(e).__name__, message=e))}), 500
     if rc is None or rc <= 32:

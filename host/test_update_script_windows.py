@@ -45,11 +45,14 @@ def _stub(path: Path, tag: str, host_marker: Path) -> None:
     """假「上位机 exe」：启动后写 started-<tag>.txt 与 host marker 就退出。
 
     用 ``.bat`` 当目标 exe：``start`` 能像 exe 一样把它拉起来，复制 / 备份 /
-    启动逻辑与真实 exe 完全一致。
+    启动逻辑与真实 exe 完全一致。同时把自己看到的
+    ``PYINSTALLER_RESET_ENVIRONMENT`` 落盘 —— 这是 WS-576 的关键：新版本
+    必须看到 ``1``，否则 PyInstaller 会按旧 onefile 父 PID 校验并拒绝启动。
     """
     text = "\r\n".join([
         "@echo off",
         'echo %s>"%%~dp0started-%s.txt"' % (tag, tag),
+        'echo %%PYINSTALLER_RESET_ENVIRONMENT%%>"%%~dp0pyi-reset-%s.txt"' % tag,
         'echo started>"%s"' % host_marker,
         "exit /b 0",
         "",
@@ -81,9 +84,9 @@ def _prepare(updates: Path, exe: Path, new: Path, marker: Path, log: Path) -> Pa
     return path
 
 
-def _run(script: Path, workdir: Path) -> None:
+def _run(script: Path, workdir: Path, env: dict | None = None) -> None:
     """跑一遍脚本；不接管道（``start`` 的子进程会继承句柄、拖住 communicate）。"""
-    proc = subprocess.Popen(["cmd", "/c", str(script)], cwd=str(workdir),
+    proc = subprocess.Popen(["cmd", "/c", str(script)], cwd=str(workdir), env=env,
                             stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -111,7 +114,12 @@ def _wait_for(path: Path, timeout: float = 20.0) -> bool:
 
 
 def test_script_swaps_the_exe_and_starts_the_new_version(tmp_path):
-    """正常路径：NEW → EXE、EXE → BAK、新版本被启动、日志逐步骤记录。"""
+    """正常路径：NEW → EXE、EXE → BAK、新版本被启动、日志逐步骤记录。
+
+    WS-576：脚本用「旧 onefile 实例执行它」时的那份环境来跑（带 ``_PYI_*``、
+    父 PID 已死），断言新版本看到 ``PYINSTALLER_RESET_ENVIRONMENT=1`` ——
+    少了这一步，真实 exe 会直接报 Security validation failure。
+    """
     root, updates = _case(tmp_path, "normal")
     exe = root / "BindDeckLite.bat"
     new = updates / "BindDeckLite.bat"
@@ -124,11 +132,22 @@ def test_script_swaps_the_exe_and_starts_the_new_version(tmp_path):
     _stub(new, "new", marker)
     new_bytes = new.read_bytes()
 
-    _run(_prepare(updates, exe, new, marker, log), root)
+    stale = dict(os.environ)
+    stale.update({
+        "_PYI_APPLICATION_HOME_DIR": r"C:\Temp\_MEI999991",
+        "_PYI_PARENT_PROCESS_LEVEL": "1",
+        "_PYI_ARCHIVE_FILE": str(exe),
+    })
+    stale.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+
+    _run(_prepare(updates, exe, new, marker, log), root, env=stale)
 
     assert exe.read_bytes() == new_bytes, "新 exe 必须被复制到目标位置"
     assert backup.read_bytes() == old_bytes, "旧 exe 必须先备份为 .bak"
     assert _wait_for(root / "started-new.txt"), "新版本必须被启动"
+    assert _wait_for(root / "pyi-reset-new.txt"), "新版本必须写下 reset 变量的值"
+    assert (root / "pyi-reset-new.txt").read_text().strip() == "1", \
+        "新版本必须在 PYINSTALLER_RESET_ENVIRONMENT=1 下启动"
 
     info = online_update.read_update_log(str(log))
     lines = "\n".join(info["lines"])
@@ -155,6 +174,9 @@ def test_script_reports_a_missing_new_exe_and_keeps_the_old_one(tmp_path):
     assert exe.read_bytes() == old_bytes, "失败时绝不能动原 exe"
     assert not Path(str(exe) + ".bak").exists(), "没到替换阶段不该产生备份"
     assert _wait_for(root / "started-old.txt"), "旧版本必须被重新拉起"
+    # 失败路径同样要带着 reset 启动：旧 exe 也是 onefile，同样会被校验拒掉。
+    assert _wait_for(root / "pyi-reset-old.txt")
+    assert (root / "pyi-reset-old.txt").read_text().strip() == "1"
 
     info = online_update.read_update_log(str(log))
     assert info["result"] == "fail", info["lines"]

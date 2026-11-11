@@ -683,7 +683,9 @@ def test_update_script_logs_every_step_and_retries_the_copy(monkeypatch):
 
     # 无窗口：CREATE_NO_WINDOW（与 DETACHED_PROCESS 互斥，不能同时给）。
     captured = {}
-    monkeypatch.setattr(online_update, "os", type("FakeOs", (), {"name": "nt"})())
+    monkeypatch.setattr(
+        online_update, "os",
+        type("FakeOs", (), {"name": "nt", "environ": os.environ})())
     monkeypatch.setattr(
         online_update.subprocess, "Popen",
         lambda command, **kwargs: captured.update(command=command, **kwargs))
@@ -692,6 +694,97 @@ def test_update_script_logs_every_step_and_retries_the_copy(monkeypatch):
     assert flags & online_update.CREATE_NO_WINDOW, "必须带 CREATE_NO_WINDOW"
     assert flags & online_update.CREATE_NEW_PROCESS_GROUP
     assert not flags & 0x00000008, "DETACHED_PROCESS 与 CREATE_NO_WINDOW 互斥"
+
+
+# --- 7c. WS-576 自更新重启：新实例不得继承旧 onefile 的 _PYI_* ----------------
+
+def test_launch_update_script_drops_inherited_onefile_state(monkeypatch):
+    """脚本必须在一个「干净」的环境里启动（WS-576）。
+
+    旧版本自己是 PyInstaller onefile，环境里带着 ``_PYI_APPLICATION_HOME_DIR``
+    / ``_PYI_PARENT_PROCESS_LEVEL`` / ``_PYI_ARCHIVE_FILE``。这些变量会一路被
+    ``cmd`` → ``update.bat`` → ``start`` 的新 exe 继承，新 exe 的 bootloader
+    于是拿旧临时目录名里的**旧父 PID** 去查祖先进程 —— 旧进程已退出，直接报
+    ``Security validation failure: invalid originating onefile parent process
+    (PID not found)!``。修复前这里根本没有 ``env``，断言会失败。
+    """
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", r"C:\Temp\_MEI123456")
+    monkeypatch.setenv("_PYI_ARCHIVE_FILE", r"C:\Apps\BindDeckLite.exe")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "2")
+    monkeypatch.delenv(online_update.PYI_RESET_ENVIRONMENT, raising=False)
+
+    captured = {}
+    monkeypatch.setattr(
+        online_update, "os",
+        type("FakeOs", (), {"name": "nt", "environ": os.environ})())
+    monkeypatch.setattr(
+        online_update.subprocess, "Popen",
+        lambda command, **kwargs: captured.update(command=command, **kwargs))
+
+    assert online_update.launch_update_script(r"C:\updates\update.bat") is True
+
+    env = captured["env"]
+    leaked = [key for key in env if key.startswith(online_update.PYI_ENV_PREFIX)]
+    assert not leaked, "新实例不能再看到旧 onefile 的私有变量: %s" % leaked
+    assert env[online_update.PYI_RESET_ENVIRONMENT] == "1", \
+        "必须显式要求 bootloader 当作全新实例重新解包"
+    # env= 是整份替换：PATH 之类的系统变量丢了，cmd 直接起不来。
+    assert env.get("PATH") == os.environ.get("PATH")
+    # 只改副本，不能动当前进程自己的环境（它还要继续跑到退出）。
+    assert os.environ["_PYI_APPLICATION_HOME_DIR"] == r"C:\Temp\_MEI123456"
+
+
+def test_update_script_resets_pyinstaller_env_before_every_start():
+    """三处 ``start`` 前面都要有 ``set "PYINSTALLER_RESET_ENVIRONMENT=1"``。
+
+    双保险：脚本被人工执行（没有经过 :func:`launch_update_script` 的干净
+    环境）时也得成立。少一处，对应的那条路径（正常启动 / 回滚 / 失败重启）
+    就仍然会带着旧 onefile 状态启动。
+    """
+    script = _plain_script()
+    lines = [line.strip() for line in script.splitlines()]
+    starts = [index for index, line in enumerate(lines) if line.startswith('start ""')]
+    assert len(starts) == 3, "正常 / 回滚 / 失败重启三条路径都要启动 exe"
+    for index in starts:
+        assert lines[index - 1] == 'set "PYINSTALLER_RESET_ENVIRONMENT=1"', \
+            "第 %d 行的 start 前缺少 reset: %r" % (index + 1, lines[index - 1])
+
+
+def test_restart_admin_clears_onefile_state_for_the_elevated_copy(monkeypatch):
+    """「以管理员身份重启」也走继承环境的 ShellExecuteW，同样要清（WS-576）。
+
+    这条路径没有 env 参数可用，只能临时改本进程环境；UAC 被取消（返回码
+    <= 32）后本进程还要继续跑，所以调用结束必须还原。
+    """
+    import ctypes
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", r"C:\Temp\_MEI123456")
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.delenv(online_update.PYI_RESET_ENVIRONMENT, raising=False)
+
+    seen = {}
+
+    class FakeShell32:
+        @staticmethod
+        def ShellExecuteW(hwnd, verb, exe, params, cwd, show):
+            seen["env"] = dict(os.environ)
+            return 5  # <= 32：用户取消了 UAC
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(shell32=FakeShell32),
+                        raising=False)
+
+    response = host_app.app.test_client().post("/api/desktop/restart-admin")
+
+    assert response.status_code == 409, "取消 UAC 应返回 409"
+    leaked = [key for key in seen["env"]
+              if key.startswith(online_update.PYI_ENV_PREFIX)]
+    assert not leaked, "elevated 实例不能再继承旧 onefile 的变量: %s" % leaked
+    assert seen["env"][online_update.PYI_RESET_ENVIRONMENT] == "1"
+    # 调用结束必须还原：本进程还要继续跑（还可能再拉起自己的子进程）。
+    assert os.environ["_PYI_APPLICATION_HOME_DIR"] == r"C:\Temp\_MEI123456"
+    assert online_update.PYI_RESET_ENVIRONMENT not in os.environ
 
 
 def test_read_update_log_reports_the_failed_step(tmp_path):

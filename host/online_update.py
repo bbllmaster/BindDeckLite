@@ -18,10 +18,14 @@
 * :func:`download_to_file` / :func:`finalize_download` — 下载 + 校验（先落
   ``.part``，校验通过才改名，不会留下半成品 exe）。
 * :func:`build_update_script` — 生成只接受固定路径的替换脚本。
+* :func:`launch_update_script` — 用干净的环境（无 ``_PYI_*``）启动它。
+* :func:`pyinstaller_clean_env` / :func:`pyinstaller_reset_scope` — 摆脱旧
+  onefile 实例的环境（WS-576 自更新重启崩溃）。
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -108,6 +112,14 @@ UPDATE_LOG_ENCODINGS = ("utf-8", "cp936", "oem", "mbcs")
 #: 互斥，不能一起给。
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+#: PyInstaller onefile 的私有环境变量前缀（``_PYI_APPLICATION_HOME_DIR`` /
+#: ``_PYI_ARCHIVE_FILE`` / ``_PYI_PARENT_PROCESS_LEVEL`` 等）。
+PYI_ENV_PREFIX = "_PYI_"
+#: PyInstaller 官方的「当作全新实例启动」开关：bootloader 见到它就丢掉从
+#: 父进程继承的全部 ``_PYI_*``、重新解包 —— 文档里专门给「派生出要活得比
+#: 自己更久的子进程（例如重启自身）」用（WS-576）。
+PYI_RESET_ENVIRONMENT = "PYINSTALLER_RESET_ENVIRONMENT"
 
 #: 固件型号键 → 清单里 firmware 的 key。
 FIRMWARE_VARIANTS = ("esp32dev", "esp32c3", "esp32c3_16mb")
@@ -1257,6 +1269,10 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         'echo [copy] step=replace result=ok attempts=%COUNT% >>"%LOG%"',
         "rem 5. start the new version with the exe directory as its CWD: relative",
         "rem    paths must not resolve inside the updates directory.",
+        "rem WS-576: the old host was a onefile build and this script inherited",
+        "rem its _PYI_* variables. A fresh bootloader would read the dead parent",
+        "rem PID out of them and refuse to start, so reset them here as well.",
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
         'start "" /D "%EXE_DIR%" "%EXE%"',
         "if errorlevel 1 goto fail_start",
         'echo [start] new version launched >>"%LOG%"',
@@ -1283,6 +1299,7 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         'if errorlevel 1 echo [rollback] copy failed, exe may still be the new build >>"%LOG%"',
         ":rollback_start",
         'del /F /Q "%LIST%" >>"%LOG%" 2>&1',
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
         'start "" /D "%EXE_DIR%" "%EXE%"',
         "goto done",
         "",
@@ -1304,6 +1321,7 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         "",
         ":restart_old",
         'del /F /Q "%LIST%" >>"%LOG%" 2>&1',
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
         'start "" /D "%EXE_DIR%" "%EXE%"',
         "",
         ":done",
@@ -1311,6 +1329,55 @@ def build_update_script(exe_path: str, new_exe: str, backup_exe: str,
         "endlocal",
         "",
     ])
+
+
+def pyinstaller_clean_env(environ=None) -> dict:
+    """返回一份去掉 PyInstaller onefile 私有变量的环境副本。
+
+    PyInstaller 6.22.1 起，onefile 的「主应用子进程」会按继承来的顶层临时
+    目录名里编码的 parent PID 去祖先进程树里找 onefile 父进程；找不到就直接
+    退出（Windows 上是 ``Security validation failure: invalid originating
+    onefile parent process (PID not found)!``）。自更新正好踩中这条链：
+
+    旧 exe → ``cmd /c update.bat`` → ``start`` 新 exe
+
+    三步都在继承旧实例的 ``_PYI_*``，而旧父进程此时已经退出。
+    ``PYINSTALLER_RESET_ENVIRONMENT=1`` 是官方给出的开关：bootloader 见到它
+    就把当前进程当作全新实例重新解包，不再核对一个已经死掉的父进程。
+
+    其余变量（``PATH`` / ``SystemRoot`` ...）必须原样保留：``env=`` 是**整份
+    替换**，漏掉 ``SystemRoot`` 会让子进程在 Windows 上直接起不来。
+    """
+    source = os.environ if environ is None else environ
+    env = {key: value for key, value in source.items()
+           if not key.startswith(PYI_ENV_PREFIX)}
+    env[PYI_RESET_ENVIRONMENT] = "1"
+    return env
+
+
+@contextlib.contextmanager
+def pyinstaller_reset_scope(environ=None):
+    """临时把本进程环境里 onefile 的私有变量清掉（退出时还原）。
+
+    只给「子进程没有 env 参数、只能继承父环境」的启动方式用
+    （``ShellExecuteW("runas")`` 就是这种）。用完必须还原：UAC 被取消时本
+    进程还要继续跑，它自己的 ``_PYI_*`` 不能就这么没了。
+    """
+    env = os.environ if environ is None else environ
+    saved = {key: env[key] for key in list(env) if key.startswith(PYI_ENV_PREFIX)}
+    had_reset = PYI_RESET_ENVIRONMENT in env
+    previous_reset = env.get(PYI_RESET_ENVIRONMENT)
+    try:
+        for key in saved:
+            del env[key]
+        env[PYI_RESET_ENVIRONMENT] = "1"
+        yield
+    finally:
+        if had_reset:
+            env[PYI_RESET_ENVIRONMENT] = previous_reset
+        else:
+            env.pop(PYI_RESET_ENVIRONMENT, None)
+        env.update(saved)
 
 
 def launch_update_script(script_path: str) -> bool:
@@ -1321,9 +1388,13 @@ def launch_update_script(script_path: str) -> bool:
     控制台，诊断信息只走 ``update.log`` + 上位机日志。
 
     三个标准流全部指向 NUL：上位机退出后原句柄已失效，脚本不能再往里写。
+
+    ``env`` 必须是 :func:`pyinstaller_clean_env` 的结果（WS-576）：脚本自己
+    再 ``start`` 出来的新 exe 会继承它，带着旧实例的 ``_PYI_*`` 启动就会被
+    PyInstaller 的 onefile 父进程校验直接拒掉。
     """
     try:
-        kwargs = {"close_fds": True}
+        kwargs = {"close_fds": True, "env": pyinstaller_clean_env()}
         if os.name == "nt":
             kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
             kwargs["stdin"] = subprocess.DEVNULL

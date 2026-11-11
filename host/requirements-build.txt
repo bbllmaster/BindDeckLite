@@ -1,5 +1,9 @@
 -r requirements.txt
 -r requirements-desktop.txt
-pyinstaller>=6.3
+# Pinned (WS-576): PyInstaller 6.22 changed the onefile bootloader's parent
+# process validation, which broke the self-update restart. Never let CI drift
+# onto a new bootloader silently - bump this after testing a full
+# download -> replace -> restart cycle on Windows.
+pyinstaller==6.22.3
 pytest>=8
 pyyaml>=6
