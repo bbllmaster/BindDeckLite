@@ -52,6 +52,9 @@
           <p class="cfg-popover-last" id="cfgLastApplyText"></p>
           <div class="cfg-popover-actions" id="cfgUntrustedActions" hidden>
             <button class="btn primary sm" id="btnUntrustedRead" data-i18n="ui.read_from_device">从设备读取</button>
+            <!-- WS-596：恢复 WS-512 的「先忽略」——只关本次会话的提示，不写 config、
+                 不改 trusted，也不解除「应用配置」前的覆盖确认。 -->
+            <button class="btn secondary sm" id="btnUntrustedIgnore" data-i18n="ui.untrusted_ignore">先忽略</button>
           </div>
         </div>
       </div>

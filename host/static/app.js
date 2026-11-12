@@ -111,6 +111,10 @@ const state = {
   // WS-512：本次会话里成功从设备读取过的设备。下发确认用它避免重复骚扰；
   // 它不同于 trusted（trusted 会落盘，会话读取只活在内存）。
   sessionRead: {},
+  // WS-596：本会话对这台设备点了「先忽略」——只关掉顶栏的「配置未确认」提示。
+  // 按设备记，不写 config、不改 trusted、不解除下发确认；重新选中该设备或
+  // 它断开重连后清空（WS-512 原文「只关掉本次会话的提示条」）。
+  pendingIgnored: {},
   sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
   pinErrors: [],      // 当前引脚表单的逐行错误，来源 /api/defaults 的 pinErrors
@@ -284,6 +288,8 @@ function resetReconnectCycle(devId) {
   if (!devId) return;
   delete state.connSince[devId];
   delete state.reconnectSynced[devId];
+  // WS-596：断开即结束本次会话对这台设备的「先忽略」，重连后提示重新出现。
+  delete state.pendingIgnored[devId];
   if (state.reconcileTimers[devId]) {
     clearTimeout(state.reconcileTimers[devId]);
     delete state.reconcileTimers[devId];
@@ -522,6 +528,8 @@ function cfgStatusView() {
     selected: state.selected,
     preview: state.preview,
     trusted: (state.cfg || {}).trusted,
+    // WS-596：「先忽略」只作用于当前设备、只活在本会话。
+    ignored: !!(state.selected && state.pendingIgnored[state.selected]),
     pendingCount: collectPending().length,
     reconnect: !!reconnectNotice(state.selected),
     lastApply: (b && b.lastApply) || null,
@@ -577,6 +585,8 @@ function cfgPopoverData(view) {
             : t("ui.all_applied_short"),
         })
       : t("ui.cfg_never_applied"),
+    // WS-596：未确认时这一组按钮里既有「从设备读取」也有「先忽略」，
+    // 两者都只在 untrusted 成立时出现。
     showRead: view.state === window.CfgStatus.STATES.UNTRUSTED,
     readDisabled: !connected || locked,
     readTitle: !connected ? t("ui.read_offline")
@@ -675,6 +685,18 @@ function bindCfgStatus() {
     btn.onclick = (e) => {
       if (e && e.stopPropagation) e.stopPropagation();
       toggleCfgPopover();
+    };
+  }
+  // WS-596：恢复 WS-512 的「先忽略」。只写会话状态：不写 config、不改
+  // trusted、也不影响 applyConfig 里按 trusted/sessionRead 判定的覆盖确认。
+  // 生命周期按设备记，重新选中或断开重连时清空（见下面两处 delete）。
+  const ignore = $("#btnUntrustedIgnore");
+  if (ignore) {
+    ignore.onclick = () => {
+      if (!state.selected) return;
+      state.pendingIgnored[state.selected] = true;
+      // 重算徽标：未确认提示收起，popover 随之关闭。
+      updatePendingUi();
     };
   }
   const close = $("#cfgPopoverClose");
@@ -1048,7 +1070,11 @@ function renderDeviceEmpty(ul) {
 }
 
 async function selectDevice(devId) {
+  // WS-596：「先忽略」只关到下一次重新选中这台设备 —— 切走再切回（或再点
+  // 一次同一台）都让提示重新出现，这是 WS-512「只关本次会话」的落法。
+  if (devId) delete state.pendingIgnored[devId];
   if (state.selected === devId) {
+    updatePendingUi();
     renderDevices();
     return;
   }
@@ -3088,9 +3114,11 @@ function buildLogRow(e, showDev) {
   row._text = rowText;
   // WS-587：3 列（时间 / 内容 / 复制）。类型改徽标放进 .log-body，设备归属
   // 放进「查看更多」<details>；行节点不重建，syncLogDeviceUi 只切换显隐。
-  row.innerHTML = `<span class="log-time">${e.time}</span>` +
+  // WS-596：time / kind 也来自事件流（设备行、后端事件），与 rowText 一样
+  // 必须转义后再进 innerHTML，否则一条 `<img onerror=…>` 就是一次 XSS。
+  row.innerHTML = `<span class="log-time">${escapeHtml(e.time)}</span>` +
     `<div class="log-body">` +
-      `<span class="log-kind">${e.kind}</span>` +
+      `<span class="log-kind">${escapeHtml(e.kind)}</span>` +
       `<span class="log-text">${escapeHtml(rowText)}</span>` +
       `<details class="log-more"${showDev ? "" : " hidden"}>` +
         `<summary>${escapeHtml(t("ui.log_view_more"))}</summary>` +
@@ -3450,8 +3478,10 @@ function retranslateDynamic() {
   // WS-561/WS-584：顶栏三态徽标与 popover 的文案都是 JS 拼的，切语言要重算。
   updatePendingUi();
   // WS-585：检查器是常驻的，它的标题 / 空态提示 / 字段标签都由 keys.js 拼，
-  // 不重绘就会停在切换前的语言上（列表已翻译、检查器还是旧语言）。
-  if (typeof renderKeyDrawer === "function") renderKeyDrawer();
+  // 不刷新就会停在切换前的语言上。WS-596：只换文案，绝不整块重绘表单 ——
+  // 重建会把宏纯文本按步骤重新序列化（空行、缩进被吃掉），用户没保存的
+  // 草稿会当场变样。详见 keys.js 的 retranslateKeyDrawer。
+  if (typeof retranslateKeyDrawer === "function") retranslateKeyDrawer();
   retranslateLog();
   syncLogFollowUi();
   renderOta();

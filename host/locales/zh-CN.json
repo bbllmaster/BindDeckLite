@@ -899,6 +899,7 @@
   "ui.unknown_reason": "未知原因",
   "ui.unsent_confirm": "有修改尚未下发到设备，读取设备配置会丢弃它们",
   "ui.untrusted_confirm": "本机没有这台设备的配置存档，界面里的引脚与键码是默认值。\n继续会覆盖设备当前的引脚、键码、编码器模式与休眠设置。仍要下发吗？",
+  "ui.untrusted_ignore": "先忽略",
   "ui.untrusted_sub": "引脚 / 键码 / 编码器模式 / 休眠以本机默认值显示，直接下发会覆盖设备当前配置。",
   "ui.untrusted_title": "本机没有这台设备的配置存档 · 现在显示的是默认值",
   "ui.update_channel": "更新通道",
