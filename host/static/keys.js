@@ -333,6 +333,17 @@ function retranslateKeyDrawer() {
     const opt = $(`#kdAct option[value="${a.id}"]`);
     if (opt) opt.textContent = actionName(a);
   });
+  // HID 下拉的「特殊」分组名是 optgroup 的 label 属性 —— data-i18n 只能改
+  // textContent，改不到属性，切语言不重写就会停在旧语言上（WS-599）。
+  const og = $("#kdHid optgroup");
+  if (og) og.label = t("keys.special_group");
+  // 「无上位机动作」的说明是 JS 拼的 innerHTML（locale 内含 <p> 包裹），
+  // 同样不在 data-i18n 覆盖范围，按当前键码重写一遍。
+  const action = item.action || { type: "none" };
+  if ((action.type || "none") === "none") {
+    const box = $("#kdValueBox");
+    if (box) renderNoActionNote(box, item);
+  }
   // 测试按钮 / 提示的文案取决于执行状态，data-i18n 只会写成「测试动作」。
   syncKeyDrawerRunning();
   if (typeof macroEditorRetranslate === "function") macroEditorRetranslate();

@@ -113,7 +113,8 @@ const state = {
   sessionRead: {},
   // WS-596：本会话对这台设备点了「先忽略」——只关掉顶栏的「配置未确认」提示。
   // 按设备记，不写 config、不改 trusted、不解除下发确认；重新选中该设备或
-  // 它断开重连后清空（WS-512 原文「只关掉本次会话的提示条」）。
+  // 它断开重连后清空（WS-512 原文「只关掉本次会话的提示条」）。WS-599：一直
+  // 离线的设备不算「断开」，状态轮询不会清掉刚点的忽略。
   pendingIgnored: {},
   sysinfo: {},        // dev_id -> 运行状态采样，来源 /api/device/<id>/sysinfo 与 /api/status
   sysinfoBusy: {},    // dev_id -> true 表示已有一条采样请求在等回包（防重复请求）
@@ -286,10 +287,15 @@ function reconnectNotice(devId) {
 /** 断开或换连接周期：清计时、已对账标记与提示。 */
 function resetReconnectCycle(devId) {
   if (!devId) return;
+  // WS-599：只有「本轮之前确实连着」才算一次连接周期结束。设备一直是离线的
+  // 时候，状态轮询每 1.2 秒都会走到这里；若无条件清 pendingIgnored，用户刚
+  // 点的「先忽略」会在一个轮询周期内被抹掉。断开发生在忽略之前，不该反过来
+  // 清掉它。
+  const wasConnected = !!state.connSince[devId];
   delete state.connSince[devId];
   delete state.reconnectSynced[devId];
-  // WS-596：断开即结束本次会话对这台设备的「先忽略」，重连后提示重新出现。
-  delete state.pendingIgnored[devId];
+  // WS-596：连接周期结束即结束本次会话对这台设备的「先忽略」，重连后提示重新出现。
+  if (wasConnected) delete state.pendingIgnored[devId];
   if (state.reconcileTimers[devId]) {
     clearTimeout(state.reconcileTimers[devId]);
     delete state.reconcileTimers[devId];
@@ -695,7 +701,8 @@ function bindCfgStatus() {
     ignore.onclick = () => {
       if (!state.selected) return;
       state.pendingIgnored[state.selected] = true;
-      // 重算徽标：未确认提示收起，popover 随之关闭。
+      // 重算徽标：未确认提示收起。没有待下发项时徽标随之隐藏、popover 也就
+      // 没有可开的入口；有未下发修改时徽标改显示 pending，popover 会留着。
       updatePendingUi();
     };
   }
@@ -1352,15 +1359,26 @@ function applyRunningState() {
   }
 }
 
+/**
+ * 「无上位机动作」的说明：键码 0 = 不发键，其余键只发 HID。
+ *
+ * WS-599：locale 里这两条自带上 `<p class="muted small">` 包裹，所以整段
+ * 只能走 innerHTML，不能挂 data-i18n（那会按 textContent 写，把标签当文字
+ * 显示出来）。抽屉切语言时由 keys.js 的 retranslateKeyDrawer 重调这里。
+ */
+function renderNoActionNote(holder, item) {
+  holder.innerHTML = t(item && item.code === 0
+    ? "ui.key_sends_nothing"
+    : "ui.key_sends_hid_only");
+}
+
 function renderActionInput(holder, item, card) {
   const action = item.action || { type: "none", value: "" };
   holder.innerHTML = "";
   if (action.type === "none") {
     // 键码 0 = 不发键。没有上位机动作时这个键按下去什么都不会发生，
     // 必须说清楚，否则用户只会看到一个「没反应」的死键。
-    holder.innerHTML = item.code === 0
-      ? t("ui.key_sends_nothing")
-      : t("ui.key_sends_hid_only");
+    renderNoActionNote(holder, item);
     return;
   }
   if (action.type === "media") {

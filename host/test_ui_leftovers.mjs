@@ -82,6 +82,11 @@ function loadApp() {
     "#cfgPopover", "#cfgPopoverClose", "#cfgPendingBlock", "#cfgPendingLabel",
     "#cfgPendingList", "#cfgUntrustedActions", "#btnUntrustedRead",
     "#btnUntrustedIgnore",
+    // 抽屉：renderKeyDrawer / retranslateKeyDrawer 都按选择器取节点，桩里必须
+    // 返回同一个对象，否则「改属性」类修复（optgroup label）观察不到。
+    "#keyDrawer", "#keyDrawerBody", "#keyDrawerTitle", "#keyDrawerBackdrop",
+    "#kdHid", "#kdHid optgroup", "#kdAct", "#kdValueBox", "#kdValueLabel",
+    "#kdTest", "#kdTestHint",
   ].forEach((sel) => { registry[sel] = [makeEl(sel)]; });
 
   const document = {
@@ -131,8 +136,9 @@ function loadApp() {
     .replace(/\ninit\(\);\s*$/, "\ninit().catch(() => {});\n");
   vm.runInContext(appSrc + `
 globalThis.__host = {
-  state, buildLogRow, retranslateDynamic, retranslateKeyDrawer,
+  state, buildLogRow, retranslateDynamic, retranslateKeyDrawer, renderKeyDrawer,
   bindCfgStatus, cfgStatusView, updatePendingUi, resetReconnectCycle, selectDevice,
+  syncConnectionCycles,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -171,6 +177,87 @@ test("retranslateDynamic 覆盖四个页面的文案刷新（不止抽屉）", (
     "renderDeviceMeta", "retranslateLog", "updatePendingUi"].forEach((fn) => {
     assert.ok(src.includes(fn), `切语言漏了 ${fn}（该页会停在旧语言）`);
   });
+});
+
+/* ---------------- 1b. 抽屉内部两处动态文案（WS-599） ---------------- */
+
+/** 打开 0 号键的抽屉：状态与键码表都是生产函数读的那几份。 */
+function openKeyDrawer(host, sandbox, item) {
+  host.state.keycodes = [{ code: 0, label: "无" }, { code: 13, label: "F13" }];
+  host.state.cfg = {
+    trusted: true,
+    keys: [item, { code: 14, mods: 0, action: { type: "none", value: "" } }],
+    pins: [], sleep: {}, encoder: { mode: 0 },
+  };
+  host.state.editingKey = 0;
+  sandbox.renderKeyDrawer();
+}
+
+/** 真跑一遍切语言的前两步（换表 + apply），再走抽屉的重译入口。
+ *  retranslateDynamic 末尾就是调它；其余页面的刷新另有上面的源码用例钉住，
+ *  这里只隔离抽屉，避免桩去跑整页重绘。 */
+function switchLanguage(host, sandbox, lang) {
+  const table = JSON.parse(
+    readFileSync(new URL(`../locales/${lang}.json`, STATIC_DIR), "utf8"));
+  sandbox.i18n.setMessages(table, lang);
+  sandbox.i18n.apply(sandbox.document);
+  host.retranslateKeyDrawer();
+}
+
+const CJK = /[\u4e00-\u9fff]/;
+
+test("切语言后抽屉「仅 HID / 不发键」提示跟着换，且保留原有 <p> 包裹", () => {
+  const { host, sandbox, el } = loadApp();
+  openKeyDrawer(host, sandbox, { code: 13, mods: 0, action: { type: "none", value: "" } });
+  const first = el("#kdValueBox")._html;
+  assert.match(first, /只发送上面的 HID 键/, "初值应是中文提示");
+
+  switchLanguage(host, sandbox, "en-US");
+  const note = el("#kdValueBox")._html;
+  assert.doesNotMatch(note, CJK, `切英文后 #kdValueBox 仍是中文：${note}`);
+  assert.match(note, /Only the HID key above is sent/);
+  // locale 原文自带 <p class="muted small">，不能当成 data-i18n 的纯文本渲染。
+  assert.match(note, /^<p class="muted small">/, "提示的样式包裹丢了");
+
+  // 键码 0（不发键）是另一条文案，同样要跟着语言走。
+  host.state.cfg.keys[0].code = 0;
+  host.retranslateKeyDrawer();
+  const none = el("#kdValueBox")._html;
+  assert.doesNotMatch(none, CJK, `键码 0 的提示没换语言：${none}`);
+  assert.match(none, /This key sends no input at all/);
+});
+
+test("切语言后 HID 下拉的「特殊」分组名跟着换", () => {
+  const { host, sandbox, el } = loadApp();
+  openKeyDrawer(host, sandbox, { code: 13, mods: 0, action: { type: "none", value: "" } });
+  const rendered = el("#keyDrawerBody")._html.match(/<optgroup label="([^"]+)"/);
+  assert.ok(rendered, "HID 下拉里应有「特殊」分组");
+  assert.equal(rendered[1], "特殊", "初值应是中文分组名");
+  const og = el("#kdHid optgroup");
+  og.label = rendered[1];            // 桩里把渲染出的属性落到节点上
+
+  switchLanguage(host, sandbox, "en-US");
+  assert.equal(og.label, "Special", "optgroup 的 label 是属性，data-i18n 改不到");
+});
+
+test("retranslateKeyDrawer 不重建抽屉 DOM：表单整块 innerHTML 不变", () => {
+  const { host, sandbox, el } = loadApp();
+  openKeyDrawer(host, sandbox, { code: 13, mods: 0, action: { type: "none", value: "" } });
+  const before = el("#keyDrawerBody")._html;
+  assert.ok(before.includes('id="kdHid"'), "抽屉表单已渲染");
+
+  // 重建走的是 renderKeyDrawer；retranslateKeyDrawer 自己也不许改 body.innerHTML
+  // （那等于把用户正在编辑的表单连同草稿一起换掉）。
+  const real = sandbox.renderKeyDrawer;
+  let rebuilt = 0;
+  sandbox.renderKeyDrawer = () => { rebuilt += 1; return real(); };
+  try {
+    switchLanguage(host, sandbox, "en-US");
+  } finally {
+    sandbox.renderKeyDrawer = real;
+  }
+  assert.equal(rebuilt, 0, "切语言路径重建了抽屉");
+  assert.equal(el("#keyDrawerBody")._html, before, "抽屉表单被整块重建，草稿会丢");
 });
 
 /* ---------------- 2. 日志字段转义 ---------------- */
@@ -246,6 +333,7 @@ test("重新选中 / 断开重连后忽略状态清空，提示重新出现", ()
   host.state.preview = false;
   host.state.cfg = { trusted: false, keys: [], pins: [], sleep: {}, encoder: { mode: 0 } };
   host.state.pendingIgnored.d1 = true;
+  host.state.connSince.d1 = Date.now();   // 本轮之前这台设备确实是连着的
 
   // 断开：resetReconnectCycle 是状态轮询里每台设备断开时都走的路径。
   host.resetReconnectCycle("d1");
@@ -256,6 +344,38 @@ test("重新选中 / 断开重连后忽略状态清空，提示重新出现", ()
   // （renderDevices 需要完整设备列表 DOM，这里只钉住生产源码里的清理动作。）
   assert.match(host.selectDevice.toString(), /delete state\.pendingIgnored\[devId\]/,
     "selectDevice 必须清掉这台设备的忽略标记");
+});
+
+test("离线设备点「先忽略」不会被状态轮询抹掉（WS-599）", () => {
+  const { host, el } = loadApp();
+  host.state.selected = "d1";
+  host.state.preview = false;
+  host.state.cfg = { trusted: false, keys: [], pins: [], sleep: {}, encoder: { mode: 0 } };
+  // 设备一直是离线的：connSince 里没有它，pollStatus 每轮都会走到断开分支。
+  host.state.devices = [{ dev_id: "d1", connected: false }];
+
+  host.bindCfgStatus();
+  el("#btnUntrustedIgnore").onclick();
+  assert.equal(el("#cfgStatus").hidden, true, "忽略后徽标收起");
+
+  host.syncConnectionCycles(host.state.devices);   // == pollStatus 的那一次
+  assert.equal(host.state.pendingIgnored.d1, true,
+    "离线设备不算「断开重连」，轮询不该抹掉刚点的忽略");
+  assert.equal(host.cfgStatusView().state, STATES.NONE, "提示仍在忽略状态");
+  assert.equal(el("#cfgStatus").hidden, true, "一个轮询周期后徽标又冒出来了");
+});
+
+test("真的从连着掉到断开：轮询结束连接周期，忽略随之清空", () => {
+  const { host } = loadApp();
+  host.state.selected = "d1";
+  host.state.preview = false;
+  host.state.cfg = { trusted: false, keys: [], pins: [], sleep: {}, encoder: { mode: 0 } };
+  host.state.pendingIgnored.d1 = true;
+  host.state.connSince.d1 = Date.now();            // 上一轮还在线
+
+  host.syncConnectionCycles([{ dev_id: "d1", connected: false }]);
+  assert.equal(host.state.connSince.d1, undefined, "连接周期已结束");
+  assert.equal(host.state.pendingIgnored.d1, undefined, "断开重连后提示重新出现");
 });
 
 test("「先忽略」按钮与文案在两套 locale 都在", () => {
