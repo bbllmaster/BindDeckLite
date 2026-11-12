@@ -45,12 +45,27 @@
   };
 
   /**
+   * WS-512 / WS-596：这台设备的「配置未确认」提示是否还要呈现。
+   *
+   * `cfg` 就是页面上的 `state.cfg`（判定只看 `trusted`），`ignored` 是本次
+   * 会话对这台设备的「先忽略」标记（`state.pendingIgnored[devId]`）。
+   *
+   * 纯函数、只读：它不碰 cfg，也就改不动 `trusted` —— 「先忽略」只关掉提示，
+   * 绝不能顺带解除「应用配置」前的覆盖确认（那条判断在 app.js 里直接读
+   * `cfg.trusted` 与 `sessionRead`）。
+   */
+  function shouldShowPending(cfg, ignored) {
+    return (cfg || {}).trusted === false && !ignored;
+  }
+
+  /**
    * 由页面事实推导当前状态。
    *
    * @param {object} input
    *   selected     {string|null} 当前设备 id
    *   preview      {boolean}     预览模式（没有设备，只有默认值）
    *   trusted      {boolean|undefined} 本机存档是否来自这台设备（WS-512）
+   *   ignored      {boolean}     WS-596 本会话对这台设备点了「先忽略」
    *   pendingCount {number}      相对「已下发快照」的改动项数
    *   reconnect    {boolean}     WS-561 重连后「有修改没下发」的提示是否成立
    *   lastApply    {{at:number, failed:number}|null} 上次下发结论
@@ -68,7 +83,17 @@
 
     // trusted === false 才表示「确认不是这台设备的存档」；undefined 是旧
     // config.json 没有该字段，按可信处理（WS-512 的兼容约定）。
-    if (o.trusted === false) return Object.assign({ state: STATES.UNTRUSTED }, base);
+    if (shouldShowPending({ trusted: o.trusted }, o.ignored)) {
+      return Object.assign({ state: STATES.UNTRUSTED }, base);
+    }
+    // 「先忽略」把未确认提示收掉，但结论本身没变：本机依然不知道设备上
+    // 是什么，所以不能改口说「已同步」。还有未下发的修改时那是另一件事，
+    // 照常按 pending 提示；两者都没有就干脆不占顶栏。
+    if (o.trusted === false) {
+      return pendingCount > 0
+        ? Object.assign({ state: STATES.PENDING }, base)
+        : Object.assign({ state: STATES.NONE }, base, { pendingCount: 0 });
+    }
 
     if (pendingCount > 0) {
       return Object.assign({ state: STATES.PENDING }, base, {
@@ -104,5 +129,5 @@
     }
   }
 
-  return { STATES, LABEL_KEYS, derive, describe };
+  return { STATES, LABEL_KEYS, shouldShowPending, derive, describe };
 });

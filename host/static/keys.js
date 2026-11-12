@@ -186,16 +186,21 @@ function closeKeyDrawer(restoreFocus = true) {
   if (restoreFocus && target) target.focus({ preventScroll: true });
 }
 
+/** 当前挂载的宏编辑器的「只换文案」入口；WS-596 切语言时用，见 retranslateKeyDrawer。 */
+let macroEditorRetranslate = null;
+
 function renderKeyDrawer() {
   const drawer = $("#keyDrawer");
   const body = $("#keyDrawerBody");
   const title = $("#keyDrawerTitle");
   if (!drawer || !body) return;
+  // 表单整块重建，旧的宏编辑器随之作废（动作类型换成非宏时没有新的可挂）。
+  macroEditorRetranslate = null;
   const idx = state.editingKey;
   const item = idx === null ? null : keyItem(idx);
   if (!item) {
     title.textContent = t("ui.key_editor");
-    body.innerHTML = `<p class="muted small">${t("ui.key_editor_hint")}</p>`;
+    body.innerHTML = `<p class="muted small" data-i18n="ui.key_editor_hint">${t("ui.key_editor_hint")}</p>`;
     drawer.classList.remove("open");
     $("#keyDrawerBackdrop").hidden = true;
     document.body.classList.remove("drawer-open");
@@ -212,8 +217,8 @@ function renderKeyDrawer() {
   const modsBlocked = (state.cfg || {}).mods_supported === false;
   const modsRow = mods.length ? `
     <div class="kd-field">
-      <span class="field-label">${t("keys.mods_label")}</span>
-      <div class="kd-mods" role="group" aria-label="${t("keys.mods_label")}">
+      <span class="field-label" data-i18n="keys.mods_label">${t("keys.mods_label")}</span>
+      <div class="kd-mods" role="group" aria-label="${t("keys.mods_label")}" data-i18n-aria-label="keys.mods_label">
         ${mods.map((m) => `
           <label class="kd-mod">
             <input type="checkbox" id="${m.id}" data-bit="${m.bit}"
@@ -221,25 +226,25 @@ function renderKeyDrawer() {
             <span>${escapeHtml(m.label)}</span>
           </label>`).join("")}
       </div>
-      ${modsBlocked ? `<p class="muted small" id="kdModsHint">${t("keys.mods_unsupported")}</p>` : ""}
+      ${modsBlocked ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_unsupported">${t("keys.mods_unsupported")}</p>` : ""}
     </div>` : "";
   body.innerHTML = `
     <div class="kd-field">
-      <label class="field-label" for="kdHid">${t("keys.hid_label")}</label>
+      <label class="field-label" for="kdHid" data-i18n="keys.hid_label">${t("keys.hid_label")}</label>
       <select id="kdHid" class="sel-key">${keyOptions(item.code)}</select>
     </div>${modsRow}
     <div class="kd-field">
-      <label class="field-label" for="kdAct">${t("keys.action_label")}</label>
+      <label class="field-label" for="kdAct" data-i18n="keys.action_label">${t("keys.action_label")}</label>
       <select id="kdAct" class="sel-act">
-        ${ACTION_TYPES.map((a) => `<option value="${a.id}" ${a.id === action.type ? "selected" : ""}>${actionName(a)}</option>`).join("")}
+        ${ACTION_TYPES.map((a) => `<option value="${a.id}" ${a.id === action.type ? "selected" : ""} data-i18n="${a.nameKey}">${actionName(a)}</option>`).join("")}
       </select>
     </div>
     <div class="kd-field">
-      <label class="field-label" id="kdValueLabel" for="kdValue">${t("keys.action_params")}</label>
+      <label class="field-label" id="kdValueLabel" for="kdValue" data-i18n="keys.action_params">${t("keys.action_params")}</label>
       <div class="act-input" id="kdValueBox"></div>
     </div>
     <div class="kd-test-row">
-      <button type="button" class="btn secondary sm" id="kdTest">${t("ui.test_action")}</button>
+      <button type="button" class="btn secondary sm" id="kdTest" data-i18n="ui.test_action">${t("ui.test_action")}</button>
       <span class="muted small" id="kdTestHint"></span>
     </div>`;
 
@@ -278,10 +283,13 @@ function renderKeyDrawer() {
   const label = $("#kdValueLabel");
   if (action.type === "macro") {
     if (label) label.textContent = t("keys.macro_steps");
+    // 标签文案随动作类型变，data-i18n 也要跟着换，i18n.apply 才不会写回旧词。
+    if (label) label.setAttribute("data-i18n", "keys.macro_steps");
     if (label) label.removeAttribute("for");
     const editor = $(".macro-editor", holder);
     if (editor && label) editor.setAttribute("aria-labelledby", "kdValueLabel");
   } else {
+    if (label) label.setAttribute("data-i18n", "keys.action_params");
     const ctl = holder.querySelector("input, select, textarea");
     if (ctl) {
       ctl.id = "kdValue";
@@ -294,6 +302,51 @@ function renderKeyDrawer() {
   const testBtn = $("#kdTest");
   testBtn.onclick = () => testKeyAction(item, idx);
   syncKeyDrawerRunning();
+}
+
+/**
+ * WS-596：切语言时只重算检查器 / 抽屉里的文案，不重建表单。
+ *
+ * 以前 retranslateDynamic() 直接调 renderKeyDrawer()，整个表单 innerHTML 重建：
+ * 宏纯文本视图里尚未规范化的原文会被按步骤重新序列化（空行、缩进被吃掉），
+ * 焦点与 caret 也一起丢，用户看到的就是「我正在写的东西被改了」。这里只改
+ * 文字节点：值、选中项、textarea 内容一概不碰。
+ *
+ * 抽屉里大部分标签已经由 i18n.apply(document) 按 data-i18n 换好；下面补的是
+ * JS 动态拼出来的那几处（标题、下拉选项、测试按钮状态、宏步骤行）。
+ */
+function retranslateKeyDrawer() {
+  const drawer = $("#keyDrawer");
+  const body = $("#keyDrawerBody");
+  const title = $("#keyDrawerTitle");
+  if (!drawer || !body) return;
+  const idx = state.editingKey;
+  const item = idx === null ? null : keyItem(idx);
+  if (!item) {
+    // 没有在编辑：抽屉里没有草稿，空态标题照旧换词即可，不必重建。
+    if (title) title.textContent = t("ui.key_editor");
+    return;
+  }
+  if (title) title.textContent = inputTitle(idx);
+  // 动作类型下拉是按 value 选中的，只改 option 文案，不动 select.value。
+  ACTION_TYPES.forEach((a) => {
+    const opt = $(`#kdAct option[value="${a.id}"]`);
+    if (opt) opt.textContent = actionName(a);
+  });
+  // HID 下拉的「特殊」分组名是 optgroup 的 label 属性 —— data-i18n 只能改
+  // textContent，改不到属性，切语言不重写就会停在旧语言上（WS-599）。
+  const og = $("#kdHid optgroup");
+  if (og) og.label = t("keys.special_group");
+  // 「无上位机动作」的说明是 JS 拼的 innerHTML（locale 内含 <p> 包裹），
+  // 同样不在 data-i18n 覆盖范围，按当前键码重写一遍。
+  const action = item.action || { type: "none" };
+  if ((action.type || "none") === "none") {
+    const box = $("#kdValueBox");
+    if (box) renderNoActionNote(box, item);
+  }
+  // 测试按钮 / 提示的文案取决于执行状态，data-i18n 只会写成「测试动作」。
+  syncKeyDrawerRunning();
+  if (typeof macroEditorRetranslate === "function") macroEditorRetranslate();
 }
 
 function syncKeyDrawerRunning() {
@@ -563,9 +616,12 @@ function mountMacroEditor(holder, action) {
   const wrap = document.createElement("div");
   wrap.className = "macro-editor";
   wrap.innerHTML = `
-    <div class="macro-tabs" role="tablist" aria-label="${t("keys.macro_view_aria")}">
-      <button type="button" class="macro-tab" data-view="steps" role="tab">${t("keys.macro_view_steps")}</button>
-      <button type="button" class="macro-tab" data-view="text" role="tab">${t("keys.macro_view_text")}</button>
+    <div class="macro-tabs" role="tablist" aria-label="${t("keys.macro_view_aria")}"
+         data-i18n-aria-label="keys.macro_view_aria">
+      <button type="button" class="macro-tab" data-view="steps" role="tab"
+              data-i18n="keys.macro_view_steps">${t("keys.macro_view_steps")}</button>
+      <button type="button" class="macro-tab" data-view="text" role="tab"
+              data-i18n="keys.macro_view_text">${t("keys.macro_view_text")}</button>
       <span class="macro-count"></span>
     </div>
     <div class="macro-pane" data-pane="steps" role="tabpanel">
@@ -575,8 +631,9 @@ function mountMacroEditor(holder, action) {
     </div>
     <div class="macro-pane" data-pane="text" role="tabpanel" hidden>
       <textarea class="macro-text" spellcheck="false"
-        placeholder="${t("keys.macro_text_placeholder")}"></textarea>
-      <p class="muted small">${t("keys.macro_text_hint")}</p>
+        placeholder="${t("keys.macro_text_placeholder")}"
+        data-i18n-placeholder="keys.macro_text_placeholder"></textarea>
+      <p class="muted small" data-i18n="keys.macro_text_hint">${t("keys.macro_text_hint")}</p>
       <p class="macro-lint" data-lint="text"></p>
     </div>`;
 
@@ -618,7 +675,7 @@ function mountMacroEditor(holder, action) {
   function renderRows() {
     list.innerHTML = "";
     if (!steps.length) {
-      list.innerHTML = `<p class="muted small">${t("keys.macro_empty")}</p>`;
+      list.innerHTML = `<p class="muted small" data-i18n="keys.macro_empty">${t("keys.macro_empty")}</p>`;
     }
     steps.forEach((step, i) => {
       const row = document.createElement("div");
@@ -698,20 +755,76 @@ function mountMacroEditor(holder, action) {
     });
   }
 
-  macroQuickInserts().forEach(([type, label]) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "btn sm";
-    btn.textContent = "+ " + label;
-    btn.onclick = () => {
-      steps.push(MACRO_STEP_DEFAULTS[type]());
-      renderRows();
-      commit();
-      const last = list.querySelector(`.macro-step[data-i="${steps.length - 1}"] .ms-value`);
-      if (last) last.focus();
-    };
-    quick.appendChild(btn);
-  });
+  // 快捷插入按钮没有用户状态，文案变了整组重建即可（不碰 steps / textarea）。
+  function buildQuick() {
+    quick.innerHTML = "";
+    macroQuickInserts().forEach(([type, label]) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn sm";
+      btn.textContent = "+ " + label;
+      btn.onclick = () => {
+        steps.push(MACRO_STEP_DEFAULTS[type]());
+        renderRows();
+        commit();
+        const last = list.querySelector(`.macro-step[data-i="${steps.length - 1}"] .ms-value`);
+        if (last) last.focus();
+      };
+      quick.appendChild(btn);
+    });
+  }
+  buildQuick();
+
+  /**
+   * WS-596：切语言时只换文案。steps / textValue / textarea.value 一律不动，
+   * 所以宏纯文本视图里正在编辑的原文（含空行、缩进）与 caret 都保留。
+   */
+  function retranslate() {
+    $$(".macro-tab", wrap).forEach((tab) => {
+      tab.textContent = t(tab.dataset.view === "text"
+        ? "keys.macro_view_text" : "keys.macro_view_steps");
+    });
+    count.textContent = t("keys.macro_count", { count: steps.length });
+    buildQuick();
+    if (!steps.length) {
+      list.innerHTML = `<p class="muted small" data-i18n="keys.macro_empty">${t("keys.macro_empty")}</p>`;
+    }
+    $$(".macro-step", list).forEach((row, i) => {
+      const step = steps[i];
+      if (!step) return;
+      const sel = $(".ms-type", row);
+      if (sel) {
+        const options = Array.from(sel.querySelectorAll("option"));
+        macroStepOptions().forEach(([id, label]) => {
+          const opt = options.find((o) => o.value === id);
+          if (opt) opt.textContent = label;
+        });
+        const unknown = options.find((o) => !MACRO_KNOWN_KINDS.has(o.value));
+        if (unknown) unknown.textContent = t("keys.unknown_type_option", { type: step.type });
+      }
+      const valueEl = $(".ms-value", row);
+      if (valueEl) valueEl.placeholder = macroValuePlaceholder(step.type);
+      const delayEl = $(".ms-delay", row);
+      if (delayEl) delayEl.title = t("keys.text_delay_placeholder");
+      const sensitive = $(".macro-sensitive", row);
+      if (sensitive) sensitive.textContent = t("keys.log_not_echoed");
+      const up = $(".ms-up", row);
+      if (up) up.title = t("keys.move_up");
+      const down = $(".ms-down", row);
+      if (down) down.title = t("keys.move_down");
+      const del = $(".ms-del", row);
+      if (del) del.title = t("keys.delete_step");
+      const err = $(".ms-error", row);
+      if (err) err.innerHTML = issueFor(step);
+    });
+    lintSteps.innerHTML = macroLintHtml(
+      steps.map((s, i) => {
+        const issue = lintMacroStep(s);
+        return issue ? { line: i + 1, ...issue } : null;
+      }).filter(Boolean));
+    if (textArea) lintText.innerHTML = macroLintHtml(lintMacroText(textArea.value));
+  }
+  macroEditorRetranslate = retranslate;
 
   function showView(next) {
     view = next;

@@ -899,6 +899,7 @@
   "ui.unknown_reason": "unknown reason",
   "ui.unsent_confirm": "Edits have not been applied yet; reading the device config discards them",
   "ui.untrusted_confirm": "This machine has no archived configuration for the deck, so the pins and key codes shown are defaults.\nContinuing overwrites the deck's current pins, key codes, encoder mode and sleep settings. Apply anyway?",
+  "ui.untrusted_ignore": "Ignore for now",
   "ui.untrusted_sub": "Pins / key codes / encoder mode / sleep are the local defaults; applying them will overwrite what the deck currently holds.",
   "ui.untrusted_title": "No configuration archived for this deck on this machine · showing defaults",
   "ui.update_channel": "Update channel",
