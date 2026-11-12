@@ -796,6 +796,11 @@ static String cfgPage(const KeysForm* form = nullptr) {
     "#portalClock{display:flex;align-items:center;justify-content:space-between;"
     "gap:8px;flex-wrap:wrap;box-sizing:border-box;border:1px solid #dadce0;"
     "border-radius:6px;padding:8px 10px;margin:0 0 12px;font-size:14px;line-height:1.4}"
+    // WS-606: an author ID rule (display:flex) outranks the UA [hidden]
+    // {display:none}, so the hidden attribute alone never hid this row - it
+    // rendered as an empty bordered box + button with no JS / no `left`.
+    // Re-assert display:none for the hidden state (specificity 110 > 100).
+    "#portalClock[hidden]{display:none}"
     "#portalClock.urgent{background:#fef7e0;border-color:#f0c36d;color:#7a4f01}"
     "#clockText{word-break:break-word}"
     "#extendBtn{flex:0 1 auto;padding:6px 10px;border:1px solid #1a73e8;"
@@ -1056,6 +1061,10 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // WS-504: self-check poller. Inline on purpose - the portal stays a single
   // response with no external resource. Kept inside the marked <script> block
   // so host/test_portal_selfcheck.mjs can extract and exercise this exact code.
+  // WS-606: this is the ONLY /keys/state poller. Its success/fail callbacks hand
+  // `left` (and the fail count) to <script id='portal-clock'> via
+  // window.__portalClockSync / __portalClockFail, so the countdown no longer
+  // opens a second 400 ms poll against the single-client WebServer.
   h += F("<script id='selfcheck'>"
          "(function(){"
          "var seq=0,primed=false,fails=0,sawHttp=false,stop=false,hitTimer=null;"
@@ -1087,6 +1096,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "return r.json();"
          "}).then(function(s){"
          "fails=0;sawHttp=false;note('');"
+         "if(typeof window!=='undefined'&&window.__portalClockSync)window.__portalClockSync(s?s.left:undefined);"
          "if(!s||typeof s.seq!=='number')return;"
          "if(!primed||s.seq<seq){primed=true;seq=s.seq;return;}"
          "if(s.seq>seq){seq=s.seq;onHit(s.index,s.gpio);}"
@@ -1095,6 +1105,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "if(e&&e.unsupported){stop=true;note('当前固件不支持按键自检');return;}"
          "if(e&&e.http)sawHttp=true;"
          "fails++;"
+         "if(typeof window!=='undefined'&&window.__portalClockFail)window.__portalClockFail(fails,e);"
          "if(fails>=3)note(sawHttp?'设备忙，稍后自动重试':'配网已退出，请重新进入');"
          "}).then(function(){later(fails>=3?2000:400);});"
          "}"
@@ -1169,21 +1180,26 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "refresh:refresh,state:state};"
          "})();</script>");
 
-  // WS-602: 配网倒计时 + 「延长 5 分钟」。独立轮询 /keys/state（400 ms 一次），
+  // WS-602 / WS-606: 配网倒计时 + 「延长 5 分钟」。
+  // 修复前这段脚本自己又开了一条 400 ms 的 /keys/state 轮询，和上面的
+  // <script id='selfcheck'> 一起打同一台单客户端 WebServer：请求翻倍，两套失败
+  // 计数还会互相矛盾（顶部说「已退出」、自检框可能说「设备忙」）。现只保留自检
+  // 那一条轮询，由它在成功/失败回调里调用 window.__portalClockSync(s.left) /
+  // window.__portalClockFail(fails,e)，本脚本只挂这两个钩子，不再自己 fetch。
   // 倒计时数字一律以设备返回的 left 为准：只在两次轮询之间用
   // lastLeft - 经过时间 递减，绝不累加；切后台回来会被下一次 left 覆盖。
-  // 自检脚本保持原样，超时时自检框原文与页面顶部红块两处并存、互不覆盖。
   // 缺 left（旧页面/旧固件）时 #portalClock 保持隐藏，不显示 undefined。
-  // host/test_portal_clock.mjs 抽取并原样运行这一段，改动此脚本会让断言变红。
+  // host/test_portal_clock.mjs 同时抽取并运行 selfcheck + 本段真实脚本，确保单轮询
+  // 集成与「改实现会变红」。
   h += F("<script id='portal-clock'>"
          "(function(){"
-         "var CLOCK_MS=1000,POLL_MS=400,FAIL_LIMIT=3,URGENT_S=60;"
+         "var CLOCK_MS=1000,FAIL_LIMIT=3,URGENT_S=60;"
          "var elClock=document.getElementById('portalClock'),"
          "elText=document.getElementById('clockText'),"
          "elBtn=document.getElementById('extendBtn'),"
          "elExpired=document.getElementById('portalExpired');"
          "if(!elClock||!elText)return;"
-         "var lastLeft=null,lastSync=0,fails=0,everLeft=false,capped=false;"
+         "var lastLeft=null,lastSync=0,everLeft=false,capped=false;"
          "elClock.hidden=true;if(elExpired)elExpired.hidden=true;"
          "function now(){return (typeof performance!=='undefined'&&performance.now)"
          "?performance.now():Date.now();}"
@@ -1198,21 +1214,18 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "elText.textContent=(urgent?'即将关闭 · ':'')+'配网模式剩余 '+fmt(left)"
          "+' · 到时自动关闭热点';}"
          "function sync(left){"
+         "if(elExpired)elExpired.hidden=true;"
          "if(typeof left!=='number'||!isFinite(left))return;"
          "lastLeft=left;lastSync=now();everLeft=true;show();}"
-         "function poll(){"
-         "fetch('/keys/state',{cache:'no-store'}).then(function(r){"
-         "if(!r.ok)throw new Error('http');return r.json();"
-         "}).then(function(s){"
-         "fails=0;"
-         "if(s&&typeof s.left==='number')sync(s.left);"
-         "}).catch(function(){"
-         "fails++;"
-         "if(fails>=FAIL_LIMIT&&everLeft&&elExpired){"
+         // 设备 alive 的任何一次成功响应都喂进来：重连后顺手收起顶部超时红块。
+         "window.__portalClockSync=function(left){sync(left);};"
+         // 只有真正的网络失联才计入「疑似退网」；HTTP 5xx（设备忙）与旧固件 404
+         // 不能让顶部红块和自检框各说一套。count 直接来自自检轮询的 fails（单一计数）。
+         "window.__portalClockFail=function(count,e){"
+         "if(e&&(e.http||e.unsupported))return;"
+         "if(count>=FAIL_LIMIT&&everLeft&&elExpired){"
          "elExpired.textContent='配网已退出（5 分钟超时），热点已关闭。重新按住第 10 个输入上电可再次进入。';"
-         "elExpired.hidden=false;}"
-         "}).then(function(){setTimeout(poll,POLL_MS);});"
-         "}"
+         "elExpired.hidden=false;}};"
          "function extend(){"
          "if(capped||!elBtn||elBtn.disabled)return;"
          "fetch('/extend',{method:'POST'}).then(function(r){"
@@ -1224,7 +1237,6 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "}).catch(function(){});}"
          "if(elBtn)elBtn.addEventListener('click',extend);"
          "setInterval(show,CLOCK_MS);"
-         "poll();"
          "})();</script>");
   h += F("</body></html>");
   return h;
@@ -1415,6 +1427,8 @@ static void setupProvisioning() {
                                                    : (g_configDeadline - now) / 1000UL;
     String j = "{\"left\":" + String(left) +
                ",\"capped\":" + String(capped ? "true" : "false") + "}";
+    cfgServer.sendHeader("Cache-Control", "no-store");
+    cfgServer.sendHeader("Connection", "close");
     cfgServer.send(200, "application/json", j);
     log_e("[cfg] extend left=%lu capped=%d", left, capped ? 1 : 0);
   });
@@ -3503,7 +3517,7 @@ void loop() {
     }
     // WS-602: the deadline (not the start) decides the timeout, so /extend and
     // the 30-min cap work even when nobody ever opens the page.
-    if (g_configMode && millis() > g_configDeadline) {
+    if (g_configMode && (long)(millis() - g_configDeadline) >= 0) {
       log_e("[cfg] leave reason=timeout duration=%lu", millis() - g_configModeStart);
       WiFi.mode(WIFI_OFF);
       g_configMode = false;
