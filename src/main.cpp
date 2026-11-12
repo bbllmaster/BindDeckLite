@@ -194,7 +194,13 @@ static String g_bleName;  // "BindDeckLite-A1B2"
 
 static bool g_configMode = false;
 static bool g_bleStarted = false;
+// WS-602: g_configModeStart is when this portal session began (used only for
+// the "how long did it last" log). g_configDeadline is the absolute millis()
+// deadline the timeout check reads: entering sets it to start + CONFIG_MODE_MS,
+// POST /extend pushes it forward (capped at start + 30 min). The page countdown
+// is derived from this value via /keys/state, never from a separate clock.
 static unsigned long g_configModeStart = 0;
+static unsigned long g_configDeadline = 0;
 static String g_cfgApName;
 static int g_otaProgress = -1;
 
@@ -782,6 +788,20 @@ static String cfgPage(const KeysForm* form = nullptr) {
     ".dbar{background:#fef7e0;border:1px solid #f0c36d;color:#7a4f01;"
     "padding:8px 10px;border-radius:6px;margin:0 0 12px;font-size:14px;"
     "line-height:1.4;word-break:break-word}"
+    // WS-602: countdown row + extend button. The row starts hidden (shown by
+    // <script id='portal-clock'> once /keys/state reports a remaining time),
+    // so a browser without JS renders exactly the old page. flex-wrap keeps the
+    // button from forcing a horizontal scrollbar at 320 px; .urgent is the
+    // amber "about to close" state at <=60 s. The timeout banner reuses .err.
+    "#portalClock{display:flex;align-items:center;justify-content:space-between;"
+    "gap:8px;flex-wrap:wrap;box-sizing:border-box;border:1px solid #dadce0;"
+    "border-radius:6px;padding:8px 10px;margin:0 0 12px;font-size:14px;line-height:1.4}"
+    "#portalClock.urgent{background:#fef7e0;border-color:#f0c36d;color:#7a4f01}"
+    "#clockText{word-break:break-word}"
+    "#extendBtn{flex:0 1 auto;padding:6px 10px;border:1px solid #1a73e8;"
+    "border-radius:6px;background:#fff;color:#1a73e8;font:inherit;font-size:13px;"
+    "cursor:pointer;white-space:normal;word-break:break-word;text-align:center}"
+    "#extendBtn:disabled{border-color:#dadce0;color:#80868b;cursor:default}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
     h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
@@ -795,14 +815,30 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // WS-572: one summary line for both forms, right under the title. Default
   // hidden and filled by <script id='dirty'> at the end of the page, so the
   // page without JS is byte-for-byte the old behaviour.
-  h += F("<h2>BindDeckLite 配置</h2><div id='dirtyBar' class='dbar' hidden></div>"
+  // WS-602: the timeout banner sits at the very top of the page (before the
+  // title's other bars). It is hidden until the clock script has seen a real
+  // `left` value and then loses the poll 3 times in a row, so the self-check
+  // box keeps its own original "配网已退出，请重新进入" note untouched.
+  h += F("<h2>BindDeckLite 配置</h2>"
+         "<div id='portalExpired' class='err' hidden></div>"
+         "<div id='dirtyBar' class='dbar' hidden></div>"
          "<p>设备: <b>");
   h += g_bleName;
   h += F("</b><br>固件: ");
   h += FW_VERSION;
   h += F(" (");
   h += FW_CHIP;
-  h += F(")</p><p>WiFi 状态: ");
+  h += F(")</p>");
+  // WS-602: the always-present countdown row lives in the page header, after
+  // the "device / firmware" block and before the WiFi form. Starts hidden;
+  // <script id='portal-clock'> reveals it and fills #clockText from the device.
+  // The "延长 5 分钟" button is type=button (no form around it), so an extend
+  // never submits/overwrites the unsaved WiFi / pin inputs.
+  h += F("<div id='portalClock' hidden>"
+         "<span id='clockText'></span>"
+         "<button id='extendBtn' type='button'>延长 5 分钟</button>"
+         "</div>");
+  h += F("<p>WiFi 状态: ");
   if (WiFi.status() == WL_CONNECTED) {
     h += "已连接 <b>" + htmlEsc(WiFi.SSID()) + "</b> · IP " + WiFi.localIP().toString();
   } else if (ssid.length()) {
@@ -946,7 +982,8 @@ static String cfgPage(const KeysForm* form = nullptr) {
   h += F("<hr><p><a href='/update'>→ 固件 OTA 升级（无线刷机）</a></p>"
          "<p style='color:#888;font-size:12px'>设备只在配网模式开热点（按住第 10 个输入上电"
          "——编码器布局下是编码器按压，12 键布局下是第 10 键；或上位机点“进入配网模式”）。"
-         "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。</p>");
+         "离开配网：长按该键约 1 秒，或等 5 分钟自动退出。"
+         "页面顶部显示剩余时间，可延长 5 分钟，单次最迟 30 分钟。</p>");
   // WS-542: deep-sleep wake capability of the inputs, recomputed on every pin
   // keystroke (no save needed). Same chip rule as isWakeCapablePin() above:
   // only RTC GPIOs can wake the chip, so the EC11 lines and the 12-key fixed
@@ -1131,6 +1168,64 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "leave:function(){return ask('exit');},"
          "refresh:refresh,state:state};"
          "})();</script>");
+
+  // WS-602: 配网倒计时 + 「延长 5 分钟」。独立轮询 /keys/state（400 ms 一次），
+  // 倒计时数字一律以设备返回的 left 为准：只在两次轮询之间用
+  // lastLeft - 经过时间 递减，绝不累加；切后台回来会被下一次 left 覆盖。
+  // 自检脚本保持原样，超时时自检框原文与页面顶部红块两处并存、互不覆盖。
+  // 缺 left（旧页面/旧固件）时 #portalClock 保持隐藏，不显示 undefined。
+  // host/test_portal_clock.mjs 抽取并原样运行这一段，改动此脚本会让断言变红。
+  h += F("<script id='portal-clock'>"
+         "(function(){"
+         "var CLOCK_MS=1000,POLL_MS=400,FAIL_LIMIT=3,URGENT_S=60;"
+         "var elClock=document.getElementById('portalClock'),"
+         "elText=document.getElementById('clockText'),"
+         "elBtn=document.getElementById('extendBtn'),"
+         "elExpired=document.getElementById('portalExpired');"
+         "if(!elClock||!elText)return;"
+         "var lastLeft=null,lastSync=0,fails=0,everLeft=false,capped=false;"
+         "elClock.hidden=true;if(elExpired)elExpired.hidden=true;"
+         "function now(){return (typeof performance!=='undefined'&&performance.now)"
+         "?performance.now():Date.now();}"
+         "function fmt(sec){sec=Math.max(0,Math.floor(sec));"
+         "var m=Math.floor(sec/60),s=sec%60;return m+':'+(s<10?'0':'')+s;}"
+         "function show(){"
+         "if(lastLeft===null){elClock.hidden=true;return;}"
+         "elClock.hidden=false;"
+         "var left=Math.max(0,lastLeft-(now()-lastSync)/1000);"
+         "var urgent=left<=URGENT_S;"
+         "if(urgent)elClock.classList.add('urgent');else elClock.classList.remove('urgent');"
+         "elText.textContent=(urgent?'即将关闭 · ':'')+'配网模式剩余 '+fmt(left)"
+         "+' · 到时自动关闭热点';}"
+         "function sync(left){"
+         "if(typeof left!=='number'||!isFinite(left))return;"
+         "lastLeft=left;lastSync=now();everLeft=true;show();}"
+         "function poll(){"
+         "fetch('/keys/state',{cache:'no-store'}).then(function(r){"
+         "if(!r.ok)throw new Error('http');return r.json();"
+         "}).then(function(s){"
+         "fails=0;"
+         "if(s&&typeof s.left==='number')sync(s.left);"
+         "}).catch(function(){"
+         "fails++;"
+         "if(fails>=FAIL_LIMIT&&everLeft&&elExpired){"
+         "elExpired.textContent='配网已退出（5 分钟超时），热点已关闭。重新按住第 10 个输入上电可再次进入。';"
+         "elExpired.hidden=false;}"
+         "}).then(function(){setTimeout(poll,POLL_MS);});"
+         "}"
+         "function extend(){"
+         "if(capped||!elBtn||elBtn.disabled)return;"
+         "fetch('/extend',{method:'POST'}).then(function(r){"
+         "if(!r.ok)throw new Error('http');return r.json();"
+         "}).then(function(d){"
+         "if(d&&typeof d.left==='number')sync(d.left);"
+         "if(d&&d.capped){capped=true;elBtn.disabled=true;"
+         "elBtn.textContent='已达单次配网上限，请退出后重新进入';}"
+         "}).catch(function(){});}"
+         "if(elBtn)elBtn.addEventListener('click',extend);"
+         "setInterval(show,CLOCK_MS);"
+         "poll();"
+         "})();</script>");
   h += F("</body></html>");
   return h;
 }
@@ -1289,12 +1384,42 @@ static void setupProvisioning() {
   // the single-client WebServer from parking the next poll behind a keep-alive
   // socket. JSON only - no CFG:/CMD: traffic, no NVS write, no HID.
   cfgServer.on("/keys/state", HTTP_GET, []() {
+    // WS-602: remaining whole seconds of this portal session. Derived from the
+    // absolute deadline, clamped at 0; the page only decrements between polls
+    // and is overwritten by the next value (no client-side accumulation).
+    unsigned long now = millis();
+    unsigned long left = (now >= g_configDeadline) ? 0UL
+                                                   : (g_configDeadline - now) / 1000UL;
     String j = "{\"seq\":" + String((unsigned long)g_recentInput.seq) +
                ",\"index\":" + String(g_recentInput.index) +
-               ",\"gpio\":" + String(g_recentInput.gpio) + "}";
+               ",\"gpio\":" + String(g_recentInput.gpio) +
+               ",\"left\":" + String(left) + "}";
     cfgServer.sendHeader("Cache-Control", "no-store");
     cfgServer.sendHeader("Connection", "close");
     cfgServer.send(200, "application/json", j);
+  });
+
+  // --- WS-602: extend this portal session by 5 minutes -------------------
+  // POST only (GET answers 405 and changes nothing), same shape as /exit.
+  // The deadline can never pass "entered + 30 min"; once there, capped=true
+  // and left stops growing. The returned left re-syncs the page countdown
+  // without a reload, so unsaved SSID / pin / OTA inputs are preserved.
+  cfgServer.on("/extend", HTTP_POST, []() {
+    unsigned long cap = g_configModeStart + 30UL * 60UL * 1000UL;
+    unsigned long newDeadline = g_configDeadline + CONFIG_MODE_MS;
+    bool capped = false;
+    if (newDeadline > cap) { newDeadline = cap; capped = true; }
+    g_configDeadline = newDeadline;
+    unsigned long now = millis();
+    unsigned long left = (now >= g_configDeadline) ? 0UL
+                                                   : (g_configDeadline - now) / 1000UL;
+    String j = "{\"left\":" + String(left) +
+               ",\"capped\":" + String(capped ? "true" : "false") + "}";
+    cfgServer.send(200, "application/json", j);
+    log_e("[cfg] extend left=%lu capped=%d", left, capped ? 1 : 0);
+  });
+  cfgServer.on("/extend", HTTP_GET, []() {
+    cfgServer.send(405, "text/plain", "Method Not Allowed");
   });
 
   // --- OTA (config mode only) ---
@@ -3170,6 +3295,7 @@ void setup() {
   g_configMode = heldAtBoot;
   if (g_configMode) {
     g_configModeStart = millis();
+    g_configDeadline = g_configModeStart + CONFIG_MODE_MS;  // WS-602
     log_e("[cfg] CONFIG MODE - AP + portal, BLE deferred");
     setupProvisioning();
   } else {
@@ -3353,7 +3479,7 @@ void loop() {
     // value (WiFi credentials, pins, host binding) is touched.
     if (g_portalExitAt && (long)(millis() - g_portalExitAt) >= 0) {
       g_portalExitAt = 0;
-      log_e("[cfg] portal exit -> reboot");
+      log_e("[cfg] leave reason=exit duration=%lu", millis() - g_configModeStart);
       g_bootReq = BOOT_REBOOT;
     }
     static unsigned long exitHold = 0;
@@ -3366,7 +3492,7 @@ void loop() {
         if (!encOn) recordInputPress(9);
       }
       else if (millis() - exitHold >= CONFIG_EXIT_MS) {
-        log_e("[cfg] exit -> BLE mode");
+        log_e("[cfg] leave reason=long-press duration=%lu", millis() - g_configModeStart);
         WiFi.mode(WIFI_OFF);
         g_configMode = false;
         g_lastActivity = millis();
@@ -3375,8 +3501,10 @@ void loop() {
     } else {
       exitHold = 0;
     }
-    if (g_configMode && millis() - g_configModeStart > CONFIG_MODE_MS) {
-      log_e("[cfg] timeout -> BLE mode");
+    // WS-602: the deadline (not the start) decides the timeout, so /extend and
+    // the 30-min cap work even when nobody ever opens the page.
+    if (g_configMode && millis() > g_configDeadline) {
+      log_e("[cfg] leave reason=timeout duration=%lu", millis() - g_configModeStart);
       WiFi.mode(WIFI_OFF);
       g_configMode = false;
       g_lastActivity = millis();
