@@ -27,6 +27,12 @@ jobs:
       - name: Portal key self-check page script
         run: node --test host/test_portal_selfcheck.mjs
 
+      # WS-614: compile the production wifiAttemptSnapshot() verbatim against
+      # minimal stubs and assert the WiFi attempt scenarios. This harness fails
+      # on the pre-WS-614 tree (one dropped poll after a connected hour -> fail).
+      - name: Portal WiFi state machine (WS-614)
+        run: python tools/test_portal_wifi_state_machine.py
+
   firmware:
     name: firmware / ${{ matrix.env }}
     runs-on: ubuntu-latest
