@@ -52,12 +52,17 @@ function keyModsText(mask) {
   return modDefs().filter((m) => bits & m.bit).map((m) => m.label);
 }
 
-/** 摘要卡上的 HID 文案：Ctrl + Shift + Esc；键码 0 一律「不发键」。 */
+/** 摘要卡上的 HID 文案：Ctrl + Shift + Esc；键码 0 一律「不发键」。
+ *  WS-550：门控为 False 时 apply_device() 一条 CFG:MODS 都不发，摘要不能再
+ *  显示修饰键（否则「显示 Ctrl、实际只发 F13」）。state.cfg 可能为空（未选
+ *  设备），此时以及 unknown / supported 时都保持原有修饰键显示。 */
 function keyHidText(item) {
   const code = parseInt(item && item.code, 10);
   if (code === 0) return t("keys.key_none");
   const known = state.keycodes.find((k) => k.code === code);
   const base = (item && item.label) || (known && known.label) || String(code);
+  const unsupported = state.cfg && state.cfg.mods_supported === false;
+  if (unsupported) return base;          // 显示 == 实际下发：只显示主键
   return keyModsText(item && item.mods).concat([base]).join(" + ");
 }
 
@@ -226,7 +231,8 @@ function renderKeyDrawer() {
             <span>${escapeHtml(m.label)}</span>
           </label>`).join("")}
       </div>
-      ${modsBlocked ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_unsupported">${t("keys.mods_unsupported")}</p>` : ""}
+      ${modsBlocked ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_unsupported">${t("keys.mods_unsupported")}</p>
+        <button type="button" class="btn secondary sm" id="kdModsRedetect" data-i18n="keys.mods_redetect">${t("keys.mods_redetect")}</button>` : ""}
     </div>` : "";
   body.innerHTML = `
     <div class="kd-field">
@@ -268,6 +274,12 @@ function renderKeyDrawer() {
       markDirty();
     };
   });
+  // WS-550：结论为「不支持」时给一个「重新检测」入口，清掉缓存结论并重探，
+  // 这样偶尔丢包被误判的新固件不必等 VERSION 变化才能恢复。
+  const redetect = $("#kdModsRedetect");
+  if (redetect) redetect.onclick = () => {
+    if (typeof redetectModsCapability === "function") redetectModsCapability();
+  };
   $("#kdAct").onchange = (e) => {
     item.action = { type: e.target.value, value: "", macro: [] };
     renderKeyDrawer();

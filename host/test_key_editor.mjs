@@ -404,3 +404,27 @@ test("running：执行中的行带 running 且行尾变成停止，结束后复�
   assert.ok(!card.classList.contains("running"));
   assert.equal(card.querySelector(".test").textContent, "测试动作");
 });
+
+/* ---------------- 用例：WS-550 门控为 False 时摘要一致性 ---------------- */
+
+test("WS-550：mods_supported=false 时摘要只显示主键（显示 == 实际下发）", async () => {
+  // 直接调用生产 keys.js 的 keyHidText（由 loadApp 的 vm 桩加载，非副本）。
+  const { host } = await loadApp();
+  const item = { code: 240, label: "F13", mods: 1 };   // Ctrl + F13
+
+  // state.cfg 可能为空（未选设备）：不能抛错，保持原有修饰键显示。
+  host.state.cfg = null;
+  assert.equal(host.keyHidText(item), "Ctrl + F13", "state.cfg 为空时保持原行为");
+
+  // 能力未知 / 明确支持：照常显示修饰键。
+  host.state.cfg = { mods_supported: true };
+  assert.equal(host.keyHidText(item), "Ctrl + F13", "支持时显示 Ctrl");
+  host.state.cfg = {};
+  assert.equal(host.keyHidText(item), "Ctrl + F13", "unknown 时照常显示");
+
+  // 关键回归：mods_supported=false 时 apply_device 一条 CFG:MODS 都不发，
+  // 摘要绝不能再显示「Ctrl」（修复前这里返回 "Ctrl + F13"）。
+  host.state.cfg = { mods_supported: false };
+  assert.equal(host.keyHidText(item), "F13",
+    "门控为 False 时摘要只显示主键，不出现「显示 Ctrl、实际不发」");
+});

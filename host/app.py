@@ -804,6 +804,14 @@ _layout_lock = threading.RLock()
 _mods_windows: dict = {}
 _mods_lock = threading.RLock()
 
+# WS-550: a single probe timeout (sent but no ``MODS:`` answer) is NOT a
+# capability verdict — BLE jitter / a busy deck can drop one 1.5 s reply.
+# Only a run of consecutive silent probes is strong enough to conclude
+# "unsupported" (old firmware never speaks CFG:MODS). Kept in memory, not in
+# config.json: it is transient probe state, and a host restart re-probes anyway.
+MODS_UNSUPPORTED_AFTER = 2
+_mods_misses: dict = {}
+
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
 # device config so a failed read leaves the stored config untouched.
@@ -1669,6 +1677,11 @@ def _on_line(dev_id: str, line: str):
                 # WS-546: same for modifiers — an OTA can add or remove the
                 # capability, so re-probe instead of trusting the old verdict.
                 cfg["mods_supported"] = None
+                # WS-550: a new firmware must not inherit the old deck's
+                # consecutive-timeout count, else one dropped probe right
+                # after the OTA would immediately re-conclude "unsupported".
+                with _mods_lock:
+                    _mods_misses.pop(dev_id, None)
             cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
@@ -4397,26 +4410,69 @@ def api_device_layout(dev_id):
 
 @app.route("/api/device/<dev_id>/mods", methods=["POST"])
 def api_device_mods(dev_id):
-    """WS-546: ask the deck whether it supports per-input modifiers.
+    """WS-546 / WS-550: ask the deck whether it supports per-input modifiers.
 
-    The answer is a capability fact, never a version comparison. ``supported``
-    is None only when the link was down (verdict unknown); True / False is
-    cached in the device config so the drawer does not re-probe on every open.
+    The answer is a capability fact, never a version comparison. There are
+    three verdicts, all reflected in the tri-state ``supported`` payload:
+      * supported (True)   — the deck answered ``MODS:<csv>``;
+      * unsupported (False) — the deck stayed silent for MODS_UNSUPPORTED_AFTER
+        consecutive probes (old firmware never speaks CFG:MODS), so
+        apply_device() keeps skipping the CFG:MODS line;
+      * unknown (None)     — link down, or a *single* dropped probe. A lone
+        1.5 s timeout is NOT a verdict: it stays unknown so the next drawer
+        open re-probes instead of permanently mislabelling a capable deck as
+        "please update firmware" (WS-550). A timeout is never treated as
+        supported (that would write a CFG:MODS line to old firmware).
+
+    ``reason`` names why and ``retryable`` tells the UI a re-detect is
+    meaningful. ``?reset=1`` (drawer「重新检测」) clears the cached verdict and
+    the consecutive-timeout counter before probing again.
     """
     cfg = device_cfg(dev_id)
+    reset = request.args.get("reset") == "1"
+    if reset:
+        with _lock:
+            cfg["mods_supported"] = None
+            save_config()
+        with _mods_lock:
+            _mods_misses.pop(dev_id, None)
+
     probe = probe_mods(dev_id)
+    changed = False
     with _lock:
-        if probe["sent"] and not probe["answered"]:
-            cfg["mods_supported"] = False
-            save_config()
-        elif probe["answered"]:
+        if probe["answered"]:
+            # Definitive: the deck speaks CFG:MODS. Any miss streak is over.
             cfg["mods_supported"] = True
+            reason = "supported"
+            changed = True
+            with _mods_lock:
+                _mods_misses.pop(dev_id, None)
+        elif not probe["sent"]:
+            # Link down: no information gained, keep any previous verdict.
+            reason = "link_down"
+        else:
+            # Sent but silent: a transient drop OR genuinely old firmware. One
+            # timeout is not enough to decide; only a consecutive run is.
+            with _mods_lock:
+                misses = _mods_misses.get(dev_id, 0) + 1
+                _mods_misses[dev_id] = misses
+            known_supported = cfg.get("mods_supported") is True
+            if misses >= MODS_UNSUPPORTED_AFTER and not known_supported:
+                cfg["mods_supported"] = False
+                reason = "unsupported"
+                changed = True
+            else:
+                # Undetermined: do NOT write False, and do NOT downgrade a
+                # deck we already know is capable on one dropped reply.
+                reason = "probe_timeout"
+        supported = cfg.get("mods_supported")  # True / False / None
+        if changed:
             save_config()
-        supported = cfg.get("mods_supported")
         payload = {"dev_id": dev_id,
-                   "supported": None if supported is None and not probe["sent"]
-                                else bool(supported),
-                   "sent": probe["sent"]}
+                   "supported": supported,
+                   "sent": probe["sent"],
+                   "reason": reason,
+                   "retryable": supported is not True}
     return jsonify(payload)
 
 
