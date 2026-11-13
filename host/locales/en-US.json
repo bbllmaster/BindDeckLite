@@ -293,6 +293,7 @@
   "keys.mod_win": "Win",
   "keys.mods_label": "Modifiers",
   "keys.mods_unsupported": "This firmware does not support modifiers. Please update the firmware.",
+  "keys.mods_redetect": "Re-detect",
   "keys.move_down": "Move down",
   "keys.move_up": "Move up",
   "keys.paste_placeholder": "Text to paste (never written to the log)",

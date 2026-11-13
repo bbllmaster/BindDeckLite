@@ -244,3 +244,123 @@ def test_keycodes_endpoint_publishes_the_same_order():
     payload = app.app.test_client().get("/api/keycodes").get_json()
     assert [m["label"] for m in payload["mods"]] == ["Ctrl", "Shift", "Alt", "Win"]
     assert [m["bit"] for m in payload["mods"]] == [0x01, 0x02, 0x04, 0x08]
+
+
+# --- WS-550：探测超时不得一次定论（后端三态 / 可重探）------------------------
+#
+# 这些用例 POST 的是**生产视图** /api/device/<id>/mods（app.api_device_mods），
+# 用桩替换 app.send 来模拟「链路已发但设备不回 MODS:」的探测超时，
+# 断言的是生产代码写进 cfg 的能力结论与返回 payload —— 没有复制判定逻辑。
+
+def _reset_probe_state():
+    """隔离模块级的连续超时计数；对修复前的代码（无该字段）也是安全的。"""
+    misses = getattr(app, "_mods_misses", None)
+    if isinstance(misses, dict):
+        misses.clear()
+
+
+def _post_mods(query=""):
+    return app.app.test_client().post(
+        "/api/device/%s/mods%s" % (DEV, query)).get_json()
+
+
+def _send_simulating_probe(sent, answer_csv=None):
+    """替换 app.send：answer_csv 为 None = 设备不回 MODS:（一次探测超时）。"""
+    def _send(dev_id, cmd):
+        if sent and answer_csv is not None:
+            app._on_line(dev_id, "MODS:" + answer_csv)
+        return {"sent": sent, "via": ["ble"]}
+    return _send
+
+
+def _call_endpoint(sent, answer_csv=None, query=""):
+    _device()
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(sent, answer_csv)
+    try:
+        payload = _post_mods(query)
+    finally:
+        app.send = original_send
+    return payload, app._config["devices"][DEV]
+
+
+def test_single_probe_timeout_does_not_cache_unsupported():
+    """验收 1：一次 1.5s 丢包不能把支持修饰键的新固件永久判成「不支持」。
+
+    修复前：sent=True 且未回 MODS: → cfg.mods_supported=False、supported=false；
+    修复后：单次超时只算「未定论」，保持 unknown（None）以便下次重探。
+    """
+    payload, cfg = _call_endpoint(sent=True, answer_csv=None)
+    assert payload["sent"] is True
+    assert cfg.get("mods_supported") is not False, \
+        "一次探测超时不得写死 mods_supported=False"
+    assert payload.get("supported") is None, \
+        "单次超时必须是三态里的 unknown（None），不是 False"
+    assert payload.get("retryable") is True, \
+        "结论未定时要告诉前端可重新检测"
+
+
+def test_probe_timeout_never_counts_as_supported():
+    """超时绝不能当 supported=True，否则旧固件会被写入 CFG:MODS 行。"""
+    _payload, cfg = _call_endpoint(sent=True, answer_csv=None)
+    assert cfg.get("mods_supported") is not True
+
+
+def test_reprobe_after_timeout_recovers_supported():
+    """验收 1 第二分句：超时后重探，设备回了 MODS: 即恢复 True。"""
+    _device()
+    _reset_probe_state()
+    original_send = app.send
+    try:
+        # 第一次：一次丢包（未定论）。
+        app.send = _send_simulating_probe(True, None)
+        first = _post_mods()
+        assert first.get("supported") is None
+        # 第二次：设备这次回了 MODS:（新固件）。
+        app.send = _send_simulating_probe(True, MODS_12)
+        second = _post_mods()
+    finally:
+        app.send = original_send
+    assert second["supported"] is True
+    assert app._config["devices"][DEV].get("mods_supported") is True
+
+
+def test_old_firmware_two_timeouts_still_concludes_unsupported():
+    """验收 3：从不回 MODS: 的旧固件，连续多次超时后仍判 False。"""
+    _device()
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(True, None)
+    try:
+        _post_mods()
+        _post_mods()
+        payload = _post_mods()
+    finally:
+        app.send = original_send
+    assert payload["supported"] is False, \
+        "旧固件最终仍须判不支持，apply_device 才会继续跳过 CFG:MODS"
+    assert app._config["devices"][DEV].get("mods_supported") is False
+
+
+def test_link_down_is_not_a_capability_verdict():
+    """链路不通（sent=False）也是 unknown，不能据此缓存任何 False/True。"""
+    payload, cfg = _call_endpoint(sent=False)
+    assert payload["sent"] is False
+    assert payload.get("supported") is None
+    assert cfg.get("mods_supported") is not False
+    assert cfg.get("mods_supported") is not True
+
+
+def test_redetect_reset_clears_cached_unsupported():
+    """抽屉「重新检测」：?reset=1 清掉缓存结论与计数，设备应答后恢复 True。"""
+    cfg = _device(supported=False)
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(True, MODS_12)
+    try:
+        payload = _post_mods("?reset=1")
+    finally:
+        app.send = original_send
+    assert payload["supported"] is True
+    assert cfg.get("mods_supported") is True

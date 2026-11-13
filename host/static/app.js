@@ -1916,6 +1916,29 @@ async function ensureModsCapability() {
   }
 }
 
+/** WS-550：抽屉「重新检测」。清掉本地缓存结论，并让后端丢弃连续超时计数
+ *  （?reset=1），再探一次；新固件偶尔丢包被误判也不必等 VERSION 变化恢复。 */
+async function redetectModsCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg || modsProbing.has(devId)) return;
+  modsProbing.add(devId);
+  cfg.mods_supported = null;
+  try {
+    const r = await api(
+      `/api/device/${encodeURIComponent(devId)}/mods?reset=1`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return;
+    cfg.mods_supported = r.supported;   // 三态：null 让下次开抽屉继续重探
+    if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
+      renderKeyDrawer();
+    }
+  } catch (_) {
+    // 保持 unknown；后端与下次开抽屉都会再探。
+  } finally {
+    modsProbing.delete(devId);
+  }
+}
+
 /** 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
 async function probeDeviceLayout(devId) {
   if (!devId) return;
