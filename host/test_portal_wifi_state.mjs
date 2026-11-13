@@ -364,3 +364,69 @@ test("wifi-state 脚本：单一轮询、textContent 写入、不新开 /keys/st
   assert.match(selfcheck, /__portalWifiSync\(s\)/,
                "自检成功回调必须把整份响应交给 wifi-state 钩子（复用同一条轮询）");
 });
+
+// --- WS-614：节流与窗口对齐的行为用例（不再只有源码正则断言） ----------------
+test("1 s 节流：1 秒内第二次响应不落 DOM，越窗后生效", async () => {
+  const p = openPortal();
+  p.sync({ wifi: "connecting", ssid: "Home", elapsed: 1,
+           wifiText: "正在连接 Home…（已 1 秒）" });
+  await flush();
+  p.sync({ wifi: "ok", ssid: "Home", ip: "10.0.0.9", elapsed: 2,
+           wifiText: "已连接 Home · IP 10.0.0.9" });
+  await flush();
+  assert.match(p.el("wifiState").textContent, /正在连接/,
+               "1 s 内的第二次同步必须被节流丢弃");
+  assert.equal(p.el("wifiState").classList.contains("wifi-ok"), false);
+
+  await step(p.clock, 1100);
+  p.sync({ wifi: "ok", ssid: "Home", ip: "10.0.0.9", elapsed: 3,
+           wifiText: "已连接 Home · IP 10.0.0.9" });
+  await flush();
+  assert.match(p.el("wifiState").textContent, /10\.0\.0\.9/, "越过 1 s 后必须落地");
+  assert.equal(p.el("wifiState").classList.contains("wifi-ok"), true);
+});
+
+test("25–30 s 不出现「可见但禁用」的重试按钮：fail 且冷却 30 s 后才露出", async () => {
+  const p = openPortal();
+  p.sync({ wifi: "connecting", ssid: "Home", elapsed: 1,
+           wifiText: "正在连接 Home…（已 1 秒）" });
+  await flush();
+  await step(p.clock, 1100);
+  p.sync({ wifi: "fail", ssid: "Home", elapsed: 25,
+           wifiText: "连接失败：无法连接，密码可能不对" });
+  await flush();
+  assert.equal(p.el("wifiRetryBtn").hidden, false, "首次 fail 必须露出重试按钮");
+
+  p.clickRetry();                          // lastRetry = 1100
+  await flush();
+  assert.equal(p.el("wifiRetryBtn").disabled, true);
+
+  // 服务端 25 s 判 fail，但客户端 30 s 冷却未到：按钮必须继续隐藏。
+  await step(p.clock, 25000);              // t = 26100
+  p.sync({ wifi: "fail", ssid: "Home", elapsed: 25,
+           wifiText: "连接失败：无法连接，密码可能不对" });
+  await flush();
+  assert.equal(p.el("wifiRetryBtn").hidden, true,
+               "25 s fail 但冷却未到 -> 不露出禁用按钮");
+  assert.equal(p.el("wifiRetryBtn").disabled, true, "此时仍在 30 s 禁用期");
+
+  // 越过 30 s 冷却后，下一次 fail 响应才把可点的按钮露出来。
+  await step(p.clock, 6000);               // t = 32100 >= 1100 + 30000
+  p.sync({ wifi: "fail", ssid: "Home", elapsed: 25,
+           wifiText: "连接失败：无法连接，密码可能不对" });
+  await flush();
+  assert.equal(p.el("wifiRetryBtn").hidden, false, "冷却结束后露出重试按钮");
+  assert.equal(p.el("wifiRetryBtn").disabled, false, "按钮此时可点");
+});
+
+test("WS-614 固件状态机：last-OK 窗口 + portal 观察态（改固件即变红）", () => {
+  assert.match(SRC, /g_wifiLastOkAt/, "缺 g_wifiLastOkAt（连上后掉线一帧的根因）");
+  assert.match(SRC, /g_wifiAttemptActive/, "缺 g_wifiAttemptActive（进配网页即起 25 s 计时）");
+  assert.match(SRC, /windowStart = g_wifiAttemptStart/, "失败窗口必须从尝试起点起算");
+  assert.match(SRC, /g_wifiLastOkAt > windowStart/, "窗口必须取 max(attemptStart,lastOk)");
+  assert.match(SRC, /\(now - windowStart\) >= WIFI_ATTEMPT_TIMEOUT_MS/,
+               "失败判定必须用 windowStart，不能再用 g_wifiAttemptStart");
+  assert.match(SRC, /wifiAttemptReset\(ssid, false\)/, "portal 打开必须是观察态");
+  assert.match(SRC, /wifiAttemptReset\(ssid, true\)/, "save/retry 必须起一次尝试");
+  assert.match(SRC, /lastRetry===null/, "客户端按钮必须与 30 s 节流对齐");
+});

@@ -204,16 +204,20 @@ static unsigned long g_configDeadline = 0;
 static String g_cfgApName;
 static int g_otaProgress = -1;
 
-// WS-610: one WiFi connect attempt, started by /save or POST /wifi/retry (and
-// by setupProvisioning() joining the saved network on entering config mode).
-// /keys/state reads these on the SAME poll the key self-check already uses, so
-// the status line needs no second request and never blocks the WebServer.
+// WS-610/614: one WiFi connect attempt, started by /save or POST /wifi/retry.
+// setupProvisioning() only OBSERVES the saved link (no fail clock), see
+// g_wifiAttemptActive. /keys/state reads these on the SAME poll the key
+// self-check already uses, so the status line needs no second request and
+// never blocks the WebServer.
 #define WIFI_ATTEMPT_TIMEOUT_MS  25000UL  // 25 s without an IP => fail
 #define WIFI_RETRY_THROTTLE_MS   30000UL  // ignore a repeat retry within 30 s
-static unsigned long g_wifiAttemptStart = 0;  // millis() of this attempt's begin
-static unsigned long g_lastWifiRetry    = 0;  // millis() of last accepted retry
-static int           g_wifiFailReason   = 0;  // last explicit WL_* failure seen
-static String        g_wifiTargetSsid;       // SSID this attempt is trying
+static unsigned long g_wifiAttemptStart  = 0;  // millis() of this attempt's begin
+static unsigned long g_wifiLastOkAt      = 0;  // millis() of last WL_CONNECTED w/ IP
+static bool          g_wifiWasConnected  = false;  // CONNECTED edge latch (WS-614)
+static bool          g_wifiAttemptActive = false;  // only /save + /wifi/retry arm the clock
+static unsigned long g_lastWifiRetry     = 0;  // millis() of last accepted retry
+static int           g_wifiFailReason    = 0;  // last explicit WL_* failure seen
+static String        g_wifiTargetSsid;        // SSID this attempt is trying
 
 // === OTA (host-driven firmware upgrade, CMD:OTA:<size>:<sha256>) ==========
 // While g_otaMode is set the CFG characteristic carries raw firmware bytes and
@@ -774,11 +778,17 @@ static String jsonEsc(const String& s) {
   return o;
 }
 
-static void wifiAttemptReset(const String& ssid) {
+// WS-614: userInitiated=true for /save and /wifi/retry, which arm the 25 s
+// "no IP" fail clock. setupProvisioning() passes false to merely observe the
+// already-saved link without judging a failure.
+static void wifiAttemptReset(const String& ssid, bool userInitiated) {
   g_wifiAttemptStart = millis();
+  g_wifiLastOkAt = 0;
+  g_wifiWasConnected = false;
   g_wifiFailReason = 0;
   g_lastWifiRetry = 0;
   g_wifiTargetSsid = ssid;
+  g_wifiAttemptActive = userInitiated;
 }
 
 // Snapshot of the current attempt, computed fresh on every /keys/state so a
@@ -796,7 +806,6 @@ static WifiAttempt wifiAttemptSnapshot() {
   WifiAttempt a;
   a.ssid = g_wifiTargetSsid;
   unsigned long now = millis();
-  a.elapsed = (now - g_wifiAttemptStart) / 1000UL;  // unsigned: wrap-safe
   wl_status_t st = WiFi.status();
 
   if (g_wifiTargetSsid.length() == 0) {
@@ -804,21 +813,73 @@ static WifiAttempt wifiAttemptSnapshot() {
     a.wifiText = "未配置";
     return a;
   }
+
+  // WS-614: opening the portal is NOT a connect attempt. Only /save and
+  // /wifi/retry arm the 25 s clock, so a device that is merely out of range
+  // keeps showing the truthful current link instead of turning red 25 s after
+  // the page was opened (while the user has not pressed save/retry yet).
+  if (!g_wifiAttemptActive) {
+    a.elapsed = 0;
+    if (st == WL_CONNECTED) {
+      String ip = WiFi.localIP().toString();
+      if (ip.length() && ip != "0.0.0.0") {
+        g_wifiLastOkAt = now;
+        g_wifiWasConnected = true;
+        a.wifi = "ok";
+        a.ip = ip;
+        a.wifiText = "已连接 " + g_wifiTargetSsid + " · IP " + ip;
+        return a;
+      }
+    }
+    a.wifi = "connecting";   // neutral grey, never the red fail state
+    switch (st) {
+      case WL_NO_SSID_AVAIL:
+        a.wifiText = "未连接，找不到该 WiFi（确认是 2.4 GHz 且名称无误）";
+        break;
+      case WL_CONNECT_FAILED:
+        a.wifiText = "未连接，无法连接，密码可能不对";
+        break;
+      default:
+        a.wifiText = "未连接";
+        break;
+    }
+    return a;
+  }
+
+  // WS-614: the 25 s "no IP" window is measured from the LAST time we had a
+  // working IP (max of attempt begin and last successful link), not from the
+  // one-off begin at /save. Without this a device connected for an hour would
+  // fail on the very first WL_DISCONNECTED poll, with a stale wrong reason.
+  unsigned long windowStart = g_wifiAttemptStart;
+  if (g_wifiLastOkAt > windowStart) windowStart = g_wifiLastOkAt;
+  a.elapsed = (now - windowStart) / 1000UL;  // unsigned: wrap-safe
+
   if (st == WL_CONNECTED) {
     String ip = WiFi.localIP().toString();
     if (ip.length() && ip != "0.0.0.0") {
+      g_wifiLastOkAt = now;
+      g_wifiWasConnected = true;
       a.wifi = "ok";
       a.ip = ip;
       a.wifiText = "已连接 " + g_wifiTargetSsid + " · IP " + ip;
       return a;
     }
   }
+
+  // WS-614: on the CONNECTED -> not-CONNECTED edge start a clean window and
+  // drop any failure code recorded before the link came up, so the eventual
+  // fail text reflects THIS outage, not a stale code from the earlier attempt.
+  if (g_wifiWasConnected) {
+    g_wifiWasConnected = false;
+    g_wifiFailReason = 0;
+  }
+
   // Remember the last explicit failure code across the WL_DISCONNECTED /
   // WL_IDLE_STATUS bouncing that background auto-reconnect produces.
   if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED) {
     g_wifiFailReason = (int)st;
   }
-  if ((now - g_wifiAttemptStart) >= WIFI_ATTEMPT_TIMEOUT_MS) {
+  if ((now - windowStart) >= WIFI_ATTEMPT_TIMEOUT_MS) {
     a.wifi = "fail";
     if (g_wifiFailReason == (int)WL_NO_SSID_AVAIL) {
       a.wifiText = "连接失败：找不到该 WiFi（确认是 2.4 GHz 且名称无误）；"
@@ -1375,6 +1436,9 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // without wifiText is ignored so an old page keeps its server-rendered text.
   // Everything is written with textContent (the SSID inside wifiText is
   // already JSON-escaped by the firmware), never with innerHTML.
+  // WS-614: the server judges fail at 25 s but throttles a repeat retry for
+  // 30 s, so the retry button stays hidden until the server would accept the
+  // click - no "visible but disabled" button in the 25-30 s gap.
   // host/test_portal_wifi_state.mjs extracts and runs this exact block against
   // a fake DOM / fetch sequence, so changing the production script turns the
   // assertions red.
@@ -1384,7 +1448,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "var elState=document.getElementById('wifiState'),"
          "elBtn=document.getElementById('wifiRetryBtn');"
          "if(!elState)return;"
-         "var ever=false,last=0;"
+         "var ever=false,last=0,lastRetry=null;"
          "function now(){return (typeof performance!=='undefined'&&performance.now)"
          "?performance.now():Date.now();}"
          "function apply(s){"
@@ -1394,7 +1458,10 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "if(s.wifi==='ok')elState.classList.add('wifi-ok');"
          "else if(s.wifi==='fail')elState.classList.add('wifi-fail');"
          "else elState.classList.add('wifi-connecting');"
-         "if(elBtn)elBtn.hidden=(s.wifi!=='fail');}"
+         "if(elBtn){"
+         "var cooled=(lastRetry===null)||(now()-lastRetry>=RETRY_DISABLE_MS);"
+         "elBtn.hidden=!(s.wifi==='fail'&&cooled);"
+         "}}"
          "window.__portalWifiSync=function(s){"
          "if(!s||typeof s.wifiText!=='string')return;"
          "var t=now();"
@@ -1402,7 +1469,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "ever=true;last=t;apply(s);};"
          "if(elBtn)elBtn.addEventListener('click',function(){"
          "if(elBtn.disabled)return;"
-         "elBtn.disabled=true;"
+         "elBtn.disabled=true;lastRetry=now();"
          "elState.textContent='正在连接…';"
          "elState.classList.remove('wifi-ok','wifi-fail');"
          "elState.classList.add('wifi-connecting');"
@@ -1429,7 +1496,10 @@ static void setupProvisioning() {
 
   String ssid, pwd;
   loadWifiCreds(ssid, pwd);
-  wifiAttemptReset(ssid);  // WS-610: attempt clock starts when the portal opens
+  // WS-614: portal open only OBSERVES the saved link. No 25 s fail clock runs
+  // until the user actually presses save or retry, so a device that is merely
+  // out of range stays "未连接" instead of turning red while the user reads.
+  wifiAttemptReset(ssid, false);
   if (ssid.length()) {
     WiFi.begin(ssid.c_str(), pwd.c_str());
     applyTimezone();
@@ -1456,7 +1526,7 @@ static void setupProvisioning() {
       String ssid, pwd;
       loadWifiCreds(ssid, pwd);
       if (ssid.length()) WiFi.begin(ssid.c_str(), pwd.c_str());
-      wifiAttemptReset(ssid);
+      wifiAttemptReset(ssid, true);
       g_lastWifiRetry = now;   // re-arm the 30 s throttle after the reset
       log_e("[cfg] wifi retry -> '%s'", ssid.c_str());
     }
@@ -1493,7 +1563,7 @@ static void setupProvisioning() {
     delay(100);
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(ssid.c_str(), pwd.c_str());
-    wifiAttemptReset(ssid);   // WS-610: 25 s attempt clock starts at /save
+    wifiAttemptReset(ssid, true);   // WS-614: 25 s attempt clock starts at /save
     applyTimezone();
     cfgServer.send(200, "text/html; charset=utf-8",
                    "<meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/'>"
