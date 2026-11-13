@@ -204,6 +204,17 @@ static unsigned long g_configDeadline = 0;
 static String g_cfgApName;
 static int g_otaProgress = -1;
 
+// WS-610: one WiFi connect attempt, started by /save or POST /wifi/retry (and
+// by setupProvisioning() joining the saved network on entering config mode).
+// /keys/state reads these on the SAME poll the key self-check already uses, so
+// the status line needs no second request and never blocks the WebServer.
+#define WIFI_ATTEMPT_TIMEOUT_MS  25000UL  // 25 s without an IP => fail
+#define WIFI_RETRY_THROTTLE_MS   30000UL  // ignore a repeat retry within 30 s
+static unsigned long g_wifiAttemptStart = 0;  // millis() of this attempt's begin
+static unsigned long g_lastWifiRetry    = 0;  // millis() of last accepted retry
+static int           g_wifiFailReason   = 0;  // last explicit WL_* failure seen
+static String        g_wifiTargetSsid;       // SSID this attempt is trying
+
 // === OTA (host-driven firmware upgrade, CMD:OTA:<size>:<sha256>) ==========
 // While g_otaMode is set the CFG characteristic carries raw firmware bytes and
 // the button / encoder / serial paths are skipped. The host sends a continuous
@@ -733,6 +744,98 @@ static String htmlEsc(const String& s) {
   return o;
 }
 
+// WS-610: JSON-escape for the /keys/state WiFi feed. The SSID may contain
+// quotes / backslashes / control bytes (Chinese, emoji, quotes); the page
+// writes wifiText with textContent, so the only risk is breaking the JSON
+// string itself. UTF-8 bytes (>= 0x80) pass through unchanged (valid JSON).
+static String jsonEsc(const String& s) {
+  String o;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    switch (c) {
+      case '"':  o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\b': o += "\\b";  break;
+      case '\f': o += "\\f";  break;
+      case '\n': o += "\\n";  break;
+      case '\r': o += "\\r";  break;
+      case '\t': o += "\\t";  break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          static const char hex[] = "0123456789abcdef";
+          o += "\\u00";
+          o += hex[((unsigned char)c >> 4) & 0x0F];
+          o += hex[(unsigned char)c & 0x0F];
+        } else {
+          o += c;
+        }
+    }
+  }
+  return o;
+}
+
+static void wifiAttemptReset(const String& ssid) {
+  g_wifiAttemptStart = millis();
+  g_wifiFailReason = 0;
+  g_lastWifiRetry = 0;
+  g_wifiTargetSsid = ssid;
+}
+
+// Snapshot of the current attempt, computed fresh on every /keys/state so a
+// phone returning from the background uses device time, never accumulated
+// client time. Never calls delay() - this runs inside the WebServer handler.
+struct WifiAttempt {
+  const char* wifi = "connecting";  // "connecting" | "ok" | "fail"
+  String ssid;
+  String ip;                        // "" unless ok
+  unsigned long elapsed = 0;        // seconds since this attempt's begin
+  String wifiText;                  // display text; JSON-escaped by the caller
+};
+
+static WifiAttempt wifiAttemptSnapshot() {
+  WifiAttempt a;
+  a.ssid = g_wifiTargetSsid;
+  unsigned long now = millis();
+  a.elapsed = (now - g_wifiAttemptStart) / 1000UL;  // unsigned: wrap-safe
+  wl_status_t st = WiFi.status();
+
+  if (g_wifiTargetSsid.length() == 0) {
+    a.elapsed = 0;
+    a.wifiText = "未配置";
+    return a;
+  }
+  if (st == WL_CONNECTED) {
+    String ip = WiFi.localIP().toString();
+    if (ip.length() && ip != "0.0.0.0") {
+      a.wifi = "ok";
+      a.ip = ip;
+      a.wifiText = "已连接 " + g_wifiTargetSsid + " · IP " + ip;
+      return a;
+    }
+  }
+  // Remember the last explicit failure code across the WL_DISCONNECTED /
+  // WL_IDLE_STATUS bouncing that background auto-reconnect produces.
+  if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED) {
+    g_wifiFailReason = (int)st;
+  }
+  if ((now - g_wifiAttemptStart) >= WIFI_ATTEMPT_TIMEOUT_MS) {
+    a.wifi = "fail";
+    if (g_wifiFailReason == (int)WL_NO_SSID_AVAIL) {
+      a.wifiText = "连接失败：找不到该 WiFi（确认是 2.4 GHz 且名称无误）；"
+                   "若为隐藏网络，确认名称大小写与是否开启广播";
+    } else if (g_wifiFailReason == (int)WL_CONNECT_FAILED) {
+      a.wifiText = "连接失败：无法连接，密码可能不对";
+    } else {
+      a.wifiText = "连接失败：请检查 WiFi 名称与密码";
+    }
+  } else {
+    a.wifi = "connecting";
+    a.wifiText = "正在连接 " + g_wifiTargetSsid + "…（已 " +
+                 String(a.elapsed) + " 秒）";
+  }
+  return a;
+}
+
 static WebServer cfgServer(80);
 
 // Names of the five encoder modes, in encMode order. Index 4 matches the host
@@ -807,6 +910,17 @@ static String cfgPage(const KeysForm* form = nullptr) {
     "border-radius:6px;background:#fff;color:#1a73e8;font:inherit;font-size:13px;"
     "cursor:pointer;white-space:normal;word-break:break-word;text-align:center}"
     "#extendBtn:disabled{border-color:#dadce0;color:#80868b;cursor:default}"
+    // WS-610: WiFi status line three states (grey connecting / green ok / red
+    // fail) + retry button. The [hidden] re-assert keeps UA [hidden] working
+    // against the ID rule (same specificity trap as WS-604).
+    "#wifiState.wifi-connecting{color:#5f6368}"
+    "#wifiState.wifi-ok{color:#188038;font-weight:600}"
+    "#wifiState.wifi-fail{color:#d93025;font-weight:600}"
+    "#wifiRetryBtn{margin-left:8px;padding:4px 10px;border:1px solid #1a73e8;"
+    "border-radius:6px;background:#fff;color:#1a73e8;font:inherit;font-size:13px;"
+    "cursor:pointer;white-space:nowrap}"
+    "#wifiRetryBtn[hidden]{display:none}"
+    "#wifiRetryBtn:disabled{border-color:#dadce0;color:#80868b;cursor:default}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
     h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
@@ -844,36 +958,50 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "<button id='extendBtn' type='button'>延长 5 分钟</button>"
          "</div>");
   h += F("<p>WiFi 状态: ");
+  // WS-610: wrap the status in a stable #wifiState span so the wifi-state
+  // script can refresh it in place from /keys/state. The initial class tracks
+  // WiFi.status() (green connected / red explicit failure / grey connecting);
+  // with JS disabled the status text stays the WS-590 wording and the retry
+  // button stays hidden - the same visible result as today.
+  String wifiBody;
+  const char* wifiCls = "wifi-connecting";
   if (WiFi.status() == WL_CONNECTED) {
-    h += "已连接 <b>" + htmlEsc(WiFi.SSID()) + "</b> · IP " + WiFi.localIP().toString();
+    wifiCls = "wifi-ok";
+    wifiBody = "已连接 <b>" + htmlEsc(WiFi.SSID()) + "</b> · IP " + WiFi.localIP().toString();
   } else if (ssid.length()) {
     // WS-590: the stored password is no longer echoed into the page, so
     // "not connected" alone would leave the user guessing. Map the WiFi state
     // to a readable reason instead.
     switch (WiFi.status()) {
       case WL_NO_SSID_AVAIL:
-        h += "未连接，找不到该 WiFi（确认是 2.4 GHz 且名称无误）";
+        wifiCls = "wifi-fail";
+        wifiBody = "未连接，找不到该 WiFi（确认是 2.4 GHz 且名称无误）";
         break;
       case WL_CONNECT_FAILED:
-        h += "未连接，无法连接，密码可能不对";
+        wifiCls = "wifi-fail";
+        wifiBody = "未连接，无法连接，密码可能不对";
         break;
       case WL_DISCONNECTED:
-        h += "未连接，正在连接…";
+        wifiBody = "未连接，正在连接…";
         break;
       case WL_IDLE_STATUS:
-        h += "未连接，尚未开始连接";
+        wifiBody = "未连接，尚未开始连接";
         break;
       default:
-        h += "未连接";
+        wifiBody = "未连接";
         break;
     }
-    h += "，已保存 <b>" + htmlEsc(ssid) + "</b>";
+    wifiBody += "，已保存 <b>" + htmlEsc(ssid) + "</b>";
   } else {
-    h += "未配置";
+    wifiBody = "未配置";
   }
+  h += "<span id='wifiState' class='" + String(wifiCls) + "'>" + wifiBody + "</span>";
+  // WS-610: retry button (hidden until wifi=fail) sits outside the WiFi form,
+  // so a tap never submits /save. The wifi-state script unhides it and POSTs.
+  h += F("<button id='wifiRetryBtn' type='button' hidden>重试连接</button></p>");
   // WS-572: the onsubmit guard is an enhancement only. With JS disabled the
   // attribute never runs and the form POSTs exactly as before.
-  h += F("</p><form method='POST' action='/save' id='fWifi' "
+  h += F("<form method='POST' action='/save' id='fWifi' "
          "onsubmit='return portalDirty.wifi()'>"
          "<p><b>WiFi 名称</b></p><input name='ssid' autocomplete='off' value='");
   h += htmlEsc(ssid);
@@ -1097,6 +1225,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "}).then(function(s){"
          "fails=0;sawHttp=false;note('');"
          "if(typeof window!=='undefined'&&window.__portalClockSync)window.__portalClockSync(s?s.left:undefined);"
+         "if(typeof window!=='undefined'&&window.__portalWifiSync)window.__portalWifiSync(s);"
          "if(!s||typeof s.seq!=='number')return;"
          "if(!primed||s.seq<seq){primed=true;seq=s.seq;return;}"
          "if(s.seq>seq){seq=s.seq;onHit(s.index,s.gpio);}"
@@ -1238,6 +1367,49 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "if(elBtn)elBtn.addEventListener('click',extend);"
          "setInterval(show,CLOCK_MS);"
          "})();</script>");
+
+  // WS-610: WiFi status line auto-update + one-click retry. This script opens
+  // NO new poll: <script id='selfcheck'> (the only /keys/state poller) hands
+  // each parsed response to window.__portalWifiSync(s), and this code only
+  // throttles the DOM write to 1 s (key highlight stays at 400 ms). A response
+  // without wifiText is ignored so an old page keeps its server-rendered text.
+  // Everything is written with textContent (the SSID inside wifiText is
+  // already JSON-escaped by the firmware), never with innerHTML.
+  // host/test_portal_wifi_state.mjs extracts and runs this exact block against
+  // a fake DOM / fetch sequence, so changing the production script turns the
+  // assertions red.
+  h += F("<script id='wifi-state'>"
+         "(function(){"
+         "var MIN_MS=1000,RETRY_DISABLE_MS=30000;"
+         "var elState=document.getElementById('wifiState'),"
+         "elBtn=document.getElementById('wifiRetryBtn');"
+         "if(!elState)return;"
+         "var ever=false,last=0;"
+         "function now(){return (typeof performance!=='undefined'&&performance.now)"
+         "?performance.now():Date.now();}"
+         "function apply(s){"
+         "if(!s||typeof s.wifiText!=='string')return;"
+         "elState.textContent=s.wifiText;"
+         "elState.classList.remove('wifi-connecting','wifi-ok','wifi-fail');"
+         "if(s.wifi==='ok')elState.classList.add('wifi-ok');"
+         "else if(s.wifi==='fail')elState.classList.add('wifi-fail');"
+         "else elState.classList.add('wifi-connecting');"
+         "if(elBtn)elBtn.hidden=(s.wifi!=='fail');}"
+         "window.__portalWifiSync=function(s){"
+         "if(!s||typeof s.wifiText!=='string')return;"
+         "var t=now();"
+         "if(ever&&t-last<MIN_MS)return;"
+         "ever=true;last=t;apply(s);};"
+         "if(elBtn)elBtn.addEventListener('click',function(){"
+         "if(elBtn.disabled)return;"
+         "elBtn.disabled=true;"
+         "elState.textContent='正在连接…';"
+         "elState.classList.remove('wifi-ok','wifi-fail');"
+         "elState.classList.add('wifi-connecting');"
+         "fetch('/wifi/retry',{method:'POST'}).catch(function(){});"
+         "setTimeout(function(){elBtn.disabled=false;},RETRY_DISABLE_MS);"
+         "});"
+         "})();</script>");
   h += F("</body></html>");
   return h;
 }
@@ -1257,6 +1429,7 @@ static void setupProvisioning() {
 
   String ssid, pwd;
   loadWifiCreds(ssid, pwd);
+  wifiAttemptReset(ssid);  // WS-610: attempt clock starts when the portal opens
   if (ssid.length()) {
     WiFi.begin(ssid.c_str(), pwd.c_str());
     applyTimezone();
@@ -1266,6 +1439,36 @@ static void setupProvisioning() {
   cfgServer.on("/", HTTP_GET, []() {
     cfgServer.send(200, "text/html; charset=utf-8", cfgPage());
   });
+
+  // --- WS-610: retry the saved WiFi without retyping the password ---------
+  // POST-only (GET answers 405 and changes nothing), same shape as /extend.
+  // A repeat call within 30 s is throttled and does NOT call WiFi.begin again.
+  // No delay() here: /keys/state must stay responsive on the single-client
+  // WebServer while the attempt runs in the background.
+  cfgServer.on("/wifi/retry", HTTP_POST, []() {
+    unsigned long now = millis();
+    bool throttled = (g_lastWifiRetry != 0) &&
+                     ((now - g_lastWifiRetry) < WIFI_RETRY_THROTTLE_MS);
+    String j = "{\"ok\":true";
+    if (throttled) {
+      j += ",\"throttled\":true";
+    } else {
+      String ssid, pwd;
+      loadWifiCreds(ssid, pwd);
+      if (ssid.length()) WiFi.begin(ssid.c_str(), pwd.c_str());
+      wifiAttemptReset(ssid);
+      g_lastWifiRetry = now;   // re-arm the 30 s throttle after the reset
+      log_e("[cfg] wifi retry -> '%s'", ssid.c_str());
+    }
+    j += "}";
+    cfgServer.sendHeader("Cache-Control", "no-store");
+    cfgServer.sendHeader("Connection", "close");
+    cfgServer.send(200, "application/json", j);
+  });
+  cfgServer.on("/wifi/retry", HTTP_GET, []() {
+    cfgServer.send(405, "text/plain", "Method Not Allowed");
+  });
+
   cfgServer.on("/save", HTTP_POST, []() {
     String ssid = cfgServer.arg("ssid");
     String pwd  = cfgServer.arg("pwd");
@@ -1290,6 +1493,7 @@ static void setupProvisioning() {
     delay(100);
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(ssid.c_str(), pwd.c_str());
+    wifiAttemptReset(ssid);   // WS-610: 25 s attempt clock starts at /save
     applyTimezone();
     cfgServer.send(200, "text/html; charset=utf-8",
                    "<meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/'>"
@@ -1405,7 +1609,16 @@ static void setupProvisioning() {
     String j = "{\"seq\":" + String((unsigned long)g_recentInput.seq) +
                ",\"index\":" + String(g_recentInput.index) +
                ",\"gpio\":" + String(g_recentInput.gpio) +
-               ",\"left\":" + String(left) + "}";
+               ",\"left\":" + String(left);
+    // WS-610: APPEND the WiFi attempt fields after left (WS-602 fields keep
+    // their names/order). Computed fresh from device state, never blocks.
+    WifiAttempt w = wifiAttemptSnapshot();
+    j += ",\"wifi\":\"" + String(w.wifi) + "\"" +
+         ",\"ssid\":\"" + jsonEsc(w.ssid) + "\"" +
+         ",\"ip\":\"" + jsonEsc(w.ip) + "\"" +
+         ",\"elapsed\":" + String(w.elapsed) +
+         ",\"wifiText\":\"" + jsonEsc(w.wifiText) + "\"";
+    j += "}";
     cfgServer.sendHeader("Cache-Control", "no-store");
     cfgServer.sendHeader("Connection", "close");
     cfgServer.send(200, "application/json", j);

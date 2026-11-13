@@ -129,10 +129,11 @@ jobs:
       #   test_ui_leftovers.mjs      WS-596 retranslate keeps macro draft / log
       #                              time+kind escaped / untrusted "ignore for now"
       #   test_portal_clock.mjs      WS-602 portal countdown / extend 5 min / timeout banner
+      #   test_portal_wifi_state.mjs WS-610 WiFi status auto-update / POST /wifi/retry
       - name: Front-end regression tests (node --test)
         working-directory: host
         run: |
-          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs test_portal_wifi_state.mjs
 
       # WS-569: exactly one upload per artifact name. A second upload of the
       # same name fails the job with 409 Conflict, which turned every PR into
