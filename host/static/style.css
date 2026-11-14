@@ -1676,6 +1676,20 @@ body.modal-open .main { overflow: hidden; }
 .ota-result-title.bad { color: var(--danger); }
 .ota-modal .btn-row { margin-top: var(--sp-4); }
 
+/* ---------- action backup import (WS-619) ---------- */
+/* 预览态里逐条列出会执行的命令 / 路径 / 网址，可滚动、按词换行。 */
+.backup-pane[hidden] { display: none; }
+.backup-preview-list {
+  margin: var(--sp-2) 0 var(--sp-3); padding: var(--sp-3);
+  max-height: 220px; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--surface-sunken); border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  font-family: ui-monospace, Consolas, monospace; font-size: var(--fs-cap);
+  line-height: 1.6; color: var(--text);
+}
+.backup-modal .btn-row { margin-top: var(--sp-4); }
+
 /* ---------- apply results ---------- */
 /* 配置结果浮层：固定定位，脱离文档流，因此不会撑高 .topbar 或推动页面内容。
    top 由 app.js 按 .topbar 的实际底边计算（见 positionApplyResults）。 */

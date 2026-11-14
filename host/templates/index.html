@@ -235,6 +235,16 @@
             </div>
             <p class="muted small" id="cfgReadStatus" data-i18n="ui.cfg_not_read">尚未读取设备配置</p>
             <p class="muted small" data-i18n="ui.read_hint">读取会以设备当前值为准覆盖上方表单；有未下发修改时会先确认。</p>
+            <!-- WS-619：动作备份入口。未选设备时两个按钮禁用并给出 title。 -->
+            <div class="card-divider">
+              <div class="card-head">
+                <h3 data-i18n="ui.backup_section">备份与迁移</h3>
+              </div>
+              <div class="btn-row">
+                <button class="btn secondary sm" id="btnBackupExport" data-i18n="ui.backup_export">导出动作…</button>
+                <button class="btn secondary sm" id="btnBackupImport" data-i18n="ui.backup_import">导入动作…</button>
+              </div>
+            </div>
           </div>
 
           <div class="card">
@@ -482,6 +492,52 @@
   </div>
 </div>
 
+<!-- ================= ACTION BACKUP IMPORT (WS-619) ================= -->
+<div class="modal" id="backupImportModal" hidden>
+  <div class="modal-card backup-modal" role="dialog" aria-modal="true" aria-labelledby="backupImportTitle">
+    <div class="modal-head">
+      <h2 id="backupImportTitle" data-i18n="ui.backup_import_title">导入动作备份</h2>
+      <button class="icon-btn" id="btnBackupImportClose" title="关闭（Esc）" aria-label="关闭" data-i18n-title="ui.close_esc" data-i18n-aria-label="ui.close">✕</button>
+    </div>
+    <div class="modal-body backup-body">
+      <!-- 选择态 -->
+      <div class="backup-pane" data-pane="select">
+        <p class="muted small" data-i18n="ui.backup_import_select_hint">选择一份之前导出的 JSON 备份。导入只改本机存档，不会下发到设备，也不会执行任何动作。</p>
+        <div class="ota-warning" role="alert" data-i18n="ui.backup_import_risk">这些命令会在按下对应按键时以当前用户身份在本机执行，只导入你信任的文件。</div>
+        <div class="btn-row">
+          <input type="file" id="backupImportFile" accept="application/json,.json" hidden>
+          <button class="btn primary" id="btnBackupImportPick" data-i18n="ui.backup_import_choose">选择 JSON 文件</button>
+          <button class="btn secondary" id="btnBackupImportCancel" data-i18n="ui.backup_import_cancel">取消</button>
+        </div>
+      </div>
+      <!-- 预览态 -->
+      <div class="backup-pane" data-pane="preview" hidden>
+        <div class="ota-rows">
+          <span class="k" data-i18n="ui.backup_import_label_file">文件名</span><span class="v" id="backupPreviewFile">—</span>
+          <span class="k" data-i18n="ui.backup_import_label_source">来源</span><span class="v" id="backupPreviewSource">—</span>
+          <span class="k" data-i18n="ui.backup_import_label_time">导出时间</span><span class="v" id="backupPreviewTime">—</span>
+          <span class="k" data-i18n="ui.backup_import_label_override">将覆盖</span><span class="v" id="backupPreviewOverride">—</span>
+          <span class="k" data-i18n="ui.backup_import_label_counts">按类型</span><span class="v" id="backupPreviewCounts">—</span>
+        </div>
+        <pre class="backup-preview-list" id="backupPreviewList"></pre>
+        <p class="muted small" id="backupPreviewSkipped" hidden></p>
+        <div class="ota-warning" role="alert" data-i18n="ui.backup_import_risk">这些命令会在按下对应按键时以当前用户身份在本机执行，只导入你信任的文件。</div>
+        <div class="btn-row">
+          <button class="btn secondary" id="btnBackupImportBack" data-i18n="ui.back">上一步</button>
+          <button class="btn primary" id="btnBackupImportConfirm" data-i18n="ui.backup_import_confirm">导入</button>
+        </div>
+      </div>
+      <!-- 结果态 -->
+      <div class="backup-pane" data-pane="result" hidden>
+        <p class="ota-result-title" id="backupResultText">—</p>
+        <div class="btn-row">
+          <button class="btn primary" id="btnBackupImportDone" data-i18n="ui.backup_import_close">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ================= ONLINE UPDATE (WS-523) ================= -->
 <div class="modal" id="updateModal" hidden>
   <div class="modal-card update-modal" role="dialog" aria-modal="true" aria-labelledby="updateTitle">
@@ -625,6 +681,7 @@
 <script src="/static/log_device.js"></script>
 <script src="/static/reconnect_sync.js"></script>
 <script src="/static/cfg_status.js"></script>
+<script src="/static/actions_io_preview.js"></script>
 <script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
 </body>

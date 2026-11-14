@@ -1,0 +1,511 @@
+"""WS-619: 动作导出 / 导入回归用例。
+
+断言全部驱动 **生产函数**（host/app.py 的 build_actions_export /
+validate_actions_import / merge_actions_import，以及 Flask 视图
+api_actions_import），不在这里复制任何一份序列化或校验逻辑 —— 改坏生产代码
+就会真的变红。
+
+运行::
+
+    cd host && python -m pytest test_actions_io.py -q
+"""
+
+import copy
+import json
+import os
+import sys
+
+import pytest
+
+# host/ 不是包，按路径 import 生产模块。
+sys.path.insert(0, os.path.dirname(__file__))
+import app as host_app
+
+
+def _cfg_with_actions():
+    """一台配了动作的设备存档（new_device_cfg 自带 12 条 keys）。"""
+    cfg = host_app.new_device_cfg("ESP32", "MyDeck")
+    cfg["keys"][0]["action"] = {
+        "type": "command", "value": "calc.exe", "macro": []}
+    cfg["keys"][3]["action"] = {
+        "type": "macro", "value": "", "macro": [
+            {"type": "key", "value": "ctrl+alt+t"},
+            {"type": "text", "value": "hello"},
+        ]}
+    cfg["encoder"]["actions"]["CW"] = {
+        "type": "command", "value": "echo cw", "macro": []}
+    return cfg
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_path):
+    """Flask 测试客户端 + 临时 config.json，并重置进程级 _config。"""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"devices": {}, "settings": {}},
+                               ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(host_app, "CONFIG_PATH", str(path))
+    host_app._config = {
+        "devices": {}, "settings": {},
+        "skipped_version": "", "last_update": {}, "update_fail_count": 0,
+        "update_channel": "stable", "lang": "system",
+    }
+    host_app.app.config["TESTING"] = True
+    return host_app.app.test_client(), path
+
+
+# ---------------------------------------------------------------------------
+# 导出结构：不含 dev_id / BLE 地址 / WiFi 凭据
+# ---------------------------------------------------------------------------
+
+def test_export_has_no_sensitive_fields():
+    cfg = _cfg_with_actions()
+    # 故意把敏感字段塞进 cfg：如果有人偷懒直接 json.dump(cfg)，这里就会露馅。
+    cfg["dev_id"] = "secret-dev-id"
+    cfg["bond"] = {"bound": True, "addr": "AA:BB:CC:DD:EE:FF"}
+    cfg["wifi"] = {"ssid": "office", "password": "hunter2"}
+    cfg["pins"] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    payload = host_app.build_actions_export(cfg)
+    text = json.dumps(payload, ensure_ascii=False)
+
+    assert "secret-dev-id" not in text
+    assert "AA:BB:CC:DD:EE:FF" not in text
+    assert "hunter2" not in text
+    assert "office" not in text
+    assert "pins" not in payload
+    assert "wifi" not in payload and "bond" not in payload
+    assert "dev_id" not in payload
+    assert payload["schema"] == host_app.ACTIONS_EXPORT_SCHEMA
+    assert set(payload) == {"schema", "exported_at", "source", "inputs", "encoder"}
+    assert set(payload["source"]) == {"name", "chip", "layout"}
+    assert all(set(i) == {"index", "code", "mods", "action"}
+               for i in payload["inputs"])
+    assert set(payload["encoder"]) == {"CW", "CCW"}
+
+
+def test_export_only_known_action_types():
+    """导出只带 type/value/macro，不带动作对象上的其它杂字段。"""
+    cfg = _cfg_with_actions()
+    cfg["keys"][0]["action"]["secret"] = "should-not-export"
+    payload = host_app.build_actions_export(cfg)
+    assert payload["inputs"][0]["action"] == {
+        "type": "command", "value": "calc.exe", "macro": []}
+
+
+# ---------------------------------------------------------------------------
+# 往返一致
+# ---------------------------------------------------------------------------
+
+def test_roundtrip_preserves_keys_and_encoder_actions():
+    cfg = _cfg_with_actions()
+    payload = host_app.build_actions_export(cfg)
+    validated = host_app.validate_actions_import(copy.deepcopy(payload))
+
+    fresh = host_app.new_device_cfg("ESP32-C3", "")
+    host_app.merge_actions_import(fresh, validated)
+
+    for item in payload["inputs"]:
+        idx = item["index"]
+        assert fresh["keys"][idx]["code"] == item["code"]
+        assert fresh["keys"][idx]["mods"] == item["mods"]
+        assert fresh["keys"][idx]["action"] == item["action"]
+    # 文件里没有出现的输入保持默认值（仅 HID）。
+    assert fresh["keys"][1]["action"]["type"] == "none"
+    assert fresh["encoder"]["actions"]["CW"] == cfg["encoder"]["actions"]["CW"]
+
+
+def test_merge_preserves_inputs_absent_from_file():
+    """按 index 覆盖，未出现的 index 保持原值。"""
+    cfg = _cfg_with_actions()
+    expected_action = copy.deepcopy(cfg["keys"][1]["action"])
+    payload = {"schema": 1, "inputs": [
+        {"index": 5, "code": 77, "mods": 3,
+         "action": {"type": "url", "value": "https://example.com", "macro": []}},
+    ], "encoder": {}}
+    validated = host_app.validate_actions_import(payload)
+    host_app.merge_actions_import(cfg, validated)
+    assert cfg["keys"][1]["action"] == expected_action
+    assert cfg["keys"][5]["action"]["value"] == "https://example.com"
+
+
+# ---------------------------------------------------------------------------
+# 坏文件整份拒绝（纯函数层）
+# ---------------------------------------------------------------------------
+
+def _bad_variants():
+    good = host_app.build_actions_export(_cfg_with_actions())
+    out = []
+
+    v = copy.deepcopy(good); v["schema"] = 99; out.append(("schema", v))
+    v = copy.deepcopy(good); v["inputs"][0]["action"]["type"] = "teleport"
+    out.append(("unknown type", v))
+    v = copy.deepcopy(good)
+    v["inputs"][3]["action"]["macro"].append({"type": "warp"})
+    out.append(("unknown macro step", v))
+    v = copy.deepcopy(good); v["inputs"] = [dict(good["inputs"][0], index=i)
+                                            for i in range(13)]
+    out.append(("too many inputs", v))
+    v = copy.deepcopy(good); v["inputs"][2]["index"] = 99
+    out.append(("bad index", v))
+    v = copy.deepcopy(good); v["inputs"][2]["index"] = good["inputs"][1]["index"]
+    out.append(("dup index", v))
+    v = copy.deepcopy(good); del v["inputs"]
+    out.append(("no inputs", v))
+    out.append(("not an object", ["not", "an", "object"]))
+    return out
+
+
+@pytest.mark.parametrize("label,data", _bad_variants(),
+                         ids=[label for label, _ in _bad_variants()])
+def test_validate_rejects_bad_files_with_chinese_reason(label, data):
+    with pytest.raises(host_app.ActionsImportError) as exc:
+        host_app.validate_actions_import(data)
+    reason = str(exc.value)
+    assert reason, label
+    # 翻译键缺失时 t() 会把 key 原样回显；以 "error." 开头说明文案没配好。
+    assert not reason.startswith("error.")
+    # 是给用户看的中文句子，不是空串或原始 key。
+    assert any("\u4e00" <= ch <= "\u9fff" for ch in reason)
+
+
+def test_validate_reason_names_the_input():
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["action"]["type"] = "teleport"
+    with pytest.raises(host_app.ActionsImportError) as exc:
+        host_app.validate_actions_import(good)
+    # 点名第几个输入。
+    assert "1" in str(exc.value) and "输入" in str(exc.value)
+
+
+def test_twelve_input_limit():
+    """12 项正好接受，第 13 项拒绝（用 12 键布局导出正好 12 项）。"""
+    cfg = _cfg_with_actions()
+    cfg["layout"] = host_app.LAYOUT_12KEY
+    good = host_app.build_actions_export(cfg)
+    assert len(good["inputs"]) == host_app.ACTIONS_INPUT_LIMIT
+    host_app.validate_actions_import(copy.deepcopy(good))  # 不抛
+    good["inputs"].append(dict(good["inputs"][0], index=12))
+    with pytest.raises(host_app.ActionsImportError):
+        host_app.validate_actions_import(good)
+
+
+# ---------------------------------------------------------------------------
+# 坏文件整份拒绝（Flask 视图层）+ config.json 零改动
+# ---------------------------------------------------------------------------
+
+def test_route_rejects_non_json_and_leaves_config_unchanged(client):
+    c, path = client
+    for raw in (b"{ truncated", b"", b"\xff\xfe", b"not json at all"):
+        before = path.read_bytes()
+        resp = c.post("/api/actions/import/dev1", data=raw,
+                      content_type="application/json")
+        assert resp.status_code == 400, raw
+        assert path.read_bytes() == before, raw  # 一个字节都没动
+
+
+def test_route_rejects_bad_shape_and_leaves_config_unchanged(client):
+    c, path = client
+    for _label, payload in _bad_variants():
+        before = path.read_bytes()
+        resp = c.post("/api/actions/import/dev1", json=payload)
+        assert resp.status_code == 400, payload
+        body = resp.get_json()
+        assert body["ok"] is False
+        assert body["error"]
+        assert path.read_bytes() == before, payload
+
+
+def test_route_rejects_oversize_file(client):
+    c, path = client
+    before = path.read_bytes()
+    big = b" " * (host_app.ACTIONS_IMPORT_MAX_BYTES + 1)
+    resp = c.post("/api/actions/import/dev1", data=big,
+                  content_type="application/json")
+    assert resp.status_code == 400
+    assert path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# 导出视图：原生保存对话框 → 写 UTF-8 / 2 空格缩进的 JSON
+# ---------------------------------------------------------------------------
+
+def test_export_route_writes_json_file(client, monkeypatch):
+    c, path = client
+    cfg = _cfg_with_actions()
+    cfg["bond"] = {"bound": True, "addr": "AA:BB:CC:DD:EE:FF"}
+    host_app._config["devices"]["dev1"] = cfg
+    out = path.parent / "backup.json"
+    seen = {}
+
+    def _fake_browse(kind, default_name=""):
+        seen["kind"] = kind
+        seen["default_name"] = default_name
+        return {"ok": True, "path": str(out)}
+
+    monkeypatch.setattr(host_app.desktop, "browse", _fake_browse)
+    resp = c.post("/api/actions/export/dev1")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["cancelled"] is False
+    # WS-623：数量按当前布局的输入数报，不再因为 keys 补齐到 12 而虚报 12。
+    assert body["count"] == host_app.input_count(cfg)
+    assert body["count"] == host_app.INPUT_COUNT_ENCODER
+    assert body["actions"] == 2          # command + macro，编码器动作另计
+    assert seen["kind"] == "save"
+    assert seen["default_name"].startswith("BindDeckLite-")
+    assert seen["default_name"].endswith(".json")
+
+    text = out.read_text(encoding="utf-8")
+    assert '\n  "schema"' in text          # 2 空格缩进
+    payload = json.loads(text)
+    assert "AA:BB:CC:DD:EE:FF" not in text
+    assert "dev_id" not in payload
+    assert payload["encoder"]["CW"]["value"] == "echo cw"
+
+
+def test_export_route_cancel_has_no_side_effects(client, monkeypatch):
+    """用户在保存对话框点取消：不写文件、不加日志、返回 cancelled。"""
+    c, path = client
+    host_app._config["devices"]["dev1"] = _cfg_with_actions()
+    before_events = len(host_app._events)
+    monkeypatch.setattr(host_app.desktop, "browse",
+                        lambda kind, default_name="": {"ok": True, "path": ""})
+    resp = c.post("/api/actions/export/dev1")
+    assert resp.status_code == 200
+    assert resp.get_json()["cancelled"] is True
+    assert len(host_app._events) == before_events
+    assert not (path.parent / "backup.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 成功导入：原子写盘 + 合并语义 + 脏标记
+# ---------------------------------------------------------------------------
+
+def test_import_route_writes_config_atomically(client):
+    c, path = client
+    cfg = _cfg_with_actions()
+    host_app._config["devices"]["dev1"] = cfg
+    host_app.save_config()  # 先落一份基线
+    payload = host_app.build_actions_export(cfg)
+    expected = copy.deepcopy(cfg["keys"][0]["action"])
+
+    resp = c.post("/api/actions/import/dev1", json=payload)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert body["dirty"] is True
+    # WS-623：10 输入布局导出 10 条，导入同布局设备全部生效、没有额外输入。
+    assert body["applied"] == host_app.INPUT_COUNT_ENCODER
+    assert body["skipped_extra"] == []
+
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["devices"]["dev1"]["keys"][0]["action"] == expected
+    assert after["devices"]["dev1"]["encoder"]["actions"]["CW"]["value"] == "echo cw"
+    # 没有留下 .tmp 半份文件。
+    assert not (path.parent / "config.json.tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# WS-623 must fix 2：code / mods 必须是整数（bool 不算），整份拒绝、零写入
+# ---------------------------------------------------------------------------
+
+_NON_INTEGERS = [{"evil": 1}, "abc", None, 1.5, True, [1, 2]]
+
+
+@pytest.mark.parametrize("bad", _NON_INTEGERS, ids=lambda v: type(v).__name__)
+def test_validate_rejects_non_integer_code(bad):
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["code"] = bad
+    with pytest.raises(host_app.ActionsImportError) as exc:
+        host_app.validate_actions_import(good)
+    reason = str(exc.value)
+    # 中文原因，点名第几个输入，且文案键确实配好了。
+    assert any("\u4e00" <= ch <= "\u9fff" for ch in reason)
+    assert "输入" in reason and "1" in reason
+    assert not reason.startswith("error.")
+
+
+@pytest.mark.parametrize("bad", _NON_INTEGERS, ids=lambda v: type(v).__name__)
+def test_validate_rejects_non_integer_mods(bad):
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["mods"] = bad
+    with pytest.raises(host_app.ActionsImportError) as exc:
+        host_app.validate_actions_import(good)
+    assert "输入" in str(exc.value)
+    assert not str(exc.value).startswith("error.")
+
+
+def test_validate_allows_unknown_integer_code():
+    """code 允许不在键码表：保留原值并显示数字，但不能是非整数类型。"""
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["code"] = 424242
+    validated = host_app.validate_actions_import(good)
+    cfg = host_app.new_device_cfg("ESP32", "")
+    host_app.merge_actions_import(cfg, validated)
+    assert cfg["keys"][0]["code"] == 424242
+    assert cfg["keys"][0]["label"] == "424242"
+
+
+def test_route_rejects_non_integer_code_leaves_config_unchanged(client):
+    """组装的回归：坏 code route 返回 400，config.json 一个字节都不改。"""
+    c, path = client
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["code"] = {"evil": 1}
+    before = path.read_bytes()
+    resp = c.post("/api/actions/import/dev1", json=good)
+    assert resp.status_code == 400
+    assert resp.get_json()["ok"] is False
+    assert path.read_bytes() == before
+
+
+def test_rejected_code_never_poisons_archive_for_apply_device():
+    """坏 code 根本不会进存档，apply_device() 的 int(k['code']) 不会再抛。"""
+    good = host_app.build_actions_export(_cfg_with_actions())
+    good["inputs"][0]["code"] = {"evil": 1}
+    cfg = host_app.new_device_cfg("ESP32", "")
+    with pytest.raises(host_app.ActionsImportError):
+        host_app.merge_actions_import(cfg, host_app.validate_actions_import(good))
+    # 被拒后 cfg 一个字段都没动，仍是合法整数键码。
+    assert isinstance(cfg["keys"][0]["code"], int)
+
+
+# ---------------------------------------------------------------------------
+# WS-623 should fix 1：导出按 input_count，不虚报 / 不静默重置 11–12 号输入
+# ---------------------------------------------------------------------------
+
+def test_export_respects_input_count():
+    ten = _cfg_with_actions()
+    assert host_app.input_count(ten) == host_app.INPUT_COUNT_ENCODER
+    assert len(host_app.build_actions_export(ten)["inputs"]) == 10
+    twelve = _cfg_with_actions()
+    twelve["layout"] = host_app.LAYOUT_12KEY
+    assert host_app.input_count(twelve) == host_app.INPUT_COUNT_12KEY
+    assert len(host_app.build_actions_export(twelve)["inputs"]) == 12
+
+
+def test_ten_input_export_does_not_reset_extra_inputs_on_12key_device():
+    """10 输入导出文件导入 12 键设备时，11–12 号输入保持不变（不静默重置）。"""
+    payload = host_app.build_actions_export(_cfg_with_actions())
+    assert len(payload["inputs"]) == 10
+    target = _cfg_with_actions()
+    target["layout"] = host_app.LAYOUT_12KEY
+    target["keys"][10]["action"] = {"type": "command", "value": "keep-me-11", "macro": []}
+    target["keys"][11]["action"] = {"type": "command", "value": "keep-me-12", "macro": []}
+    validated = host_app.validate_actions_import(copy.deepcopy(payload))
+    host_app.merge_actions_import(target, validated)
+    assert target["keys"][10]["action"]["value"] == "keep-me-11"
+    assert target["keys"][11]["action"]["value"] == "keep-me-12"
+
+
+def test_import_12key_file_into_10input_device(client):
+    """12 键文件导入 10 输入设备：前 10 个生效，11–12 保存但暂不显示。"""
+    c, path = client
+    host_app._config["devices"]["dev1"] = _cfg_with_actions()   # 10 输入设备
+    src = _cfg_with_actions()
+    src["layout"] = host_app.LAYOUT_12KEY
+    payload = host_app.build_actions_export(src)
+    assert len(payload["inputs"]) == 12
+    resp = c.post("/api/actions/import/dev1", json=payload)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["applied"] == host_app.INPUT_COUNT_ENCODER
+    assert body["skipped_extra"] == [11, 12]
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert len(after["devices"]["dev1"]["keys"]) >= 12
+
+
+# ---------------------------------------------------------------------------
+# WS-623 should fix 2：文件缺 encoder 键 => 保持现有编码器动作，不重置
+# ---------------------------------------------------------------------------
+
+def _input_only_payload():
+    return {"schema": 1, "inputs": [
+        {"index": 0, "code": 0, "mods": 0,
+         "action": {"type": "none", "value": "", "macro": []}},
+    ]}
+
+
+def test_missing_encoder_key_keeps_existing_rotation_actions():
+    cfg = _cfg_with_actions()
+    original_cw = copy.deepcopy(cfg["encoder"]["actions"]["CW"])
+    validated = host_app.validate_actions_import(_input_only_payload())  # 无 encoder 键
+    host_app.merge_actions_import(cfg, validated)
+    assert cfg["encoder"]["actions"]["CW"] == original_cw
+
+
+def test_empty_encoder_dict_keeps_existing_rotation_actions():
+    cfg = _cfg_with_actions()
+    original_cw = copy.deepcopy(cfg["encoder"]["actions"]["CW"])
+    payload = _input_only_payload()
+    payload["encoder"] = {}
+    validated = host_app.validate_actions_import(payload)
+    host_app.merge_actions_import(cfg, validated)
+    assert cfg["encoder"]["actions"]["CW"] == original_cw
+
+
+def test_merge_preserves_inputs_absent_from_file_encoder_too():
+    """原有 case 的加强：encoder: {} 时现有 CW 动作也必须保持。"""
+    cfg = _cfg_with_actions()
+    original_cw = copy.deepcopy(cfg["encoder"]["actions"]["CW"])
+    payload = {"schema": 1, "inputs": [
+        {"index": 5, "code": 77, "mods": 3,
+         "action": {"type": "url", "value": "https://example.com", "macro": []}},
+    ], "encoder": {}}
+    host_app.merge_actions_import(cfg, host_app.validate_actions_import(payload))
+    assert cfg["encoder"]["actions"]["CW"] == original_cw
+
+
+# ---------------------------------------------------------------------------
+# WS-623 should fix 3：导出原子写（临时文件 + os.replace），失败不留半份
+# ---------------------------------------------------------------------------
+
+def test_export_route_replaces_existing_file_atomically(client, monkeypatch):
+    c, path = client
+    host_app._config["devices"]["dev1"] = _cfg_with_actions()
+    out = path.parent / "existing.json"
+    out.write_text("SENTINEL-HALF-FILE", encoding="utf-8")
+    monkeypatch.setattr(host_app.desktop, "browse",
+                        lambda kind, default_name="": {"ok": True, "path": str(out)})
+    resp = c.post("/api/actions/export/dev1")
+    assert resp.status_code == 200
+    text = out.read_text(encoding="utf-8")
+    assert "SENTINEL-HALF-FILE" not in text
+    assert json.loads(text)["schema"] == host_app.ACTIONS_EXPORT_SCHEMA
+    assert not (path.parent / "existing.json.tmp").exists()
+
+
+def test_export_route_write_failure_returns_500_without_half_file(client, monkeypatch):
+    c, path = client
+    host_app._config["devices"]["dev1"] = _cfg_with_actions()
+    out = path.parent / "backup.json"
+    # 让临时文件写失败（目标 .tmp 同名目录），不污染既有备份、不留半份文件。
+    (path.parent / "backup.json.tmp").mkdir()
+    monkeypatch.setattr(host_app.desktop, "browse",
+                        lambda kind, default_name="": {"ok": True, "path": str(out)})
+    resp = c.post("/api/actions/export/dev1")
+    assert resp.status_code == 500
+    assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# WS-623 should fix 4：save_config 失败不再谎报 ok:true，返回 500 并回滚内存
+# ---------------------------------------------------------------------------
+
+def test_import_route_save_failure_returns_500_and_rolls_back(client, monkeypatch):
+    c, path = client
+    cfg = _cfg_with_actions()
+    host_app._config["devices"]["dev1"] = cfg
+    host_app.save_config()
+    before_bytes = path.read_bytes()
+    before_action = copy.deepcopy(cfg["keys"][0]["action"])
+    payload = host_app.build_actions_export(_cfg_with_actions())
+    payload["inputs"][0]["action"] = {
+        "type": "command", "value": "SHOULD-NOT-PERSIST", "macro": []}
+
+    monkeypatch.setattr(host_app, "save_config", lambda: False)
+    resp = c.post("/api/actions/import/dev1", json=payload)
+    assert resp.status_code == 500
+    assert resp.get_json()["ok"] is False
+    # 磁盘零改动、内存也回滚，别让用户以为导入已保存。
+    assert path.read_bytes() == before_bytes
+    assert host_app._config["devices"]["dev1"]["keys"][0]["action"] == before_action
