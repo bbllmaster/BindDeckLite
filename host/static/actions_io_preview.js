@@ -50,11 +50,24 @@
    *
    * inputCount 是当前设备布局下可见的输入数（10 或 12）。索引 >= 它的
    * 输入会照常写进存档，但在切换布局前不显示，列进 skippedExtra。
+   *
+   * WS-623 must fix 1：编码器 CW/CCW 动作与 inputs 一样会写进存档，转动
+   * 编码器就会执行。以前本函数只读 inputs，导致这两条命令在预览里完全
+   * 看不见，确认后却照样生效 —— 击穿「会执行的命令必须完整可见」。现在
+   * 两个方向一并计数、一并列进预览，逐条带方向名。
+   *
+   * labels 可选，传 { cw, ccw } 两个方向的可译文案（app.js 用 t() 注入）。
+   * 不传时退回 ASCII 方向名，保证本共享模块不含硬编码中文（i18n guard）。
    */
-  function buildImportPreview(data, filename, inputCount) {
+  function buildImportPreview(data, filename, inputCount, labels) {
     const doc = data && typeof data === "object" ? data : {};
     const inputs = Array.isArray(doc.inputs) ? doc.inputs : [];
     const source = doc.source && typeof doc.source === "object" ? doc.source : {};
+    const l = labels && typeof labels === "object" ? labels : {};
+    const encoderLabels = {
+      CW: String(l.cw || "Encoder CW"),
+      CCW: String(l.ccw || "Encoder CCW"),
+    };
     const typeCounts = {};
     KNOWN_ACTION_TYPES.forEach((k) => { typeCounts[k] = 0; });
     const items = [];
@@ -66,7 +79,25 @@
       typeCounts[type] += 1;
       const display = actionDisplay(action);
       if (display) {
-        items.push({ index: (Number(e.index) || 0) + 1, type, display });
+        const label = "#" + ((Number(e.index) || 0) + 1);
+        items.push({ index: (Number(e.index) || 0) + 1, label, type, display });
+      }
+    });
+    // 编码器两个方向：与 inputs 采用同一套展示规则（宏摘要、text:/paste:
+    // 只给长度、command:/app:/url: 全文），并计入 typeCounts。
+    const enc = doc.encoder && typeof doc.encoder === "object" ? doc.encoder : {};
+    let encoderOverride = 0;
+    ["CW", "CCW"].forEach((dir) => {
+      // 文件里没有该方向就跳过（与「没有的输入保持不变」一致）。
+      if (!Object.prototype.hasOwnProperty.call(enc, dir)) return;
+      encoderOverride += 1;
+      const action = enc[dir] && typeof enc[dir] === "object" ? enc[dir] : {};
+      const type = String(action.type || "none");
+      if (typeCounts[type] === undefined) typeCounts[type] = 0;
+      typeCounts[type] += 1;
+      const display = actionDisplay(action);
+      if (display) {
+        items.push({ label: encoderLabels[dir], dir, type, display });
       }
     });
     const skippedExtra = [];
@@ -78,15 +109,18 @@
     });
     skippedExtra.sort((a, b) => a - b);
     // 预览里实际展示的纯文本：命令 / 路径 / 网址全文 + 宏摘要，无 text:/paste: 正文。
+    // 每条带编号 / 方向名，编码器动作与 inputs 一视同仁。
     const safeText = items
-      .map((it) => "#" + it.index + " [" + it.type + "] " + it.display)
+      .map((it) => it.label + " [" + it.type + "] " + it.display)
       .join("\n");
     return {
       filename: String(filename || ""),
       source: [source.name, source.chip].filter(Boolean).join(" / "),
       exportedAt: String(doc.exported_at || ""),
-      override: inputs.length,
-      typeCounts,
+      override: inputs.length,          // 将覆盖的输入卡数量（不含编码器）
+      overrideIncludesEncoder: false,   // 明确口径：override 不含编码器
+      encoderOverride,                  // 另将被覆盖的编码器方向动作数
+      typeCounts,                       // 按类型计数含编码器方向动作
       items,
       skippedExtra,
       safeText,

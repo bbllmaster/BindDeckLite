@@ -3607,12 +3607,22 @@ async function onBackupFileChosen(file) {
 }
 
 function renderBackupPreview(data, filename) {
-  const view = window.ActionsIOPreview.buildImportPreview(data, filename, inputCount());
+  // WS-623：方向名走 i18n，避免共享预览模块里出现硬编码中文；编码器动作
+  // 与 inputs 一样会写入存档，所以预览必须把它们一并列出。
+  const view = window.ActionsIOPreview.buildImportPreview(data, filename, inputCount(), {
+    cw: t("ui.backup_encoder_cw"),
+    ccw: t("ui.backup_encoder_ccw"),
+  });
   $("#backupPreviewFile").textContent = view.filename || "—";
   $("#backupPreviewSource").textContent = view.source || "—";
   $("#backupPreviewTime").textContent = view.exportedAt || "—";
-  $("#backupPreviewOverride").textContent =
-    t("ui.backup_import_override_count", { count: view.override });
+  // 「将覆盖」只数输入卡；编码器方向动作另写，明确说明是否含编码器。
+  let overrideText = t("ui.backup_import_override_count", { count: view.override });
+  if (view.encoderOverride > 0) {
+    overrideText += " " + t("ui.backup_import_override_encoder",
+                            { count: view.encoderOverride });
+  }
+  $("#backupPreviewOverride").textContent = overrideText;
   const parts = [];
   Object.keys(view.typeCounts).forEach((type) => {
     const n = view.typeCounts[type];

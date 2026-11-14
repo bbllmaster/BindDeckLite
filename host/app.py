@@ -1252,13 +1252,44 @@ def load_config():
 
 
 def save_config():
+    """Persist ``_config`` atomically; return True on success, False on failure.
+
+    WS-623: the import route must not report ``ok: True`` when the disk write
+    failed, so the failure is returned (and still logged) instead of being
+    swallowed.  Every other caller ignores the return value and is unchanged.
+    """
+    tmp = CONFIG_PATH + ".tmp"
     try:
-        tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_config, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CONFIG_PATH)
+        return True
     except Exception as e:  # noqa: BLE001
         print("[app] config save failed:", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _atomic_write_json(path: str, payload) -> None:
+    """Write *payload* via a temp file + ``os.replace`` (WS-623).
+
+    Overwriting an existing backup used to go straight through ``open(w)``;
+    a failure mid-write left a half file behind.  Mirrors ``save_config()``.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --- action backup: export / import (WS-619) -----------------------------
@@ -1302,9 +1333,15 @@ def build_actions_export(cfg: dict) -> dict:
     sleep, tz and global settings are deliberately left OUT.
     """
     cfg = cfg or {}
+    # WS-623: export only the inputs this layout actually shows.  The keys
+    # table is always padded to 12 (ensure_key_items), so slicing to the limit
+    # used to make a 10-input deck export 12 entries whose last two were
+    # defaults; importing that file on a 12-key deck then silently reset
+    # inputs 11-12 to "none".  input_count() keeps the file honest and makes
+    # the "exported N inputs" log / toast report the real number.
     keys = cfg.get("keys") or []
     inputs = []
-    for i, item in enumerate(keys[:ACTIONS_INPUT_LIMIT]):
+    for i, item in enumerate(keys[:input_count(cfg)]):
         item = item or {}
         inputs.append({
             "index": i,
@@ -1385,21 +1422,40 @@ def validate_actions_import(data) -> dict:
             raise ActionsImportError(t("error.actions_import_dup_index", pos=pos))
         seen.add(idx)
         where = t("error.actions_input_n", n=idx + 1)
+        # WS-623 must fix 2: code / mods are written straight into the archive
+        # and later fed to int(k["code"]) in apply_device().  A non-integer
+        # (dict / null / str / float / bool) used to slip through and either
+        # turn "apply config" into a 500 or store a corrupt label.  The code
+        # may be outside the keycode table (kept as-is, shown as a number),
+        # but its TYPE must be an integer; bool deliberately does not count.
+        code = entry.get("code", 0)
+        mods = entry.get("mods", 0)
+        if not isinstance(code, int) or isinstance(code, bool):
+            raise ActionsImportError(
+                t("error.actions_import_bad_code", where=where))
+        if not isinstance(mods, int) or isinstance(mods, bool):
+            raise ActionsImportError(
+                t("error.actions_import_bad_mods", where=where))
         norm.append({
             "index": idx,
-            "code": entry.get("code", 0),
-            "mods": entry.get("mods", 0),
+            "code": code,
+            "mods": mods,
             "action": _validate_action(entry.get("action"), where),
         })
+    # WS-623 should fix 2: an absent encoder key means "leave the existing
+    # rotation actions alone", matching the "inputs missing from the file keep
+    # their value" rule.  Only directions actually present are normalized, so
+    # a file without this key no longer resets a configured CW/CCW to "none".
     encoder = {}
-    enc_src = data.get("encoder") or {}
-    if not isinstance(enc_src, dict):
-        enc_src = {}
-    for direction in ("CW", "CCW"):
-        where = t("error.actions_encoder_dir", dir=direction)
-        encoder[direction] = _validate_action(
-            enc_src.get(direction) or {"type": "none", "value": "", "macro": []},
-            where)
+    enc_src = data.get("encoder")
+    if isinstance(enc_src, dict):
+        for direction in ("CW", "CCW"):
+            if direction not in enc_src:
+                continue
+            where = t("error.actions_encoder_dir", dir=direction)
+            encoder[direction] = _validate_action(
+                enc_src.get(direction) or {"type": "none", "value": "", "macro": []},
+                where)
     return {"inputs": norm, "encoder": encoder}
 
 
@@ -1426,9 +1482,13 @@ def merge_actions_import(cfg: dict, validated: dict) -> tuple:
             keys[idx]["label"] = next(
                 (lbl for lbl, c in KEY_CODES if c == entry["code"]),
                 str(entry["code"]))
-    cfg.setdefault("encoder", {}).setdefault("actions", {})
-    for direction in ("CW", "CCW"):
-        cfg["encoder"]["actions"][direction] = validated["encoder"][direction]
+    # WS-623 should fix 2: only directions present in the file are
+    # overwritten; a file without an encoder key leaves the existing
+    # rotation actions untouched (no silent reset to "none").
+    if validated["encoder"]:
+        cfg.setdefault("encoder", {}).setdefault("actions", {})
+        for direction, action in validated["encoder"].items():
+            cfg["encoder"]["actions"][direction] = action
     skipped = sorted(e["index"] + 1 for e in validated["inputs"]
                      if e["index"] >= count)
     applied = sum(1 for e in validated["inputs"] if e["index"] < count)
@@ -4383,8 +4443,9 @@ def api_actions_export(dev_id):
         # 用户取消：不弹 toast、不写日志、不写文件。
         return jsonify({"ok": True, "cancelled": True})
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        # WS-623 should fix 3: temp file + os.replace, so a failed overwrite
+        # never leaves an existing backup half-written.
+        _atomic_write_json(path, payload)
     except OSError as exc:
         return jsonify({"ok": False, "cancelled": False,
                         "error": t("error.actions_export_write_failed",
@@ -4427,9 +4488,19 @@ def api_actions_import(dev_id):
     except ActionsImportError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     with _lock:
+        # WS-623 should fix 4: save_config() now returns False on a failed
+        # disk write.  Roll back the in-memory change too, so the import is
+        # all-or-nothing and never reports success when nothing was saved.
+        before = copy.deepcopy(_config)
         cfg = device_cfg(dev_id)
         applied, skipped = merge_actions_import(cfg, validated)
-        save_config()
+        saved = save_config()
+        if not saved:
+            _config.clear()
+            _config.update(before)
+    if not saved:
+        return jsonify({"ok": False,
+                        "error": t("error.actions_import_save_failed")}), 500
     return jsonify({"ok": True, "applied": applied,
                     "skipped_extra": skipped, "dirty": True})
 

