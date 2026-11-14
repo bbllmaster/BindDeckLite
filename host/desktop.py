@@ -374,14 +374,18 @@ def close_decision(force_quit: bool, behavior: str, use_tray: bool) -> tuple[boo
 
 
 # --- native file dialog ---------------------------------------------------
-def _dialog_command(kind: str) -> list[str]:
+def _dialog_command(kind: str, default_name: str = "") -> list[str]:
     if is_frozen():
-        return [sys.executable, "--file-dialog", kind]
-    here = os.path.dirname(os.path.abspath(__file__))
-    return [sys.executable, os.path.join(here, "app.py"), "--file-dialog", kind]
+        cmd = [sys.executable, "--file-dialog", kind]
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        cmd = [sys.executable, os.path.join(here, "app.py"), "--file-dialog", kind]
+    if default_name:
+        cmd += ["--file-dialog-name", default_name]
+    return cmd
 
 
-def dialog_main(kind: str) -> int:
+def dialog_main(kind: str, default_name: str = "") -> int:
     """Entry point of the short-lived child process that owns the dialog."""
     try:
         import tkinter as tk
@@ -404,6 +408,18 @@ def dialog_main(kind: str) -> int:
             pass
         if kind == "dir":
             path = filedialog.askdirectory(parent=root, title=t("dialog.choose_dir"), mustexist=True)
+        elif kind == "save":
+            # WS-619: 导出动作备份用的「保存到…」对话框。
+            path = filedialog.asksaveasfilename(
+                parent=root,
+                title=t("dialog.save_title"),
+                initialfile=default_name or "",
+                defaultextension=".json",
+                filetypes=[
+                    (t("dialog.filter_json"), "*.json"),
+                    (t("dialog.filter_all"), "*.*"),
+                ],
+            )
         else:
             path = filedialog.askopenfilename(
                 parent=root,
@@ -427,17 +443,19 @@ def dialog_main(kind: str) -> int:
     return 0
 
 
-def browse(kind: str = "file") -> dict:
+def browse(kind: str = "file", default_name: str = "") -> dict:
     """Open a native dialog in a child process and return the picked path.
 
     A child process is used because Tk must own the main thread on macOS and
     because the frozen exe can re-enter itself with ``--file-dialog``.
+    ``kind="save"`` opens an asksaveasfilename dialog; ``default_name`` is its
+    suggested filename (only meaningful for a save dialog).
     """
-    if kind not in ("file", "dir"):
+    if kind not in ("file", "dir", "save"):
         kind = "file"
     try:
         proc = subprocess.run(
-            _dialog_command(kind),
+            _dialog_command(kind, default_name if kind == "save" else ""),
             capture_output=True,
             text=True,
             timeout=BROWSE_TIMEOUT,

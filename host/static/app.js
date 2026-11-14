@@ -938,6 +938,8 @@ async function pollStatus() {
     // 弹窗开着时，连接/OTA 状态变化要实时反映到固件区块（WS-577 验收 9）。
     const updateModal = $("#updateModal");
     if (updateModal && !updateModal.hidden) renderUpdateFw();
+    // 选中设备 / 预览模式变化时，导出/导入按钮的可用态与 title 跟着变。
+    updateBackupButtons();
   } catch (e) {
     $("#statusDot").className = "dot bad";
     $("#statusText").textContent = t("ui.host_not_ready");
@@ -1082,6 +1084,7 @@ async function selectDevice(devId) {
   if (devId) delete state.pendingIgnored[devId];
   if (state.selected === devId) {
     updatePendingUi();
+    updateBackupButtons();
     renderDevices();
     return;
   }
@@ -1097,6 +1100,7 @@ async function selectDevice(devId) {
   if (typeof closeKeyDrawer === "function") closeKeyDrawer(false);
   state.selected = devId;
   state.preview = false;
+  updateBackupButtons();
   // WS-542：可唤醒输入属于上一台设备的芯片/布局/引脚，先清掉，避免切换瞬间
   // 把旧设备的结论画到新设备上；本次 validatePins 返回后会重新填。
   state.wakeInputs = null;
@@ -3528,6 +3532,200 @@ function retranslateDynamic() {
   renderOta();
   renderUpdateApp();
   renderUpdateFw();
+  updateBackupButtons();
+}
+
+/* ---------------- 动作备份：导出 / 导入（WS-619） ----------------
+ *
+ * 导出/导入只动本机存档，不发 CFG:、不自动「应用配置」。预览与「取消零请求」
+ * 的判定在 static/actions_io_preview.js（纯函数，Node 测试直接 import），这里
+ * 只负责把它接到 DOM 与网络请求上。
+ */
+
+let backupImportData = null;     // 当前预览的解析后 JSON
+let backupImportFilename = "";
+
+const BACKUP_TYPE_KEYS = {
+  none: "ui.act_none", launch: "ui.act_launch", url: "ui.act_url",
+  command: "ui.act_command", macro: "ui.act_macro", media: "ui.act_media",
+};
+
+/** 未选设备时禁用两个入口并给出 title；切语言 / 轮询时反复调用保持同步。 */
+function updateBackupButtons() {
+  const need = !state.selected;
+  const tip = need ? t("ui.backup_need_device") : "";
+  ["btnBackupExport", "btnBackupImport"].forEach((id) => {
+    const el = $("#" + id);
+    if (!el) return;
+    el.disabled = need;
+    el.title = tip;
+  });
+}
+
+function backupPane(name) {
+  $$("#backupImportModal .backup-pane").forEach((p) => {
+    p.hidden = p.dataset.pane !== name;
+  });
+}
+
+function openBackupImport() {
+  if (!state.selected) return;
+  backupImportData = null;
+  backupImportFilename = "";
+  const file = $("#backupImportFile");
+  if (file) file.value = "";
+  backupPane("select");
+  $("#backupImportModal").hidden = false;
+}
+
+function closeBackupImport() {
+  $("#backupImportModal").hidden = true;
+  backupImportData = null;
+  backupImportFilename = "";
+}
+
+async function onBackupFileChosen(file) {
+  if (!file) return;
+  let text;
+  try {
+    text = await file.text();
+  } catch (e) {
+    toast(t("ui.backup_import_read_failed") + (e.message || e), "bad");
+    return;
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (_) {
+    toast(t("ui.backup_import_bad_json"), "bad");
+    return;
+  }
+  backupImportData = data;
+  backupImportFilename = file.name || "";
+  renderBackupPreview(data, backupImportFilename);
+  backupPane("preview");
+}
+
+function renderBackupPreview(data, filename) {
+  // WS-623：方向名走 i18n，避免共享预览模块里出现硬编码中文；编码器动作
+  // 与 inputs 一样会写入存档，所以预览必须把它们一并列出。
+  const view = window.ActionsIOPreview.buildImportPreview(data, filename, inputCount(), {
+    cw: t("ui.backup_encoder_cw"),
+    ccw: t("ui.backup_encoder_ccw"),
+  });
+  $("#backupPreviewFile").textContent = view.filename || "—";
+  $("#backupPreviewSource").textContent = view.source || "—";
+  $("#backupPreviewTime").textContent = view.exportedAt || "—";
+  // 「将覆盖」只数输入卡；编码器方向动作另写，明确说明是否含编码器。
+  let overrideText = t("ui.backup_import_override_count", { count: view.override });
+  if (view.encoderOverride > 0) {
+    overrideText += " " + t("ui.backup_import_override_encoder",
+                            { count: view.encoderOverride });
+  }
+  $("#backupPreviewOverride").textContent = overrideText;
+  const parts = [];
+  Object.keys(view.typeCounts).forEach((type) => {
+    const n = view.typeCounts[type];
+    if (n > 0) parts.push(t(BACKUP_TYPE_KEYS[type] || type) + " x" + n);
+  });
+  $("#backupPreviewCounts").textContent = parts.join(", ") || "—";
+  $("#backupPreviewList").textContent =
+    view.safeText || t("ui.backup_import_no_actions");
+  const skipped = $("#backupPreviewSkipped");
+  if (view.skippedExtra.length) {
+    skipped.hidden = false;
+    skipped.textContent = t("ui.backup_import_skipped",
+                            { indices: view.skippedExtra.join(", ") });
+  } else {
+    skipped.hidden = true;
+  }
+}
+
+/** 把一个 decision 的 requests 真正发出去（cancel 的 requests 为空 → 零请求）。 */
+function sendBackupRequest(req) {
+  return api(req.url, { method: req.method, body: JSON.stringify(req.body) });
+}
+
+async function confirmBackupImport() {
+  if (!state.selected || !backupImportData) return;
+  const devId = state.selected;
+  const before = snapshotCfg(state.cfg);
+  const decision = window.ActionsIOPreview.decideImportAction("confirm", {
+    devId, data: backupImportData,
+  });
+  try {
+    const results = await window.ActionsIOPreview.runDecision(decision, sendBackupRequest);
+    const r = results[0] || {};
+    if (!r.ok) throw new Error(r.error || t("ui.backup_import_failed"));
+    // 后端已原子写好本机存档：拉回最新配置，刷新键位列表 / 抽屉 / 摘要并置脏。
+    const fresh = await api(`/api/config/${encodeURIComponent(devId)}`);
+    state.cfg = fresh;
+    const b = bucketFor(devId);
+    b.cfg = fresh;
+    // 把导入前的本机快照当作「已下发基线」，顶栏据此显示「有未下发修改」。
+    if (!b.applied) b.applied = before;
+    if (state.editingKey !== null && typeof closeKeyDrawer === "function") {
+      closeKeyDrawer(false);
+    }
+    renderKeys();
+    renderEncoder();
+    renderDeviceMeta();
+    setDirty(true);
+    $("#backupResultText").textContent =
+      t("ui.backup_import_result", { count: r.applied });
+    backupPane("result");
+  } catch (e) {
+    toast(t("ui.backup_import_failed") + (e.message || e), "bad");
+  }
+}
+
+async function exportActions() {
+  if (!state.selected) return;
+  try {
+    const r = await api(`/api/actions/export/${encodeURIComponent(state.selected)}`,
+                        { method: "POST" });
+    if (r.cancelled) return;   // 取消：不弹 toast、不写日志
+    if (!r.ok) {
+      toast(t("ui.backup_export_failed") + (r.error || ""), "bad");
+      return;
+    }
+    toast(t("ui.backup_export_done", { count: r.count, actions: r.actions }), "ok");
+  } catch (e) {
+    toast(t("ui.backup_export_failed") + (e.message || e), "bad");
+  }
+}
+
+function bindBackup() {
+  const exportBtn = $("#btnBackupExport");
+  if (exportBtn) exportBtn.onclick = exportActions;
+  const importBtn = $("#btnBackupImport");
+  if (importBtn) importBtn.onclick = openBackupImport;
+  const file = $("#backupImportFile");
+  const pick = $("#btnBackupImportPick");
+  if (pick && file) pick.onclick = () => file.click();
+  if (file) {
+    file.onchange = () => {
+      const f = file.files && file.files[0];
+      if (f) onBackupFileChosen(f);
+    };
+  }
+  const cancel = $("#btnBackupImportCancel");
+  if (cancel) {
+    cancel.onclick = () => {
+      // 取消只关模态：decision 的 requests 为空 → 不发请求、不写日志、不动配置。
+      window.ActionsIOPreview.runDecision(
+        window.ActionsIOPreview.decideImportAction("cancel", {}), sendBackupRequest);
+      closeBackupImport();
+    };
+  }
+  const back = $("#btnBackupImportBack");
+  if (back) back.onclick = () => backupPane("select");
+  const confirm = $("#btnBackupImportConfirm");
+  if (confirm) confirm.onclick = confirmBackupImport;
+  const close = $("#btnBackupImportClose");
+  if (close) close.onclick = closeBackupImport;
+  const done = $("#btnBackupImportDone");
+  if (done) done.onclick = closeBackupImport;
 }
 
 async function init() {
@@ -3541,6 +3739,8 @@ async function init() {
   bindLogFilters();
   bindLogFollow();
   bindCfgStatus();
+  bindBackup();
+  updateBackupButtons();
   syncLogFollowUi();
   try {
     const k = await api("/api/keycodes");
