@@ -8,8 +8,13 @@
 # pythonnet is pywebview's Windows backend (WinForms) and is pulled in
 # automatically by pywebview on win32; listed here explicitly so the PyInstaller
 # hidden-imports and the bundled .NET interop assembly are unambiguous.
-pywebview>=6.0
-pythonnet>=3.0; sys_platform == "win32"
-pystray>=0.19.5
-pillow>=10.0
-keyboard>=0.13.5; sys_platform == "win32"
+# WS-624: keep every packaging dep bounded.  A floating `pillow>=10.0` let
+# pip pull Pillow 13.0.0 (2026-11-14), which broke the frozen exe's startup
+# and turned every PR's windows-exe job red (tray_available=false).  These
+# upper bounds restore the dependency set that was green at main@d2373cf.
+# Bump a bound only after a full download -> replace -> restart smoke test.
+pywebview>=6.0,<7
+pythonnet>=3.0,<4; sys_platform == "win32"
+pystray>=0.19.5,<0.20
+pillow>=10,<13
+keyboard>=0.13.5,<0.14; sys_platform == "win32"

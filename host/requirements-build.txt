@@ -5,5 +5,10 @@
 # onto a new bootloader silently - bump this after testing a full
 # download -> replace -> restart cycle on Windows.
 pyinstaller==6.22.3
-pytest>=8
-pyyaml>=6
+# WS-624: pyinstaller-hooks-contrib was left unpinned, so CI drifted onto
+# 2026.10 (2026-11-14) and the frozen exe stopped starting.  Cap it below the
+# drifted release and bound the build tools too, so the whole packaging env is
+# deterministic.  build_deps.assert_packaging_pinned() enforces this in CI.
+pyinstaller-hooks-contrib<2026.10
+pytest>=8,<9
+pyyaml>=6,<7
