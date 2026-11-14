@@ -1261,6 +1261,180 @@ def save_config():
         print("[app] config save failed:", e)
 
 
+# --- action backup: export / import (WS-619) -----------------------------
+# The per-input host-side actions live only in config.json — there is no second
+# copy on the device and no action concept in CFG:/CMD:.  A backup is the only
+# way to move them to another machine/directory.  The helpers below are pure
+# (no globals, no I/O) so the pytest regression can import them and verify the
+# "reject the whole file, change nothing" contract directly.
+
+ACTIONS_EXPORT_SCHEMA = 1
+ACTIONS_IMPORT_MAX_BYTES = 512 * 1024        # 512 KB
+ACTIONS_INPUT_LIMIT = INPUT_COUNT_12KEY      # a backup never carries > 12 inputs
+KNOWN_ACTION_TYPES = {"none", "launch", "url", "command", "macro", "media"}
+KNOWN_MACRO_STEP_TYPES = {
+    "key", "text", "paste", "delay", "wait", "url", "browser", "app",
+}
+
+
+class ActionsImportError(ValueError):
+    """A user-facing (Chinese) reason why a backup file must be rejected whole."""
+
+
+def _clean_action(action) -> dict:
+    """Export-safe copy of one action: only type/value/macro, nothing else."""
+    action = action if isinstance(action, dict) else {}
+    macro = action.get("macro")
+    if not isinstance(macro, list):
+        macro = []
+    return {
+        "type": action.get("type", "none"),
+        "value": action.get("value", ""),
+        "macro": copy.deepcopy(macro),
+    }
+
+
+def build_actions_export(cfg: dict) -> dict:
+    """Build the portable backup for one device (pure, no dev_id/address/etc.).
+
+    Only the per-input HID code/mods/action and the two encoder rotation
+    actions are exportable.  dev_id, BLE address, WiFi credentials, pins,
+    sleep, tz and global settings are deliberately left OUT.
+    """
+    cfg = cfg or {}
+    keys = cfg.get("keys") or []
+    inputs = []
+    for i, item in enumerate(keys[:ACTIONS_INPUT_LIMIT]):
+        item = item or {}
+        inputs.append({
+            "index": i,
+            "code": item.get("code", 0),
+            "mods": item.get("mods", 0),
+            "action": _clean_action(item.get("action")),
+        })
+    enc_actions = ((cfg.get("encoder") or {}).get("actions") or {})
+    encoder = {
+        "CW": _clean_action(enc_actions.get("CW")),
+        "CCW": _clean_action(enc_actions.get("CCW")),
+    }
+    return {
+        "schema": ACTIONS_EXPORT_SCHEMA,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source": {
+            "name": cfg.get("name", ""),
+            "chip": cfg.get("chip", ""),
+            "layout": layout_of(cfg),
+        },
+        "inputs": inputs,
+        "encoder": encoder,
+    }
+
+
+def _validate_action(action, where) -> dict:
+    """Normalize one action; raise ActionsImportError on an unknown type/step."""
+    if not isinstance(action, dict):
+        raise ActionsImportError(t("error.actions_import_bad_action", where=where))
+    kind = action.get("type", "none")
+    if kind not in KNOWN_ACTION_TYPES:
+        raise ActionsImportError(
+            t("error.actions_import_bad_type", where=where, type=kind))
+    macro = action.get("macro")
+    if macro is None:
+        macro = []
+    if not isinstance(macro, list):
+        raise ActionsImportError(t("error.actions_import_bad_macro", where=where))
+    for step_no, step in enumerate(macro, 1):
+        stype = str(step.get("type") or "") if isinstance(step, dict) else ""
+        if not isinstance(step, dict) or stype not in KNOWN_MACRO_STEP_TYPES:
+            raise ActionsImportError(t(
+                "error.actions_import_bad_step", where=where,
+                step=step_no, type=stype))
+    return {"type": kind, "value": action.get("value", ""),
+            "macro": copy.deepcopy(macro)}
+
+
+def validate_actions_import(data) -> dict:
+    """Validate a parsed backup JSON (pure). Returns a normalized copy to merge.
+
+    Any problem raises ``ActionsImportError`` with a Chinese reason that names
+    the offending input.  Nothing is written here — the route only calls
+    ``device_cfg``/``save_config`` after this returns, so a bad file leaves
+    config.json byte-for-byte unchanged.
+    """
+    if not isinstance(data, dict):
+        raise ActionsImportError(t("error.actions_import_not_object"))
+    if data.get("schema") != ACTIONS_EXPORT_SCHEMA:
+        raise ActionsImportError(
+            t("error.actions_import_bad_schema", schema=data.get("schema")))
+    inputs = data.get("inputs")
+    if not isinstance(inputs, list):
+        raise ActionsImportError(t("error.actions_import_no_inputs"))
+    if len(inputs) > ACTIONS_INPUT_LIMIT:
+        raise ActionsImportError(
+            t("error.actions_import_too_many", limit=ACTIONS_INPUT_LIMIT))
+    norm = []
+    seen = set()
+    for pos, entry in enumerate(inputs, 1):
+        if not isinstance(entry, dict):
+            raise ActionsImportError(t("error.actions_import_bad_input", pos=pos))
+        idx = entry.get("index")
+        if (not isinstance(idx, int) or isinstance(idx, bool)
+                or idx < 0 or idx >= ACTIONS_INPUT_LIMIT):
+            raise ActionsImportError(t("error.actions_import_bad_index", pos=pos))
+        if idx in seen:
+            raise ActionsImportError(t("error.actions_import_dup_index", pos=pos))
+        seen.add(idx)
+        where = t("error.actions_input_n", n=idx + 1)
+        norm.append({
+            "index": idx,
+            "code": entry.get("code", 0),
+            "mods": entry.get("mods", 0),
+            "action": _validate_action(entry.get("action"), where),
+        })
+    encoder = {}
+    enc_src = data.get("encoder") or {}
+    if not isinstance(enc_src, dict):
+        enc_src = {}
+    for direction in ("CW", "CCW"):
+        where = t("error.actions_encoder_dir", dir=direction)
+        encoder[direction] = _validate_action(
+            enc_src.get(direction) or {"type": "none", "value": "", "macro": []},
+            where)
+    return {"inputs": norm, "encoder": encoder}
+
+
+def merge_actions_import(cfg: dict, validated: dict) -> tuple:
+    """Overlay validated inputs onto *cfg* in place (pure apart from *cfg*).
+
+    Inputs are written by index; indices absent from the file keep their old
+    value.  All 12 entries are stored (ensure_key_items), so a 12-key backup
+    imported on a 10-input deck keeps inputs 11–12 for when the layout is
+    switched.  Returns ``(applied, skipped_extra)``: applied is the count
+    visible on the current layout, skipped_extra the 1-based numbers of the
+    inputs beyond it.
+    """
+    ensure_key_items(cfg)
+    keys = cfg["keys"]
+    count = input_count(cfg)
+    for entry in validated["inputs"]:
+        idx = entry["index"]
+        if idx < len(keys):
+            keys[idx]["code"] = entry["code"]
+            keys[idx]["mods"] = entry["mods"]
+            keys[idx]["action"] = entry["action"]
+            # Keep the label in step with the code (same rule as _apply_cfg_field).
+            keys[idx]["label"] = next(
+                (lbl for lbl, c in KEY_CODES if c == entry["code"]),
+                str(entry["code"]))
+    cfg.setdefault("encoder", {}).setdefault("actions", {})
+    for direction in ("CW", "CCW"):
+        cfg["encoder"]["actions"][direction] = validated["encoder"][direction]
+    skipped = sorted(e["index"] + 1 for e in validated["inputs"]
+                     if e["index"] >= count)
+    applied = sum(1 for e in validated["inputs"] if e["index"] < count)
+    return applied, skipped
+
+
 def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
     """A fresh default configuration for one deck (ESP32 or C3 pin map)."""
     return {
@@ -4186,6 +4360,80 @@ def api_config(dev_id):
     return jsonify({"ok": True, "config": cfg})
 
 
+@app.route("/api/actions/export/<dev_id>", methods=["POST"])
+def api_actions_export(dev_id):
+    """Serialize one device's host-side actions to a user-chosen JSON file.
+
+    Export is independent of the connection state and never sends a CFG: line.
+    A missing native dialog reuses /api/browse's error text; cancelling the
+    dialog produces no toast and no log line.
+    """
+    cfg = device_cfg(dev_id)
+    payload = build_actions_export(cfg)
+    name = cfg.get("name") or dev_id
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    default_name = f"BindDeckLite-{safe}-{time.strftime('%Y%m%d-%H%M')}.json"
+    result = desktop.browse("save", default_name=default_name)
+    if not result.get("ok"):
+        # 原生保存对话框不可用：沿用 /api/browse 的错误文案，不写半份文件。
+        return jsonify({"ok": False, "cancelled": False,
+                        "error": result.get("error", "")}), 503
+    path = result.get("path") or ""
+    if not path:
+        # 用户取消：不弹 toast、不写日志、不写文件。
+        return jsonify({"ok": True, "cancelled": True})
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        return jsonify({"ok": False, "cancelled": False,
+                        "error": t("error.actions_export_write_failed",
+                                   detail=exc)}), 500
+    with_action = sum(1 for item in payload["inputs"]
+                      if item["action"]["type"] != "none")
+    add_event("desktop",
+              t("log.actions_exported", count=len(payload["inputs"]),
+                actions=with_action, path=path), dev_id, "ok")
+    return jsonify({"ok": True, "cancelled": False, "path": path,
+                    "count": len(payload["inputs"]), "actions": with_action})
+
+
+@app.route("/api/actions/import/<dev_id>", methods=["POST"])
+def api_actions_import(dev_id):
+    """Validate then merge an exported backup into the current device's archive.
+
+    Validation runs BEFORE any config write, so a truncated / non-JSON / bad
+    schema / unknown type file is rejected whole with zero writes.  Import only
+    touches the local archive — it never calls /api/apply and never emits a
+    CFG: line.
+    """
+    upload = request.files.get("file") if request.files else None
+    raw = upload.read() if upload is not None else (request.get_data() or b"")
+    if not raw:
+        return jsonify({"ok": False,
+                        "error": t("error.actions_import_no_file")}), 400
+    if len(raw) > ACTIONS_IMPORT_MAX_BYTES:
+        return jsonify({"ok": False, "error": t(
+            "error.actions_import_too_large",
+            limit=ACTIONS_IMPORT_MAX_BYTES // 1024)}), 400
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return jsonify({"ok": False,
+                        "error": t("error.actions_import_bad_json")}), 400
+    # 校验在前、写入在后：坏文件在这里整份拒绝，config.json 一个字节都不动。
+    try:
+        validated = validate_actions_import(data)
+    except ActionsImportError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    with _lock:
+        cfg = device_cfg(dev_id)
+        applied, skipped = merge_actions_import(cfg, validated)
+        save_config()
+    return jsonify({"ok": True, "applied": applied,
+                    "skipped_extra": skipped, "dirty": True})
+
+
 @app.route("/api/apply/<dev_id>", methods=["POST"])
 def api_apply(dev_id):
     result = apply_device(dev_id)
@@ -6120,7 +6368,8 @@ def _parse_args(argv):
                         help=t("cli.minimized_help"))
     parser.add_argument("--no-tray", dest="no_tray", action="store_true",
                         help=t("cli.no_tray_help"))
-    parser.add_argument("--file-dialog", choices=("file", "dir"), help=argparse.SUPPRESS)
+    parser.add_argument("--file-dialog", choices=("file", "dir", "save"), help=argparse.SUPPRESS)
+    parser.add_argument("--file-dialog-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
@@ -6128,7 +6377,8 @@ def _parse_args(argv):
 def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.file_dialog:
-        return desktop.dialog_main(args.file_dialog)
+        return desktop.dialog_main(args.file_dialog,
+                                   default_name=args.file_dialog_name)
 
     if desktop.is_frozen():
         # A windowed exe has no console; keep prints in a log file next to config.
