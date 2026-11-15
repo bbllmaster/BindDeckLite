@@ -165,3 +165,16 @@ test("只改编码器模式时日志只列「编码器模式」（验收：已�
     "已按设备同步：编码器模式"
   );
 });
+
+// WS-629 should fix：设备侧方向反转（CFG:ENCDIR）改了之后，重连对账日志不能
+// 静默略过它。取值器 / label 漏掉时，这条会真的变红。
+test("设备侧方向反转变了 → changedFields 报 encdir，日志点名「旋转方向」", () => {
+  const before = realCfg();
+  const after = realCfg();
+  after.encoder.inverted = true;
+  assert.deepEqual(changedFields(before, after), ["encdir"]);
+  assert.equal(
+    syncSummary(before, after, (f) => zh[LABEL_KEYS[f]], zh["ui.list_comma"]),
+    "旋转方向"
+  );
+});

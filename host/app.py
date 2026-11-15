@@ -2272,6 +2272,9 @@ def probe_encdir(dev_id: str, timeout: float = 1.5) -> dict:
     """
     event = threading.Event()
     box = {"value": None}
+    # WS-629 nit：send() 抛异常时 finally 之后仍要 return，sent 必须先有兜底值，
+    # 否则会变成 UnboundLocalError 把能力探测变成 500。
+    sent = False
     with _encdir_lock:
         _encdir_windows[dev_id] = (event, box)
     try:

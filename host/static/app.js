@@ -241,6 +241,14 @@ function collectPending() {
   if (!sameJson(encMode(cfg), encMode(base))) {
     out.push({ field: "enc", label: t("ui.panel_encoder"), tab: "encoder" });
   }
+  // WS-629：旋转方向反转（设备侧 CFG:ENCDIR）与编码器模式并列接入 dirty /
+  // 待下发判定。取值器与 reconnect_sync.changedFields 共用同一份实现，避免
+  // 「改了反转却算 0 项」导致顶栏不亮、readDeviceConfig 不弹确认、重连对账
+  // 覆盖本机值。不要动 encoder.actions（纯上位机动作，从不下发）。
+  const encInverted = window.ReconnectSync.encoderInverted;
+  if (!sameJson(encInverted(cfg), encInverted(base))) {
+    out.push({ field: "encdir", label: t("ui.encoder_dir_label"), tab: "encoder" });
+  }
   return out;
 }
 
@@ -447,7 +455,9 @@ function applyReconcileReadback(devId, before, r) {
   setDirty(false);
 
   if (layoutChanged || fields.includes("keys")) renderKeys();
-  if (layoutChanged || fields.includes("enc")) renderEncoder();
+  // WS-629：设备侧方向变了也要重绘方向胶囊（renderEncoder 内部会调
+  // renderEncoderDir），否则「以设备为准」后本机值更新了、控件却停在旧高亮。
+  if (layoutChanged || fields.includes("enc") || fields.includes("encdir")) renderEncoder();
   if (layoutChanged || fields.includes("pins")) renderPins();
   if (layoutChanged || fields.includes("keys") || fields.includes("sleep")) {
     renderDeviceMeta();
@@ -1591,16 +1601,11 @@ function renderEncoderDir() {
     box.appendChild(el);
   });
   if (note) {
-    if (twelve) {
-      note.textContent = t("ui.encoder_dir_12key");
-      note.hidden = false;
-    } else if (unsupported) {
-      note.textContent = t("ui.encoder_dir_unsupported");
-      note.hidden = false;
-    } else {
-      note.textContent = "";
-      note.hidden = true;
-    }
+    // WS-629 nit：12 键布局的禁用说明已由面板级 #encoderDisabledNote 给出，
+    // 不再在这里重复同一句提示；#encoderDirNote 只承载「旧固件不支持反转」。
+    const show = unsupported && !twelve;
+    note.textContent = show ? t("ui.encoder_dir_unsupported") : "";
+    note.hidden = !show;
   }
 }
 
@@ -2739,6 +2744,10 @@ function highlightFormField(field) {
       break;
     case "enc":
       $("#encoderModes").classList.add("field-highlight");
+      break;
+    case "encdir":
+      // WS-629：方向被设备拒绝时高亮方向胶囊，与浮层里的 encdir 行一致。
+      $("#encoderDirSegments").classList.add("field-highlight");
       break;
     case "sleep":
       $("#sleepEnabled").classList.add("field-highlight");

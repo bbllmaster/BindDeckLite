@@ -30,7 +30,14 @@
     return mode === undefined || mode === null ? 0 : mode;
   }
 
-  // 参与对账比较的四组配置，顺序即日志里的字段顺序（与后端一致）。
+  // WS-629：旋转方向反转（设备侧 CFG:ENCDIR）存在 `cfg.encoder.inverted`。
+  // 与 encoderMode 一样用取值器，让 collectPending() 与 changedFields() 共用
+  // 同一份实现；旧存档没有该字段时按 false（默认不反转）处理，与后端一致。
+  function encoderInverted(cfg) {
+    return !!(((cfg || {}).encoder || {}).inverted);
+  }
+
+  // 参与对账比较的几组配置，顺序即日志里的字段顺序（与后端一致）。
   // `key` 是后端 CFG: 的组名（也是回读字段名）；`value` 是取该组参与比较
   // 的值的函数，缺省时取同名字段。给了取值器的组按取值结果比较，不做整对象比。
   const FIELDS = [
@@ -38,6 +45,8 @@
     { key: "keys" },
     { key: "enc", value: encoderMode },
     { key: "sleep" },
+    // WS-629：手机配网页 / 旧上位机改了设备侧方向后，对账日志要点名该字段。
+    { key: "encdir", value: encoderInverted },
   ];
 
   /**
@@ -49,6 +58,8 @@
     keys: "ui.group_keys",
     enc: "ui.group_enc",
     sleep: "ui.group_sleep",
+    // WS-629：方向反转对账日志用的组名（复用编码器页「旋转方向」文案）。
+    encdir: "ui.encoder_dir_label",
   };
 
   /**
@@ -104,6 +115,7 @@
     FIELDS,
     LABEL_KEYS,
     encoderMode,
+    encoderInverted,
     shouldReconcile,
     changedFields,
     syncSummary,
