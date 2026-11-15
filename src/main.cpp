@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.10"  // WS-546: 每输入修饰键（CFG:MODS）；1.3.9 由 WS-542 深睡修复占用
+#define FW_VERSION "1.3.11"  // WS-626: 编码器旋转方向反转（CFG:ENCDIR）；1.3.10 为 WS-546 修饰键
 
 #define FW_MODEL   "Lite"
 
@@ -146,6 +146,9 @@ int buttonKeys[NUM_INPUTS_MAX];
 // truncates or shifts the table.
 uint8_t buttonMods[NUM_INPUTS_MAX];
 int encMode = 0;
+// WS-626: invert the rotation direction at the single flip point in
+// handleEncoderAction(). Stored in NVS; default false = unchanged behaviour.
+bool encInverted = false;
 // WS-499: true = encoder layout (10 inputs), false = 12-key layout.
 // Stored as NVS key "encOn", independent of CFG_SCHEMA (see the note above).
 bool encOn = true;
@@ -536,6 +539,8 @@ static BleBootFacts bootFacts() {
 static void saveConfig() {
   preferences.begin("binddecklite", false);
   preferences.putInt("encMode", encMode);
+  // WS-626: direction flag lives next to encMode (same NVS namespace).
+  preferences.putBool("encInverted", encInverted);
   preferences.putInt("cfgVer", CFG_SCHEMA);
   // WS-499: layout flag, stored on its own so adding it never bumps the schema.
   preferences.putBool("encOn", encOn);
@@ -590,6 +595,10 @@ static void loadConfig() {
 
   encMode = preferences.getInt("encMode", 0);
   if (encMode < 0 || encMode > 4) encMode = 0;
+  // WS-626: getBool maps only a stored 1 to true, so a missing key, an
+  // out-of-range / dirty byte (2, 255, ...) all fall back to false (default,
+  // no inversion) - the same "bad value -> default" rule as encMode above.
+  encInverted = preferences.getBool("encInverted", false);
   // WS-499: must be known before the pin set is validated - the three encoder
   // pins are legal button pins in the 12-key layout only.
   encOn = preferences.getBool("encOn", true);
@@ -690,6 +699,11 @@ static void sendKeyForInput(int idx) {
 }
 
 static void handleEncoderAction(bool forward) {
+  // WS-626: the ONE flip point. Inverting here turns BOTH the HID key sent
+  // below and the ENC: direction word at the end, so device-direct and
+  // host-side actions always agree. Sampling, /4 scaling, throttling and the
+  // ENC: line format are deliberately left untouched.
+  if (encInverted) forward = !forward;
   if (bleKeyboard.isConnected()) {
     switch (encMode) {
       case 0:  // volume
@@ -3008,6 +3022,27 @@ static void processCommand(String data) {
     // Read-back: LAYOUT:<0|1>. Old hosts ignore the unknown line, new hosts
     // use it to decide between 10 and 12 input cards.
     sendToHost("LAYOUT:" + String(encOn ? 1 : 0));
+  } else if (data.startsWith("CFG:ENCDIR:")) {
+    // WS-626: CFG:ENCDIR:0|1 - set the rotation-direction flag. Only the
+    // exact single digit 0 or 1 is accepted: a malformed / empty / non-digit
+    // or out-of-range value keeps the stored value and logs one rejection
+    // line, so a bad write can never corrupt NVS. The generic ACK: at the
+    // end of this function confirms the write (same path as every CFG:*).
+    String v = data.substring(11);   // "CFG:ENCDIR:" is 11 chars
+    v.trim();
+    if (v == "0" || v == "1") {
+      encInverted = (v == "1");
+      saveConfig();
+      log_e("[cfg] encdir applied (%d)", encInverted ? 1 : 0);
+    } else {
+      log_e("[cfg] encdir REJECTED (bad=%s, keeping %d)",
+            v.length() ? v.c_str() : "(empty)", encInverted ? 1 : 0);
+    }
+  } else if (data == "CFG:ENCDIR") {
+    // WS-626: read-only capability probe. New firmware answers ENCDIR:0|1;
+    // old firmware stays silent (it only emits the generic ACK:), which is
+    // how the host tells supported from unsupported without a version number.
+    sendToHost("ENCDIR:" + String(encInverted ? 1 : 0));
   } else if (data.startsWith("CFG:ENC:")) {
     encMode = data.substring(8).toInt();
     if (encMode < 0 || encMode > 4) encMode = 0;
@@ -3064,8 +3099,8 @@ static void processCommand(String data) {
     // "设备未回报该字段" report can be checked against what the deck actually
     // held without a BLE sniffer. Logging happens before the notifications so
     // the line is on the CDC console even if a notify fails.
-    log_e("[cfg] GET_CFG -> keys=%s pins=%s enc=%d sleep=%d,%lu tz=%s",
-          keys.c_str(), pins.c_str(), encMode, (int)sleepEnabled,
+    log_e("[cfg] GET_CFG -> keys=%s pins=%s enc=%d encdir=%d sleep=%d,%lu tz=%s",
+          keys.c_str(), pins.c_str(), encMode, (int)encInverted, (int)sleepEnabled,
           (unsigned long)(sleepTimeoutMs / 60000UL), tzString);
     sendToHost("CFG_KEYS:" + keys);
     sendToHost("CFG_PINS:" + pins);
@@ -3083,6 +3118,11 @@ static void processCommand(String data) {
       mods += String(buttonMods[i]);
     }
     sendToHost("CFG_MODS:" + mods);
+    // WS-626: the very last line, following WS-546's "new line only added
+    // at the end" convention. Its presence marks a deck that speaks
+    // CFG:ENCDIR; old firmware never sends it, so old hosts that stop
+    // reading at CFG_MODS are unaffected.
+    sendToHost("CFG_ENCDIR:" + String(encInverted ? 1 : 0));
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {

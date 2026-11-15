@@ -1131,6 +1131,8 @@ async function selectDevice(devId) {
     if (deviceConnected(devId)) queueReconcile(devId);
     // WS-546: 顺带确认修饰键能力，抽屉打开时行状态已经是对的。
     ensureModsCapability();
+    // WS-626: 同上，确认编码器方向反转能力（编码器页行状态已经是对的）。
+    ensureEncDirCapability();
     return;
   }
 
@@ -1163,6 +1165,8 @@ async function selectDevice(devId) {
     if (deviceConnected(devId)) queueReconcile(devId);
     // WS-546: 同上，确认修饰键能力（旧固件不回 MODS: → 禁用整行）。
     ensureModsCapability();
+    // WS-626: 同上，确认编码器方向反转能力（旧固件不回 ENCDIR: → 置灰）。
+    ensureEncDirCapability();
   } catch (e) {
     toast(t("ui.read_config_failed") + e.message, "bad");
   }
@@ -1542,6 +1546,62 @@ function renderEncoder() {
   // the rotation-action card depends on the active mode, so redraw it
   // whenever the mode grid is (re)rendered.
   renderEncoderActions();
+  // WS-626: the direction row shares the layout / capability gate, so it is
+  // redrawn alongside the mode grid.
+  renderEncoderDir();
+}
+
+/** WS-626：旋转方向反转（设备侧 CFG:ENCDIR）。两个胶囊按钮，当前值高亮；
+ *  12 键布局 / 旧固件（能力探测判定不支持）时置灰并给出原因；切回编码器布局
+ *  并应用后恢复，反转值保存在 cfg.encoder.inverted，不会丢失。 */
+function renderEncoderDir() {
+  const box = $("#encoderDirSegments");
+  if (!box || !state.cfg) return;
+  const note = $("#encoderDirNote");
+  box.innerHTML = "";
+  const enc = state.cfg.encoder || {};
+  const inverted = !!enc.inverted;
+  const twelve = is12Key();
+  const unsupported = state.cfg.encdir_supported === false;
+  const disabled = twelve || unsupported;
+  box.classList.toggle("locked", disabled);
+  const opts = [
+    { val: false, label: t("ui.encoder_dir_default") },
+    { val: true, label: t("ui.encoder_dir_inverted") },
+  ];
+  opts.forEach((o) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "enc-seg" + (o.val === inverted ? " active" : "") +
+      (disabled ? " locked" : "");
+    el.disabled = disabled;
+    el.setAttribute("role", "radio");
+    el.setAttribute("aria-checked", o.val === inverted ? "true" : "false");
+    el.textContent = o.label;
+    el.onclick = () => {
+      if (disabled) {
+        toast(twelve ? t("ui.encoder_dir_12key") : t("ui.encoder_dir_unsupported"), "warn");
+        return;
+      }
+      state.cfg.encoder = state.cfg.encoder || {};
+      state.cfg.encoder.inverted = o.val;
+      renderEncoderDir();
+      markDirty();
+    };
+    box.appendChild(el);
+  });
+  if (note) {
+    if (twelve) {
+      note.textContent = t("ui.encoder_dir_12key");
+      note.hidden = false;
+    } else if (unsupported) {
+      note.textContent = t("ui.encoder_dir_unsupported");
+      note.hidden = false;
+    } else {
+      note.textContent = "";
+      note.hidden = true;
+    }
+  }
 }
 
 /* ---------------- encoder rotation actions ---------------- */
@@ -1940,6 +2000,34 @@ async function redetectModsCapability() {
     // 保持 unknown；后端与下次开抽屉都会再探。
   } finally {
     modsProbing.delete(devId);
+  }
+}
+
+/** WS-626：确认设备是否支持 CFG:ENCDIR（能力探测，绝不写死版本号）。
+ *  未连接时返回 null 且不记结论；已有 True/False 时直接复用缓存（WS-550 三态）。 */
+const encdirProbing = new Set();
+
+async function ensureEncDirCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return null;
+  if (cfg.encdir_supported === true || cfg.encdir_supported === false) {
+    return cfg.encdir_supported;
+  }
+  if (encdirProbing.has(devId)) return null;
+  encdirProbing.add(devId);
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/encdir`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return null;
+    if (!r.sent) return null;            // 链路不通 = 结论未知，保持现状
+    cfg.encdir_supported = r.supported;  // 三态 True / False / null
+    // 编码器页开着就按新结论重绘（置灰 / 去提示）。
+    if (typeof renderEncoderDir === "function") renderEncoderDir();
+    return cfg.encdir_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    encdirProbing.delete(devId);
   }
 }
 
@@ -3331,6 +3419,8 @@ function bindTabs() {
     }
     // 日志页隐藏期间容器量不出高度，切回来时补一次贴底 / 胶囊重绘。
     if (tab.dataset.tab === "log") syncLogFollowUi({ stick: true });
+    // WS-626：打开编码器页时探测反转能力（旧固件连续两次无应答 → 置灰）。
+    if (tab.dataset.tab === "encoder") ensureEncDirCapability();
   };
 
   tabs.forEach((tab, i) => {

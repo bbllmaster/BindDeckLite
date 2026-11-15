@@ -29,6 +29,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG:MODS:` | `CFG:MODS:1,0,0,0,0,0,0,0,0,6` | 每个输入的修饰键掩码（WS-546）：bit0 Ctrl / bit1 Shift / bit2 Alt / bit3 GUI（v1 只发左变体）。值的个数必须等于当前布局的输入数（10 或 12），每个 0–15；个数或取值不合法时**整条拒绝并保持原值**，日志为 `[cfg] mods REJECTED (got N, want M, bad=<v>)`。掩码按输入编号保存，切换布局不截断、不串位 |
 | `CFG:MODS` | | 查询修饰键掩码，回一行 `MODS:<0-15,...>`（个数同当前布局）；旧固件不回该行（WS-546） |
 | `CFG:ENC:` | `CFG:ENC:0` | 编码器模式 0–4 |
+| `CFG:ENCDIR:` | `CFG:ENCDIR:1` | 编码器旋转方向反转（WS-626）：`0` = 默认，`1` = 反转（顺/逆时针互换，5 个模式一起翻面）。**设备侧设置**，存 NVS；只接受 `0`/`1`，其它值（非法 / 空 / 非数字）整条拒绝并保持原值，日志为 `[cfg] encdir REJECTED`。缺省 `0`，与引入前完全一致 |
+| `CFG:ENCDIR` | | 查询旋转方向，回一行 `ENCDIR:<0\|1>`；旧固件不回该行（WS-626，供三态能力探测） |
 | `CFG:SLEEP:` | `CFG:SLEEP:1,5` | 启用休眠, 分钟（最小 1） |
 | `CFG:TZ:` | `CFG:TZ:CST-8` | POSIX 时区串（NTP） |
 | `CFG:WIFI:` | `CFG:WIFI:ssid\|password` | 保存并连接 WiFi（配网模式） |
@@ -159,6 +161,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | 3 | 撤销 / 重做 | Ctrl + Z / Ctrl + Y |
 | 4 | 上位机动作 | F23 / F24（在上位机编码器页配置） |
 
+旋转方向反转（`CFG:ENCDIR`，WS-626）是**设备侧设置**：翻转点在 `handleEncoderAction()` 入口，设备直发的 HID 键与 `ENC:` 方向字一起翻面，断开上位机（只留 BLE）仍生效。新固件缺省 `0`，与旧行为完全一致；旧上位机不发该命令，设备沿用 NVS 里的值（可能为 `1`），此时 `ENC:` 已翻但旧界面不显示该开关、也不会覆盖它。12 键布局没有旋转编码器，该开关在上位机置灰且不生效。
+
 ## 设备 → 上位机
 
 | 消息 | 示例 | 说明 |
@@ -177,6 +181,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG_TZ:` | `CFG_TZ:CST-8` | `CMD:GET_CFG` 应答 |
 | `CFG_LAYOUT:` | `CFG_LAYOUT:0` | `CMD:GET_CFG` 应答（追加在最后，WS-499）；旧固件不发这一行 |
 | `CFG_MODS:` | `CFG_MODS:1,0,0,0,0,0,0,0,0,6` | `CMD:GET_CFG` 应答（追加在 `CFG_LAYOUT:` 之后，WS-546）；个数同当前布局；旧固件不发这一行 |
+| `ENCDIR:` | `ENCDIR:1` | `CFG:ENCDIR` 的应答；`0` = 默认，`1` = 反转（WS-626）；旧固件不回这一行 |
+| `CFG_ENCDIR:` | `CFG_ENCDIR:1` | `CMD:GET_CFG` 应答（追加在 `CFG_MODS:` **之后**，即最末行，WS-626）；`0` = 默认，`1` = 反转；旧固件不发这一行 |
 | `TZ_INFO:` | `TZ_INFO:CST-8` | `CMD:GET_TZ` 应答 |
 | `WIFI_INFO:` | `WIFI_INFO:home,192.168.1.42` | `CMD:GET_WIFI` 应答；未连接为 `DISCONNECTED,0.0.0.0` |
 | `BOND_STATUS:` | `BOND_STATUS:bound,A1B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |

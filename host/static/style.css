@@ -1027,6 +1027,26 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   color: var(--muted); background: transparent; border-color: transparent; font-weight: 500;
 }
 
+/* WS-626：旋转方向反转行（设备侧 CFG:ENCDIR），在模式分段与说明之间。 */
+.enc-dir-row {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.enc-dir-row-label {
+  flex: 0 0 auto;
+  font-size: var(--fs-sm); color: var(--muted);
+}
+.enc-dir-row > .enc-segmented {
+  flex: 1 1 auto;
+  margin-bottom: 0;
+}
+.enc-dir-note {
+  flex: 1 0 100%;
+  margin: 0;
+  font-size: var(--fs-sm); color: var(--muted);
+}
+
 /* 当前模式的说明：5 段只放名字，描述集中在这里读。 */
 .enc-mode-desc {
   margin: 0 0 var(--sp-4);
