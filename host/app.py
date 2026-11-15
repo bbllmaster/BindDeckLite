@@ -812,6 +812,19 @@ _mods_lock = threading.RLock()
 MODS_UNSUPPORTED_AFTER = 2
 _mods_misses: dict = {}
 
+# WS-626: one pending CFG:ENCDIR probe per device. Same tri-state idea as the
+# WS-546 modifier probe: a deck that answers ``ENCDIR:`` supports the rotation
+# direction inversion command, one that stays silent predates it. Capability
+# is decided by this answer, never by a version number.
+_encdir_windows: dict = {}
+_encdir_lock = threading.RLock()
+
+# WS-550 / WS-626: a single probe timeout (sent but no ``ENCDIR:`` answer) is
+# NOT a verdict - only a run of consecutive silent probes concludes
+# "unsupported" (old firmware never speaks CFG:ENCDIR). Kept in memory.
+ENCDIR_UNSUPPORTED_AFTER = 2
+_encdir_misses: dict = {}
+
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
 # device config so a failed read leaves the stored config untouched.
@@ -888,6 +901,9 @@ _CFG_READBACK_FIELDS = [
 _CFG_OPTIONAL_FIELDS = [
     ("layout", "LAYOUT", t("ui.layout_label")),
     ("mods", "MODS", t("keys.mods_label")),
+    # WS-626: CFG_ENCDIR:0|1 is the very last CMD:GET_CFG tail line. Its mere
+    # presence marks a deck that speaks CFG:ENCDIR (see probe_encdir).
+    ("encdir", "ENCDIR", t("ui.encoder_dir_label")),
 ]
 _ALL_CFG_FIELDS = _CFG_READBACK_FIELDS + _CFG_OPTIONAL_FIELDS
 
@@ -1119,6 +1135,18 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
         # fact (never inferred from a version number).
         cfg["mods_supported"] = True
         return True
+    if field == "encdir":
+        # WS-626: ``CFG_ENCDIR:`` / ``ENCDIR:`` - the device-side direction
+        # flag. Only the exact string 0 or 1 is accepted; a malformed /
+        # empty / out-of-range value returns False WITHOUT touching the
+        # stored config, so a bad read-back cannot corrupt the local state.
+        raw = raw.strip()
+        if raw not in ("0", "1"):
+            return False
+        cfg.setdefault("encoder", {})["inverted"] = (raw == "1")
+        # The device just told us it speaks CFG:ENCDIR - a capability fact.
+        cfg["encdir_supported"] = True
+        return True
     if field == "pins":
         vals = [v for v in raw.split(",") if v.strip()]
         try:
@@ -1165,8 +1193,8 @@ def _split_cfg_line(line: str):
 
     Every group in ``_ALL_CFG_FIELDS`` is recognized.  Only the four required
     ones (pins / keys / enc / sleep) decide whether the answer is complete;
-    ``tz`` / ``layout`` / ``mods`` are captured when they arrive and never
-    waited for (old firmware does not send them).
+    ``tz`` / ``layout`` / ``mods`` / ``encdir`` are captured when they arrive
+    and never waited for (old firmware does not send them).
     """
     for field, prefix, _ in _ALL_CFG_FIELDS:
         if line.startswith("CFG_" + prefix + ":"):
@@ -1514,7 +1542,7 @@ def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
         # WS-389: rotation actions are host-side (never sent to the device), so they
 # live next to the device-side encoder mode. Default = 未配置 (仅 HID).
 # Keys are the raw ENC: direction ("CW"|"CCW"), not lowercase.
-"encoder": {"mode": 0, "actions": {
+"encoder": {"mode": 0, "inverted": False, "actions": {
     "CW": {"type": "none", "value": "", "macro": []},
     "CCW": {"type": "none", "value": "", "macro": []}}},
         "sleep": {"enabled": True, "minutes": 5},
@@ -1883,6 +1911,18 @@ def _on_line(dev_id: str, line: str):
             box["csv"] = raw
             event.set()
         return
+    if line.startswith("ENCDIR:"):
+        # WS-626: answer to the CFG:ENCDIR capability probe. Only the probe
+        # records it - the value is capability evidence, not a config write
+        # (the direction flag itself lands from the CFG_ENCDIR tail line).
+        raw = line[len("ENCDIR:"):].strip()
+        with _encdir_lock:
+            pending = _encdir_windows.get(dev_id)
+        if pending is not None:
+            event, box = pending
+            box["value"] = raw
+            event.set()
+        return
     if line.startswith("ENC:"):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
@@ -1911,11 +1951,17 @@ def _on_line(dev_id: str, line: str):
                 # WS-546: same for modifiers — an OTA can add or remove the
                 # capability, so re-probe instead of trusting the old verdict.
                 cfg["mods_supported"] = None
+                # WS-626: same for the direction-inversion capability - an
+                # OTA can add it, so re-probe instead of trusting a cached
+                # "unsupported" verdict from the old firmware.
+                cfg["encdir_supported"] = None
                 # WS-550: a new firmware must not inherit the old deck's
                 # consecutive-timeout count, else one dropped probe right
                 # after the OTA would immediately re-conclude "unsupported".
                 with _mods_lock:
                     _mods_misses.pop(dev_id, None)
+                with _encdir_lock:
+                    _encdir_misses.pop(dev_id, None)
             cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
@@ -2001,6 +2047,15 @@ def _on_line(dev_id: str, line: str):
         cfg = device_cfg(dev_id)
         with _lock:
             _apply_cfg_field(cfg, "mods", line[len("CFG_MODS:"):])
+            save_config()
+        return
+    if line.startswith("CFG_ENCDIR:"):
+        # WS-626: CMD:GET_CFG tail line. Its presence marks the deck as
+        # supporting CFG:ENCDIR and writes cfg.encoder.inverted (see
+        # _apply_cfg_field). Old firmware never sends this line.
+        cfg = device_cfg(dev_id)
+        with _lock:
+            _apply_cfg_field(cfg, "encdir", line[len("CFG_ENCDIR:"):])
             save_config()
         return
     # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
@@ -2192,6 +2247,49 @@ def probe_mods(dev_id: str, timeout: float = 1.5) -> dict:
             "mods": box["csv"]}
 
 
+def encdir_applicable(cfg: dict) -> bool:
+    """WS-626: whether the rotation-direction control is usable for *cfg*.
+
+    False for a 12-key layout (there is no rotary encoder) and for firmware
+    the ENCDIR probe concluded "unsupported" (old firmware that never answers
+    ``ENCDIR:``). A link-down / single-timeout verdict (None) stays usable so
+    a transient BLE drop does not flash "please update firmware" (WS-550
+    tri-state). This is the single gate shared by the UI and by apply_device.
+    """
+    if layout_of(cfg) == LAYOUT_12KEY:
+        return False
+    return cfg.get("encdir_supported") is not False
+
+
+def probe_encdir(dev_id: str, timeout: float = 1.5) -> dict:
+    """Ask one deck whether it speaks ``CFG:ENCDIR`` (WS-626).
+
+    Returns ``{"sent", "answered"}``. ``answered`` means the deck replied
+    with ``ENCDIR:<0|1>`` - i.e. it supports direction inversion. ``sent``
+    False means the link was down, which is "unknown", NOT "unsupported".
+    This is the only place capability is decided, so the UI can disable the
+    direction row for old firmware without hard-coding any version number.
+    """
+    event = threading.Event()
+    box = {"value": None}
+    # WS-629 nit：send() 抛异常时 finally 之后仍要 return，sent 必须先有兜底值，
+    # 否则会变成 UnboundLocalError 把能力探测变成 500。
+    sent = False
+    with _encdir_lock:
+        _encdir_windows[dev_id] = (event, box)
+    try:
+        result = send(dev_id, "CFG:ENCDIR")
+        sent = bool((result or {}).get("sent"))
+        if sent:
+            event.wait(timeout)
+    finally:
+        with _encdir_lock:
+            _encdir_windows.pop(dev_id, None)
+    return {"sent": sent,
+            "answered": box["value"] is not None,
+            "encdir": box["value"]}
+
+
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
     target_layout = layout_of(cfg)
@@ -2245,6 +2343,16 @@ def apply_device(dev_id: str) -> dict:
     send_mods = (cfg.get("mods_supported") is not False
                  and (cfg.get("mods_supported") is True or mods_nonzero))
 
+    # WS-626: same shape as the WS-546 modifier gating. Never send
+    # CFG:ENCDIR to a 12-key deck or to firmware the probe ruled out; with
+    # an undecided verdict, only send when there is something to set (a
+    # default 0 on an old deck would only create a "not reported" row).
+    inverted = bool((cfg.get("encoder") or {}).get("inverted", False))
+    encdir_val = "1" if inverted else "0"
+    encdir_supported = cfg.get("encdir_supported")
+    send_encdir = (encdir_applicable(cfg)
+                   and (encdir_supported is True or inverted))
+
     snapshot = {
         "pins": pins,
         "keys": keys,
@@ -2255,6 +2363,8 @@ def apply_device(dev_id: str) -> dict:
     }
     if send_mods:
         snapshot["mods"] = mods
+    if send_encdir:
+        snapshot["encdir"] = encdir_val
 
     # Create the per-device apply window before sending anything.
     window = ApplyWindow(dev_id, snapshot)
@@ -2279,6 +2389,11 @@ def apply_device(dev_id: str) -> dict:
         ]
         if tz_val:
             commands.append(("tz", "CFG:TZ:" + tz_val))
+        # WS-626: appended last (after CFG:MODS when present), following the
+        # "new line only added at the end" convention so the ordering of
+        # every existing line - and old hosts reading them - is unchanged.
+        if send_encdir:
+            commands.append(("encdir", "CFG:ENCDIR:" + encdir_val))
 
         any_sent = False
         for field, cmd in commands:
@@ -2384,6 +2499,37 @@ def apply_device(dev_id: str) -> dict:
             if actual and cfg.get("mods_supported") is not True:
                 with _lock:
                     cfg["mods_supported"] = True
+                    save_config()
+
+        # WS-626: the direction flag is compared only when we sent it. A
+        # deck that reports CFG_ENCDIR is inversion-capable from now on.
+        if "encdir" in snapshot:
+            expected = snapshot["encdir"]
+            actual = window.readback.get("encdir", "")
+            ack_ok = window._ack_ok.get("encdir", False)
+            if not ack_ok:
+                status = "unconfirmed"
+                reason = t("log.not_connected") if not any_sent else t("log.connection_lost")
+            elif not actual:
+                status = "unverified"
+                reason = t("log.field_not_reported")
+            elif actual == expected:
+                status = "ok"
+                reason = ""
+            else:
+                status = "rejected"
+                reason = _rejection_reason("encdir", expected, actual)
+            items.append({
+                "field": "encdir",
+                "label": t("ui.encoder_dir_label"),
+                "status": status,
+                "expected": expected,
+                "actual": actual,
+                "reason": reason,
+            })
+            if actual and cfg.get("encdir_supported") is not True:
+                with _lock:
+                    cfg["encdir_supported"] = True
                     save_config()
 
         ok_all = all(i["status"] == "ok" for i in items)
@@ -4785,6 +4931,62 @@ def api_device_mods(dev_id):
                 # deck we already know is capable on one dropped reply.
                 reason = "probe_timeout"
         supported = cfg.get("mods_supported")  # True / False / None
+        if changed:
+            save_config()
+        payload = {"dev_id": dev_id,
+                   "supported": supported,
+                   "sent": probe["sent"],
+                   "reason": reason,
+                   "retryable": supported is not True}
+    return jsonify(payload)
+
+
+@app.route("/api/device/<dev_id>/encdir", methods=["POST"])
+def api_device_encdir(dev_id):
+    """WS-626 / WS-550: ask the deck whether it supports CFG:ENCDIR.
+
+    Three verdicts, all reflected in the tri-state ``supported`` payload:
+      * supported (True)   - the deck answered ``ENCDIR:<0|1>``;
+      * unsupported (False) - ENCDIR_UNSUPPORTED_AFTER consecutive silent
+        probes (old firmware), so apply_device() keeps skipping the line;
+      * unknown (None)     - link down, or a *single* dropped probe. A lone
+        timeout is NOT a verdict (WS-550); it stays unknown so the next page
+        open re-probes instead of permanently mislabelling a capable deck.
+
+    ``?reset=1`` clears the cached verdict and the miss counter before
+    re-probing, so a firmware upgrade can recover without a restart.
+    """
+    cfg = device_cfg(dev_id)
+    if request.args.get("reset") == "1":
+        with _lock:
+            cfg["encdir_supported"] = None
+            save_config()
+        with _encdir_lock:
+            _encdir_misses.pop(dev_id, None)
+
+    probe = probe_encdir(dev_id)
+    changed = False
+    with _lock:
+        if probe["answered"]:
+            cfg["encdir_supported"] = True
+            reason = "supported"
+            changed = True
+            with _encdir_lock:
+                _encdir_misses.pop(dev_id, None)
+        elif not probe["sent"]:
+            reason = "link_down"
+        else:
+            with _encdir_lock:
+                misses = _encdir_misses.get(dev_id, 0) + 1
+                _encdir_misses[dev_id] = misses
+            known_supported = cfg.get("encdir_supported") is True
+            if misses >= ENCDIR_UNSUPPORTED_AFTER and not known_supported:
+                cfg["encdir_supported"] = False
+                reason = "unsupported"
+                changed = True
+            else:
+                reason = "probe_timeout"
+        supported = cfg.get("encdir_supported")  # True / False / None
         if changed:
             save_config()
         payload = {"dev_id": dev_id,

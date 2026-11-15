@@ -145,6 +145,13 @@
       <!-- WS-586：5 张模式卡收敛成一行分段控件；描述只显示当前选中项，避免 5 段都塞两行。 -->
       <div class="enc-segmented" id="encoderModes" role="radiogroup"
            aria-label="编码器模式" data-i18n-aria-label="ui.encoder_mode_label"></div>
+      <!-- WS-626: rotation-direction inversion (device-side CFG:ENCDIR), placed between the mode segments and their description. -->
+      <div class="enc-dir-row" id="encoderDirRow">
+        <span class="enc-dir-row-label" data-i18n="ui.encoder_dir_label">旋转方向</span>
+        <div class="enc-segmented" id="encoderDirSegments" role="radiogroup"
+             aria-label="旋转方向" data-i18n-aria-label="ui.encoder_dir_label"></div>
+        <p class="enc-dir-note" id="encoderDirNote" hidden></p>
+      </div>
       <p class="enc-mode-desc" id="encoderModeDesc"></p>
       <div id="encoderActions"></div>
       <details class="enc-note">
