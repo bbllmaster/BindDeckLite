@@ -856,6 +856,12 @@ async function pollStatus() {
       syncLogDeviceUi();
     }
     state.actionsEnabled = !!s.actions_enabled;
+    // WS-630: 固件通道持久化在 config.json，经 /api/status 回传。只在首次
+    // 拿到时恢复一次，避免之后用户切换的通道被轮询结果顶回去。
+    if (!updateState.fwChannelLoaded && s.app_version && s.app_version.fw_channel) {
+      updateState.fwChannel = s.app_version.fw_channel;
+      updateState.fwChannelLoaded = true;
+    }
     state.running = s.running || {};
     // 最近一次扫描的结论（为什么没找到设备）。
     state.scan = s.scan || null;
@@ -4642,7 +4648,10 @@ const updateState = {
   appTask: null,    // 上位机更新任务 id
   appChecking: false, // 重新检查中：保留旧结果，只换状态行
   appCheckedAt: null, // 上一次检查完成的时间
-  channel: "stable",// 当前更新通道（stable / rolling）
+  channel: "stable",// 上位机更新通道（stable / rolling）
+  // WS-630: 固件通道独立于上位机通道，默认 stable。
+  fwChannel: "stable",
+  fwChannelLoaded: false, // 已从 /api/status 恢复过持久化通道就不再覆盖
   fw: null,         // /api/firmware/update/check 的结果
   fwTask: null,     // 固件更新设备 id
   fwChecking: false,
@@ -4960,6 +4969,16 @@ function renderUpdateFw() {
   const applyBtn = $("#btnFwApply");
   if (!st) return;
 
+  // WS-630: 通道选择器以 updateState 为准（切换请求未回来时旧结果的 channel
+  // 还是上一个通道，不能拿它把用户刚选的值顶回去），并联动通道说明文案。
+  const isRolling = updateState.fwChannel === "rolling";
+  const channelSel = $("#fwChannel");
+  const noteStable = $("#fwChannelNoteStable");
+  const noteRolling = $("#fwChannelNoteRolling");
+  if (channelSel) channelSel.value = updateState.fwChannel;
+  if (noteStable) noteStable.hidden = isRolling;
+  if (noteRolling) noteRolling.hidden = !isRolling;
+
   if (dev) dev.textContent = sel ? sel.name || sel.dev_id : t("update.no_device");
 
   const info = fwDeviceInfo(sel);
@@ -5005,7 +5024,12 @@ function renderUpdateFw() {
 
   if (variant) variant.textContent = r.device_variant || t("ui.unknown");
   if (current) current.textContent = fmtVersion(r.current);
-  if (latest) latest.textContent = r.latest ? fmtVersion(r.latest) : "—";
+  if (latest) {
+    // WS-630: 滚动通道在版本行显示目标 tag（main-YYYYMMDD-HHMM），
+    // 与上位机滚动格式一致；stable 仍显示版本号。
+    latest.textContent = (r.channel === "rolling" && r.tag)
+      ? r.tag : (r.latest ? fmtVersion(r.latest) : "—");
+  }
   const showAssets = !!r.has_update;
   setRowsHidden(".upd-fw-asset", !showAssets);
   if (size) size.textContent = r.asset && r.asset.size ? formatBytes(r.asset.size) : "—";
@@ -5034,6 +5058,11 @@ function renderUpdateFw() {
   } else if (r.reason) {
     st.textContent = r.reason;
     st.classList.remove("ok");
+  } else if (r.channel === "rolling") {
+    // WS-630: 滚动通道固件版本与设备一致时不提示更新（避免每个 main 构建
+    // 反复提示），单独说明「一致」并附上目标 tag。
+    st.textContent = t("update.fw_rolling_same", { tag: r.tag || "" });
+    st.classList.add("ok");
   } else {
     st.textContent = t("update.fw_up_to_date", { time: formatClock(updateState.fwCheckedAt) });
     st.classList.add("ok");
@@ -5121,6 +5150,42 @@ async function switchUpdateChannel(channel) {
   await checkAppUpdate(true);
 }
 
+/** WS-630: 切换固件通道 —— 先持久化到 config.json，再立即按新通道重查。
+ *  与上位机通道互不影响：这里只写 fw_channel、只重查固件。 */
+async function switchFwChannel(channel) {
+  const sel = $("#fwChannel");
+  const prev = updateState.fwChannel;
+  if (channel === prev) {
+    renderUpdateFw();
+    return;
+  }
+  updateState.fwChannel = channel;
+  updateState.fwChannelLoaded = true; // 别让之后的 status 轮询覆盖用户选择
+  if (sel) sel.value = channel;
+  // POST 与重查期间保留旧结果，只把状态行换成 loading。
+  updateState.fwChecking = true;
+  renderUpdateFw();
+  try {
+    const d = await api("/api/firmware/update/channel", {
+      method: "POST",
+      body: JSON.stringify({ channel }),
+    });
+    updateState.fwChannel = d.channel || channel;
+    if (sel) sel.value = updateState.fwChannel;
+    toast(t("update.channel_switched", {
+      channel: t("ui.update_channel_" + updateState.fwChannel),
+    }), "ok");
+  } catch (e) {
+    updateState.fwChecking = false;
+    updateState.fwChannel = prev;
+    if (sel) sel.value = prev;
+    toast(t("update.channel_switch_failed") + (e.message || e), "bad");
+    renderUpdateFw();
+    return;
+  }
+  await checkFwUpdate(true);
+}
+
 async function checkFwUpdate(quiet) {
   const sel = selectedDevice();
   if (!sel) {
@@ -5141,15 +5206,22 @@ async function checkFwUpdate(quiet) {
   updateState.fwChecking = true;
   renderUpdateFw();
   try {
+    // WS-630: 把当前固件通道一起提交；check 与 apply 用同一个值，保证一致。
     updateState.fw = await api(
-      `/api/firmware/update/check?dev_id=${encodeURIComponent(sel.dev_id)}`);
+      `/api/firmware/update/check?dev_id=${encodeURIComponent(sel.dev_id)}`
+      + `&channel=${encodeURIComponent(updateState.fwChannel)}`);
   } catch (e) {
     updateState.fw = {
       dev_id: sel.dev_id,
       has_update: false, device_variant: "", current: "", latest: "",
+      channel: updateState.fwChannel, tag: "",
       reason: t("update.check_failed_detail") + (e.message || e), reason_code: "E_REQUEST",
       release_url: "https://github.com/bbllmaster/BindDeckLite/releases/latest",
     };
+  }
+  // 后端回显本次实际使用的通道，保持选择器与结果一致。
+  if (updateState.fw && updateState.fw.channel) {
+    updateState.fwChannel = updateState.fw.channel;
   }
   updateState.fwChecking = false;
   updateState.fwCheckedAt = new Date();
@@ -5329,7 +5401,8 @@ async function applyFwUpdate() {
   try {
     const r = await api("/api/firmware/update/apply", {
       method: "POST",
-      body: JSON.stringify({ dev_id: sel.dev_id }),
+      // WS-630: 带上与 check 相同的固件通道，避免 apply 悄悄回到 stable。
+      body: JSON.stringify({ dev_id: sel.dev_id, channel: updateState.fwChannel }),
     });
     updateState.fwTask = sel.dev_id;
     // 升级真正开始后才显示五步条（验收 4）。
@@ -5448,6 +5521,9 @@ function bindUpdate() {
   if (fwCopy) fwCopy.onclick = () => copySha("fw");
   const channelSel = $("#updateChannel");
   if (channelSel) channelSel.onchange = (e) => switchUpdateChannel(e.target.value);
+  // WS-630: 固件通道选择独立于上位机通道，切换即持久化并立即重查。
+  const fwChannelSel = $("#fwChannel");
+  if (fwChannelSel) fwChannelSel.onchange = (e) => switchFwChannel(e.target.value);
   const fwCheck = $("#btnFwCheck");
   if (fwCheck) fwCheck.onclick = () => checkFwUpdate(false);
   const fwApply = $("#btnFwApply");

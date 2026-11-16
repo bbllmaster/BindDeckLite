@@ -621,8 +621,18 @@
         </div>
 
         <div id="fwOnlinePane">
-        <!-- 固件始终走稳定通道，别让用户误以为跟随上面的滚动通道（WS-577 验收 14）。 -->
-        <p class="muted small upd-channel-note" data-i18n="update.fw_channel_note">固件固定使用稳定版</p>
+        <!-- WS-630：固件通道独立于上位机通道，默认 stable；切换后立即重查。 -->
+        <div class="ota-rows">
+          <span class="k" data-i18n="ui.fw_channel">固件通道</span>
+          <span class="v upd-channel-cell">
+            <select id="fwChannel" class="lang-select">
+              <option value="stable" data-i18n="ui.update_channel_stable">稳定版</option>
+              <option value="rolling" data-i18n="ui.update_channel_rolling">滚动版</option>
+            </select>
+          </span>
+        </div>
+        <p class="muted small upd-channel-note" id="fwChannelNoteStable" data-i18n="update.fw_channel_stable_note">固件稳定版</p>
+        <p class="muted small upd-channel-note" id="fwChannelNoteRolling" data-i18n="update.fw_channel_rolling_note" hidden>固件滚动版 · 每次 main 构建，可能不稳定</p>
         <div class="upd-version-line">
           <span class="upd-version-cell">
             <span class="upd-version-cap" data-i18n="ui.current_firmware">当前固件</span>
