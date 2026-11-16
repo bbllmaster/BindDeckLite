@@ -299,6 +299,10 @@ static bool g_otaFirstBlockChecked = false;
 // or a lost first block). The POST completion handler reports it instead of
 // claiming success.
 static const char* g_portalOtaError = nullptr;
+// WS-631: true from UPLOAD_FILE_START until the upload finishes or aborts.
+// A WiFi scan during an OTA upload would fight the flash write for the radio
+// task (and salt the upload with retries), so /wifi/scan answers 409 instead.
+static bool g_portalOtaActive = false;
 // WS-519: machine-readable short code for a failure that only surfaces in
 // Update.end() (whose error code never reached the page before). Sent to the
 // browser as X-Ota-Code so the result card can explain the cause.
@@ -911,6 +915,115 @@ static WifiAttempt wifiAttemptSnapshot() {
   return a;
 }
 
+// === WS-631: portal "scan nearby WiFi" ====================================
+// The page needs a list of SSIDs it can tap instead of typing the name on a
+// phone. The scan itself is asynchronous: POST /wifi/scan only arms the state
+// machine and returns, the WiFi task does the radio work, and loop() collects
+// the result with scanComplete(). The single-client WebServer is therefore
+// never blocked (no delay(), no synchronous scan in the handler).
+//
+// Results live in RAM only: they are replaced by the next scan and lost on
+// reset, so a scan can never touch the saved SSID / password in NVS.
+#define WIFI_SCAN_MAX         8      // rows the page shows
+#define WIFI_SCAN_COLLECT     24     // raw entries kept before dedupe + sort
+#define WIFI_SCAN_TIMEOUT_MS  10000UL
+
+struct ScanNet {
+  String ssid;
+  int    rssi;
+  bool   enc;
+};
+
+// IDLE -> SCANNING -> DONE | FAILED. The page mirrors these four names.
+enum ScanState : uint8_t { SCAN_IDLE, SCAN_SCANNING, SCAN_DONE, SCAN_FAILED };
+
+static ScanState     g_scanState = SCAN_IDLE;
+static unsigned long g_scanStart = 0;   // millis() when the scan was accepted
+static unsigned long g_scanSeq   = 0;   // +1 per finished scan (page redraw)
+static ScanNet       g_scanNets[WIFI_SCAN_MAX];
+static int           g_scanCount = 0;
+
+static const char* scanStateName() {
+  switch (g_scanState) {
+    case SCAN_SCANNING: return "scanning";
+    case SCAN_DONE:     return "done";
+    case SCAN_FAILED:   return "failed";
+    default:            return "idle";
+  }
+}
+
+// Drop the previous result and make sure no radio work is still queued.
+// Called when the portal opens, so a page never shows a list from the last
+// session (the state itself is RAM-only and would otherwise survive /exit).
+static void portalScanReset() {
+  if (g_scanState == SCAN_SCANNING) WiFi.scanDelete();
+  g_scanCount = 0;
+  g_scanState = SCAN_IDLE;
+}
+
+// Collect the async result. Only loop() calls this, once per config-mode pass,
+// so a DONE/FAILED transition is visible to the very next 400 ms poll.
+static void loopPortalScan() {
+  if (g_scanState != SCAN_SCANNING) return;
+  int16_t n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    // A scan of a crowded band can outlast the page's patience. Ten seconds
+    // is far above the 2-4 s a normal scan takes; treat it as a failure the
+    // user can retry rather than leaving the button spinning forever.
+    if (millis() - g_scanStart >= WIFI_SCAN_TIMEOUT_MS) {
+      WiFi.scanDelete();
+      g_scanState = SCAN_FAILED;
+      log_e("[cfg] wifi scan timeout");
+    }
+    return;
+  }
+  if (n == WIFI_SCAN_FAILED) {
+    WiFi.scanDelete();
+    g_scanState = SCAN_FAILED;
+    log_e("[cfg] wifi scan failed");
+    return;
+  }
+  if (n < 0) return;
+
+  // Dedupe by SSID first (mesh setups expose one name on several APs), keep
+  // the strongest, then sort by RSSI. Scanning is a snapshot: rssi is the value
+  // measured during the scan, never refreshed afterwards.
+  static ScanNet raw[WIFI_SCAN_COLLECT];
+  int cnt = 0;
+  for (int i = 0; i < n; i++) {
+    String s = WiFi.SSID(i);
+    if (!s.length()) continue;   // hidden network: no name to fill into #ssid
+    int  r = WiFi.RSSI(i);
+    bool e = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    int dup = -1;
+    for (int k = 0; k < cnt; k++) {
+      if (raw[k].ssid == s) { dup = k; break; }
+    }
+    if (dup >= 0) {
+      if (r > raw[dup].rssi) { raw[dup].rssi = r; raw[dup].enc = e; }
+      continue;
+    }
+    if (cnt >= WIFI_SCAN_COLLECT) continue;   // pathological density
+    raw[cnt].ssid = s;
+    raw[cnt].rssi = r;
+    raw[cnt].enc  = e;
+    cnt++;
+  }
+  // Insertion sort, strongest first; at most 24 entries, so O(n^2) is free.
+  for (int i = 1; i < cnt; i++) {
+    ScanNet key = raw[i];
+    int k = i - 1;
+    while (k >= 0 && raw[k].rssi < key.rssi) { raw[k + 1] = raw[k]; k--; }
+    raw[k + 1] = key;
+  }
+  g_scanCount = (cnt > WIFI_SCAN_MAX) ? WIFI_SCAN_MAX : cnt;
+  for (int i = 0; i < g_scanCount; i++) g_scanNets[i] = raw[i];
+  WiFi.scanDelete();
+  g_scanState = SCAN_DONE;
+  g_scanSeq++;
+  log_e("[cfg] wifi scan done: %d shown / %d raw", g_scanCount, cnt);
+}
+
 static WebServer cfgServer(80);
 
 // Names of the five encoder modes, in encMode order. Index 4 matches the host
@@ -996,6 +1109,31 @@ static String cfgPage(const KeysForm* form = nullptr) {
     "cursor:pointer;white-space:nowrap}"
     "#wifiRetryBtn[hidden]{display:none}"
     "#wifiRetryBtn:disabled{border-color:#dadce0;color:#80868b;cursor:default}"
+    // WS-631: scan button / hint / result list. The list is a plain <ul> that
+    // the script fills with textContent - SSIDs come out of the air and must
+    // never reach innerHTML. Rows are 44 px tall (tappable), the name cell
+    // ellipsizes so a 32-char SSID cannot widen a 320 px screen, and the
+    // [hidden] re-asserts keep the UA rule working against the ID rules.
+    "#wifiScanBox{margin:0 0 12px}"
+    "#wifiScanBox[hidden]{display:none}"
+    "#btnWifiScan{display:block;width:100%;box-sizing:border-box;min-height:44px;"
+    "padding:8px 12px;border:1px solid #1a73e8;border-radius:6px;background:#fff;"
+    "color:#1a73e8;font:inherit;font-size:14px;cursor:pointer}"
+    "#btnWifiScan:disabled{border-color:#dadce0;color:#80868b;cursor:default}"
+    ".scanhint{font-size:12px;color:#5f6368;margin:6px 0 0;line-height:1.4;"
+    "word-break:break-word}"
+    "#wifiScanList{list-style:none;margin:8px 0 0;padding:0;border:1px solid #dadce0;"
+    "border-radius:6px;overflow:hidden}"
+    "#wifiScanList[hidden]{display:none}"
+    "#wifiScanList li{display:flex;align-items:center;gap:8px;box-sizing:border-box;"
+    "min-height:44px;padding:6px 10px;border-top:1px solid #f1f3f4;font-size:14px;"
+    "cursor:pointer}"
+    "#wifiScanList li:first-child{border-top:0}"
+    "#wifiScanList li.sel{background:#e8f0fe}"
+    ".scanBars{flex:0 0 auto;color:#188038;font-size:12px;letter-spacing:1px}"
+    ".scanSsid{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;"
+    "white-space:nowrap}"
+    ".scanRssi,.scanLock{flex:0 0 auto;color:#5f6368;font-size:12px;white-space:nowrap}"
     "</style></head><body>");
   if (form && !form->errors.empty()) {
     h += F("<div class='err' role='alert'><b>保存失败，未写入设备：</b><ul>");
@@ -1074,6 +1212,14 @@ static String cfgPage(const KeysForm* form = nullptr) {
   // WS-610: retry button (hidden until wifi=fail) sits outside the WiFi form,
   // so a tap never submits /save. The wifi-state script unhides it and POSTs.
   h += F("<button id='wifiRetryBtn' type='button' hidden>重试连接</button></p>");
+  // WS-631: scan entry point, right under the status line and before the WiFi
+  // form. type='button' and outside #fWifi, so a tap can never submit /save.
+  // The box starts hidden: without JS (or against an old firmware whose
+  // /keys/state has no `scan`) the page is exactly today's page.
+  h += F("<div id='wifiScanBox' hidden>"
+         "<button id='btnWifiScan' type='button'>扫描附近 WiFi</button>"
+         "<div id='wifiScanHint' class='scanhint' aria-live='polite'></div>"
+         "<ul id='wifiScanList' hidden></ul></div>");
   // WS-572: the onsubmit guard is an enhancement only. With JS disabled the
   // attribute never runs and the form POSTs exactly as before.
   h += F("<form method='POST' action='/save' id='fWifi' "
@@ -1301,6 +1447,9 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "fails=0;sawHttp=false;note('');"
          "if(typeof window!=='undefined'&&window.__portalClockSync)window.__portalClockSync(s?s.left:undefined);"
          "if(typeof window!=='undefined'&&window.__portalWifiSync)window.__portalWifiSync(s);"
+         // WS-631: same single poll, one more consumer. The scan block only
+         // redraws when the device's state/seq changes.
+         "if(typeof window!=='undefined'&&window.__portalScanSync)window.__portalScanSync(s);"
          "if(!s||typeof s.seq!=='number')return;"
          "if(!primed||s.seq<seq){primed=true;seq=s.seq;return;}"
          "if(s.seq>seq){seq=s.seq;onHit(s.index,s.gpio);}"
@@ -1491,6 +1640,126 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "setTimeout(function(){elBtn.disabled=false;},RETRY_DISABLE_MS);"
          "});"
          "})();</script>");
+  // WS-631: scan block. It opens NO request of its own except the one POST the
+  // user taps: results ride the existing 400 ms /keys/state poll (the
+  // selfcheck script hands each parsed response to window.__portalScanSync),
+  // so the single-client WebServer still has exactly one poller (WS-606).
+  // Rows are built with createElement + textContent because an SSID is
+  // attacker controlled (anyone can name an AP with HTML in it) - the list
+  // never touches innerHTML. host/test_portal_scan.mjs extracts and runs this
+  // exact block against a fake DOM, so changing it turns the assertions red.
+  h += F("<script id='portal-scan'>"
+         "(function(){"
+         "var MAXNETS=8;"
+         "var elBox=document.getElementById('wifiScanBox'),"
+         "elBtn=document.getElementById('btnWifiScan'),"
+         "elHint=document.getElementById('wifiScanHint'),"
+         "elList=document.getElementById('wifiScanList'),"
+         "elSsid=document.querySelector('input[name=ssid]');"
+         "if(!elBox||!elBtn||!elList)return;"
+         "var lastState='',lastSeq=-1,sel=-1,nets=[],connected=false,busy=false;"
+         "function hint(t){if(elHint)elHint.textContent=t||'';}"
+         "function setBtn(t,off){elBtn.textContent=t;elBtn.disabled=!!off;}"
+         "function clearList(){elList.textContent='';elList.hidden=true;}"
+         // Four bars for a strong signal down to one for a weak one: -67 dBm
+         // is the usual "usable" line, -78 the edge where a save will fail.
+         "function bars(r){var lv=r>=-55?4:(r>=-67?3:(r>=-78?2:1));"
+         "return '▮▮▮▮'.slice(0,lv)+'▯▯▯▯'.slice(0,4-lv);}"
+         "function cell(cls,txt){var s=document.createElement('span');"
+         "s.className=cls;s.textContent=txt;return s;}"
+         "function row(n,i){"
+         "var li=document.createElement('li');"
+         "li.className=(i===sel)?'sel':'';"
+         "var name=cell('scanSsid',n.s);name.title=n.s;"
+         "li.appendChild(cell('scanBars',bars(n.r)));"
+         "li.appendChild(name);"
+         "li.appendChild(cell('scanRssi',String(n.r)+' dBm'));"
+         "li.appendChild(cell('scanLock',n.e?'加密':'开放'));"
+         "li.addEventListener('click',function(){pick(n);});"
+         "return li;}"
+         // A tap only fills the SSID box: no submit, no password change, no
+         // navigation. Assigning .value never fires input, so the unsaved bar
+         // (WS-572) is refreshed explicitly.
+         "function pick(n){"
+         "if(elSsid)elSsid.value=n.s;"
+         "sel=nets.indexOf(n);"
+         "var kids=elList.children||[];"
+         "for(var i=0;i<kids.length;i++){kids[i].className=(i===sel)?'sel':'';}"
+         "hint('已填入「'+n.s+'」；密码填好后点「保存并连接」');"
+         "if(window.portalDirty&&window.portalDirty.refresh)window.portalDirty.refresh();}"
+         // The device already dedupes/sorts, but the page normalises too: it
+         // drops nameless beacons, keeps the strongest row per name and shows
+         // at most eight, so the list is right even if a device sends raw.
+         "function normalise(list){"
+         "var out=[],i,j;"
+         "for(i=0;list&&i<list.length;i++){"
+         "var it=list[i]||{},s=(typeof it.s==='string')?it.s:'',"
+         "r=(typeof it.r==='number')?it.r:-999,e=it.e?1:0;"
+         "if(!s)continue;"
+         "var dup=-1;"
+         "for(j=0;j<out.length;j++){if(out[j].s===s){dup=j;break;}}"
+         "if(dup>=0){if(r>out[dup].r){out[dup].r=r;out[dup].e=e;}continue;}"
+         "out.push({s:s,r:r,e:e});}"
+         "out.sort(function(a,b){return b.r-a.r;});"
+         "return out.slice(0,MAXNETS);}"
+         "function render(){clearList();"
+         "for(var i=0;i<nets.length;i++)elList.appendChild(row(nets[i],i));"
+         "if(nets.length)elList.hidden=false;}"
+         "function apply(st){"
+         "busy=(st==='scanning');"
+         "elBox.hidden=false;"
+         "if(st==='scanning'){setBtn('扫描中…',true);"
+         "hint('约 2–4 秒；扫描期间请勿离开页面');return;}"
+         // Connected STA blocks a scan: AP+STA share one radio, so a scan can
+         // stall the very link this page is being read over.
+         "setBtn('扫描附近 WiFi',connected);"
+         "if(st==='failed'){clearList();nets=[];sel=-1;"
+         "hint('扫描失败，请再试一次');return;}"
+         "if(st==='done'){"
+         "if(!nets.length){clearList();"
+         "hint('没有扫描到 2.4 GHz 网络。设备只支持 2.4 GHz；5 GHz-only 或隐藏网络请手动输入名称');"
+         "return;}"
+         "hint(connected?'已连接 WiFi，断开后可扫描；仍可点一行填入名称':"
+         "'共 '+nets.length+' 个网络，点一行填入名称');render();return;}"
+         "clearList();nets=[];sel=-1;"
+         "hint(connected?'已连接 WiFi，断开后可扫描':'');}"
+         // Fed by the selfcheck poller. No scan object (old firmware) -> the
+         // block stays hidden and the page is exactly today's page.
+         "window.__portalScanSync=function(s){"
+         "if(!s||!s.scan||typeof s.scan.state!=='string'){elBox.hidden=true;return;}"
+         "var st=s.scan.state,seq=(typeof s.scan.seq==='number')?s.scan.seq:-1,"
+         "conn=(s.wifi==='ok');"
+         // Redraw only when something the block shows changed. A connect /
+         // disconnect flips the button even though scan state and seq stand
+         // still, so the link state is part of the comparison.
+         "if(st===lastState&&seq===lastSeq&&conn===connected)return;"
+         "connected=conn;"
+         "if(st==='done'){if(seq!==lastSeq){nets=normalise(s.scan.nets);sel=-1;}}"
+         "else{nets=[];}"
+         "lastState=st;lastSeq=seq;"
+         "apply(st);};"
+         "elBtn.addEventListener('click',function(){"
+         "if(busy||elBtn.disabled)return;"
+         "busy=true;nets=[];sel=-1;clearList();"
+         "setBtn('扫描中…',true);hint('正在扫描…');"
+         "var done=false;"
+         "function fail(msg){if(done)return;done=true;busy=false;"
+         "setBtn('扫描附近 WiFi',connected);hint(msg);}"
+         "fetch('/wifi/scan',{method:'POST'}).then(function(r){"
+         "return r.json().then(function(d){return {ok:r.ok,d:d};},"
+         "function(){return {ok:r.ok,d:null};});"
+         "}).then(function(res){"
+         "var d=(res&&res.d)||{};"
+         "if(!res.ok||d.ok===false){"
+         "if(d.error==='ota_busy')fail('升级中不可扫描');"
+         "else if(d.error==='wifi_connected')fail('已连接 WiFi，断开后可扫描');"
+         "else fail('扫描启动失败，请再试一次');"
+         "return;}"
+         "if(done)return;done=true;"
+         "hint('约 2–4 秒；扫描期间请勿离开页面');"
+         "}).catch(function(){fail('扫描启动失败，请再试一次');});"
+         "});"
+         "})();</script>");
   h += F("</body></html>");
   return h;
 }
@@ -1502,6 +1771,10 @@ static void otaDiagReadback(int code);           // defined below, used by both
 
 static void setupProvisioning() {
   WiFi.mode(WIFI_AP_STA);
+  // WS-631: a fresh portal session starts with no scan result; the page hides
+  // its scan block until /keys/state carries one anyway, but dropping the last
+  // session's list keeps the state honest.
+  portalScanReset();
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
                     IPAddress(255, 255, 255, 0));
   WiFi.softAP(g_cfgApName.c_str(), NULL, 6, 4);
@@ -1550,6 +1823,46 @@ static void setupProvisioning() {
     cfgServer.send(200, "application/json", j);
   });
   cfgServer.on("/wifi/retry", HTTP_GET, []() {
+    cfgServer.send(405, "text/plain", "Method Not Allowed");
+  });
+
+  // --- WS-631: scan the neighbourhood, no second poll on the page -------
+  // POST-only (GET answers 405, same shape as /exit /extend /wifi/retry).
+  // Nothing here waits for the radio: the async scan is armed and the page
+  // learns the result from the /keys/state it already polls every 400 ms.
+  // Two refusals:
+  //   * OTA upload in flight -> 409 ota_busy (the flash write must not share
+  //     the radio with a scan);
+  //   * STA already connected -> 409 wifi_connected. AP+STA shares one radio,
+  //     so a scan can stall (or drop) the very link the phone is browsing
+  //     this page over. The button is disabled in that state too.
+  // A repeat POST while scanning returns already=true and starts nothing.
+  cfgServer.on("/wifi/scan", HTTP_POST, []() {
+    String j;
+    int code = 200;
+    if (g_portalOtaActive) {
+      code = 409;
+      j = "{\"ok\":false,\"error\":\"ota_busy\"}";
+    } else if (g_scanState == SCAN_SCANNING) {
+      j = "{\"ok\":true,\"already\":true}";
+    } else if (WiFi.status() == WL_CONNECTED) {
+      code = 409;
+      j = "{\"ok\":false,\"error\":\"wifi_connected\"}";
+    } else {
+      g_scanCount = 0;
+      g_scanStart = millis();
+      g_scanState = SCAN_SCANNING;
+      // async=true (return immediately), show_hidden=false (a hidden network
+      // has no name to put in #ssid anyway).
+      WiFi.scanNetworks(true, false);
+      j = "{\"ok\":true}";
+      log_e("[cfg] wifi scan start");
+    }
+    cfgServer.sendHeader("Cache-Control", "no-store");
+    cfgServer.sendHeader("Connection", "close");
+    cfgServer.send(code, "application/json", j);
+  });
+  cfgServer.on("/wifi/scan", HTTP_GET, []() {
     cfgServer.send(405, "text/plain", "Method Not Allowed");
   });
 
@@ -1702,6 +2015,17 @@ static void setupProvisioning() {
          ",\"ip\":\"" + jsonEsc(w.ip) + "\"" +
          ",\"elapsed\":" + String(w.elapsed) +
          ",\"wifiText\":\"" + jsonEsc(w.wifiText) + "\"";
+    // WS-631: APPEND the scan snapshot (WS-602 / WS-610 fields keep their
+    // names and order). Filled by loop(), so this handler only copies RAM.
+    j += ",\"scan\":{\"state\":\"" + String(scanStateName()) +
+         "\",\"seq\":" + String(g_scanSeq) + ",\"nets\":[";
+    for (int i = 0; i < g_scanCount; i++) {
+      if (i) j += ",";
+      j += "{\"s\":\"" + jsonEsc(g_scanNets[i].ssid) +
+           "\",\"r\":" + String(g_scanNets[i].rssi) +
+           ",\"e\":" + String(g_scanNets[i].enc ? 1 : 0) + "}";
+    }
+    j += "]}";
     j += "}";
     cfgServer.sendHeader("Cache-Control", "no-store");
     cfgServer.sendHeader("Connection", "close");
@@ -1925,6 +2249,10 @@ static void setupProvisioning() {
   });
   cfgServer.on("/update", HTTP_POST,
     []() {
+      // WS-631: the upload is over (finished, refused or aborted) - scanning
+      // is allowed again. Set before the branches below, because the gate
+      // refusal returns from here without ever seeing UPLOAD_FILE_END.
+      g_portalOtaActive = false;
       String msg = F("<meta charset='utf-8'><p>升级");
       if (g_portalOtaError) {
         // WS-420: the gate refused the slot before anything was written. Say
@@ -1958,6 +2286,7 @@ static void setupProvisioning() {
       HTTPUpload& up = cfgServer.upload();
       if (up.status == UPLOAD_FILE_START) {
         g_otaProgress = 0;
+        g_portalOtaActive = true;   // WS-631: /wifi/scan now answers 409
         g_portalOtaError = nullptr;
         g_portalOtaCode = nullptr;
         // WS-425: the read-back gate below needs a per-session byte count.
@@ -3808,6 +4137,9 @@ void loop() {
   // ---- config mode -------------------------------------------------------
   if (g_configMode) {
     cfgServer.handleClient();
+    // WS-631: collect a scan started by POST /wifi/scan. Runs here, on the
+    // Arduino loop task, so the HTTP callback never waits for the radio.
+    loopPortalScan();
     loopWiFi();
     // WS-551: POST /exit deadline. The 200 is already queued on the socket;
     // hand the restart to the deferred-boot block above (never restart from
