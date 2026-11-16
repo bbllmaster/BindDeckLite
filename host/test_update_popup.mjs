@@ -90,6 +90,7 @@ function buildRegistry() {
     "updAppNotes", "updAppRollingWarn", "updAppHint",
     "btnAppCheck", "btnUpdateApply", "btnUpdateSkip", "btnAppShaCopy",
     "updateChannel",
+    "fwChannel", "fwChannelNoteStable", "fwChannelNoteRolling",
     "updFwDevice", "updFwDeviceState", "updFwVariant", "updFwCurrent",
     "updFwLatest", "updFwSize", "updFwSha", "updFwState", "updFwCheckedAt",
     "updFwError", "updFwNotesBox", "updFwNotesTitle", "updFwNotes",
@@ -176,8 +177,8 @@ function loadApp(fetchImpl) {
   vm.runInContext(appSrc + `
 globalThis.__upd = {
   updateState, state, renderUpdateApp, renderUpdateFw, checkAppUpdate,
-  checkFwUpdate, switchUpdateChannel, copySha, fmtVersion,
-  updateTargetText, updateCurrentText,
+  checkFwUpdate, switchUpdateChannel, switchFwChannel, applyFwUpdate,
+  copySha, fmtVersion, updateTargetText, updateCurrentText,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -433,4 +434,138 @@ test("固件升级进行中才显示五步条", () => {
   host.updateState.fwRunning = false;
   host.renderUpdateFw();
   assert.equal(el("updFwSteps").hidden, true);
+});
+
+/* ---------------- WS-630 固件通道（独立于上位机通道） ---------------- */
+
+test("WS-630 默认 stable：选择器与文案为稳定版，版本行显示版本号", () => {
+  const { host, el } = loadApp(quietFetch());
+  host.state.devices = [{ dev_id: "d1", name: "Deck", connected: true }];
+  host.state.selected = "d1";
+  host.updateState.fwChannel = "stable";
+  host.updateState.fw = {
+    ok: true, channel: "stable", tag: "v1.4.2", has_update: true,
+    current: "1.3.8", latest: "1.4.2", device_variant: "esp32c3",
+    asset: { size: 100, sha256: FULL_SHA }, notes: "",
+  };
+
+  host.renderUpdateFw();
+
+  assert.equal(el("fwChannel").value, "stable");
+  assert.equal(el("fwChannelNoteStable").hidden, false);
+  assert.equal(el("fwChannelNoteRolling").hidden, true);
+  assert.equal(el("updFwLatest").textContent, "v1.4.2", "stable 显示版本号而非 tag");
+});
+
+test("WS-630 rolling 同版本一致：不提示更新，显示一致文案 + 目标 tag", () => {
+  const { host, el } = loadApp(quietFetch());
+  host.state.devices = [{ dev_id: "d1", name: "Deck", connected: true }];
+  host.state.selected = "d1";
+  host.updateState.fwChannel = "rolling";
+  host.updateState.fwCheckedAt = new Date("2026-11-12T03:04:05");
+  host.updateState.fw = {
+    ok: true, channel: "rolling", tag: "main-20261112-0100",
+    has_update: false, current: "1.4.5", latest: "1.4.5",
+    device_variant: "esp32c3", asset: { size: 0, sha256: "" }, notes: "",
+  };
+
+  host.renderUpdateFw();
+
+  assert.equal(el("fwChannel").value, "rolling");
+  assert.equal(el("fwChannelNoteStable").hidden, true);
+  assert.equal(el("fwChannelNoteRolling").hidden, false);
+  // 版本行显示目标 tag（与上位机滚动格式一致）。
+  assert.equal(el("updFwLatest").textContent, "main-20261112-0100");
+  // 同版本不能反复提示升级，而是明确「一致」。
+  assert.match(el("updFwState").textContent, /滚动通道当前固件与设备一致/);
+  assert.match(el("updFwState").textContent, /main-20261112-0100/);
+  assert.equal(el("btnFwApply").hidden, true, "同版本不提供升级按钮");
+});
+
+test("WS-630 切换固件通道：持久化 + 立即重查（检查带 channel）+ apply 带同一 channel", async () => {
+  const calls = [];
+  const fetchImpl = async (path, opts = {}) => {
+    calls.push({
+      path,
+      method: (opts.method || "GET"),
+      body: opts.body ? JSON.parse(opts.body) : null,
+    });
+    if (path.endsWith("/api/firmware/update/channel")) {
+      return okResponse({ ok: true, channel: "rolling" });
+    }
+    if (path.startsWith("/api/firmware/update/check")) {
+      return okResponse({
+        ok: true, channel: "rolling", tag: "main-20261112-0100",
+        current: "1.3.8", latest: "1.4.5", has_update: true,
+        device_variant: "esp32c3",
+        asset: { size: 100, sha256: FULL_SHA }, notes: "",
+      });
+    }
+    if (path.endsWith("/api/firmware/update/apply")) {
+      return okResponse({ ok: true, task: "d1", version: "1.4.5",
+                          asset: "ota_binddecklite_c3_v1.4.5.bin",
+                          channel: "rolling" });
+    }
+    if (path.startsWith("/api/firmware/update/progress")) {
+      return okResponse({ phase: "done" });
+    }
+    return okResponse({});
+  };
+  const { host, el } = loadApp(fetchImpl);
+  host.state.devices = [{ dev_id: "d1", name: "Deck", connected: true }];
+  host.state.selected = "d1";
+  host.updateState.fwChannel = "stable";
+  host.updateState.fwChannelLoaded = true;
+
+  // ① 切换：POST 持久化通道，随后立即按新通道重查。
+  await host.switchFwChannel("rolling");
+  await tick(8);
+
+  const post = calls.find((c) => c.path === "/api/firmware/update/channel");
+  assert.ok(post, "切换应 POST 持久化固件通道");
+  assert.equal(post.method, "POST");
+  assert.deepEqual(post.body, { channel: "rolling" });
+
+  const check = calls.find((c) => c.path.startsWith("/api/firmware/update/check"));
+  assert.ok(check, "切换后应重新检查固件");
+  assert.match(check.path, /channel=rolling/, "重查必须带 rolling 通道");
+  assert.equal(el("fwChannel").value, "rolling");
+  assert.equal(el("fwChannelNoteRolling").hidden, false);
+  assert.equal(el("updFwLatest").textContent, "main-20261112-0100");
+
+  // ② 立即升级：apply 请求必须带与 check 相同的 channel。
+  await host.applyFwUpdate();
+  await tick(6);
+  const apply = calls.find((c) => c.path === "/api/firmware/update/apply");
+  assert.ok(apply, "应发起 apply 请求");
+  assert.equal(apply.method, "POST");
+  assert.equal(apply.body.dev_id, "d1");
+  assert.equal(apply.body.channel, "rolling", "apply 必须带同一固件通道");
+});
+
+test("WS-630 checkFwUpdate 把当前固件通道拼进查询串", async () => {
+  const calls = [];
+  const fetchImpl = async (path) => {
+    calls.push(path);
+    if (path.startsWith("/api/firmware/update/check")) {
+      return okResponse({
+        ok: true, channel: "rolling", tag: "main-20261112-0100",
+        current: "1.3.8", latest: "1.4.5", has_update: false,
+        device_variant: "esp32c3", asset: { size: 0, sha256: "" }, notes: "",
+      });
+    }
+    return okResponse({});
+  };
+  const { host } = loadApp(fetchImpl);
+  host.state.devices = [{ dev_id: "d1", name: "Deck", connected: true }];
+  host.state.selected = "d1";
+  host.updateState.fwChannel = "rolling";
+
+  await host.checkFwUpdate(true);
+  await tick(4);
+
+  const url = calls.find((p) => p.startsWith("/api/firmware/update/check"));
+  assert.ok(url);
+  assert.match(url, /dev_id=d1/);
+  assert.match(url, /channel=rolling/);
 });

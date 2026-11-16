@@ -1257,6 +1257,10 @@ def load_config():
                 # → stable，不因为升级而改变用户已有的更新来源。
                 "update_channel": online_update.normalize_channel(
                     data.get("update_channel", online_update.DEFAULT_UPDATE_CHANNEL)),
+                # WS-630: 固件通道独立于上位机通道；旧 config 没有这个键 → stable，
+                # 不因为升级而改变用户已有的固件更新来源。
+                "fw_channel": online_update.normalize_channel(
+                    data.get("fw_channel", online_update.DEFAULT_UPDATE_CHANNEL)),
                 # WS-529: 语言偏好同样在顶层；旧 config 没有这个键时用
                 # system（跟随系统），不因为缺键而改动已有设置。
                 "lang": str(data.get("lang", SYSTEM_PREF) or SYSTEM_PREF),
@@ -1277,6 +1281,9 @@ def load_config():
     # WS-557: 同理，通道也一定存在（缺省 stable）。
     _config["update_channel"] = online_update.normalize_channel(
         _config.get("update_channel", online_update.DEFAULT_UPDATE_CHANNEL))
+    # WS-630: 固件通道同样一定存在（缺省 stable），持久化切换结果不丢。
+    _config["fw_channel"] = online_update.normalize_channel(
+        _config.get("fw_channel", online_update.DEFAULT_UPDATE_CHANNEL))
 
 
 def save_config():
@@ -5482,6 +5489,9 @@ def _update_settings() -> dict:
             "update_fail_count": int(_config.get("update_fail_count") or 0),
             "update_channel": online_update.normalize_channel(
                 _config.get("update_channel")),
+            # WS-630: 固件通道（与上位机 update_channel 相互独立）。
+            "fw_channel": online_update.normalize_channel(
+                _config.get("fw_channel")),
         }
 
 
@@ -5514,6 +5524,8 @@ def api_app_version():
         "executable": sys.executable if getattr(sys, "frozen", False) else "",
         "update_fail_count": _update_settings()["update_fail_count"],
         "update_channel": _update_settings()["update_channel"],
+        # WS-630: 把持久化的固件通道也暴露出来（前端弹窗据此恢复选择器状态）。
+        "fw_channel": _update_settings()["fw_channel"],
     })
 
 
@@ -5527,6 +5539,8 @@ def _app_version_payload() -> dict:
         "executable": sys.executable if frozen else "",
         "update_fail_count": _update_settings()["update_fail_count"],
         "update_channel": _update_settings()["update_channel"],
+        # WS-630: /api/status 也带固件通道，前端 pollStatus() 据此恢复选择。
+        "fw_channel": _update_settings()["fw_channel"],
     }
 
 
@@ -6057,15 +6071,39 @@ def api_app_update_cancel():
 
 # --- firmware online update (WS-523) ---------------------------------------
 
+@app.route("/api/firmware/update/channel", methods=["POST"])
+def api_firmware_update_channel():
+    """切换固件更新通道（stable / rolling），立即持久化到 config.json。
+
+    WS-630: 固件通道与上位机通道（update_channel）相互独立，用户可以
+    「上位机稳定 + 固件滚动」单独测试固件修复，或反过来。非法通道按现有
+    ``api_app_update_channel`` 约定返回 400。
+    """
+    data = request.get_json(silent=True) or {}
+    channel = str(data.get("channel") or "").strip().lower()
+    if channel not in online_update.UPDATE_CHANNELS:
+        return jsonify({"ok": False, **_err(t("error.update_channel_invalid"))}), 400
+    _set_update_state(fw_channel=channel)
+    return jsonify({"ok": True, "channel": channel})
+
+
 @app.route("/api/firmware/update/check")
 def api_firmware_update_check():
-    """检查某个设备的在线固件版本。
+    """检查某个设备的在线固件版本（按 ``?channel=`` 指定的固件通道）。
 
-    返回 ``{device_variant, current, latest, has_update, asset, notes, reason}``。
+    WS-630: 默认 stable；``tag`` 在滚动通道是 ``main-YYYYMMDD-HHMM``，供前端
+    显示目标构建。版本判定仍用 ``version_is_newer``，**不**把「同版本不同
+    SHA」当更新 —— 否则每个 rolling 构建都会反复提示升级。
+
+    返回 ``{device_variant, current, latest, has_update, asset, notes,
+    channel, tag, reason}``。
     """
     dev_id = request.args.get("dev_id") or ""
     if not dev_id:
         return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
+    # WS-630: 默认 stable（normalize_channel(None) → stable），非法值同样回退
+    # stable；不传 channel 时行为与接线前完全一致。
+    channel = online_update.normalize_channel(request.args.get("channel"))
 
     with _lock:
         cfg = _config["devices"].get(dev_id) or {}
@@ -6085,6 +6123,9 @@ def api_firmware_update_check():
         "notes": "",
         "published_at": "",
         "release_url": online_update.RELEASE_PAGE_URL,
+        "channel": channel,
+        # WS-630: 滚动通道把目标 tag（main-YYYYMMDD-HHMM）回给前端显示。
+        "tag": "",
         "reason": "",
     }
 
@@ -6097,7 +6138,7 @@ def api_firmware_update_check():
     payload["device_variant"] = variant
 
     try:
-        info = online_update.resolve_latest_update()
+        info = online_update.resolve_latest_update(channel=channel)
     except online_update.UpdateError as exc:
         payload["ok"] = False
         payload["reason"] = exc.message
@@ -6108,6 +6149,7 @@ def api_firmware_update_check():
     payload["notes"] = info.get("notes", "")
     payload["published_at"] = info.get("published_at", "")
     payload["release_url"] = info.get("release_url", online_update.RELEASE_PAGE_URL)
+    payload["tag"] = str(info.get("tag") or "")
 
     entry = (info.get("firmware") or {}).get(variant)
     if not entry:
@@ -6145,6 +6187,9 @@ def api_firmware_update_apply():
     dev_id = str(data.get("dev_id") or "")
     if not dev_id:
         return jsonify({"ok": False, **_err(t("error.missing_dev_id"))}), 400
+    # WS-630: 必须与 check 用同一通道（前端两次都提交同一个 fw_channel）。
+    # 默认 stable，非法值回退 stable，与 check 的 normalize_channel 一致。
+    channel = online_update.normalize_channel(data.get("channel"))
 
     busy = _ota_busy_reason()
     if busy:
@@ -6161,7 +6206,7 @@ def api_firmware_update_apply():
                         "error_code": "E_NO_VARIANT"}), 400
 
     try:
-        info = online_update.resolve_latest_update()
+        info = online_update.resolve_latest_update(channel=channel)
     except online_update.UpdateError as exc:
         return jsonify({"ok": False, "error": exc.message, "error_code": exc.code,
                         "release_url": online_update.RELEASE_PAGE_URL}), 503
@@ -6200,7 +6245,7 @@ def api_firmware_update_apply():
                      args=(dev_id, variant, entry, fw),
                      daemon=True, name="fw-update-%s" % dev_id).start()
     return jsonify({"ok": True, "task": dev_id, "version": entry["version"],
-                    "asset": entry["asset"]})
+                    "asset": entry["asset"], "channel": channel})
 
 
 def _fw_update_worker(dev_id, variant, entry, fw):
