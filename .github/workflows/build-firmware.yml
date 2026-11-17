@@ -33,6 +33,13 @@ jobs:
       - name: Portal WiFi state machine (WS-614)
         run: python tools/test_portal_wifi_state_machine.py
 
+      # WS-635: a cancelled / dropped OTA upload must still release
+      # g_portalOtaActive, because WebServer skips the route's final handler
+      # when the multipart body is truncated. Compiles the production upload
+      # callback against WebServer / Update stubs and drives the four statuses.
+      - name: Portal OTA abort releases the scan refusal (WS-635)
+        run: python tools/test_portal_ota_abort.py
+
   firmware:
     name: firmware / ${{ matrix.env }}
     runs-on: ubuntu-latest

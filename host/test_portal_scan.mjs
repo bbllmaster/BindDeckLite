@@ -333,12 +333,28 @@ test("OTA 中 409 ota_busy → 提示「升级中不可扫描」，按钮恢复"
   assert.equal(p.btn.textContent, "扫描附近 WiFi");
 });
 
+test("点了扫描但设备其实已连上 → 409 wifi_connected 的提示是可执行的说法", async () => {
+  // 页面以为未连接（上一轮轮询还是 idle），设备侧已经连上：这是按钮没被置灰
+  // 的唯一窗口，提示必须说清楚"换网怎么办"，不能让人去找不存在的断开入口。
+  const p = openPortal({ ok: false, body: { ok: false, error: "wifi_connected" } });
+  p.btn.fire("click");
+  await flush();
+
+  assert.match(p.hint.textContent, /已连接 WiFi，暂不可扫描；换网请直接手填名称/);
+  assert.doesNotMatch(p.hint.textContent, /断开后/, "配网页没有断开 WiFi 的入口，不能这么写");
+  assert.equal(p.btn.disabled, false);
+  assert.equal(p.btn.textContent, "扫描附近 WiFi");
+});
+
 test("已连接 WiFi → 按钮禁用并说明原因；旧固件缺 scan → 整块隐藏", async () => {
   const p = openPortal();
   p.sync(state({ state: "idle", seq: 0, nets: [] }, { wifi: "ok" }));
   await flush();
   assert.equal(p.btn.disabled, true, "STA 已连接时不能扫描（AP+STA 同一射频）");
-  assert.match(p.hint.textContent, /已连接 WiFi，断开后可扫描/);
+  // WS-635: the hint must describe something the page can actually do - the
+  // portal has no "disconnect WiFi" control, so "断开后可扫描" was a dead end.
+  assert.match(p.hint.textContent, /已连接 WiFi，暂不可扫描；换网请直接手填名称/);
+  assert.doesNotMatch(p.hint.textContent, /断开后/);
 
   p.sync({ seq: 1, index: -1, gpio: -1, left: 200, wifi: "ok", wifiText: "已连接" });
   await flush();
@@ -356,6 +372,8 @@ test("扫描后 STA 连上 → 同一 seq 也要把按钮置灰（连接状态�
   p.sync(state(done, { wifi: "ok" }));
   await flush();
   assert.equal(p.btn.disabled, true);
-  assert.match(p.hint.textContent, /已连接 WiFi，断开后可扫描/);
+  assert.match(p.hint.textContent, /已连接 WiFi，暂不可扫描/);
+  assert.match(p.hint.textContent, /换网可点下方列表或直接手填名称/);
+  assert.doesNotMatch(p.hint.textContent, /断开后/);
   assert.equal(p.list.children.length, 1, "列表保留，只是不能再扫");
 });

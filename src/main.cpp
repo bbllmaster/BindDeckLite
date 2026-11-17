@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.11"  // WS-626: 编码器旋转方向反转（CFG:ENCDIR）；1.3.10 为 WS-546 修饰键
+#define FW_VERSION "1.3.12"  // WS-635: 配网 OTA 中断复位（g_portalOtaActive / Update.abort）；1.3.11 为 WS-626
 
 #define FW_MODEL   "Lite"
 
@@ -1719,10 +1719,10 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "if(!nets.length){clearList();"
          "hint('没有扫描到 2.4 GHz 网络。设备只支持 2.4 GHz；5 GHz-only 或隐藏网络请手动输入名称');"
          "return;}"
-         "hint(connected?'已连接 WiFi，断开后可扫描；仍可点一行填入名称':"
+         "hint(connected?'已连接 WiFi，暂不可扫描；换网可点下方列表或直接手填名称':"
          "'共 '+nets.length+' 个网络，点一行填入名称');render();return;}"
          "clearList();nets=[];sel=-1;"
-         "hint(connected?'已连接 WiFi，断开后可扫描':'');}"
+         "hint(connected?'已连接 WiFi，暂不可扫描；换网请直接手填名称':'');}"
          // Fed by the selfcheck poller. No scan object (old firmware) -> the
          // block stays hidden and the page is exactly today's page.
          "window.__portalScanSync=function(s){"
@@ -1752,7 +1752,7 @@ static String cfgPage(const KeysForm* form = nullptr) {
          "var d=(res&&res.d)||{};"
          "if(!res.ok||d.ok===false){"
          "if(d.error==='ota_busy')fail('升级中不可扫描');"
-         "else if(d.error==='wifi_connected')fail('已连接 WiFi，断开后可扫描');"
+         "else if(d.error==='wifi_connected')fail('已连接 WiFi，暂不可扫描；换网请直接手填名称');"
          "else fail('扫描启动失败，请再试一次');"
          "return;}"
          "if(done)return;done=true;"
@@ -2354,6 +2354,19 @@ static void setupProvisioning() {
           otaDiagReadback(code);
           log_e("[ota] Update.end failed (end_failed:%s(%d))", detail, code);
         }
+      } else if (up.status == UPLOAD_FILE_ABORTED) {
+        // WS-635: a multipart body cut short (page closed, cancel pressed,
+        // phone lost the AP) never reaches the request handler above -
+        // WebServer's _parseFormUploadAborted() answers false, so
+        // _handleRequest() and this route's final handler are skipped. That
+        // left g_portalOtaActive stuck at true and /wifi/scan answering 409
+        // ota_busy for the rest of the portal session. Release it here.
+        g_portalOtaActive = false;
+        // The aborted session still owns Update's slot bookkeeping: without
+        // this abort a retry in the same portal session is refused by
+        // Update.begin() ("already running") and reported as a failed upgrade.
+        if (Update.isRunning()) Update.abort();
+        log_e("[ota] portal upload aborted after %u bytes", g_otaReceived);
       }
     });
   cfgServer.onNotFound([]() {
