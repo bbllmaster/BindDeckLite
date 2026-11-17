@@ -364,3 +364,82 @@ def test_redetect_reset_clears_cached_unsupported():
         app.send = original_send
     assert payload["supported"] is True
     assert cfg.get("mods_supported") is True
+
+
+# --- WS-618：重新检测不得重开 CFG:MODS 窗口 --------------------------------
+#
+# 「重新检测」的 reset 清掉连续超时计数是必要的，但不能把一条已知的
+# 「不支持」清成 None：apply_device() 对 None 且掩码非零时会下发 CFG:MODS，
+# 旧固件会因此多回一条「修饰键 未上报」。这里全部走生产视图
+# /api/device/<id>/mods 与生产 app.apply_device，不复制门控逻辑。
+
+def test_redetect_keeps_unsupported_verdict_when_reprobe_times_out():
+    """验收 2：旧固件点「重新检测」后结论仍是 False。"""
+    cfg = _device(supported=False)
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(True, None)   # 旧固件仍然不回 MODS:
+    try:
+        payload = _post_mods("?reset=1")
+    finally:
+        app.send = original_send
+    assert payload["supported"] is False, \
+        "未定论的重探必须保留原 false，而不是退回 unknown"
+    assert cfg.get("mods_supported") is False
+    assert app._mods_misses.get(DEV, 0) == 1, "reset 仍要清掉旧的连续超时计数"
+
+
+def test_redetect_then_apply_still_sends_no_cfg_mods_to_old_firmware():
+    """验收 2 的下发侧：reset 之后 apply_device() 一条 CFG:MODS 都不发。"""
+    cfg = _device(supported=False)
+    for item in cfg["keys"]:
+        item["mods"] = 1                    # 掩码非零 —— 修复前正是这条被发出去
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(True, None)
+    try:
+        _post_mods("?reset=1")
+    finally:
+        app.send = original_send
+    assert cfg.get("mods_supported") is False
+
+    sent = []
+    reported = {"keys": "", "mods": None}
+    app.send = _fake_send(sent, reported)
+    try:
+        result = app.apply_device(DEV)
+    finally:
+        app.send = original_send
+    assert not [c for c in sent if c.startswith("CFG:MODS:")], \
+        "重探未定论后仍不得向旧固件发 CFG:MODS"
+    assert not [i for i in result["items"] if i["field"] == "mods"], \
+        "没发就不该出现「修饰键 未上报」行"
+
+
+def test_redetect_upgrades_when_the_deck_actually_answers():
+    """反向保护：reset 不是把 False 焊死 —— 设备回了 MODS: 就要升为 True。"""
+    cfg = _device(supported=False)
+    _reset_probe_state()
+    original_send = app.send
+    app.send = _send_simulating_probe(True, MODS_12)
+    try:
+        payload = _post_mods("?reset=1")
+    finally:
+        app.send = original_send
+    assert payload["supported"] is True
+    assert cfg.get("mods_supported") is True
+
+
+def test_cfg_mods_readback_clears_the_consecutive_timeout_streak():
+    """WS-618 nit：成功回读证明设备在说话，旧的超时计数必须清零。
+
+    修复前 _mods_misses 只在 MODS: 探测应答时清；相隔很久的两次超时会被
+    凑成「连续」直接判 False。这里直接喂生产 _on_line 的 CFG_MODS 分支。
+    """
+    cfg = _device(supported=False)
+    _reset_probe_state()
+    app._mods_misses[DEV] = app.MODS_UNSUPPORTED_AFTER - 1
+    app._on_line(DEV, "CFG_MODS:" + MODS_12)
+    assert cfg.get("mods_supported") is True, "回读本身就把设备标为支持"
+    assert DEV not in app._mods_misses, \
+        "成功回读后旧的超时计数必须清零，不能与很久之后的超时凑成连续"

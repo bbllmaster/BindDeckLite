@@ -1964,6 +1964,17 @@ function renderSysinfo() {
  *  未连接时返回 null 且不记结论；已有 True/False 时直接复用缓存。 */
 const modsProbing = new Set();
 
+/** WS-618：修饰键结论写回后，抽屉与摘要卡必须一起重绘。
+ *  keys.js 的 keyHidText() 也按 mods_supported 决定显不显示修饰键，只重绘
+ *  抽屉会让卡片继续写「Ctrl + F13」，而 apply_device() 实际一条 CFG:MODS
+ *  都不发 —— 「显示 == 下发」在刷新时机上又破了。 */
+function refreshModsVerdictUi() {
+  if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
+    renderKeyDrawer();
+  }
+  if (typeof renderKeys === "function") renderKeys();
+}
+
 async function ensureModsCapability() {
   const devId = state.selected;
   const cfg = state.cfg;
@@ -1979,10 +1990,7 @@ async function ensureModsCapability() {
     if (state.selected !== devId || state.cfg !== cfg) return null;
     if (!r.sent) return null;              // 链路不通 = 结论未知，保持现状
     cfg.mods_supported = r.supported;
-    // 抽屉开着就按新结论重绘（禁用行 / 去掉提示）。
-    if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
-      renderKeyDrawer();
-    }
+    refreshModsVerdictUi();
     return cfg.mods_supported;
   } catch (_) {
     return null;
@@ -1991,24 +1999,29 @@ async function ensureModsCapability() {
   }
 }
 
-/** WS-550：抽屉「重新检测」。清掉本地缓存结论，并让后端丢弃连续超时计数
- *  （?reset=1），再探一次；新固件偶尔丢包被误判也不必等 VERSION 变化恢复。 */
+/** WS-550：抽屉「重新检测」。清掉后端连续超时计数（?reset=1），再探一次；
+ *  新固件偶尔丢包被误判也不必等 VERSION 变化恢复。
+ *  WS-618：探测期间保留原结论，且结果未定论（null）时不覆盖它 —— 否则
+ *  reset 就成了向旧固件发 CFG:MODS 的窗口（见 app.api_device_mods）。 */
 async function redetectModsCapability() {
   const devId = state.selected;
   const cfg = state.cfg;
   if (!devId || !cfg || modsProbing.has(devId)) return;
   modsProbing.add(devId);
-  cfg.mods_supported = null;
+  const prev = cfg.mods_supported;
   try {
     const r = await api(
       `/api/device/${encodeURIComponent(devId)}/mods?reset=1`, { method: "POST" });
     if (state.selected !== devId || state.cfg !== cfg) return;
-    cfg.mods_supported = r.supported;   // 三态：null 让下次开抽屉继续重探
-    if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
-      renderKeyDrawer();
+    // 三态：只有设备明确答复才改结论；未定论保留原值（含 false）。
+    if (r.supported === true || r.supported === false) {
+      cfg.mods_supported = r.supported;
+    } else if (r.supported === null) {
+      cfg.mods_supported = prev;
     }
+    refreshModsVerdictUi();
   } catch (_) {
-    // 保持 unknown；后端与下次开抽屉都会再探。
+    // 保持原结论；后端与下次开抽屉都会再探。
   } finally {
     modsProbing.delete(devId);
   }

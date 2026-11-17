@@ -2055,6 +2055,11 @@ def _on_line(dev_id: str, line: str):
         with _lock:
             _apply_cfg_field(cfg, "mods", line[len("CFG_MODS:"):])
             save_config()
+        # WS-618 nit: a real read-back proves the deck answers CFG:MODS, so a
+        # miss streak from long-ago dropped probes must not keep counting
+        # toward MODS_UNSUPPORTED_AFTER ("consecutive" means consecutive).
+        with _mods_lock:
+            _mods_misses.pop(dev_id, None)
         return
     if line.startswith("CFG_ENCDIR:"):
         # WS-626: CMD:GET_CFG tail line. Its presence marks the deck as
@@ -4897,15 +4902,22 @@ def api_device_mods(dev_id):
         supported (that would write a CFG:MODS line to old firmware).
 
     ``reason`` names why and ``retryable`` tells the UI a re-detect is
-    meaningful. ``?reset=1`` (drawer「重新检测」) clears the cached verdict and
-    the consecutive-timeout counter before probing again.
+    meaningful. ``?reset=1`` (drawer「重新检测」) clears the consecutive-timeout
+    counter before probing again; a cached ``False`` survives the reset unless
+    the deck answers (WS-618), so re-detecting never reopens the CFG:MODS
+    window for old firmware.
     """
     cfg = device_cfg(dev_id)
     reset = request.args.get("reset") == "1"
     if reset:
         with _lock:
-            cfg["mods_supported"] = None
-            save_config()
+            # WS-618: 「重新检测」不能让一条已知的「不支持」暂时消失。清成
+            # None 会让 apply_device() 在探测窗口里按「未确认」把 CFG:MODS
+            # 发给旧固件，并多出一条「修饰键 未上报」。否定结论只由设备回
+            # MODS: 或固件版本变化（VERSION 分支）翻案，重探本身不降级。
+            if cfg.get("mods_supported") is not False:
+                cfg["mods_supported"] = None
+                save_config()
         with _mods_lock:
             _mods_misses.pop(dev_id, None)
 
