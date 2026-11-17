@@ -638,6 +638,8 @@
   "ui.device_address": "Device address",
   "ui.device_and_host": "Device and host",
   "ui.device_intro": "Adjust the pins to match the wiring; applying takes effect immediately and stores them in the deck's NVS.",
+  "ui.device_last_input": "Input {n}",
+  "ui.device_last_key": "Key {n}",
   "ui.device_list": "Device list",
   "ui.device_model": "Device model",
   "ui.device_name": "Device name",

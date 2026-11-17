@@ -106,6 +106,9 @@ const state = {
   running: {},         // dev_id -> {"<idx>": 已运行秒数}，来源 /api/status
   stopping: {},        // dev_id -> {"<idx>": true}，已发出停止请求、等状态确认
   scan: null,          // 最近一次扫描的结论，来源 /api/status
+  // WS-637：dev_id -> {index, age}，最近一次输入，来源 /api/status 的 last_press。
+  // 侧栏行据此短暂显示「按键 N / 输入 N」；旧后端没有这个字段时是空对象。
+  lastPress: {},
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段
   // WS-512：本次会话里成功从设备读取过的设备。下发确认用它避免重复骚扰；
@@ -865,6 +868,9 @@ async function pollStatus() {
     state.running = s.running || {};
     // 最近一次扫描的结论（为什么没找到设备）。
     state.scan = s.scan || null;
+    // WS-637：侧栏行用它判「刚按下」。旧后端没有 last_press → 空对象，
+    // 侧栏与改动前完全一致（只显示地址 / 失败原因）。
+    state.lastPress = s.last_press || {};
     // additive field — old front-ends simply ignore it.
     state.encRunning = s.encoder_running || {};
     // the server remembers the last read-back per device, so the
@@ -1044,12 +1050,23 @@ function renderDevices() {
     });
     if (li.getAttribute("aria-label") !== label) li.setAttribute("aria-label", label);
 
-    const sub = reason || d.address || "";
+    // WS-637：副标题与「刚按下」判定在同一次渲染里一起算 —— 先写地址再打补丁
+    // 的话，补丁活不过下一次轮询。命中时副标题换成输入编号、颜色用强调色。
+    const view = window.DeviceRow.deviceRowView({
+      connected: !!d.connected,
+      devId: d.dev_id,
+      address: d.address,
+      reason,
+      lastPress: state.lastPress,
+    });
+    const sub = view.text;
     if (li._sub.textContent !== sub) li._sub.textContent = sub;
-    const subClass = reason ? "reason" : "";
+    const subClass = view.hit ? "dev-hit-sub" : reason ? "reason" : "";
     if (li._sub.className !== subClass) li._sub.className = subClass;
-    // 地址同样可能被截断，悬停提示用全文（失败原因本来就是全文）。
+    // 地址同样可能被截断，悬停提示用全文（命中时与副标题同步成编号）。
     if (li._sub.title !== sub) li._sub.title = sub;
+    // 命中态只换成强调色描边 + 卡片底：行高、padding、无动效都不变（52 px）。
+    if (li.classList.contains("dev-hit") !== view.hit) li.classList.toggle("dev-hit", view.hit);
   });
 
   // 扫描后设备可能消失：移除对应的行。
