@@ -558,6 +558,11 @@ textarea:focus-visible {
 }
 .device:hover { background: var(--card); }
 .device.active { background: var(--card); border-color: rgba(53, 224, 194, 0.35); }
+/* WS-637：刚按下过的那一行。选中行自己的 .device.active 描边特异性同为
+   两级且颜色更弱，这里用 .device.dev-hit 保证命中时确实是 --accent 描边；
+   只改颜色不动行高 / padding，也不加动效。 */
+.device.dev-hit { border-color: var(--accent); }
+.dev-hit { background: var(--card); }
 .dev-main { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
 /* 设备名与副标题都单行省略，长名字/长地址只出省略号，不会把行撑高。 */
 .dev-main b {
@@ -570,6 +575,9 @@ textarea:focus-visible {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .dev-main small.reason { color: var(--warn); }
+/* WS-637：命中时副标题（「按键 N / 输入 N」）用强调色，与描边同一信号。
+   带上 .dev-main small 前缀，否则压不过上面 .dev-main small 的 --muted。 */
+.dev-main small.dev-hit-sub { color: var(--accent); }
 .device-empty { color: var(--muted); font-size: var(--fs-sm); padding: var(--sp-3); }
 .device-empty b { display: block; color: var(--text); margin-bottom: var(--sp-2); }
 .device-empty span { display: block; line-height: 1.8; }

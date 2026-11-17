@@ -638,6 +638,8 @@
   "ui.device_address": "设备地址",
   "ui.device_and_host": "设备与上位机",
   "ui.device_intro": "引脚按实际接线调整；应用后立即生效并写入设备 NVS。",
+  "ui.device_last_input": "输入 {n}",
+  "ui.device_last_key": "按键 {n}",
   "ui.device_list": "设备列表",
   "ui.device_model": "设备型号",
   "ui.device_name": "设备名",
