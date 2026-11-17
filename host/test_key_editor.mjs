@@ -118,6 +118,12 @@ async function loadApp() {
     querySelector(sel) {
       if (registry[sel]) return registry[sel][0];
       if (sel === "#keyGrid") return grid;
+      // 生产 keys.js 的 refreshKeyCard() 用 `.keycard[data-idx="N"]` 找卡片；
+      // 桩若每次都新建节点，改写就会落到一个游离对象上，摘要文本永远断言不到。
+      const card = /^\.keycard\[data-idx="(\d+)"\]$/.exec(sel);
+      if (card) {
+        return gridCards()[parseInt(card[1], 10)] || makeEl(sel);
+      }
       return makeEl(sel);
     },
     querySelectorAll(sel) {
@@ -183,6 +189,7 @@ async function loadApp() {
 globalThis.__host = {
   state, renderKeys, applyRunningState, highlightKeys, openKeyDrawer, closeKeyDrawer,
   setCardRunning, inputCount, keyHidText, syncKeySelection,
+  ensureModsCapability, redetectModsCapability,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -427,4 +434,53 @@ test("WS-550：mods_supported=false 时摘要只显示主键（显示 == 实际�
   host.state.cfg = { mods_supported: false };
   assert.equal(host.keyHidText(item), "F13",
     "门控为 False 时摘要只显示主键，不出现「显示 Ctrl、实际不发」");
+});
+
+/* ---------------- 用例：WS-618 结论写回 / 重新检测 ---------------- */
+
+test("WS-618：结论由 unknown 写回 false 后摘要卡立即只显示主键", async () => {
+  // 生产入口：app.js 的 ensureModsCapability()（vm 桩加载，不是副本）。
+  // 修复前它只调 renderKeyDrawer()，抽屉关着时摘要卡一直停在「Ctrl + F13」。
+  const { host, sandbox, grid } = await loadApp();
+  const cfg = makeCfg(10);
+  cfg.mods_supported = null;          // VERSION 变化后重探的初始态
+  cfg.keys[0].mods = 1;               // Ctrl + F13
+  host.state.cfg = cfg;
+  host.state.editingKey = null;       // 抽屉关着：只有摘要卡会变
+  host.renderKeys();
+  assert.equal(grid.children[0].querySelector(".kc-hid").textContent, "Ctrl + F13",
+    "结论未知时摘要照常显示修饰键");
+
+  sandbox.api = async () => ({ sent: true, supported: false, reason: "unsupported" });
+  await host.ensureModsCapability();
+
+  assert.equal(cfg.mods_supported, false);
+  assert.equal(grid.children[0].querySelector(".kc-hid").textContent, "F13",
+    "写回 false 后摘要卡必须重绘：显示 == 实际下发");
+});
+
+test("WS-618：旧固件点「重新检测」不会暂时打开修饰键门控", async () => {
+  // 修复前 redetectModsCapability() 先把 cfg.mods_supported 清成 null，
+  // 超时结果又是 null —— 抽屉与摘要都退回「支持」，apply_device 会发 CFG:MODS。
+  const { host, sandbox, grid } = await loadApp();
+  const cfg = makeCfg(10);
+  cfg.mods_supported = false;         // 已判定旧固件
+  cfg.keys[0].mods = 1;
+  host.state.cfg = cfg;
+  host.state.editingKey = null;
+  host.renderKeys();
+  assert.equal(grid.children[0].querySelector(".kc-hid").textContent, "F13");
+
+  let calledPath = null;
+  sandbox.api = async (path) => {
+    calledPath = String(path);
+    return { sent: true, supported: null, reason: "probe_timeout" };
+  };
+  await host.redetectModsCapability();
+
+  assert.match(calledPath, /\/mods\?reset=1$/, "重新检测要带 ?reset=1");
+  assert.equal(cfg.mods_supported, false, "未定论的重探必须保留原 false 结论");
+  assert.equal(host.keyHidText(cfg.keys[0]), "F13",
+    "重探期间/之后摘要都不能重新出现修饰键");
+  assert.equal(grid.children[0].querySelector(".kc-hid").textContent, "F13");
 });
