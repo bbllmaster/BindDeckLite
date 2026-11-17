@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.11"  // WS-626: 编码器旋转方向反转（CFG:ENCDIR）；1.3.10 为 WS-546 修饰键
+#define FW_VERSION "1.3.12"  // WS-635: 配网 OTA 中断复位（g_portalOtaActive / Update.abort）；1.3.11 为 WS-626
 
 #define FW_MODEL   "Lite"
 
