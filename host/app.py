@@ -125,6 +125,12 @@ _lock = threading.RLock()
 _events = deque(maxlen=400)
 _event_seq = 0
 _last_press = {}          # dev_id -> (index, timestamp)
+# WS-641: per-device encoder rotation counters for the encoder page self-check.
+# dev_id -> {"cw": int, "ccw": int, "last_dir": "CW"|"CCW", "at": timestamp}
+# Session only: never persisted, never sent to the device. The direction word is
+# the one the firmware already sends (it applies CFG:ENCDIR before emitting
+# ``ENC:``), so nothing here flips it a second time.
+_enc_stats = {}
 _action_running = {}      # (dev_id, idx) -> {"started", "token", "thread", "cancel"}; WS-359/360, WS-495
 _action_token_seq = 0     # bumped under _lock, one token per claim
 # WS-389: encoder rotation actions share the same preemption model as keys, but
@@ -1863,6 +1869,47 @@ ble = BleLinkManager(on_line=lambda dev_id, line: _on_line(dev_id, line),
                      on_diag=_on_ble_diag)
 
 
+def _record_enc_rotation(dev_id: str, direction: str):
+    """WS-641: count one ``ENC:`` line for the encoder-page self-check.
+
+    The counters are what makes "the encoder is wired but reversed" visually
+    different from "the encoder is dead": a dead A/B line produces no ``ENC:``
+    at all, a reversed one still ticks — into the other column. Direction is
+    whatever the firmware sent; the host must not invert it again.
+    """
+    if direction not in ("CW", "CCW"):
+        return
+    now = time.time()
+    with _lock:
+        stats = _enc_stats.get(dev_id)
+        if stats is None:
+            stats = _enc_stats[dev_id] = {"cw": 0, "ccw": 0,
+                                          "last_dir": direction, "at": now}
+        stats["cw" if direction == "CW" else "ccw"] += 1
+        stats["last_dir"] = direction
+        stats["at"] = now
+
+
+def _enc_stats_snapshot() -> dict:
+    """WS-641: ``/api/status`` shape — per-device counts plus a relative age.
+
+    ``age`` mirrors ``last_press``: the server owns the clock, so the browser
+    never has to compare its own ``Date.now()`` against a device timestamp.
+    """
+    now = time.time()
+    with _lock:
+        stats = {dev_id: dict(values) for dev_id, values in _enc_stats.items()}
+    return {
+        dev_id: {
+            "cw": values["cw"],
+            "ccw": values["ccw"],
+            "last_dir": values["last_dir"],
+            "age": round(now - values["at"], 2),
+        }
+        for dev_id, values in stats.items()
+    }
+
+
 def _on_line(dev_id: str, line: str):
     dev_id = dev_id or ""
 
@@ -1933,6 +1980,9 @@ def _on_line(dev_id: str, line: str):
     if line.startswith("ENC:"):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
+        # WS-641: count before dispatching — the self-check must reflect what
+        # the device really sent, including while a host action is still busy.
+        _record_enc_rotation(dev_id, direction)
         add_event("enc", t("ui.input_encoder_cw") if direction == "CW"
                   else t("ui.input_encoder_ccw"), dev_id)
         # WS-389: mode 4 ("上位机动作") may bind a host-side action to each
@@ -4501,6 +4551,9 @@ def api_status():
         "actions_enabled": _config["settings"].get("actions_enabled", True),
         "last_press": {k: {"index": v[0], "age": round(time.time() - v[1], 2)}
                        for k, v in last.items()},
+        # WS-641: additive — session CW/CCW counters for the encoder self-check.
+        # Old front-ends ignore it; a missing field keeps the bar hidden.
+        "encoder_stats": _enc_stats_snapshot(),
         # WS-359: additive field — old front-ends simply ignore it.
         "running": _running_snapshot(),
         # WS-389: additive — encoder rotation actions executing, per direction.
