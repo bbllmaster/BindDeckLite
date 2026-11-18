@@ -162,6 +162,9 @@ async function loadApp() {
   });
   [
     "#encoderModes", "#encoderModeDesc", "#encoderActions", "#encoderDisabledNote",
+    // WS-641：自检条（wrap 会重建 #encoderModes 的子节点，这几个节点本身不重建）。
+    "#encoderSelfCheck", "#encSelfCw", "#encSelfCcw", "#encoderSelfRecent",
+    "#btnEncSelfClear", "#encoderDirSegments", "#encoderDirNote",
     "#stripConn", "#stripUptime", "#stripHeap", "#stripFw",
     "#sysInfo", "#sysSampleAt", "#fwOnlinePane", "#fwLocalPane", "#btnFwLocal",
   ].forEach((sel) => { registry[sel] = [makeEl(sel)]; });
@@ -181,11 +184,14 @@ async function loadApp() {
   run("reconnect_sync.js");
   run("cfg_status.js");
   run("keys.js");
+  // WS-641：编码器自检的计数口径（app.js 的 renderEncoderSelfCheck 依赖它）。
+  run("encoder_stats.js");
 
   const appSrc = readFileSync(new URL("app.js", STATIC_DIR), "utf8");
   vm.runInContext(appSrc + `
 globalThis.__host = {
-  state, renderEncoder, renderEncoderActions, renderStatusStrip, renderSysinfo,
+  state, renderEncoder, renderEncoderActions, renderEncoderSelfCheck,
+  clearEncoderSelfCheck, renderStatusStrip, renderSysinfo,
   setFwMethod, is12Key,
 };
 `, sandbox, { filename: "app.js" });
@@ -264,6 +270,66 @@ test("12 键布局：整组分段锁定，不靠 opacity 表达", async () => {
   assert.doesNotMatch(lockedRule[1], /opacity/, "锁定态不能用 opacity");
   assert.match(css, /\.enc-segmented\.locked \{[^}]*--surface-sunken/,
     "锁定态容器改用 --surface-sunken");
+});
+
+/* ---------------- 编码器：旋转自检（WS-641） ---------------- */
+
+test("自检条：计数 / 最近 / 清零零副作用 / 12 键与预览隐藏", async () => {
+  const { host, registry, sandbox } = await loadApp();
+  const bar = () => registry["#encoderSelfCheck"][0];
+  const cw = () => registry["#encSelfCw"][0].textContent;
+  const ccw = () => registry["#encSelfCcw"][0].textContent;
+  const recent = () => registry["#encoderSelfRecent"][0].textContent;
+
+  // 12 键布局没有编码器：整条隐藏（面板级「编码器不可用」说明保留）。
+  host.state.cfg = makeCfg({ layout: 0 });
+  host.state.devices = [{ dev_id: "t1", connected: true }];
+  host.state.selected = "t1";
+  host.state.encoderStats = { t1: { cw: 5, ccw: 0, last_dir: "CW", age: 0.3 } };
+  host.renderEncoder();
+  assert.equal(bar().hidden, true, "12 键布局不显示自检条");
+
+  // 编码器布局 + 已连接：两列计数与「最近」都出现。
+  host.state.cfg = makeCfg();
+  host.renderEncoder();
+  assert.equal(bar().hidden, false);
+  assert.equal(cw(), "5");
+  assert.equal(ccw(), "0");
+  assert.match(recent(), /顺时针/);
+  assert.match(recent(), /0\.3 s/);
+
+  // 预览模式没有「这台设备」：整条隐藏。
+  host.state.preview = true;
+  host.renderEncoderSelfCheck();
+  assert.equal(bar().hidden, true);
+  host.state.preview = false;
+
+  // 清零：计数归零、最近清空，且不发请求、不标脏。
+  let calls = 0;
+  sandbox.api = async () => { calls += 1; throw new Error("clear must not call the API"); };
+  host.state.dirty = false;
+  host.clearEncoderSelfCheck();
+  assert.equal(cw(), "0");
+  assert.equal(ccw(), "0");
+  assert.equal(recent(), "转动编码器开始自检");
+  assert.equal(calls, 0, "清零不能发 HTTP");
+  assert.equal(host.state.dirty, false, "清零不能让顶栏变成「有未下发修改」");
+
+  // 清零后立刻又来一条 CW：从 1 开始（基线语义，不是从累计值 6 开始）。
+  host.state.encoderStats = { t1: { cw: 6, ccw: 0, last_dir: "CW", age: 0.05 } };
+  host.renderEncoderSelfCheck();
+  assert.equal(cw(), "1");
+
+  // 断开：计数停住不动，文案改成「已断开，计数暂停」。
+  host.state.devices = [{ dev_id: "t1", connected: false }];
+  host.renderEncoderSelfCheck();
+  assert.equal(cw(), "1", "断开不能让计数清零或回退");
+  assert.equal(recent(), "已断开，计数暂停");
+
+  // 旧后端没有 encoder_stats：整条隐藏，不渲染成「转过 0 次」。
+  host.state.encoderStats = null;
+  host.renderEncoderSelfCheck();
+  assert.equal(bar().hidden, true);
 });
 
 /* ---------------- 设备页：状态条唯一事实源 ---------------- */

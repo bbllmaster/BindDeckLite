@@ -1055,6 +1055,61 @@ textarea.macro { resize: vertical; font-family: ui-monospace, Consolas, monospac
   font-size: var(--fs-sm); color: var(--muted);
 }
 
+/* WS-641：旋转自检条（左计数 / 中最近方向 / 右清零）。它读的是同一条 1.2 s
+   轮询，所以样式上跟方向行同一层卡片语言；计数用等宽 + min-width，数字从
+   9 跳到 10 也不推着「最近」左右晃。窄窗允许折行，不清零方向胶囊。 */
+.enc-self {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card-2);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+.enc-self[hidden] { display: none; }
+.enc-self-counts {
+  display: flex; align-items: center;
+  gap: var(--sp-2);
+  flex: 0 0 auto;
+}
+.enc-self-label { color: var(--muted); }
+.enc-self-count {
+  display: inline-flex; align-items: baseline;
+  gap: var(--sp-1);
+  color: var(--text);
+}
+.enc-self-glyph { color: var(--muted); }
+.enc-self-num {
+  min-width: 3ch;
+  font-family: ui-monospace, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+  color: var(--text);
+}
+.enc-self-sep { color: var(--muted); }
+.enc-self-recent {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.enc-self-recent.is-frozen { color: var(--state-warn-fg); }
+.enc-self-clear {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-family: inherit; font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.enc-self-clear:hover { text-decoration: underline; }
+.enc-self-clear:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-control); }
+
 /* 当前模式的说明：5 段只放名字，描述集中在这里读。 */
 .enc-mode-desc {
   margin: 0 0 var(--sp-4);

@@ -110,6 +110,11 @@ const state = {
   // 侧栏行据此短暂显示「按键 N / 输入 N」；旧后端没有这个字段时是空对象。
   lastPress: {},
   encRunning: {},     // dev_id -> {"CW"|"CCW": 已运行秒数}，来源 /api/status
+  // WS-641：dev_id -> {cw, ccw, last_dir, age}，编码器自检的原始计数。
+  // null = 旧后端没有该字段，自检条保持隐藏。
+  encoderStats: null,
+  // WS-641：dev_id -> {cw, ccw, at}，「清零」只记前端基线（不发请求）。
+  encBaseline: {},
   readStatus: {},     // dev_id -> {at, fields, ok}，来源 /api/status 的 read 字段
   // WS-512：本次会话里成功从设备读取过的设备。下发确认用它避免重复骚扰；
   // 它不同于 trusted（trusted 会落盘，会话读取只活在内存）。
@@ -873,6 +878,10 @@ async function pollStatus() {
     state.lastPress = s.last_press || {};
     // additive field — old front-ends simply ignore it.
     state.encRunning = s.encoder_running || {};
+    // WS-641：编码器自检的累计计数。字段整张缺失 = 旧后端，保持 null，
+    // 自检条隐藏（不能把「后端不支持」渲染成「转过 0 次」）。
+    state.encoderStats =
+      s.encoder_stats && typeof s.encoder_stats === "object" ? s.encoder_stats : null;
     // the server remembers the last read-back per device, so the
     // device page keeps showing "上次读取" across a page reload.
     state.devices.forEach((d) => {
@@ -957,6 +966,8 @@ async function pollStatus() {
     highlightKeys(s.last_press || {});
     applyRunningState();
     applyEncoderRunningState();
+    // WS-641：自检条跟同一条轮询走 —— 没有额外的 fetch / setInterval。
+    renderEncoderSelfCheck();
     // 弹窗开着时，连接/OTA 状态变化要实时反映到固件区块（WS-577 验收 9）。
     const updateModal = $("#updateModal");
     if (updateModal && !updateModal.hidden) renderUpdateFw();
@@ -1582,6 +1593,9 @@ function renderEncoder() {
   // WS-626: the direction row shares the layout / capability gate, so it is
   // redrawn alongside the mode grid.
   renderEncoderDir();
+  // WS-641: the self-check bar is per device, so switching devices (or
+  // switching language) has to redraw it too.
+  renderEncoderSelfCheck();
 }
 
 /** WS-626：旋转方向反转（设备侧 CFG:ENCDIR）。两个胶囊按钮，当前值高亮；
@@ -1630,6 +1644,93 @@ function renderEncoderDir() {
     note.textContent = show ? t("ui.encoder_dir_unsupported") : "";
     note.hidden = !show;
   }
+}
+
+/* ---------------- encoder self-check (WS-641) ---------------- */
+
+/** 这台设备的原始自检计数；没有记录（还没转过）返回 null。 */
+function encoderStatsFor(devId) {
+  const table = state.encoderStats;
+  return table && devId ? table[devId] || null : null;
+}
+
+/** 当前选中设备是否连着（未选中 / 预览都算断开，计数冻结）。 */
+function encoderSelfConnected() {
+  const dev = state.devices.find((d) => d.dev_id === state.selected);
+  return !!(dev && dev.connected);
+}
+
+/** 0.8 / 3.2 这样的秒数文字；>10 s 时不保留小数位。 */
+function fmtEncAge(age) {
+  const n = Number(age) || 0;
+  return (n < 10 ? n.toFixed(1) : String(Math.round(n))) + " s";
+}
+
+/**
+ * 画编码器自检条：左计数 / 中最近方向 / 右清零。
+ *
+ * 判定口径在 `EncoderStats.view()`（纯函数，Node 测试直接 import）；这里
+ * 只做显隐与文案。显隐沿用面板的布局判定：12 键没有编码器、预览模式没有
+ * 「这台设备」，两种都隐藏。旧后端没有 `encoder_stats` 时同样隐藏 ——
+ * 显示一个永远 0 的计数比不显示更容易误导。
+ */
+function renderEncoderSelfCheck() {
+  const box = $("#encoderSelfCheck");
+  if (!box) return;
+  // 页面与 app.js 版本不一致（例如浏览器缓存了旧 index.html）时模块可能不在：
+  // 整条隐藏即可，不能让编码器页其余部分跟着挂掉。
+  if (!window.EncoderStats) {
+    box.hidden = true;
+    return;
+  }
+  const view = window.EncoderStats.view({
+    stats: state.encoderStats,
+    devId: state.selected,
+    baseline: state.selected ? state.encBaseline[state.selected] : null,
+    connected: encoderSelfConnected(),
+    now: Date.now() / 1000,
+  });
+  const show = view.available && !!state.selected && !state.preview && !is12Key();
+  box.hidden = !show;
+  if (!show) return;
+
+  const cwEl = $("#encSelfCw");
+  const ccwEl = $("#encSelfCcw");
+  if (cwEl) cwEl.textContent = String(view.cw);
+  if (ccwEl) ccwEl.textContent = String(view.ccw);
+
+  const recent = $("#encoderSelfRecent");
+  if (recent) {
+    if (view.frozen) {
+      recent.textContent = t("ui.encoder_self_paused");
+    } else if (view.recent) {
+      const dir = t(view.recent.dir === "CW" ? "ui.encoder_self_cw" : "ui.encoder_self_ccw");
+      recent.textContent = t("ui.encoder_self_recent", {
+        dir,
+        age: fmtEncAge(view.recent.age),
+      });
+    } else {
+      recent.textContent = t("ui.encoder_self_idle");
+    }
+    recent.classList.toggle("is-frozen", view.frozen);
+  }
+
+  const btn = $("#btnEncSelfClear");
+  if (btn) btn.onclick = clearEncoderSelfCheck;
+}
+
+/**
+ * 「清零」：只记一条前端基线，两个计数与「最近」就地归零。
+ *
+ * 不发 HTTP、不写 `CFG:`、不调 `markDirty()` —— 这是看数用的，不是配置；
+ * 顶栏徽标必须保持「已同步」，设备侧也不会因为点一下而多收一行命令。
+ */
+function clearEncoderSelfCheck() {
+  const devId = state.selected;
+  if (!devId) return;
+  state.encBaseline[devId] = window.EncoderStats.makeBaseline(
+    encoderStatsFor(devId), Date.now() / 1000);
+  renderEncoderSelfCheck();
 }
 
 /* ---------------- encoder rotation actions ---------------- */

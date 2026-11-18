@@ -152,6 +152,30 @@
              aria-label="旋转方向" data-i18n-aria-label="ui.encoder_dir_label"></div>
         <p class="enc-dir-note" id="encoderDirNote" hidden></p>
       </div>
+      <!-- WS-641: 旋转自检。数据搭下面那条 1.2 s 轮询（/api/status 的
+           encoder_stats），不新增请求也不挂定时器；计数用等宽数字 + 固定
+           宽度，免得 9→10 时把中间的「最近」推着走。 -->
+      <div class="enc-self" id="encoderSelfCheck" hidden>
+        <span class="enc-self-counts">
+          <span class="enc-self-label" data-i18n="ui.encoder_self_session">本次会话</span>
+          <span class="enc-self-count">
+            <span class="enc-self-glyph" role="img"
+                  data-i18n-aria-label="ui.encoder_self_cw"
+                  data-i18n-title="ui.encoder_self_cw">↻</span><span class="enc-self-num" id="encSelfCw">0</span>
+          </span>
+          <span class="enc-self-sep" aria-hidden="true">·</span>
+          <span class="enc-self-count">
+            <span class="enc-self-glyph" role="img"
+                  data-i18n-aria-label="ui.encoder_self_ccw"
+                  data-i18n-title="ui.encoder_self_ccw">↺</span><span class="enc-self-num" id="encSelfCcw">0</span>
+          </span>
+        </span>
+        <span class="enc-self-recent" id="encoderSelfRecent"></span>
+        <button class="enc-self-clear" id="btnEncSelfClear" type="button"
+                data-i18n="ui.encoder_self_clear"
+                data-i18n-title="ui.encoder_self_clear_title"
+                data-i18n-aria-label="ui.encoder_self_clear_title">清零</button>
+      </div>
       <p class="enc-mode-desc" id="encoderModeDesc"></p>
       <div id="encoderActions"></div>
       <details class="enc-note">
@@ -699,6 +723,7 @@
 <script src="/static/reconnect_sync.js"></script>
 <script src="/static/cfg_status.js"></script>
 <script src="/static/device_row.js"></script>
+<script src="/static/encoder_stats.js"></script>
 <script src="/static/actions_io_preview.js"></script>
 <script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
