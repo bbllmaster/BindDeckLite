@@ -109,8 +109,8 @@ function loadApp() {
   [
     "#logList", "#logEmpty", "#logDev", "#logDevLabel", "#logKind",
     "#logSearch", "#logLevelChips", "#btnLogFilterReset", "#btnLogEmptyReset",
-    "#btnLogMoreFilters", "#logMoreFilters", "#helpModal", "#btnHelp",
-    "#btnHelpClose", "#helpSearch", "#helpToc",
+    "#btnLogMoreFilters", "#logMoreFilters", "#btnLogExport", "#helpModal",
+    "#btnHelp", "#btnHelpClose", "#helpSearch", "#helpToc",
   ].forEach(reg);
 
   const sections = [
@@ -165,6 +165,7 @@ function loadApp() {
     JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
+  run("log_export.js");
   run("reconnect_sync.js");
   run("cfg_status.js");
   run("keys.js");
@@ -263,6 +264,41 @@ test("清除全部过滤：空态出现，点按钮后过滤条件 / 控件 / �
   assert.equal(chipEls.filter((b) => b.classList.contains("active")).length, 1,
     "只剩「全部」胶囊选中");
   assert.equal(chipEls[0].getAttribute("aria-pressed"), "true");
+});
+
+/* ---------------- 日志行：3 列 ---------------- */
+
+test("日志导出按钮：按当前可见行数禁用 / 启用，且不改筛选与暂停状态", () => {
+  const { host, el } = loadApp();
+  const btn = el("#btnLogExport");
+  const list = el("#logList");
+
+  // 空列表：0 行禁用，title 说明原因。
+  host.state.logFilter = { kind: "", level: "", q: "", dev: "" };
+  host.state.logFollow = false;
+  host.syncLogFilterChrome();
+  assert.equal(btn.disabled, true);
+  assert.equal(btn.title, "没有可导出的日志");
+
+  // 2 行可见 + 1 行被筛掉：按钮可点，判定只看可见行。
+  const row = (level, hidden) => {
+    const r = makeEl("div.log-row");
+    r.hidden = hidden;
+    r.dataset = { kind: "key", level, dev: "" };
+    list.appendChild(r);
+    return r;
+  };
+  row("error", false);
+  row("error", false);
+  row("info", true);
+  host.state.logFilter = { kind: "", level: "error", q: "", dev: "" };
+  host.syncLogFilterChrome();
+  assert.equal(btn.disabled, false);
+  assert.equal(btn.title, "导出当前筛选命中的日志");
+
+  // 只读：按钮态重算不动筛选条件，也不动「跟随 / 暂停」。
+  assert.equal(host.state.logFilter.level, "error");
+  assert.equal(host.state.logFollow, false);
 });
 
 /* ---------------- 日志行：3 列 ---------------- */

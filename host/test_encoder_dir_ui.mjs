@@ -167,6 +167,7 @@ function loadApp() {
     JSON.parse(readFileSync(new URL("../locales/zh-CN.json", STATIC_DIR), "utf8")), "zh-CN");
   run("log_follow.js");
   run("log_device.js");
+  run("log_export.js");
   run("reconnect_sync.js");
   run("cfg_status.js");
   run("keys.js");

@@ -137,6 +137,7 @@ function loadApp({ preloadZh = true } = {}) {
   }
   run("log_follow.js");
   run("log_device.js");
+  run("log_export.js");
   run("reconnect_sync.js");
   run("keys.js");
 
