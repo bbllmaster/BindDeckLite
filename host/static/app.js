@@ -3274,8 +3274,9 @@ function resetLogFilters() {
 function syncLogFilterChrome() {
   const list = $("#logList");
   const empty = $("#logEmpty");
+  const rows = list ? Array.from(list.children) : [];
+  const anyVisible = rows.some((row) => !row.hidden);
   if (empty && list) {
-    const anyVisible = Array.from(list.children).some((row) => !row.hidden);
     empty.hidden = !(logFilterActive() && list.children.length > 0 && !anyVisible);
   }
   const reset = $("#btnLogFilterReset");
@@ -3285,6 +3286,19 @@ function syncLogFilterChrome() {
   if (moreBtn) {
     const f = state.logFilter;
     moreBtn.classList.toggle("active", !!(f && (f.kind || f.dev)));
+  }
+  // WS-646：导出按「当前筛选命中的行数」驱动，不改任何过滤 / 暂停状态。
+  // 导出进行中由 logExportBusy 说话：轮询 / 加行 / 改筛选 / 切语言都会走到
+  // 这里，如果照常按行数算 disabled，就会把「导出中」重新算成「可点」，
+  // 于是能弹出第二个保存框。busy 只由 exportVisibleLog 的 finally 清。
+  const exportBtn = $("#btnLogExport");
+  if (exportBtn) {
+    const st = window.LogExport.exportButtonState(
+      rows.filter((row) => !row.hidden).length, logExportBusy);
+    exportBtn.disabled = st.disabled;
+    exportBtn.title = st.title;
+    // 切语言会把 data-i18n 的按钮文案刷回「导出…」，导出中要拉回「导出中…」。
+    if (logExportBusy) exportBtn.textContent = t("log.export_busy");
   }
 }
 
@@ -3454,8 +3468,11 @@ async function pollLog() {
     syncLogDeviceUi();
 
     // 裁剪前后的内容高度差 = 被移除行占掉的高度，暂停态要补回滚动位置。
+    // 上限与导出头部的「屏幕最多保留 N 行」是同一个常量，不能各写一份数字。
     const heightBeforeTrim = list.scrollHeight;
-    while (list.children.length > 300) list.removeChild(list.firstChild);
+    while (list.children.length > window.LogExport.VIEW_MAX) {
+      list.removeChild(list.firstChild);
+    }
     const removedHeight = Math.max(0, heightBeforeTrim - list.scrollHeight);
 
     // 计数按实际新增、且过滤后可见的行数累加（裁剪前统计），不按批次 +1。
@@ -3524,6 +3541,81 @@ async function copyLogLine(text, btn) {
     btn.textContent = label;
     btn.classList.remove("copied");
   }, 1200);
+}
+
+/* ---------------- 日志导出（WS-645 / WS-646） ----------------
+ * 只读：取当前筛选命中的可见行 → 头部 5 行 + 正文，交给后端保存。
+ * 文案拼装、行文本、按钮态、文件名都在 static/log_export.js（纯函数），
+ * 这里只接 DOM 与网络；不发 CFG:/CMD:，不动筛选、暂停与跟随状态。
+ */
+
+// 导出是否正在进行。这是**唯一**的防重依据：轮询会反复重算按钮态，读
+// btn.disabled 反推会把它算回「可点」，第二个保存对话框就这么来的。
+let logExportBusy = false;
+
+async function exportVisibleLog() {
+  const btn = $("#btnLogExport");
+  const list = $("#logList");
+  if (!btn || !list || logExportBusy) return;
+
+  const rows = Array.from(list.children);
+  if (!rows.some((row) => !row.hidden)) return;   // 0 行：按钮本就禁用
+
+  // 先置忙再取版本：慢请求期间再点一次也只会有一个保存对话框。
+  logExportBusy = true;
+  btn.disabled = true;
+  btn.textContent = t("log.export_busy");
+  try {
+    // 上位机版本只进头部，取不到就写 "—"（不编造版本号）。
+    let version = "";
+    try {
+      version = (await api("/api/app/version")).version || "";
+    } catch (_) {
+      /* 旧后端没有该端点：头部留空即可 */
+    }
+    const desktop = state.desktop || {};
+    const devLabel = state.logFilter.dev
+      ? window.LogDevice.deviceDisplayName(state.logFilter.dev, state.devices)
+      : "";
+    const now = new Date();
+    const payload = window.LogExport.buildExportText({
+      rows,
+      devices: state.devices,
+      now,
+      version,
+      mode: desktop.frozen || desktop.desktop_mode ? "desktop" : "browser",
+      filter: state.logFilter,
+      devLabel,
+    });
+    if (!payload.count) return;
+
+    const r = await api("/api/log/export", {
+      method: "POST",
+      body: JSON.stringify({
+        text: payload.text,
+        count: payload.count,
+        suggested_name: window.LogExport.suggestFileName(devLabel, now),
+      }),
+    });
+    // 用户取消保存对话框：不弹 toast、不记日志（后端也没写文件）。
+    if (r.cancelled) return;
+    if (r.fallback === "clipboard") {
+      // 浏览器模式 / 无原生对话框：正文进剪贴板，并说清复制了多少行。
+      const ok = await copyText(payload.text);
+      toast(ok
+        ? t("log.export_copied", { count: payload.count })
+        : t("log.export_copy_failed"), ok ? "" : "bad");
+      return;
+    }
+    toast(t("log.export_ok", { count: payload.count, path: r.path }), "ok");
+  } catch (err) {
+    toast(t("log.export_failed", { detail: err.message }), "bad");
+  } finally {
+    logExportBusy = false;
+    btn.textContent = t("log.export_btn");
+    // 重新按当前可见行数决定 disabled / title（导出期间日志可能被清空）。
+    syncLogFilterChrome();
+  }
 }
 
 /* ---------------- misc ---------------- */
@@ -3743,6 +3835,8 @@ function retranslateLog() {
   $$("#logList .log-more summary").forEach((s) => {
     s.textContent = t("ui.log_view_more");
   });
+  // WS-646：「导出…」的文案与 title 都是 JS 写的，切语言要跟着重算。
+  syncLogFilterChrome();
 }
 
 /** 切语言后重绘动态内容；表单与选中的设备都来自 state，不会丢。 */
@@ -4029,6 +4123,7 @@ async function init() {
     }
   };
   $("#btnApply").onclick = applyConfig;
+  $("#btnLogExport").onclick = exportVisibleLog;
   $("#btnClearLog").onclick = () => {
     $("#logList").innerHTML = "";
     // 清空后没有可读的旧行，强制回跟随。

@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -1326,6 +1327,51 @@ def _atomic_write_json(path: str, payload) -> None:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --- 日志导出（WS-646） ---------------------------------------------------
+# 日志缓冲区是内存 deque(maxlen=400)，只按 seq 增量提供 GET /api/log；
+# 导出把「当前筛选命中的行」原样落盘，供用户直接当附件交出来。文本由前端
+# 拼好（行格式与单行「复制」同源），后端只负责选路径与写盘。
+LOG_EXPORT_NAME_MAX = 120
+
+
+def sanitize_log_export_name(name: str) -> str:
+    """建议文件名 → 只含 ``[A-Za-z0-9._-]`` 的安全名。
+
+    设备名可能带空格、中文、MAC 冒号或路径分隔符，一律替换成 ``_``；
+    连续下划线合并，首尾的点/下划线去掉。净化后为空时给一个通用名，
+    长度上限防止超长设备名撑破文件系统限制。
+    """
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or ""))
+    clean = re.sub(r"_+", "_", clean).strip("._")[:LOG_EXPORT_NAME_MAX]
+    if not clean:
+        return "BindDeckLite-log.txt"
+    if not clean.lower().endswith(".txt"):
+        clean += ".txt"
+    return clean
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """UTF-8 **带 BOM** 写文本（目标场景是记事本 / 聊天窗口）。
+
+    临时文件 + ``os.replace``：写失败时不会留下半份文件，也不会破坏用户
+    原本选中的同名旧文件。``newline="\\n"`` 保证内容逐字落盘，不被平台
+    换成 CRLF。
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8-sig", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except (OSError, UnicodeError):
+        # UnicodeError（孤立代理项等编码失败）不是 OSError：只捕 OSError 会
+        # 把 0 字节的 .tmp 留在用户目录里。
         try:
             os.remove(tmp)
         except OSError:
@@ -6730,6 +6776,50 @@ def api_log():
     with _lock:
         items = [e for e in _events if e["seq"] > since_i]
     return jsonify({"events": items, "seq": _event_seq})
+
+
+@app.route("/api/log/export", methods=["POST"])
+def api_log_export():
+    """把前端拼好的日志文本写到用户选定的文件（WS-646）。
+
+    只读写本机文件：不发 ``CFG:`` / ``CMD:``、不改 ``config.json``、不动
+    暂停/跟随与筛选状态。取消保存对话框时零副作用（不写文件、不记日志）；
+    没有原生对话框（浏览器模式 / 无 tkinter）时返回 ``fallback``，由前端
+    写剪贴板。
+    """
+    data = request.get_json(silent=True) or {}
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"ok": False,
+                        "error": t("error.log_export_empty")}), 400
+    try:
+        count = int(data.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        # 不允许导出空文件：前端 0 行时按钮已禁用，这里再兜一层。
+        return jsonify({"ok": False,
+                        "error": t("error.log_export_empty")}), 400
+
+    default_name = sanitize_log_export_name(
+        data.get("suggested_name") or "BindDeckLite-log.txt")
+    result = desktop.browse("save", default_name=default_name)
+    if not result.get("ok"):
+        # 没有原生保存对话框：改走剪贴板，不报「导出失败」。
+        return jsonify({"ok": True, "fallback": "clipboard"})
+    path = result.get("path") or ""
+    if not path:
+        # 用户取消：不写文件、不记日志。
+        return jsonify({"ok": False, "cancelled": True})
+    try:
+        atomic_write_text(path, text)
+    except (OSError, UnicodeError) as exc:
+        # 编码失败（代理项）与磁盘错误一样要回 JSON 原因，不能漏成 HTML 500。
+        return jsonify({"ok": False, "cancelled": False,
+                        "error": t("error.log_export_write_failed",
+                                   detail=exc)}), 500
+    add_event("desktop", t("log.export_ok", count=count, path=path), level="ok")
+    return jsonify({"ok": True, "cancelled": False, "path": path, "count": count})
 
 
 @app.route("/api/keycodes")

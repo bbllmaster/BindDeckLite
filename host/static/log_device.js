@@ -107,11 +107,15 @@
 
   /**
    * 单行复制文本：`HH:MM:SS [kind] [设备名] 正文`，dev 为空时不加设备段。
+   *
+   * `text` 可选：传渲染后的正文（`row._text`）时用它，切语言后导出仍与
+   * 屏幕一致；不传则沿用事件里的原始 `e.text`，单行「复制」行为不变。
    */
-  function logCopyText(event, devices) {
+  function logCopyText(event, devices, text) {
     const e = event || {};
     const dev = e.dev ? " [" + deviceDisplayName(e.dev, devices) + "]" : "";
-    return `${e.time} [${e.kind}]${dev} ${e.text}`;
+    const body = text === undefined || text === null ? e.text : text;
+    return `${e.time} [${e.kind}]${dev} ${body}`;
   }
 
   return {
