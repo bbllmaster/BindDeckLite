@@ -3288,11 +3288,17 @@ function syncLogFilterChrome() {
     moreBtn.classList.toggle("active", !!(f && (f.kind || f.dev)));
   }
   // WS-646：导出按「当前筛选命中的行数」驱动，不改任何过滤 / 暂停状态。
+  // 导出进行中由 logExportBusy 说话：轮询 / 加行 / 改筛选 / 切语言都会走到
+  // 这里，如果照常按行数算 disabled，就会把「导出中」重新算成「可点」，
+  // 于是能弹出第二个保存框。busy 只由 exportVisibleLog 的 finally 清。
   const exportBtn = $("#btnLogExport");
   if (exportBtn) {
-    const st = window.LogExport.exportButtonState(rows.filter((row) => !row.hidden).length);
+    const st = window.LogExport.exportButtonState(
+      rows.filter((row) => !row.hidden).length, logExportBusy);
     exportBtn.disabled = st.disabled;
     exportBtn.title = st.title;
+    // 切语言会把 data-i18n 的按钮文案刷回「导出…」，导出中要拉回「导出中…」。
+    if (logExportBusy) exportBtn.textContent = t("log.export_busy");
   }
 }
 
@@ -3462,8 +3468,11 @@ async function pollLog() {
     syncLogDeviceUi();
 
     // 裁剪前后的内容高度差 = 被移除行占掉的高度，暂停态要补回滚动位置。
+    // 上限与导出头部的「屏幕最多保留 N 行」是同一个常量，不能各写一份数字。
     const heightBeforeTrim = list.scrollHeight;
-    while (list.children.length > 300) list.removeChild(list.firstChild);
+    while (list.children.length > window.LogExport.VIEW_MAX) {
+      list.removeChild(list.firstChild);
+    }
     const removedHeight = Math.max(0, heightBeforeTrim - list.scrollHeight);
 
     // 计数按实际新增、且过滤后可见的行数累加（裁剪前统计），不按批次 +1。
@@ -3539,15 +3548,21 @@ async function copyLogLine(text, btn) {
  * 文案拼装、行文本、按钮态、文件名都在 static/log_export.js（纯函数），
  * 这里只接 DOM 与网络；不发 CFG:/CMD:，不动筛选、暂停与跟随状态。
  */
+
+// 导出是否正在进行。这是**唯一**的防重依据：轮询会反复重算按钮态，读
+// btn.disabled 反推会把它算回「可点」，第二个保存对话框就这么来的。
+let logExportBusy = false;
+
 async function exportVisibleLog() {
   const btn = $("#btnLogExport");
   const list = $("#logList");
-  if (!btn || !list || btn.disabled) return;
+  if (!btn || !list || logExportBusy) return;
 
   const rows = Array.from(list.children);
   if (!rows.some((row) => !row.hidden)) return;   // 0 行：按钮本就禁用
 
-  // 先禁用再取版本：慢请求期间再点一次也只会有一个保存对话框。
+  // 先置忙再取版本：慢请求期间再点一次也只会有一个保存对话框。
+  logExportBusy = true;
   btn.disabled = true;
   btn.textContent = t("log.export_busy");
   try {
@@ -3596,6 +3611,7 @@ async function exportVisibleLog() {
   } catch (err) {
     toast(t("log.export_failed", { detail: err.message }), "bad");
   } finally {
+    logExportBusy = false;
     btn.textContent = t("log.export_btn");
     // 重新按当前可见行数决定 disabled / title（导出期间日志可能被清空）。
     syncLogFilterChrome();

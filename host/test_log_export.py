@@ -44,7 +44,7 @@ SAMPLE_TEXT = (
     "导出时间: 2026-11-20 00:12:33\n"
     "上位机: v1.4.3（桌面版）\n"
     "筛选: 级别=错误 · 类型=全部 · 设备=全部 · 搜索=(无)\n"
-    "命中: 1 行（日志缓冲上限 400 行，更早的行已丢弃）\n"
+    "命中: 1 行（日志缓冲上限 400 行，屏幕最多保留 300 行，更早的行已不在列表里）\n"
     "\n"
     "00:00:01 [key] [BindDeckLite-A1B2] 按键 1\n"
 )
@@ -145,6 +145,37 @@ def test_export_write_failure_leaves_no_tmp(client, monkeypatch, tmp_path):
     assert not (tmp_path / "occupied.tmp").exists()
     assert target.is_dir()                    # 原来的目录没被替换掉
     assert len(host_app._events) == before    # 失败不记「已导出」
+
+
+# ---------------------------------------------------------------------------
+# 编码失败（孤立代理项）：回 JSON 原因，且不留 0 字节 .tmp（WS-649）
+# ---------------------------------------------------------------------------
+
+def test_export_unencodable_text_leaves_no_tmp(client, monkeypatch, tmp_path):
+    """``UnicodeEncodeError`` 不是 ``OSError``，只捕后者会留下半个文件。
+
+    文本里出现孤立代理项（``\\ud800``）时 UTF-8 编码会失败：要么 500 里
+    带原因、目录干净，要么就是用户拿到一个 0 字节的「导出成功」。
+    """
+    c, _ = client
+    out = tmp_path / "log.txt"
+    monkeypatch.setattr(host_app.desktop, "browse",
+                        lambda kind, default_name="": {"ok": True,
+                                                       "path": str(out)})
+    before = len(host_app._events)
+    # 请求体里直接写 JSON 转义 ``\\ud800``：解析后是一个孤立代理项，正是
+    # UTF-8 编码不了的输入（前端照抄事件正文时也可能带上类似的坏字符）。
+    resp = c.post("/api/log/export",
+                  data='{"text": "bad \\ud800 char", "count": 1}',
+                  content_type="application/json")
+
+    assert resp.status_code == 500
+    body = resp.get_json()
+    assert body["ok"] is False and body["cancelled"] is False
+    assert body["error"], "编码失败也要给出原因，不能是 HTML 500"
+    assert not out.exists()
+    assert not (tmp_path / "log.txt.tmp").exists()
+    assert len(host_app._events) == before
 
 
 # ---------------------------------------------------------------------------

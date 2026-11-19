@@ -1,10 +1,11 @@
-// WS-646 日志页「导出…」的前端回归用例。
+// WS-646 日志页「导出…」的前端回归用例（WS-649 补齐防重与 _text）。
 //
 // 运行：node --test test_log_export.mjs
 //
 // 断言对象是 host/static/log_export.js 里的**生产函数**（app.js 在浏览器里
-// 用的同一份），以及它所复用的 LogDevice.logCopyText —— 不在这里复制任何
-// 头部拼装 / 行格式化逻辑，改坏生产代码会让断言真的失败。
+// 用的同一份）、它所复用的 LogDevice.logCopyText，以及通过 app_harness.mjs
+// 加载的**生产 app.js** 本身 —— 不在这里复制任何头部拼装 / 行格式化 / 防重
+// 逻辑，改坏生产代码会让断言真的失败。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -12,9 +13,11 @@ import { readFileSync } from "node:fs";
 import LogExport from "./static/log_export.js";
 import LogDevice from "./static/log_device.js";
 import i18n from "./static/i18n.js";
+import { loadApp, makeEl } from "./app_harness.mjs";
 
 const {
   BUFFER_MAX,
+  VIEW_MAX,
   formatStamp,
   suggestFileName,
   exportButtonState,
@@ -53,8 +56,12 @@ test("头部固定 5 行，未生效的筛选项写「全部」「(无)」", () 
   assert.equal(header[1], "导出时间: 2026-11-20 00:12:33");
   assert.equal(header[2], "上位机: v1.4.3（桌面版）");
   assert.equal(header[3], "筛选: 级别=全部 · 类型=全部 · 设备=全部 · 搜索=(无)");
-  assert.equal(header[4], `命中: 12 行（日志缓冲上限 ${BUFFER_MAX} 行，更早的行已丢弃）`);
+  // WS-649：头部必须同时写出「内存缓冲 400」与「屏幕只留 300」，
+  // 否则用户会以为导出少了 100 行。
+  assert.equal(header[4], `命中: 12 行（日志缓冲上限 ${BUFFER_MAX} 行，屏幕最多保留 ${VIEW_MAX} 行，更早的行已不在列表里）`);
   assert.equal(BUFFER_MAX, 400);
+  assert.equal(VIEW_MAX, 300);
+  assert.ok(header[4].includes(String(BUFFER_MAX)) && header[4].includes(String(VIEW_MAX)));
 });
 
 // 2. 头部按实际生效项写：级别 / 类型用页面上的同一套标签，搜索词带引号，
@@ -71,7 +78,7 @@ test("头部按生效筛选写级别/类型/设备/搜索，搜索词原样带�
   assert.equal(header[2], "上位机: v1.4.3（浏览器）");
   assert.equal(header[3],
     "筛选: 级别=错误 · 类型=配置 cfg · 设备=BindDeckLite-A1B2 · 搜索=\"timeout\"");
-  assert.equal(header[4], `命中: 3 行（日志缓冲上限 ${BUFFER_MAX} 行，更早的行已丢弃）`);
+  assert.equal(header[4], `命中: 3 行（日志缓冲上限 ${BUFFER_MAX} 行，屏幕最多保留 ${VIEW_MAX} 行，更早的行已不在列表里）`);
 });
 
 // 3. 正文只取可见行、保持 DOM 顺序，且每一行都等于 logCopyText 的输出
@@ -164,5 +171,141 @@ test("切语言后头部用英文", () => {
   });
   assert.equal(header[0], "BindDeckLite log export");
   assert.equal(header[3], "Filter: level=All · kind=All · device=All · search=(none)");
-  assert.equal(header[4], `Matched: 5 rows (the buffer holds ${BUFFER_MAX} rows; older rows are gone)`);
+  assert.equal(header[4], `Matched: 5 rows (the buffer holds ${BUFFER_MAX} rows; the list keeps only the newest ${VIEW_MAX})`);
+  // 还原语言：i18n 是模块级单例，后面的用例仍按中文断言。
+  const zh = JSON.parse(readFileSync(new URL("locales/zh-CN.json", import.meta.url), "utf8"));
+  i18n.setMessages(zh, "zh-CN");
+});
+
+// 9. WS-649：正文取**渲染后**的 row._text，不是事件里的原始正文。
+//    切语言后屏幕上是英文，导出也必须是英文（两参调用 logCopyText 会退回归
+//    事件原文，这条断言就会红）。
+test("正文用 row._text 而不是事件原文（切语言后导出仍是屏幕上的字）", () => {
+  const event = { time: "00:00:05", kind: "key", dev: A, text: "按键 1" };
+  const out = buildExportText({
+    rows: [row(event, { _text: "Button 1" })],
+    devices: DEVICES, now: NOW, version: "v1.4.3",
+    mode: "desktop", filter: {}, devLabel: "",
+  });
+  assert.equal(out.count, 1);
+  assert.equal(out.rows[0], "00:00:05 [key] [BindDeckLite-A1B2] Button 1");
+  assert.ok(!out.text.includes("按键 1"), "不得回退到未渲染的事件正文");
+});
+
+// 10. WS-649：导出中恒禁用 —— 纯函数层面先钉住判定，再在下面用生产 app.js
+//     验证调用方真的把 busy 传了进来（只改一处都不够）。
+test("导出中按钮恒禁用，与命中行数无关", () => {
+  const busySome = exportButtonState(3, true);
+  assert.equal(busySome.disabled, true);
+  assert.equal(busySome.title, "导出中…");
+  assert.equal(exportButtonState(0, true).disabled, true);
+  // 不忙时按行数判定，行为不变。
+  assert.equal(exportButtonState(3, false).disabled, false);
+  assert.equal(exportButtonState(0, false).disabled, true);
+});
+
+/* ---------------- 导出防重（生产 app.js + 真实入口） ----------------
+ * 复现路径就是评审报告的那条：导出进行中（/api/log/export 未返回）时轮询
+ * 追加一行 → syncLogFilterChrome() 重算按钮态 → 再点一次。旧实现读
+ * btn.disabled 当状态，会被重新算成「可点」，于是发第二份请求、弹第二个
+ * 保存对话框。
+ */
+
+/** 让本轮微任务跑完：vm 里的 await 链在 test realm 之外，需要一次宏任务。 */
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** app.js 的 init() 也会发若干引导请求；只数导出流程自己的那两条。 */
+const EXPORT_URLS = ["/api/app/version", "/api/log/export"];
+const exportCalls = (calls) => calls.filter((u) => EXPORT_URLS.includes(u));
+
+/** 往 #logList 里放一行「屏幕上的日志」，字段与 buildLogRow 产出的一致。 */
+function appendRow(list, text = "按键 1") {
+  const row = makeEl("div.log-row");
+  row.dataset = { kind: "key", level: "info", dev: "" };
+  row._event = { time: "00:00:01", kind: "key", dev: "", text, level: "info" };
+  row._text = text;
+  row.hidden = false;
+  list.appendChild(row);
+  return row;
+}
+
+test("导出中轮询/改筛选/切语言都不会重新启用按钮，连点只发一次请求", async () => {
+  const calls = [];
+  // 永不 resolve：模拟保存对话框还开着、/api/log/export 没返回。
+  const hang = () => new Promise(() => {});
+  const { host, el } = loadApp({
+    fetch: (url) => { calls.push(url); return hang(); },
+  });
+  const btn = el("#btnLogExport");
+  const list = el("#logList");
+
+  host.state.logFilter = { kind: "", level: "", q: "", dev: "" };
+  host.state.logFollow = false;
+  appendRow(list);
+  host.syncLogFilterChrome();
+  assert.equal(btn.disabled, false, "有可见行时可点");
+
+  // 第一次点击：进入导出，卡在取版本号上。
+  void host.exportVisibleLog();
+  await flush();
+  assert.equal(btn.disabled, true);
+  assert.equal(btn.textContent, "导出中…");
+  assert.deepEqual(exportCalls(calls), ["/api/app/version"]);
+
+  // 轮询追加一行并重算按钮态（旧实现就是在这里把按钮重新打开）。
+  appendRow(list, "按键 2");
+  host.syncLogFilterChrome();
+  assert.equal(btn.disabled, true, "导出中追加日志不得重新启用按钮");
+  assert.equal(btn.textContent, "导出中…");
+  assert.equal(host.isLogExportBusy(), true, "忙标记要覆盖整个导出过程");
+
+  // 改筛选、切语言同样会重算，也不许打开。
+  host.state.logFilter = { kind: "key", level: "", q: "", dev: "" };
+  host.applyLogFilter();
+  assert.equal(btn.disabled, true, "导出中改筛选不得重新启用按钮");
+  host.retranslateLog();
+  assert.equal(btn.disabled, true, "导出中切语言不得重新启用按钮");
+
+  // 再点一次：busy 直接挡回，不发第二份请求、不弹第二个对话框。
+  void host.exportVisibleLog();
+  await flush();
+  assert.deepEqual(exportCalls(calls), ["/api/app/version"], "第二次点击不得发起新请求");
+});
+
+test("导出结束后释放 busy：取消保存对话框后按钮按行数恢复", async () => {
+  const calls = [];
+  const { host, el } = loadApp({
+    fetch: async (url) => {
+      calls.push(url);
+      if (url === "/api/app/version") {
+        return { ok: true, json: async () => ({ version: "v1.4.3" }) };
+      }
+      if (url === "/api/log/export") {
+        return { ok: true, json: async () => ({ ok: false, cancelled: true }) };
+      }
+      // 其余是 init() 的引导请求：挂住即可，不影响导出流程的断言。
+      return new Promise(() => {});
+    },
+  });
+  const btn = el("#btnLogExport");
+  const list = el("#logList");
+
+  host.state.logFilter = { kind: "", level: "", q: "", dev: "" };
+  host.state.logFollow = false;
+  appendRow(list);
+  host.syncLogFilterChrome();
+
+  await host.exportVisibleLog();
+  assert.deepEqual(exportCalls(calls), ["/api/app/version", "/api/log/export"]);
+  assert.equal(host.isLogExportBusy(), false, "finally 必须释放 busy");
+  assert.equal(btn.textContent, "导出…");
+  assert.equal(btn.disabled, false, "取消后还有可见行，按钮恢复可点");
+
+  // 清空后导出结束，按 0 行禁用（不是靠 busy 兜着）。
+  host.state.logFilter = { kind: "", level: "", q: "", dev: "" };
+  list.innerHTML = "";
+  list.children.length = 0;
+  host.syncLogFilterChrome();
+  assert.equal(btn.disabled, true);
+  assert.equal(btn.title, "没有可导出的日志");
 });

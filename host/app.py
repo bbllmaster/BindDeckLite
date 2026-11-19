@@ -1369,7 +1369,9 @@ def atomic_write_text(path: str, text: str) -> None:
         with open(tmp, "w", encoding="utf-8-sig", newline="\n") as fh:
             fh.write(text)
         os.replace(tmp, path)
-    except OSError:
+    except (OSError, UnicodeError):
+        # UnicodeError（孤立代理项等编码失败）不是 OSError：只捕 OSError 会
+        # 把 0 字节的 .tmp 留在用户目录里。
         try:
             os.remove(tmp)
         except OSError:
@@ -6811,7 +6813,8 @@ def api_log_export():
         return jsonify({"ok": False, "cancelled": True})
     try:
         atomic_write_text(path, text)
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
+        # 编码失败（代理项）与磁盘错误一样要回 JSON 原因，不能漏成 HTML 500。
         return jsonify({"ok": False, "cancelled": False,
                         "error": t("error.log_export_write_failed",
                                    detail=exc)}), 500

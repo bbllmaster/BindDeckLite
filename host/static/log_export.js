@@ -29,6 +29,15 @@
   /** 与 host/app.py 的 deque(maxlen=400) 一致：头部要如实写明上限。 */
   const BUFFER_MAX = 400;
 
+  /**
+   * 日志 DOM 的裁剪上限（`pollLog()` 里的 `while (list.children.length > N)`）。
+   *
+   * 比内存缓冲的 400 小：屏幕上永远看不到更早的 100 行，导出也只可能拿到
+   * 列表里的行。头部必须把这两个数字都写出来，否则「命中最多 300 行」
+   * 与「缓冲上限 400 行」对不上，用户会以为导出少给了 100 行。
+   */
+  const VIEW_MAX = 300;
+
   /** 文件名里设备名片段的最大长度；标题行仍保留完整设备名。 */
   const NAME_PART_MAX = 40;
 
@@ -54,6 +63,11 @@
    * 设备名可能带空格、中文、冒号（MAC 地址）、路径分隔符 —— 这些都进不了
    * 默认文件名。连续下划线合并成一条，首尾的下划线/点去掉，避免 `__A` 这种
    * 反而更难读的名字；全空时由调用方决定回退值。
+   *
+   * 与动作备份（`app.py` 的 `api_actions_export()` 用 `c.isalnum()` 保留中文）
+   * **故意不同**：这份文件的目标是「拖进聊天窗口 / 记事本再当附件交出去」，文件名
+   * 会经过 Windows→Linux→issue 多跳，只留 ASCII 才不会在某一跳变成乱码或被
+   * 邮件客户端拒绝；中文设备名在文件头与行内仍是原样，信息不丢。
    */
   function sanitizeNamePart(value) {
     const raw = String(value == null ? "" : value)
@@ -75,11 +89,14 @@
   }
 
   /**
-   * 按钮状态：0 行禁用并说明原因，有命中即可点。
+   * 按钮状态：导出中恒禁用；否则 0 行禁用并说明原因，有命中即可点。
    *
-   * 导出不看暂停 / 跟随状态，只看当前筛选命中多少行。
+   * 导出不看暂停 / 跟随状态，只看当前筛选命中多少行。`busy` 必须由调用方
+   * 的模块级状态传入，**不能**读 `btn.disabled` 反推：轮询会在导出期间反复
+   * 调这里，读 DOM 会把「导出中」重新算成「可点」，于是能弹出第二个保存框。
    */
-  function exportButtonState(count) {
+  function exportButtonState(count, busy) {
+    if (busy) return { disabled: true, title: t("log.export_busy") };
     const n = Number(count) || 0;
     return n > 0
       ? { disabled: false, title: t("log.export_btn_title") }
@@ -130,6 +147,7 @@
       q: searchLabel((o.filter || {}).q),
       count: Number(o.count) || 0,
       max: BUFFER_MAX,
+      view: VIEW_MAX,
     });
     return String(text).split("\n");
   }
@@ -175,6 +193,7 @@
 
   return {
     BUFFER_MAX,
+    VIEW_MAX,
     NAME_PART_MAX,
     formatStamp,
     formatFileStamp,

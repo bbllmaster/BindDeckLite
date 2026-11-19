@@ -387,7 +387,7 @@
   "log.export_copy_failed": "导出失败：无法写入剪贴板",
   "log.export_failed": "导出失败：{detail}",
   "log.export_filter": "筛选: 级别={level} · 类型={kind} · 设备={dev} · 搜索={q}",
-  "log.export_header": "BindDeckLite 日志导出\n导出时间: {time}\n上位机: {version}（{mode}）\n筛选: 级别={level} · 类型={kind} · 设备={dev} · 搜索={q}\n命中: {count} 行（日志缓冲上限 {max} 行，更早的行已丢弃）",
+  "log.export_header": "BindDeckLite 日志导出\n导出时间: {time}\n上位机: {version}（{mode}）\n筛选: 级别={level} · 类型={kind} · 设备={dev} · 搜索={q}\n命中: {count} 行（日志缓冲上限 {max} 行，屏幕最多保留 {view} 行，更早的行已不在列表里）",
   "log.export_mode_browser": "浏览器",
   "log.export_mode_desktop": "桌面版",
   "log.export_none": "(无)",

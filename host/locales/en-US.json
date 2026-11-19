@@ -387,7 +387,7 @@
   "log.export_copy_failed": "Export failed: could not write to the clipboard",
   "log.export_failed": "Export failed: {detail}",
   "log.export_filter": "Filter: level={level} · kind={kind} · device={dev} · search={q}",
-  "log.export_header": "BindDeckLite log export\nExported at: {time}\nHost: {version} ({mode})\nFilter: level={level} · kind={kind} · device={dev} · search={q}\nMatched: {count} rows (the buffer holds {max} rows; older rows are gone)",
+  "log.export_header": "BindDeckLite log export\nExported at: {time}\nHost: {version} ({mode})\nFilter: level={level} · kind={kind} · device={dev} · search={q}\nMatched: {count} rows (the buffer holds {max} rows; the list keeps only the newest {view})",
   "log.export_mode_browser": "browser",
   "log.export_mode_desktop": "desktop",
   "log.export_none": "(none)",
