@@ -929,7 +929,23 @@ textarea:focus-visible {
   border-radius: var(--r-control); background: var(--card);
 }
 .ms-type { flex: none; width: 132px; }
-.ms-value { flex: 1 1 140px; min-width: 0; }
+.ms-value { flex: 1 1 auto; min-width: 0; }
+/* WS-651：录入按钮固定宽度，输入框可伸缩 —— 375 px 窄抽屉里不得把输入框
+   压到不可编辑（min-width: 0 已在 .ms-value 上）。 */
+.ms-rec { flex: none; white-space: nowrap; }
+.ms-rec.recording {
+  color: var(--accent); border-color: rgba(53, 224, 194, 0.55);
+  background: rgba(53, 224, 194, 0.1);
+}
+/* 录入态只在行上画 outline（不占布局），行高不跳；刻意不复用「执行中」的
+   .kc-live，两者含义不同、也不该同时点亮。 */
+.macro-step.recording {
+  outline: 1px solid rgba(53, 224, 194, 0.55); outline-offset: -1px;
+  background: rgba(53, 224, 194, 0.05);
+}
+.ms-value[readonly] { color: var(--muted); cursor: default; }
+.ms-rec-hint { flex-basis: 100%; margin: 0; font-size: var(--fs-cap); color: var(--accent); }
+.ms-rec-hint[hidden] { display: none; }
 .ms-delay { flex: none; width: 84px; }
 .ms-move { display: flex; gap: var(--sp-1); flex: none; }
 .ms-move .btn { padding: var(--sp-1) var(--sp-2); }
