@@ -177,6 +177,8 @@ function openKeyDrawer(idx) {
 
 function closeKeyDrawer(restoreFocus = true) {
   if (state.editingKey === null) return;
+  // 关抽屉先退出录入态：值不写，Esc 只关抽屉（录入态自己已经吃掉 Esc）。
+  stopMacroRecord();
   const idx = state.editingKey;
   const fallback = $(`.keycard[data-idx="${idx}"] .edit`);
   const target = state.keyDrawerReturn && state.keyDrawerReturn.isConnected
@@ -200,6 +202,8 @@ function renderKeyDrawer() {
   const title = $("#keyDrawerTitle");
   if (!drawer || !body) return;
   // 表单整块重建，旧的宏编辑器随之作废（动作类型换成非宏时没有新的可挂）。
+  // 录入态也必须一起退出：它的 row / 按钮引用在重建后已经是孤儿。
+  stopMacroRecord();
   macroEditorRetranslate = null;
   const idx = state.editingKey;
   const item = idx === null ? null : keyItem(idx);
@@ -619,6 +623,245 @@ const macroQuickInserts = () => [
   ["app", t("keys.kind_app")],
 ];
 
+/* ---------------- 宏 Key 步骤：按一次组合键就录入（WS-651） ----------------
+ * 值输入框右侧的「录入」按钮把真实按键翻译成 `key:` 能用的规范名，省掉
+ * 「记拼法 + 查帮助表 + 手打」这一圈。整段逻辑只碰前端草稿：不写配置、
+ * 不发 CFG: / CMD:。
+ */
+
+// 与 host/app.py 的 MACRO_KEY_NAMES 键集合**同源**。两边的一致性由
+// test_macro_record.mjs 直接解析 app.py 源码断言 —— 后端加名字而这里没跟
+// 上、或者这里多写一个后端不认识的名字，测试都会变红。
+// 集合包含后端接受的全部别名（return / del / pgup …）：录入只写规范名，
+// 别名留在集合里只为让「同源」断言成立。
+const MACRO_REC_KEY_NAMES = [
+  "tab", "enter", "return", "esc", "escape", "space", "backspace",
+  "insert", "ins", "delete", "del", "home", "end",
+  "pageup", "pgup", "pagedown", "pgdn", "left", "right", "up", "down",
+  "lctrl", "ctrl", "control", "rctrl", "lshift", "shift", "rshift",
+  "lalt", "alt", "ralt", "altgr", "lwin", "win", "rwin",
+];
+for (let i = 1; i <= 12; i++) MACRO_REC_KEY_NAMES.push("f" + i);
+const MACRO_REC_KEY_SET = new Set(MACRO_REC_KEY_NAMES);
+
+// KeyboardEvent.key → 写入 key: 的规范名。字母 / 数字走下面的单字符正则。
+const MACRO_REC_EVENT_NAMES = {
+  Tab: "tab", Enter: "enter", Escape: "esc", " ": "space",
+  Backspace: "backspace", Insert: "insert", Delete: "delete",
+  Home: "home", End: "end", PageUp: "pageup", PageDown: "pagedown",
+  ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down",
+  "+": "+",
+};
+for (let i = 1; i <= 12; i++) MACRO_REC_EVENT_NAMES["F" + i] = "f" + i;
+
+// 修饰键固定顺序：ctrl → shift → alt → win（与后端 `+` 连接顺序一致）。
+const MACRO_REC_MODS = [
+  ["ctrl", "ctrlKey"],
+  ["shift", "shiftKey"],
+  ["alt", "altKey"],
+  ["win", "metaKey"],
+];
+
+// 浏览器 / 宿主占用的组合：拦不到就白按，直接拒绝并让人手输。
+const MACRO_REC_RESERVED = new Set(["ctrl+w", "ctrl+t", "ctrl+n", "alt+f4"]);
+
+const MACRO_REC_TIMEOUT_MS = 3000;
+
+/** macOS 上 Meta 是 Cmd、Alt 是 Option；写入值仍是 ctrl/shift/alt/win。 */
+function macroRecModLabel(id) {
+  const ua = (typeof navigator !== "undefined" && navigator && navigator.userAgent) || "";
+  const mac = /Mac|iPhone|iPad/i.test(ua);
+  if (id === "win") return mac ? "Cmd" : "Win";
+  if (id === "alt") return mac ? "Option" : "Alt";
+  return id.charAt(0).toUpperCase() + id.slice(1);
+}
+
+/** 事件里按固定顺序取出按住的修饰键 id。 */
+function macroRecModsFromEvent(e) {
+  return MACRO_REC_MODS.filter(([, flag]) => e[flag]).map(([id]) => id);
+}
+
+/**
+ * 一个 keydown 对应的录入结果：
+ *   { ok: true, name }                     → 写回值并退出录入
+ *   { ok: false, reason: "modifier" }      → 只按了修饰键，回显不落值
+ *   { ok: false, reason: "plus" }          → + 是分隔符
+ *   { ok: false, reason: "reserved" }      → 浏览器 / 系统占用
+ *   { ok: false, reason: "unsupported" }   → 表里没有这个主键
+ */
+function macroRecordKeyName(e) {
+  const key = e && typeof e.key === "string" ? e.key : "";
+  if (!key) return { ok: false, reason: "unsupported" };
+  const mods = macroRecModsFromEvent(e);
+  // 纯修饰键：只回显，不落值（单独按 Ctrl 不是合法的 key: 步骤）。
+  if (key === "Control" || key === "Shift" || key === "Alt" || key === "Meta") {
+    return { ok: false, reason: "modifier" };
+  }
+  let main = MACRO_REC_EVENT_NAMES[key];
+  if (main === undefined && /^[a-z0-9]$/i.test(key)) main = key.toLowerCase();
+  if (main === undefined) return { ok: false, reason: "unsupported" };
+  if (main === "+") return { ok: false, reason: "plus" };
+  // 单字母 / 单数字后端原样透传（不在 MACRO_KEY_NAMES 里），其余主键必须
+  // 是后端认识的规范名，否则写进去的 key: 步骤要到执行时才报错。
+  if (main.length > 1 && !MACRO_REC_KEY_SET.has(main)) {
+    return { ok: false, reason: "unsupported" };
+  }
+  const name = mods.concat([main]).join("+");
+  if (MACRO_REC_RESERVED.has(name)) return { ok: false, reason: "reserved" };
+  return { ok: true, name };
+}
+
+function macroRecordActive() {
+  return !!(state.macroRec && state.macroRec.row);
+}
+
+/** 提示行内容是「文案 key + 参数」，切语言时按当前语言重算而不是写死。 */
+function setMacroRecordHint(key, params) {
+  const rec = state.macroRec;
+  if (!rec) return;
+  rec.hintKey = key;
+  rec.hintParams = params;
+  if (rec.hint) {
+    rec.hint.hidden = false;
+    rec.hint.textContent = t(key, params);
+  }
+}
+
+function armMacroRecordTimer() {
+  const rec = state.macroRec;
+  if (!rec) return;
+  if (rec.timer !== null) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => {
+    // 宿主没把按键转给页面（焦点在别的窗口 / 系统吞了）：只提示，不退出。
+    if (state.macroRec !== rec) return;
+    setMacroRecordHint("keys.macro_rec_silent");
+  }, MACRO_REC_TIMEOUT_MS);
+}
+
+function showMacroRecordHeld(e) {
+  const mods = macroRecModsFromEvent(e).map(macroRecModLabel);
+  setMacroRecordHint("keys.macro_rec_held", { mods: mods.join(" + ") });
+}
+
+function macroRecordKeydown(e) {
+  const rec = state.macroRec;
+  if (!rec) return;
+  // 输入法组合过程中的 keydown（key 为 "Process" / keyCode 229）一律忽略：
+  // 既不拦截也不落值，否则会在选词时把半个组合写进配置。
+  if (e.isComposing || e.keyCode === 229 || (e.keyCode === 0 && e.key === "Process")) return;
+  // 录入期间这个按键归我们：不触发浏览器快捷键，也不能冒泡到
+  // keys.js bindKeyDrawer / app.js 的 Esc 关抽屉监听。
+  if (e.preventDefault) e.preventDefault();
+  if (e.stopPropagation) e.stopPropagation();
+  if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+  armMacroRecordTimer();
+  if (e.key === "Escape") {
+    cancelMacroRecord({ focus: true });
+    return;
+  }
+  const res = macroRecordKeyName(e);
+  if (res.ok) {
+    rec.apply(res.name);
+    stopMacroRecord({ focus: true, keepValue: true });
+    return;
+  }
+  if (res.reason === "modifier") {
+    showMacroRecordHeld(e);
+    return;
+  }
+  // 拒绝集：值零变化，留在录入态让用户重按或 Esc 退出。
+  if (res.reason === "plus") setMacroRecordHint("keys.macro_rec_plus");
+  else if (res.reason === "reserved") setMacroRecordHint("keys.macro_rec_reserved");
+  else setMacroRecordHint("keys.macro_rec_unsupported");
+}
+
+/** 点到 / 聚焦到录入行以外的东西：先退出，值不写。 */
+function macroRecordOutside(e) {
+  const rec = state.macroRec;
+  if (!rec || !rec.row) return;
+  const target = e && e.target;
+  if (target && typeof rec.row.contains === "function" && rec.row.contains(target)) return;
+  cancelMacroRecord();
+}
+
+/**
+ * 进入录入态。opts：{index, row, btn, input, hint, value, apply(name)}。
+ * apply 由宏编辑器提供：写 steps[i].value + 走既有 commit()。
+ */
+function startMacroRecord(opts) {
+  if (!opts || !opts.row || typeof opts.apply !== "function") return;
+  stopMacroRecord();
+  const rec = {
+    stepIndex: opts.index,
+    originalValue: String(opts.value === undefined ? "" : opts.value),
+    row: opts.row,
+    btn: opts.btn,
+    input: opts.input,
+    hint: opts.hint,
+    apply: opts.apply,
+    hintKey: "keys.macro_rec_hint",
+    hintParams: undefined,
+    timer: null,
+  };
+  state.macroRec = rec;
+  rec.row.classList.add("recording");
+  if (rec.btn) {
+    rec.btn.classList.add("recording");
+    rec.btn.textContent = t("keys.macro_rec_active");
+  }
+  // readonly 保留原值：录入期间不能手打，也不会因为 readonly 被清空。
+  if (rec.input) rec.input.readOnly = true;
+  setMacroRecordHint("keys.macro_rec_hint");
+  document.addEventListener("keydown", macroRecordKeydown, true);
+  document.addEventListener("pointerdown", macroRecordOutside, true);
+  document.addEventListener("focusin", macroRecordOutside, true);
+  armMacroRecordTimer();
+}
+
+/** 退出录入态并把按钮 / 行 / 输入框恢复原样；不碰 steps 与值。
+ *  keepValue=false 时把输入框写回进入录入前的原文 —— 取消路径的值与
+ *  进入前逐字节一致，不依赖「readonly 期间没人改过」这个假设。 */
+function stopMacroRecord({ focus = false, keepValue = false } = {}) {
+  const rec = state.macroRec;
+  if (!rec) return;
+  state.macroRec = null;
+  if (rec.timer !== null) clearTimeout(rec.timer);
+  document.removeEventListener("keydown", macroRecordKeydown, true);
+  document.removeEventListener("pointerdown", macroRecordOutside, true);
+  document.removeEventListener("focusin", macroRecordOutside, true);
+  if (rec.row) rec.row.classList.remove("recording");
+  if (rec.btn) {
+    rec.btn.classList.remove("recording");
+    rec.btn.textContent = t("keys.macro_rec");
+  }
+  if (rec.input) {
+    if (!keepValue) rec.input.value = rec.originalValue;
+    rec.input.readOnly = false;
+  }
+  if (rec.hint) {
+    rec.hint.hidden = true;
+    rec.hint.textContent = "";
+  }
+  if (focus && rec.btn && typeof rec.btn.focus === "function") rec.btn.focus();
+}
+
+/** Esc / 点别处 / 重建表单时的取消：值、action.macro、dirty 逐字节不变。 */
+function cancelMacroRecord({ focus = false } = {}) {
+  stopMacroRecord({ focus });
+}
+
+/** 切语言：只重算录入按钮与提示行的文案，不动值、不退出。 */
+function retranslateMacroRecord() {
+  const rec = state.macroRec;
+  if (!rec) return;
+  if (rec.btn) {
+    rec.btn.textContent = t("keys.macro_rec_active");
+    rec.btn.title = t("keys.macro_rec");
+    rec.btn.setAttribute("aria-label", t("keys.macro_rec"));
+  }
+  if (rec.hint) rec.hint.textContent = t(rec.hintKey, rec.hintParams);
+}
+
 function mountMacroEditor(holder, action) {
   if (!Array.isArray(action.macro)) action.macro = [];
   let steps = action.macro.map(normalizeMacroStep);
@@ -685,6 +928,9 @@ function mountMacroEditor(holder, action) {
   }
 
   function renderRows() {
+    // 整行重建（切类型 / 上移下移 / 删除 / 切视图）会让录入行的引用失效：
+    // 先退出，值不写。
+    stopMacroRecord();
     list.innerHTML = "";
     if (!steps.length) {
       list.innerHTML = `<p class="muted small" data-i18n="keys.macro_empty">${t("keys.macro_empty")}</p>`;
@@ -712,12 +958,19 @@ function mountMacroEditor(holder, action) {
         ${step.type === "text" || step.type === "paste"
           ? `<span class="macro-sensitive" title="${t("keys.text_body_hint")}">${t("keys.log_not_echoed")}</span>`
           : ""}
+        ${step.type === "key"
+          ? `<button type="button" class="btn sm ms-rec"
+               title="${t("keys.macro_rec")}" aria-label="${t("keys.macro_rec")}"
+               data-i18n-title="keys.macro_rec"
+               data-i18n-aria-label="keys.macro_rec">${t("keys.macro_rec")}</button>`
+          : ""}
         <span class="ms-move">
           <button type="button" class="btn sm ms-up" title="${t("keys.move_up")}" ${i === 0 ? "disabled" : ""}>↑</button>
           <button type="button" class="btn sm ms-down" title="${t("keys.move_down")}" ${i === steps.length - 1 ? "disabled" : ""}>↓</button>
           <button type="button" class="btn sm ms-del" title="${t("keys.delete_step")}">✕</button>
         </span>
-        <p class="ms-error"></p>`;
+        <p class="ms-error"></p>
+        <p class="ms-rec-hint" hidden></p>`;
       list.appendChild(row);
 
       const err = $(".ms-error", row);
@@ -736,6 +989,26 @@ function mountMacroEditor(holder, action) {
         err.innerHTML = issueFor(steps[i]);
         commit();
       };
+      if (step.type === "key") {
+        // 录入按钮：写回值仍走 commit()，摘要卡与「有未下发修改」在同一次
+        // 渲染里更新，宏编辑器以外的状态（textValue / lint）也一起刷新。
+        const recBtn = $(".ms-rec", row);
+        const recHint = $(".ms-rec-hint", row);
+        recBtn.onclick = () => startMacroRecord({
+          index: i,
+          row,
+          btn: recBtn,
+          input: valueEl,
+          hint: recHint,
+          value: steps[i].value,
+          apply: (name) => {
+            steps[i].value = name;
+            valueEl.value = name;
+            err.innerHTML = issueFor(steps[i]);
+            commit();
+          },
+        });
+      }
       const delayEl = $(".ms-delay", row);
       if (delayEl) {
         delayEl.oninput = () => {
@@ -820,6 +1093,12 @@ function mountMacroEditor(holder, action) {
       if (delayEl) delayEl.title = t("keys.text_delay_placeholder");
       const sensitive = $(".macro-sensitive", row);
       if (sensitive) sensitive.textContent = t("keys.log_not_echoed");
+      const recBtn = $(".ms-rec", row);
+      if (recBtn) {
+        recBtn.textContent = t("keys.macro_rec");
+        recBtn.title = t("keys.macro_rec");
+        recBtn.setAttribute("aria-label", t("keys.macro_rec"));
+      }
       const up = $(".ms-up", row);
       if (up) up.title = t("keys.move_up");
       const down = $(".ms-down", row);
@@ -834,10 +1113,11 @@ function mountMacroEditor(holder, action) {
         const issue = lintMacroStep(s);
         return issue ? { line: i + 1, ...issue } : null;
       }).filter(Boolean));
+    // 录入态是「暂时」的：切语言只换文案，不退出、不动值。
+    retranslateMacroRecord();
     if (textArea) lintText.innerHTML = macroLintHtml(lintMacroText(textArea.value));
   }
   macroEditorRetranslate = retranslate;
-
   function showView(next) {
     view = next;
     state.macroView = next;
