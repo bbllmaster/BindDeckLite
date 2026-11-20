@@ -663,7 +663,51 @@ const MACRO_REC_MODS = [
 ];
 
 // 浏览器 / 宿主占用的组合：拦不到就白按，直接拒绝并让人手输。
+// 只写「必需的修饰键 + 主键」，判定见 macroRecReserved：同族组合（如
+// Ctrl+Shift+W）浏览器照样吞掉、preventDefault 无效，所以一律拒绝。
 const MACRO_REC_RESERVED = new Set(["ctrl+w", "ctrl+t", "ctrl+n", "alt+f4"]);
+
+// 静止态的可访问名比可见文字更具体（「录入按键」），可见文字仍是「录入」：
+// 读屏能读出按钮用途，视觉宽度不变（行内空间很紧）。录入态两处一起换成
+// 「按组合键…」，退出时再换回来。
+const MACRO_REC_ARIA_KEY = "keys.macro_rec_aria";
+const MACRO_REC_ACTIVE_KEY = "keys.macro_rec_active";
+
+/**
+ * 一组按住的修饰键 + 主键是否命中保留集。
+ * 命中条件：保留集里的必需修饰键全部按下，且**多出来的只有 shift**。
+ *   - 带 shift 的同族组合照样拒绝：浏览器对 Ctrl+Shift+W / Ctrl+Shift+T
+ *     的处理不变，preventDefault 仍然无效（Ctrl+Shift+W 直接关窗）。
+ *   - 多出 ctrl / alt 等其他修饰键不算命中：Ctrl+Alt+T 是普通可录入组合，
+ *     不能因为主键是 t 就误伤。
+ */
+function macroRecReserved(mods, main) {
+  for (const combo of MACRO_REC_RESERVED) {
+    const parts = combo.split("+");
+    if (parts[parts.length - 1] !== main) continue;
+    const need = parts.slice(0, -1);
+    const extra = mods.filter((m) => !need.includes(m));
+    if (need.every((m) => mods.includes(m)) && extra.every((m) => m === "shift")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 录入按钮的文字 / tooltip / 可访问名一起换，data-i18n-* 跟着走 —— 否则
+ * 切语言时 i18n.apply() 会按旧 key 把标题写回另一个状态的词。
+ * textKey 管可见文字，ariaKey 管 title 与 aria-label（缺省同 textKey）。
+ */
+function setMacroRecordBtnLabel(btn, textKey, ariaKey) {
+  if (!btn) return;
+  const aria = ariaKey || textKey;
+  btn.textContent = t(textKey);
+  btn.title = t(aria);
+  btn.setAttribute("aria-label", t(aria));
+  btn.setAttribute("data-i18n-title", aria);
+  btn.setAttribute("data-i18n-aria-label", aria);
+}
 
 const MACRO_REC_TIMEOUT_MS = 3000;
 
@@ -706,8 +750,8 @@ function macroRecordKeyName(e) {
   if (main.length > 1 && !MACRO_REC_KEY_SET.has(main)) {
     return { ok: false, reason: "unsupported" };
   }
+  if (macroRecReserved(mods, main)) return { ok: false, reason: "reserved" };
   const name = mods.concat([main]).join("+");
-  if (MACRO_REC_RESERVED.has(name)) return { ok: false, reason: "reserved" };
   return { ok: true, name };
 }
 
@@ -807,7 +851,8 @@ function startMacroRecord(opts) {
   rec.row.classList.add("recording");
   if (rec.btn) {
     rec.btn.classList.add("recording");
-    rec.btn.textContent = t("keys.macro_rec_active");
+    // 文案、tooltip、可访问名一起切：只换 textContent 的话读屏仍读「录入」。
+    setMacroRecordBtnLabel(rec.btn, MACRO_REC_ACTIVE_KEY);
   }
   // readonly 保留原值：录入期间不能手打，也不会因为 readonly 被清空。
   if (rec.input) rec.input.readOnly = true;
@@ -832,7 +877,8 @@ function stopMacroRecord({ focus = false, keepValue = false } = {}) {
   if (rec.row) rec.row.classList.remove("recording");
   if (rec.btn) {
     rec.btn.classList.remove("recording");
-    rec.btn.textContent = t("keys.macro_rec");
+    // Esc / 提交 / 点外面 / 重建表单都走这里：三处文案与 i18n 标记一并复原。
+    setMacroRecordBtnLabel(rec.btn, "keys.macro_rec", MACRO_REC_ARIA_KEY);
   }
   if (rec.input) {
     if (!keepValue) rec.input.value = rec.originalValue;
@@ -854,11 +900,7 @@ function cancelMacroRecord({ focus = false } = {}) {
 function retranslateMacroRecord() {
   const rec = state.macroRec;
   if (!rec) return;
-  if (rec.btn) {
-    rec.btn.textContent = t("keys.macro_rec_active");
-    rec.btn.title = t("keys.macro_rec");
-    rec.btn.setAttribute("aria-label", t("keys.macro_rec"));
-  }
+  if (rec.btn) setMacroRecordBtnLabel(rec.btn, MACRO_REC_ACTIVE_KEY);
   if (rec.hint) rec.hint.textContent = t(rec.hintKey, rec.hintParams);
 }
 
@@ -960,9 +1002,9 @@ function mountMacroEditor(holder, action) {
           : ""}
         ${step.type === "key"
           ? `<button type="button" class="btn sm ms-rec"
-               title="${t("keys.macro_rec")}" aria-label="${t("keys.macro_rec")}"
-               data-i18n-title="keys.macro_rec"
-               data-i18n-aria-label="keys.macro_rec">${t("keys.macro_rec")}</button>`
+               title="${t(MACRO_REC_ARIA_KEY)}" aria-label="${t(MACRO_REC_ARIA_KEY)}"
+               data-i18n-title="${MACRO_REC_ARIA_KEY}"
+               data-i18n-aria-label="${MACRO_REC_ARIA_KEY}">${t("keys.macro_rec")}</button>`
           : ""}
         <span class="ms-move">
           <button type="button" class="btn sm ms-up" title="${t("keys.move_up")}" ${i === 0 ? "disabled" : ""}>↑</button>
@@ -1094,11 +1136,7 @@ function mountMacroEditor(holder, action) {
       const sensitive = $(".macro-sensitive", row);
       if (sensitive) sensitive.textContent = t("keys.log_not_echoed");
       const recBtn = $(".ms-rec", row);
-      if (recBtn) {
-        recBtn.textContent = t("keys.macro_rec");
-        recBtn.title = t("keys.macro_rec");
-        recBtn.setAttribute("aria-label", t("keys.macro_rec"));
-      }
+      if (recBtn) setMacroRecordBtnLabel(recBtn, "keys.macro_rec", MACRO_REC_ARIA_KEY);
       const up = $(".ms-up", row);
       if (up) up.title = t("keys.move_up");
       const down = $(".ms-down", row);

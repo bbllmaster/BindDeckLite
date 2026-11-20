@@ -78,9 +78,11 @@ function makeEl(sel = "") {
       for (const child of this._q.values()) if (child.contains(node)) return true;
       return this.children.some((c) => c.contains(node));
     },
-    getAttribute() { return null; },
-    setAttribute(k, v) { this.attributes = this.attributes || {}; this.attributes[k] = v; },
-    removeAttribute() {},
+    getAttribute(k) { return (this.attributes && this.attributes[k]) ?? null; },
+    setAttribute(k, v) { this.attributes = this.attributes || {}; this.attributes[k] = String(v); },
+    removeAttribute(k) {
+      if (this.attributes) delete this.attributes[k];
+    },
     insertAdjacentHTML() {},
     closest() { return null; },
     getBoundingClientRect() { return { top: 0, bottom: 0, height: 0, width: 0 }; },
@@ -169,6 +171,7 @@ function loadKeys(lang = "zh-CN") {
   vm.runInContext(keysSrc + `
 globalThis.__rec = {
   state, mountMacroEditor, macroRecordKeyName, macroRecordActive,
+  retranslateMacroRecord,
   MACRO_REC_KEY_NAMES, MACRO_REC_KEY_SET, MACRO_REC_EVENT_NAMES,
   MACRO_REC_RESERVED,
 };
@@ -210,9 +213,9 @@ globalThis.__rec = {
   return { sandbox, document, rec, fire, calls, seen, docListeners };
 }
 
-/** 挂一个只有一个 key 步骤的宏编辑器，返回行 / 按钮 / 输入框 / 提示行。 */
-function mountOne(env, value = "") {
-  const action = { type: "macro", value: "", macro: [{ type: "key", value }] };
+/** 挂一个宏编辑器（steps 由调用方给），返回行 / 按钮 / 输入框 / 提示行。 */
+function mountMacro(env, macro) {
+  const action = { type: "macro", value: "", macro };
   const holder = makeEl("#kdValueBox");
   env.rec.mountMacroEditor(holder, action);
   const wrap = holder.children[0];           // mountMacroEditor 挂上去的 .macro-editor
@@ -229,7 +232,15 @@ function mountOne(env, value = "") {
   };
 }
 
+/** 只有一个 key 步骤的宏编辑器。 */
+function mountOne(env, value = "") {
+  return mountMacro(env, [{ type: "key", value }]);
+}
+
 const press = (env, ...events) => events.forEach((e) => env.fire("keydown", e));
+
+const localeMessages = (lang) => JSON.parse(
+  readFileSync(new URL(`../locales/${lang}.json`, STATIC_DIR), "utf8"));
 
 /* ---------------- 用例 ---------------- */
 
@@ -334,6 +345,108 @@ test("Ctrl+W 与 + 被拒绝：不写值、给文案、仍在录入态", () => {
   assert.equal(env.calls.markDirty, 0);
 });
 
+test("Ctrl+Shift+W / Ctrl+Shift+T 同族组合一样拒绝：不写值、有文案、Esc 可退", () => {
+  const env = loadKeys();
+  const m = mountOne(env);
+  m.btn.onclick();
+  const reserved = env.sandbox.t("keys.macro_rec_reserved");
+
+  // 浏览器对这两个组合 preventDefault 无效（Ctrl+Shift+W 直接关窗），
+  // 所以和 Ctrl+W / Ctrl+T 一样按「被占用」处理，不能写进配置。
+  for (const key of ["w", "t"]) {
+    const ev = env.fire("keydown", { key, ctrlKey: true, shiftKey: true });
+    assert.equal(ev.defaultPrevented, true, `Ctrl+Shift+${key.toUpperCase()} 仍要吞掉事件`);
+    assert.equal(m.action.value, "", `Ctrl+Shift+${key.toUpperCase()} 不能写值`);
+    assert.equal(m.action.macro[0].value, "");
+    assert.equal(m.input.value, "");
+    assert.equal(m.hint.textContent, reserved);
+    assert.ok(env.rec.state.macroRec, "拒绝后留在录入态");
+  }
+  // Ctrl+Shift+N 与 Alt+Shift+F4 也没被漏掉。
+  press(env, { key: "n", ctrlKey: true, shiftKey: true });
+  assert.equal(m.action.value, "");
+  assert.equal(m.hint.textContent, reserved);
+  press(env, { key: "F4", altKey: true, shiftKey: true });
+  assert.equal(m.action.value, "");
+  assert.equal(m.hint.textContent, reserved);
+  assert.equal(env.calls.markDirty, 0);
+
+  const ev = env.fire("keydown", { key: "Escape" });
+  assert.equal(ev.propagationStopped, true);
+  assert.equal(env.rec.state.macroRec, null);
+  assert.equal(m.action.value, "");
+  // 不同族：Shift+W 不含 ctrl，是普通组合，照常录入（拒绝规则不能放宽成
+  // 「主键命中就拒绝」）。
+  m.btn.onclick();
+  press(env, { key: "w", shiftKey: true });
+  assert.equal(m.action.macro[0].value, "shift+w");
+});
+
+test("key 步骤真的渲染出 .ms-rec 按钮，非 key 步骤没有", () => {
+  const env = loadKeys();
+  const m = mountOne(env);
+  const aria = env.sandbox.t("keys.macro_rec_aria");
+  const label = env.sandbox.t("keys.macro_rec");
+  // 断言读的是 mountMacroEditor 写进 row 的**真实 HTML**：桩里的
+  // row.querySelector 会凭空造节点，只查 querySelector 的话删掉按钮也不会红。
+  assert.match(m.row._html, /<button[^>]*class="btn sm ms-rec"/,
+    "key 步骤缺少「录入」按钮的 markup");
+  assert.ok(m.row._html.includes(`title="${aria}"`), "按钮 title 应取 keys.macro_rec_aria");
+  assert.ok(m.row._html.includes(`aria-label="${aria}"`), "按钮 aria-label 应取 keys.macro_rec_aria");
+  assert.ok(m.row._html.includes('data-i18n-title="keys.macro_rec_aria"'));
+  assert.ok(m.row._html.includes('data-i18n-aria-label="keys.macro_rec_aria"'));
+  assert.ok(m.row._html.includes(`>${label}</button>`), "按钮可见文字仍是「录入」");
+
+  const text = mountMacro(env, [{ type: "text", value: "hello" }]);
+  assert.doesNotMatch(text.row._html, /class="btn sm ms-rec"/, "非 key 步骤不该出现录入按钮");
+});
+
+test("录入态可访问名切到「按组合键…」，Esc / 提交 / 点外面都恢复", () => {
+  const active = "keys.macro_rec_active";
+  const aria = "keys.macro_rec_aria";
+  const exits = [
+    ["Esc", (env) => press(env, { key: "Escape" })],
+    ["提交", (env) => press(env, { key: "t", ctrlKey: true, altKey: true })],
+    ["点外面", (env) => env.fire("pointerdown", { target: makeEl("body") })],
+  ];
+  for (const [name, exit] of exits) {
+    const env = loadKeys();
+    const m = mountOne(env);
+    const t = env.sandbox.t;
+    m.btn.onclick();
+    assert.equal(m.btn.textContent, t(active), `${name}：录入态文字`);
+    assert.equal(m.btn.title, t(active), `${name}：录入态 title 要跟着换，读屏才知道在等键`);
+    assert.equal(m.btn.getAttribute("aria-label"), t(active), `${name}：录入态 aria-label`);
+    assert.equal(m.btn.getAttribute("data-i18n-title"), active, `${name}：data-i18n-title`);
+    assert.equal(m.btn.getAttribute("data-i18n-aria-label"), active, `${name}：data-i18n-aria-label`);
+
+    exit(env);
+    assert.equal(env.rec.state.macroRec, null, `${name} 应退出录入态`);
+    assert.equal(m.btn.textContent, t("keys.macro_rec"), `${name}：退出后文字`);
+    assert.equal(m.btn.title, t(aria), `${name}：退出后 title`);
+    assert.equal(m.btn.getAttribute("aria-label"), t(aria), `${name}：退出后 aria-label`);
+    assert.equal(m.btn.getAttribute("data-i18n-title"), aria, `${name}：退出后 data-i18n-title`);
+    assert.equal(m.btn.getAttribute("data-i18n-aria-label"), aria, `${name}：退出后 data-i18n-aria-label`);
+  }
+});
+
+test("录入中切语言：可访问名跟当前语言，退出后也跟当前语言", () => {
+  const env = loadKeys();
+  const m = mountOne(env);
+  m.btn.onclick();
+  env.sandbox.i18n.setMessages(localeMessages("en-US"), "en-US");
+  env.rec.retranslateMacroRecord();
+  assert.equal(m.btn.textContent, "Press keys…");
+  assert.equal(m.btn.title, "Press keys…");
+  assert.equal(m.btn.getAttribute("aria-label"), "Press keys…");
+  assert.equal(m.btn.getAttribute("data-i18n-title"), "keys.macro_rec_active");
+
+  press(env, { key: "Escape" });
+  assert.equal(m.btn.title, "Record keys");
+  assert.equal(m.btn.getAttribute("aria-label"), "Record keys");
+  assert.doesNotMatch(m.btn.title, /[\u4e00-\u9fff]/, "英文界面不得残留中文");
+});
+
 test("已手写的键名不因取消被改写（PageUp 保持原样）", () => {
   const env = loadKeys();
   const m = mountOne(env, "PageUp");
@@ -381,7 +494,9 @@ test("键名同源：前端集合 == 后端 MACRO_KEY_NAMES 键集合", () => {
   const start = src.indexOf("MACRO_KEY_NAMES = {");
   assert.ok(start >= 0, "app.py 里找不到 MACRO_KEY_NAMES");
   const block = src.slice(start, src.indexOf("\n}", start));
-  const backend = new Set([...block.matchAll(/"([a-z0-9]+)"\s*:/g)].map((m) => m[1]));
+  // 键名可以带 `_` / `-`（num_plus、ctrl-shift 这类别名），只认 [a-z0-9]
+  // 会漏掉它们：后端加了名字、前端没跟，用例照样绿。
+  const backend = new Set([...block.matchAll(/"([^"]+)"\s*:/g)].map((m) => m[1]));
 
   // F1–F12 由紧随其后的 update(...) 生成，按 range 边界展开。
   const upd = /MACRO_KEY_NAMES\.update\(\{f"f\{i\}": f"f\{i\}" for i in range\((\d+),\s*(\d+)\)\}\)/.exec(src);
