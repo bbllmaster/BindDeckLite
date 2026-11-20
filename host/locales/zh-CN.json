@@ -320,6 +320,7 @@
   "keys.mods_redetect": "重新检测",
   "keys.macro_rec": "录入",
   "keys.macro_rec_active": "按组合键…",
+  "keys.macro_rec_aria": "录入按键",
   "keys.macro_rec_held": "{mods} + …",
   "keys.macro_rec_hint": "现在按下要发送的组合键；Esc 取消，单独按修饰键不算",
   "keys.macro_rec_plus": "+ 是组合键分隔符，请手动输入",

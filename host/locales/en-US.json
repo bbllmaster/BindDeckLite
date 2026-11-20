@@ -320,6 +320,7 @@
   "keys.mods_redetect": "Re-detect",
   "keys.macro_rec": "Record",
   "keys.macro_rec_active": "Press keys…",
+  "keys.macro_rec_aria": "Record keys",
   "keys.macro_rec_held": "{mods} + …",
   "keys.macro_rec_hint": "Press the shortcut to send; Esc cancels, a modifier alone is not recorded",
   "keys.macro_rec_plus": "+ is the combo separator; type it manually",
