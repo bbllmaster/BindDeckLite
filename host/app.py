@@ -705,6 +705,34 @@ KEY_CODES = [
 ]
 KEY_CODES += [(chr(c), c) for c in range(ord("A"), ord("Z") + 1)]
 KEY_CODES += [(chr(c), c) for c in range(ord("0"), ord("9") + 1)]
+
+# --- WS-661: media keys ---------------------------------------------------
+# A media key is a consumer-control usage, not a keyboard usage, so it gets its
+# own value segment: ``MEDIA_CODE_BASE + usage`` (256 + usage). 0..255 stay
+# keyboard keys and nothing can collide. This table is the single source for
+# the dropdown, the label lookup and apply_device()'s capability filter; the
+# firmware keeps the same 7 usages in src/nimble_hid.h (MEDIA_USAGES).
+MEDIA_CODE_BASE = 256
+MEDIA_KEYS = [
+    (t("keys.media_play_pause"), 0x00CD),   # play / pause
+    (t("keys.media_prev"), 0x00B6),         # previous track
+    (t("keys.media_next"), 0x00B5),         # next track
+    (t("keys.media_stop"), 0x00B7),         # stop
+    (t("keys.media_mute"), 0x00E2),         # mute
+    (t("keys.media_vol_up"), 0x00E9),       # volume up
+    (t("keys.media_vol_down"), 0x00EA),     # volume down
+]
+KEY_CODES += [(label, MEDIA_CODE_BASE + usage) for label, usage in MEDIA_KEYS]
+
+
+def is_media_code(code) -> bool:
+    """True when *code* belongs to the WS-661 media segment (>= 256)."""
+    try:
+        return int(code) >= MEDIA_CODE_BASE
+    except (TypeError, ValueError):
+        return False
+
+
 # WS-508: sentinel code 0 = 「不发键」—— 这个键只跑上位机动作，设备不发 HID
 # （固件 v1.3.8 起直接跳过；更早的固件会发一帧全 0 报告，OS 不产生字符）。
 # 必须留在列表末尾：``keyOptions(selected)`` 找不到 selected 时退回第一项，
@@ -831,6 +859,19 @@ _encdir_lock = threading.RLock()
 # "unsupported" (old firmware never speaks CFG:ENCDIR). Kept in memory.
 ENCDIR_UNSUPPORTED_AFTER = 2
 _encdir_misses: dict = {}
+
+# WS-661: one pending CFG:MEDIA probe per device. Same tri-state idea: a deck
+# that answers ``MEDIA:1`` accepts the >=256 media key-code segment; one that
+# stays silent predates it. Deciding this is what makes it SAFE to hide the
+# media group and to keep every >=256 code off the wire (old firmware would
+# truncate it to a keyboard usage).
+_media_windows: dict = {}
+_media_lock = threading.RLock()
+
+# WS-550 rule again: one dropped 1.5 s reply is not a verdict. Only a run of
+# consecutive silent probes concludes "unsupported".
+MEDIA_UNSUPPORTED_AFTER = 2
+_media_misses: dict = {}
 
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
@@ -1546,6 +1587,34 @@ def validate_actions_import(data) -> dict:
     return {"inputs": norm, "encoder": encoder}
 
 
+def filter_import_media(cfg: dict, validated: dict) -> tuple:
+    """WS-661: keep media key codes out of a deck that cannot send them.
+
+    Returns ``(filtered, rejected)``: *filtered* is a copy of *validated* whose
+    media-code inputs were dropped, *rejected* the 0-based indices that were
+    dropped. A dropped input keeps its archive value (code / mods / action) —
+    it is never rewritten to a different key — and the import result tells the
+    user those inputs were refused by the device (「设备拒绝」).
+
+    The filter only bites once the CFG:MEDIA probe concluded "unsupported". An
+    unknown verdict (deck offline) keeps the codes: apply_device() probes
+    again and refuses to write them if the deck still cannot take them.
+    """
+    if (cfg or {}).get("media_supported") is not False:
+        return validated, []
+    kept, rejected = [], []
+    for entry in validated.get("inputs", []):
+        if is_media_code(entry.get("code")):
+            rejected.append(entry["index"])
+        else:
+            kept.append(entry)
+    if not rejected:
+        return validated, []
+    out = dict(validated)
+    out["inputs"] = kept
+    return out, rejected
+
+
 def merge_actions_import(cfg: dict, validated: dict) -> tuple:
     """Overlay validated inputs onto *cfg* in place (pure apart from *cfg*).
 
@@ -1999,6 +2068,16 @@ def _on_line(dev_id: str, line: str):
             box["value"] = cfg["layout"]
             event.set()
         return
+    if line.startswith("MEDIA:"):
+        # WS-661: answer to the CFG:MEDIA capability probe. Only the probe
+        # records it - a value here is capability evidence, not a config value.
+        with _media_lock:
+            pending = _media_windows.get(dev_id)
+        if pending is not None:
+            event, box = pending
+            box["value"] = line[len("MEDIA:"):].strip()
+            event.set()
+        return
     if line.startswith("MODS:"):
         # WS-546: answer to the CFG:MODS capability probe. Only the probe
         # records it — the values are capability evidence, not a config value,
@@ -2058,6 +2137,9 @@ def _on_line(dev_id: str, line: str):
                 # OTA can add it, so re-probe instead of trusting a cached
                 # "unsupported" verdict from the old firmware.
                 cfg["encdir_supported"] = None
+                # WS-661: same for media keys - a new firmware may accept the
+                # >=256 segment, so the cached verdict must not survive an OTA.
+                cfg["media_supported"] = None
                 # WS-550: a new firmware must not inherit the old deck's
                 # consecutive-timeout count, else one dropped probe right
                 # after the OTA would immediately re-conclude "unsupported".
@@ -2065,6 +2147,8 @@ def _on_line(dev_id: str, line: str):
                     _mods_misses.pop(dev_id, None)
                 with _encdir_lock:
                     _encdir_misses.pop(dev_id, None)
+                with _media_lock:
+                    _media_misses.pop(dev_id, None)
             cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
@@ -2165,6 +2249,18 @@ def _on_line(dev_id: str, line: str):
         with _lock:
             _apply_cfg_field(cfg, "encdir", line[len("CFG_ENCDIR:"):])
             save_config()
+        return
+    if line.startswith("CFG_MEDIA:"):
+        # WS-661: CMD:GET_CFG tail line. Its mere presence proves the deck
+        # accepts the >=256 media segment - a capability fact, no value to
+        # store. Clears a stale miss streak, like CFG_MODS does.
+        cfg = device_cfg(dev_id)
+        with _lock:
+            if cfg.get("media_supported") is not True:
+                cfg["media_supported"] = True
+                save_config()
+        with _media_lock:
+            _media_misses.pop(dev_id, None)
         return
     # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
     # These arrive during a host-driven firmware push (CMD:OTA); the push
@@ -2398,6 +2494,34 @@ def probe_encdir(dev_id: str, timeout: float = 1.5) -> dict:
             "encdir": box["value"]}
 
 
+def probe_media(dev_id: str, timeout: float = 1.5) -> dict:
+    """Ask one deck whether it speaks ``CFG:MEDIA`` (WS-661).
+
+    Returns ``{"sent", "answered", "value"}``. ``answered`` means the deck
+    replied with ``MEDIA:1`` — i.e. it accepts the >=256 media key-code
+    segment. ``sent`` False means the link was down, which is "unknown", NOT
+    "unsupported". This is the only place the verdict is born, so the UI can
+    hide the media group on old firmware without ever writing a code that
+    firmware would truncate into a keystroke.
+    """
+    event = threading.Event()
+    box = {"value": None}
+    sent = False
+    with _media_lock:
+        _media_windows[dev_id] = (event, box)
+    try:
+        result = send(dev_id, "CFG:MEDIA")
+        sent = bool((result or {}).get("sent"))
+        if sent:
+            event.wait(timeout)
+    finally:
+        with _media_lock:
+            _media_windows.pop(dev_id, None)
+    return {"sent": sent,
+            "answered": box["value"] is not None,
+            "value": box["value"]}
+
+
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
     target_layout = layout_of(cfg)
@@ -2430,7 +2554,30 @@ def apply_device(dev_id: str) -> dict:
     # readback is compared against, so a rejected field shows the user what
     # they tried to set vs what the device actually kept.
     pins = ",".join(str(int(p)) for p in cfg.get("pins", [])[:9])
-    keys = ",".join(str(int(k["code"])) for k in cfg.get("keys", [])[:count])
+    # WS-661: a media code (>=256) may only be written to firmware that
+    # answered CFG:MEDIA. When the verdict is still unknown it is probed here:
+    # apply is the last gate, and old firmware truncates the code to a
+    # keyboard usage (typing a character). If the deck stays silent the media
+    # code is NOT sent — that input goes out as 0 (「不发键」, the protocol's
+    # explicit "no key" value, never a different key) and the keys row below
+    # is forced to 设备拒绝. Everything else still applies.
+    key_codes = [int(k["code"]) for k in cfg.get("keys", [])[:count]]
+    media_inputs = [i for i, c in enumerate(key_codes) if c >= MEDIA_CODE_BASE]
+    if media_inputs and cfg.get("media_supported") is None:
+        probe = probe_media(dev_id)
+        if probe["answered"]:
+            with _lock:
+                cfg["media_supported"] = True
+                save_config()
+    media_blocked = []
+    if media_inputs and cfg.get("media_supported") is not True:
+        media_blocked = [i + 1 for i in media_inputs]
+        for i in media_inputs:
+            key_codes[i] = 0
+        add_event("cfg", t("log.media_not_sent",
+                           inputs="、".join(str(n) for n in media_blocked)),
+                  dev_id, "warn")
+    keys = ",".join(str(c) for c in key_codes)
     enc_val = str(int(cfg["encoder"].get("mode", 0)))
     sleep = cfg.get("sleep", {})
     sleep_val = "%d,%d" % (
@@ -2640,6 +2787,17 @@ def apply_device(dev_id: str) -> dict:
                     cfg["encdir_supported"] = True
                     save_config()
 
+        # WS-661: when a media code was filtered out of the line, the keys row
+        # must read 设备拒绝 even though the read-back matches the (0-substituted)
+        # line — the value the user configured did not reach the deck, and
+        # pretending it did would hide a silently disabled key.
+        if media_blocked:
+            for item in items:
+                if item["field"] == "keys" and item["status"] == "ok":
+                    item["status"] = "rejected"
+                    item["reason"] = t("error.media_unsupported")
+                    break
+
         ok_all = all(i["status"] == "ok" for i in items)
         # WS-512: only an apply whose every field read back with the value we
         # sent makes the archive trustworthy.  A rejected / unconfirmed /
@@ -2654,6 +2812,8 @@ def apply_device(dev_id: str) -> dict:
             "ok": ok_all,
             "results": results,
             "items": items,
+            # WS-661: 1-based inputs whose media code was not sent.
+            "media_blocked": media_blocked,
         }
     finally:
         with _apply_lock:
@@ -4750,7 +4910,10 @@ def api_actions_import(dev_id):
         # all-or-nothing and never reports success when nothing was saved.
         before = copy.deepcopy(_config)
         cfg = device_cfg(dev_id)
-        applied, skipped = merge_actions_import(cfg, validated)
+        # WS-661: a media code the deck cannot send stays out of the archive;
+        # that input keeps its current value and the result names it.
+        mergeable, rejected_media = filter_import_media(cfg, validated)
+        applied, skipped = merge_actions_import(cfg, mergeable)
         saved = save_config()
         if not saved:
             _config.clear()
@@ -4759,7 +4922,9 @@ def api_actions_import(dev_id):
         return jsonify({"ok": False,
                         "error": t("error.actions_import_save_failed")}), 500
     return jsonify({"ok": True, "applied": applied,
-                    "skipped_extra": skipped, "dirty": True})
+                    "skipped_extra": skipped,
+                    "rejected_media": [i + 1 for i in rejected_media],
+                    "dirty": True})
 
 
 @app.route("/api/apply/<dev_id>", methods=["POST"])
@@ -5105,6 +5270,64 @@ def api_device_encdir(dev_id):
             else:
                 reason = "probe_timeout"
         supported = cfg.get("encdir_supported")  # True / False / None
+        if changed:
+            save_config()
+        payload = {"dev_id": dev_id,
+                   "supported": supported,
+                   "sent": probe["sent"],
+                   "reason": reason,
+                   "retryable": supported is not True}
+    return jsonify(payload)
+
+
+@app.route("/api/device/<dev_id>/media", methods=["POST"])
+def api_device_media(dev_id):
+    """WS-661: ask the deck whether it accepts the >=256 media key segment.
+
+    Same tri-state contract as the modifier / ENCDIR probes (WS-550):
+      * supported (True)   — the deck answered ``MEDIA:1``;
+      * unsupported (False) — MEDIA_UNSUPPORTED_AFTER consecutive silent
+        probes (old firmware predates CFG:MEDIA); apply_device() then never
+        writes a media code, the dropdown hides the media group;
+      * unknown (None)     — link down, or a single dropped probe.
+
+    A timeout is never treated as supported: writing 461 to old firmware would
+    truncate it to 0xCD and type a character. ``?reset=1`` clears the miss
+    counter (a cached False survives unless the deck actually answers).
+    """
+    cfg = device_cfg(dev_id)
+    reset = request.args.get("reset") == "1"
+    if reset:
+        with _lock:
+            if cfg.get("media_supported") is not False:
+                cfg["media_supported"] = None
+                save_config()
+        with _media_lock:
+            _media_misses.pop(dev_id, None)
+
+    probe = probe_media(dev_id)
+    changed = False
+    with _lock:
+        if probe["answered"]:
+            cfg["media_supported"] = True
+            reason = "supported"
+            changed = True
+            with _media_lock:
+                _media_misses.pop(dev_id, None)
+        elif not probe["sent"]:
+            reason = "link_down"
+        else:
+            with _media_lock:
+                misses = _media_misses.get(dev_id, 0) + 1
+                _media_misses[dev_id] = misses
+            known_supported = cfg.get("media_supported") is True
+            if misses >= MEDIA_UNSUPPORTED_AFTER and not known_supported:
+                cfg["media_supported"] = False
+                reason = "unsupported"
+                changed = True
+            else:
+                reason = "probe_timeout"
+        supported = cfg.get("media_supported")  # True / False / None
         if changed:
             save_config()
         payload = {"dev_id": dev_id,
@@ -6825,6 +7048,10 @@ def api_log_export():
 @app.route("/api/keycodes")
 def api_keycodes():
     return jsonify({"keys": [{"label": l, "code": c} for l, c in KEY_CODES],
+                    # WS-661: where the media segment starts (256 = usage
+                    # offset). The dropdown groups by ``code >= media_base``,
+                    # so the constant exists once, on the server.
+                    "media_base": MEDIA_CODE_BASE,
                     # WS-546: modifiers in display order (Ctrl -> Shift -> Alt
                     # -> Win). The drawer and the summary both render from this
                     # list, so the order exists exactly once.

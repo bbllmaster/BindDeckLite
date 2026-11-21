@@ -5,13 +5,42 @@
 
 /* ---------------- 摘要卡 ---------------- */
 
+/** WS-661：媒体键段的起点（服务器 /api/keycodes 的 media_base，默认 256）。
+ *  键码 = 256 + HID consumer usage，与键盘键（0–255）不冲突。 */
+function mediaBase() {
+  const base = Number(state.mediaBase);
+  return Number.isFinite(base) && base > 0 ? base : 256;
+}
+
+/** 一个键码是否属于媒体键段（>= 256）。 */
+function isMediaCode(code) {
+  return parseInt(code, 10) >= mediaBase();
+}
+
+/** 设备的 CFG:MEDIA 结论：只有明确 True 才显示媒体分组（先探测、再显示）。
+ *  False = 旧固件，整组隐藏并提示升级；None = 未定论，等探测结果再显示。 */
+function mediaSupported() {
+  return (state.cfg || {}).media_supported === true;
+}
+
 function keyOptions(selected) {
   // 键码 0 = 「不发键」，单独收进「特殊」分组，普通键码的顺序不变。
+  // WS-661：媒体键（>= 256）收进「媒体键」分组，排在普通键之后、「特殊」
+  // 之前；设备未确认支持时不列出来（旧固件下发会被截成键盘键）。
+  // 已经选中媒体键时至少保留那一项，否则下拉会退回第一项、显示成 F13。
   const opt = (k) =>
-    `<option value="${k.code}" ${k.code === selected ? "selected" : ""}>${k.label}</option>`;
-  const normal = state.keycodes.filter((k) => k.code !== 0);
+    `<option value="${k.code}" ${String(k.code) === String(selected) ? "selected" : ""}>${k.label}</option>`;
+  const base = mediaBase();
+  const normal = state.keycodes.filter((k) => k.code !== 0 && k.code < base);
+  const media = state.keycodes.filter((k) => k.code >= base);
   const special = state.keycodes.filter((k) => k.code === 0);
   let html = normal.map(opt).join("");
+  const shownMedia = mediaSupported()
+    ? media
+    : media.filter((k) => String(k.code) === String(selected));
+  if (shownMedia.length) {
+    html += `<optgroup label="${t("keys.media_group")}">${shownMedia.map(opt).join("")}</optgroup>`;
+  }
   if (special.length) {
     html += `<optgroup label="${t("keys.special_group")}">${special.map(opt).join("")}</optgroup>`;
   }
@@ -55,12 +84,15 @@ function keyModsText(mask) {
 /** 摘要卡上的 HID 文案：Ctrl + Shift + Esc；键码 0 一律「不发键」。
  *  WS-550：门控为 False 时 apply_device() 一条 CFG:MODS 都不发，摘要不能再
  *  显示修饰键（否则「显示 Ctrl、实际只发 F13」）。state.cfg 可能为空（未选
- *  设备），此时以及 unknown / supported 时都保持原有修饰键显示。 */
+ *  设备），此时以及 unknown / supported 时都保持原有修饰键显示。
+ *  WS-661：媒体键没有修饰键（consumer 报告没有修饰位），摘要只显示标签，
+ *  标签与下拉、检查器同源（/api/keycodes 的键码表）。 */
 function keyHidText(item) {
   const code = parseInt(item && item.code, 10);
   if (code === 0) return t("keys.key_none");
   const known = state.keycodes.find((k) => k.code === code);
-  const base = (item && item.label) || (known && known.label) || String(code);
+  const base = (known && known.label) || (item && item.label) || String(code);
+  if (isMediaCode(code)) return base;
   const unsupported = state.cfg && state.cfg.mods_supported === false;
   if (unsupported) return base;          // 显示 == 实际下发：只显示主键
   return keyModsText(item && item.mods).concat([base]).join(" + ");
@@ -171,6 +203,9 @@ function openKeyDrawer(idx) {
   document.body.classList.add("drawer-open");
   // WS-546: 修饰键能力还未知时问一次设备（旧固件超时后整行禁用并提示）。
   if (typeof ensureModsCapability === "function") ensureModsCapability();
+  // WS-661: 媒体键能力同理 —— 探测到 MEDIA:1 才把「媒体键」分组放出来，
+  // 旧固件（两次无应答）整组隐藏并提示升级，绝不把 >=256 的键码写下去。
+  if (typeof ensureMediaCapability === "function") ensureMediaCapability();
   const first = $("#kdHid");
   if (first) first.focus({ preventScroll: true });
 }
@@ -223,7 +258,17 @@ function renderKeyDrawer() {
   // /api/device/<id>/mods 探测后写进 cfg.mods_supported。
   const mods = modDefs();
   const mask = parseInt(item.mods, 10) || 0;
-  const modsBlocked = (state.cfg || {}).mods_supported === false;
+  // WS-661: a media key has no modifier byte at all, so the whole row is
+  // disabled while one is selected — Ctrl+播放/暂停 can never be built in the UI.
+  // Old firmware keeps its own "modifiers unsupported" reason (WS-546).
+  const itemIsMedia = isMediaCode(item.code);
+  const modsBlocked = itemIsMedia || (state.cfg || {}).mods_supported === false;
+  const modsHint = itemIsMedia
+    ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_media_ignored">${t("keys.mods_media_ignored")}</p>`
+    : modsBlocked
+      ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_unsupported">${t("keys.mods_unsupported")}</p>
+        <button type="button" class="btn secondary sm" id="kdModsRedetect" data-i18n="keys.mods_redetect">${t("keys.mods_redetect")}</button>`
+      : "";
   const modsRow = mods.length ? `
     <div class="kd-field">
       <span class="field-label" data-i18n="keys.mods_label">${t("keys.mods_label")}</span>
@@ -235,13 +280,19 @@ function renderKeyDrawer() {
             <span>${escapeHtml(m.label)}</span>
           </label>`).join("")}
       </div>
-      ${modsBlocked ? `<p class="muted small" id="kdModsHint" data-i18n="keys.mods_unsupported">${t("keys.mods_unsupported")}</p>
-        <button type="button" class="btn secondary sm" id="kdModsRedetect" data-i18n="keys.mods_redetect">${t("keys.mods_redetect")}</button>` : ""}
+      ${modsHint}
     </div>` : "";
+  // WS-661: the probe ruled the media segment out — say why the group is gone
+  // instead of leaving the user wondering where 「播放/暂停」 went.
+  const mediaBlocked = (state.cfg || {}).media_supported === false;
+  const mediaHint = mediaBlocked
+    ? `<p class="muted small" id="kdMediaHint" data-i18n="keys.media_unsupported">${t("keys.media_unsupported")}</p>`
+    : "";
   body.innerHTML = `
     <div class="kd-field">
       <label class="field-label" for="kdHid" data-i18n="keys.hid_label">${t("keys.hid_label")}</label>
       <select id="kdHid" class="sel-key">${keyOptions(item.code)}</select>
+      ${mediaHint}
     </div>${modsRow}
     <div class="kd-field">
       <label class="field-label" for="kdAct" data-i18n="keys.action_label">${t("keys.action_label")}</label>
@@ -260,9 +311,17 @@ function renderKeyDrawer() {
 
   $("#kdHid").onchange = (e) => {
     const code = parseInt(e.target.value, 10);
+    const wasMedia = isMediaCode(item.code);
     item.code = code;
     item.label = (state.keycodes.find((k) => k.code === code) || {}).label || String(code);
+    // WS-661: a media key drops any modifier mask — the consumer report has
+    // no modifier byte, so keeping Ctrl would show a combination the device
+    // cannot send. Switching back to a keyboard key keeps the (now 0) mask.
+    if (isMediaCode(code)) item.mods = 0;
     refreshKeyCard(idx);
+    // Only a keyboard <-> media switch changes the drawer's own state (the
+    // modifier row is disabled for media keys), so avoid a pointless rebuild.
+    if (wasMedia !== isMediaCode(code)) renderKeyDrawer();
     markDirty();
   };
   // 4 个复选框合成一个 0–15 的掩码：勾/取消只改这一位，其余位保留。

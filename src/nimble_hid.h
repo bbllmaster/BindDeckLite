@@ -40,6 +40,40 @@ struct MediaKeyReport { uint16_t usage; };
 const MediaKeyReport KEY_MEDIA_VOLUME_UP   = { 0x00E9 };
 const MediaKeyReport KEY_MEDIA_VOLUME_DOWN = { 0x00EA };
 
+// WS-661: media keys as a per-input key code. The wire value is
+// ``MEDIA_CODE_BASE + HID consumer usage`` (256 + usage), a segment that can
+// never collide with a keyboard usage (0..255). This table is the ONE source
+// shared by CFG:KEYS validation, sendKeyForInput() and docs/protocol.md; the
+// host mirrors it in host/app.py's KEY_CODES. Adding an entry is additive -
+// old firmware rejects the whole CFG:KEYS line for a code it does not know,
+// which is exactly what keeps an old deck from receiving a truncated usage.
+static const uint16_t MEDIA_CODE_BASE = 256;
+static const uint16_t MEDIA_USAGES[] = {
+  0x00CD,  // play / pause
+  0x00B6,  // previous track
+  0x00B5,  // next track
+  0x00B7,  // stop
+  0x00E2,  // mute
+  0x00E9,  // volume up
+  0x00EA,  // volume down
+};
+static const uint8_t MEDIA_USAGE_COUNT =
+    (uint8_t)(sizeof(MEDIA_USAGES) / sizeof(MEDIA_USAGES[0]));
+
+// Decode one key code: true when it is a defined media code, *usage filled in
+// with the consumer usage to send. Codes < 256 are keyboard keys (false).
+static inline bool mediaUsageForCode(int code, uint16_t* usage) {
+  if (code < (int)MEDIA_CODE_BASE) return false;
+  const int want = code - (int)MEDIA_CODE_BASE;
+  for (uint8_t i = 0; i < MEDIA_USAGE_COUNT; i++) {
+    if ((int)MEDIA_USAGES[i] == want) {
+      if (usage) *usage = MEDIA_USAGES[i];
+      return true;
+    }
+  }
+  return false;
+}
+
 // WS-429: what main.cpp observed BEFORE this boot wrote anything into the
 // NVS. It is what tells "brand-new deck" from "the deck lost its identity" -
 // see blepol::classifyIdentity().

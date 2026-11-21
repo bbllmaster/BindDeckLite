@@ -86,6 +86,9 @@ const state = {
   selectedConnected: false,
   cfg: null,
   keycodes: [],
+  // WS-661: 媒体键码段起点（= 256，/api/keycodes 的 media_base）。键码 >= 它
+  // 属于媒体键（256 + consumer usage），下拉按它分组。
+  mediaBase: 256,
   // WS-546: 修饰键定义（bit / id / label），顺序由服务器给出（Ctrl→Shift→Alt→Win）。
   modDefs: [],
   logSeq: 0,
@@ -1177,6 +1180,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（编码器页行状态已经是对的）。
     ensureEncDirCapability();
+    // WS-661: 媒体键能力（旧固件不回 MEDIA: → 下拉里没有媒体分组）。
+    ensureMediaCapability();
     return;
   }
 
@@ -1211,6 +1216,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（旧固件不回 ENCDIR: → 置灰）。
     ensureEncDirCapability();
+    // WS-661: 同上，确认媒体键能力（旧固件不回 MEDIA: → 整组隐藏）。
+    ensureMediaCapability();
   } catch (e) {
     toast(t("ui.read_config_failed") + e.message, "bad");
   }
@@ -2170,6 +2177,43 @@ async function ensureEncDirCapability() {
     return null;
   } finally {
     encdirProbing.delete(devId);
+  }
+}
+
+/** WS-661：媒体键能力（CFG:MEDIA）。三态，和修饰键 / 方向反转同一套规则：
+ *  只有设备明确回 MEDIA:1 才把下拉里的「媒体键」分组放出来；旧固件连续两次
+ *  无应答才判不支持（整组隐藏 + 提示升级）；链路不通 / 单次丢包 = 未定论，
+ *  保持现状、下次再探。 */
+const mediaProbing = new Set();
+
+/** 结论写回后抽屉与摘要一起重绘：分组出现/消失、媒体键摘要都要跟着变。 */
+function refreshMediaVerdictUi() {
+  if (state.editingKey !== null && typeof renderKeyDrawer === "function") {
+    renderKeyDrawer();
+  }
+  if (typeof renderKeys === "function") renderKeys();
+}
+
+async function ensureMediaCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return null;
+  if (cfg.media_supported === true || cfg.media_supported === false) {
+    return cfg.media_supported;
+  }
+  if (mediaProbing.has(devId)) return null;
+  mediaProbing.add(devId);
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/media`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return null;
+    if (!r.sent) return null;             // 链路不通 = 结论未知，保持现状
+    cfg.media_supported = r.supported;    // 三态 True / False / null
+    refreshMediaVerdictUi();
+    return cfg.media_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    mediaProbing.delete(devId);
   }
 }
 
@@ -4001,8 +4045,14 @@ async function confirmBackupImport() {
     renderEncoder();
     renderDeviceMeta();
     setDirty(true);
-    $("#backupResultText").textContent =
-      t("ui.backup_import_result", { count: r.applied });
+    // WS-661: inputs whose media code the deck cannot send keep their old
+    // value — say so instead of letting the import look lossless.
+    let resultText = t("ui.backup_import_result", { count: r.applied });
+    if (Array.isArray(r.rejected_media) && r.rejected_media.length) {
+      resultText += " " + t("ui.backup_import_media_rejected",
+                            { inputs: r.rejected_media.join("、") });
+    }
+    $("#backupResultText").textContent = resultText;
     backupPane("result");
   } catch (e) {
     toast(t("ui.backup_import_failed") + (e.message || e), "bad");
@@ -4076,6 +4126,7 @@ async function init() {
     const k = await api("/api/keycodes");
     state.keycodes = k.keys;
     state.modDefs = k.mods || [];
+    state.mediaBase = Number(k.media_base) || 256;
   } catch (_) {
     state.keycodes = [];
     state.modDefs = [];
