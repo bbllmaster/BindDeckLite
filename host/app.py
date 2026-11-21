@@ -249,7 +249,7 @@ def _input_label(cfg, idx: int) -> str:
 def default_key_item(i: int) -> dict:
     """One ``keys[i]`` entry with the shipped default code and label."""
     code = DEFAULT_KEYS[i] if i < len(DEFAULT_KEYS) else 0
-    label = DEFAULT_LABELS[i] if i < len(DEFAULT_LABELS) else str(code)
+    label = str(DEFAULT_LABELS[i]) if i < len(DEFAULT_LABELS) else str(code)
     # WS-546: ``mods`` lives next to the code (0 = no modifier), so a config
     # written before this feature reads exactly like an all-zero deck.
     return {"code": code, "label": label, "mods": 0,
@@ -754,6 +754,22 @@ def is_known_media_code(code) -> bool:
 # 0 排第一会让每个未知键码都显示成「不发键」。
 KEY_CODES += [(t("ui.key_none_hint"), 0)]
 
+
+def _key_label(code: int) -> str:
+    """Label for *code* as a plain ``str`` — safe to keep inside ``_config``.
+
+    WS-666: ``KEY_CODES`` holds ``i18n.Message`` for entries whose text comes
+    from ``t()`` (the WS-661 media keys and the trailing "no key" sentinel).
+    ``Message`` is a ``str`` subclass whose ``__new__`` needs
+    ``(text, code, params)``, so a Message stored in the config makes the next
+    ``copy.deepcopy(_config)`` raise ``TypeError`` and the route answer 500.
+    Both config write sites (``_apply_cfg_field``'s keys branch and
+    ``merge_actions_import``) go through here; ``default_key_item`` builds its
+    label from ``DEFAULT_LABELS`` and already stores a plain ``str``.
+    """
+    return str(next((lbl for lbl, c in KEY_CODES if c == code), code))
+
+
 # --- macro key names ------------------------------------------------------
 # ``key:`` macro steps are written with the names the UI shows in the HID key
 # list, but the ``keyboard`` library spells several of them differently
@@ -1177,7 +1193,7 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
             keys.append(default_key_item(i))
         for i, code in enumerate(codes[:INPUT_COUNT_12KEY]):
             keys[i]["code"] = code
-            keys[i]["label"] = next((lbl for lbl, c in KEY_CODES if c == code), str(code))
+            keys[i]["label"] = _key_label(code)
         return True
     if field == "mods":
         # WS-546: ``CFG_MODS:`` / ``MODS:`` — one 0..15 mask per input.
@@ -1659,9 +1675,7 @@ def merge_actions_import(cfg: dict, validated: dict) -> tuple:
             keys[idx]["mods"] = entry["mods"]
             keys[idx]["action"] = entry["action"]
             # Keep the label in step with the code (same rule as _apply_cfg_field).
-            keys[idx]["label"] = next(
-                (lbl for lbl, c in KEY_CODES if c == entry["code"]),
-                str(entry["code"]))
+            keys[idx]["label"] = _key_label(entry["code"])
     # WS-623 should fix 2: only directions present in the file are
     # overwritten; a file without an encoder key leaves the existing
     # rotation actions untouched (no silent reset to "none").

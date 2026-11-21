@@ -172,6 +172,15 @@ class Message(str):
         obj.params = dict(params)
         return obj
 
+    def __reduce__(self):
+        """Make ``copy`` / ``pickle`` rebuild with all three arguments (WS-666).
+
+        The default ``str`` reduce only passes the text to ``cls(...)``, which
+        trips ``__new__``'s required ``code`` / ``params`` when a ``Message``
+        is deep-copied.  Rebuilding explicitly keeps both attributes intact.
+        """
+        return (self.__class__, (str(self), self.code, self.params))
+
     def __mod__(self, args):
         """``t("key") % value`` keeps the key, so the error body still has code."""
         rendered = super().__mod__(args)
