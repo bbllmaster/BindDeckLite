@@ -85,7 +85,9 @@ function loadApp() {
     // 抽屉：renderKeyDrawer / retranslateKeyDrawer 都按选择器取节点，桩里必须
     // 返回同一个对象，否则「改属性」类修复（optgroup label）观察不到。
     "#keyDrawer", "#keyDrawerBody", "#keyDrawerTitle", "#keyDrawerBackdrop",
-    "#kdHid", "#kdHid optgroup", "#kdAct", "#kdValueBox", "#kdValueLabel",
+    "#kdHid", '#kdHid optgroup[data-group="special"]',
+    '#kdHid optgroup[data-group="media"]',
+    "#kdAct", "#kdValueBox", "#kdValueLabel",
     "#kdTest", "#kdTestHint",
   ].forEach((sel) => { registry[sel] = [makeEl(sel)]; });
 
@@ -231,10 +233,10 @@ test("切语言后抽屉「仅 HID / 不发键」提示跟着换，且保留原�
 test("切语言后 HID 下拉的「特殊」分组名跟着换", () => {
   const { host, sandbox, el } = loadApp();
   openKeyDrawer(host, sandbox, { code: 13, mods: 0, action: { type: "none", value: "" } });
-  const rendered = el("#keyDrawerBody")._html.match(/<optgroup label="([^"]+)"/);
+  const rendered = el("#keyDrawerBody")._html.match(/<optgroup[^>]*label="([^"]+)"/);
   assert.ok(rendered, "HID 下拉里应有「特殊」分组");
   assert.equal(rendered[1], "特殊", "初值应是中文分组名");
-  const og = el("#kdHid optgroup");
+  const og = el('#kdHid optgroup[data-group="special"]');
   og.label = rendered[1];            // 桩里把渲染出的属性落到节点上
 
   switchLanguage(host, sandbox, "en-US");

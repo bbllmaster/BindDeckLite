@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.12"  // WS-635: 配网 OTA 中断复位（g_portalOtaActive / Update.abort）；1.3.11 为 WS-626
+#define FW_VERSION "1.3.13"  // WS-661: 按键媒体键（>=256 键码段 + CFG:MEDIA）；1.3.12 为 WS-635
 
 #define FW_MODEL   "Lite"
 
@@ -682,24 +682,41 @@ static void applyTimezone() { configTzTime(tzString, "pool.ntp.org"); }
 // === HID actions ==========================================================
 static void sendKeyForInput(int idx) {
   if (idx < 0 || idx >= inputCount()) return;
+  const int code = buttonKeys[idx];
   // WS-508: 键码 0 = 「不发键」—— 这个键只跑上位机动作。直接返回，连一帧
   // 全 0 报告都不发；BLE 连接判断、BTN: 事件与其它输入都不受影响（BTN: 由
   // 调用方单独发送，不经过这里）。WS-546 沿用这一语义：主键不发时连修饰键
   // 也不发，绝不单独留下一个按下的修饰位。
-  if (buttonKeys[idx] <= 0) return;
-  if (bleKeyboard.isConnected()) {
-    // WS-546: modifiers first (fixed order Ctrl, Shift, Alt, GUI), then the
-    // main key, then one releaseAll() that clears every bit — a modifier can
-    // never stay stuck when the main key is itself a modifier or a media key.
-    const uint8_t mods = buttonMods[idx] & MOD_MASK;
-    if (mods & MOD_CTRL)  bleKeyboard.press(KEY_LEFT_CTRL);
-    if (mods & MOD_SHIFT) bleKeyboard.press(KEY_LEFT_SHIFT);
-    if (mods & MOD_ALT)   bleKeyboard.press(KEY_LEFT_ALT);
-    if (mods & MOD_GUI)   bleKeyboard.press(KEY_LEFT_GUI);
-    bleKeyboard.press(buttonKeys[idx]);
-    delay(8);
-    bleKeyboard.releaseAll();
+  if (code <= 0) return;
+  if (!bleKeyboard.isConnected()) return;
+  // WS-661: key codes are segmented. 1..255 = keyboard usage (modifiers +
+  // press/release); >= 256 = media key (consumer usage = code - 256). A media
+  // key NEVER carries a modifier: the consumer report has no modifier byte,
+  // and pressing one here would leave it down for the next keyboard frame.
+  if (code >= (int)MEDIA_CODE_BASE) {
+    uint16_t usage = 0;
+    if (!mediaUsageForCode(code, &usage)) {
+      // Runtime defence: CFG:KEYS already rejects unknown media codes, so this
+      // only fires for a value that reached NVS some other way (downgrade,
+      // hand-edited config). Send nothing rather than truncating to 8 bits -
+      // an old keyboard report would type a random character.
+      log_e("[cfg] media code ignored %d", code);
+      return;
+    }
+    bleKeyboard.write(MediaKeyReport{ usage });
+    return;
   }
+  // WS-546: modifiers first (fixed order Ctrl, Shift, Alt, GUI), then the
+  // main key, then one releaseAll() that clears every bit — a modifier can
+  // never stay stuck when the main key is itself a modifier or a media key.
+  const uint8_t mods = buttonMods[idx] & MOD_MASK;
+  if (mods & MOD_CTRL)  bleKeyboard.press(KEY_LEFT_CTRL);
+  if (mods & MOD_SHIFT) bleKeyboard.press(KEY_LEFT_SHIFT);
+  if (mods & MOD_ALT)   bleKeyboard.press(KEY_LEFT_ALT);
+  if (mods & MOD_GUI)   bleKeyboard.press(KEY_LEFT_GUI);
+  bleKeyboard.press((uint8_t)code);
+  delay(8);
+  bleKeyboard.releaseAll();
 }
 
 static void handleEncoderAction(bool forward) {
@@ -3270,27 +3287,60 @@ static void processCommand(String data) {
     // layout, 12 values in the 12-key layout (WS-499). The old 10-value form
     // stays valid in the 12-key layout too - the two missing tail codes then
     // take their defaults (F23/F24), so an old host cannot truncate the map.
+    //
+    // WS-661: every value must be a plain decimal 0..255 (keyboard) or a code
+    // in the media table (256 + consumer usage). One bad value rejects the
+    // WHOLE line and keeps the stored map, exactly like CFG:MODS. That is the
+    // guard that stops an old host - or a hand-edited config - from turning a
+    // media code into a truncated keyboard usage.
     String payload = data.substring(9);
     int keys[NUM_INPUTS_MAX];
     int n = 0;
-    while (n < NUM_INPUTS_MAX && payload.length() > 0) {
+    bool ok = true;
+    String badTok = "-";
+    // Consume the payload completely, including a trailing token without a
+    // comma, so a 13th value cannot slip through the NUM_INPUTS_MAX guard.
+    while (payload.length() > 0) {
       int comma = payload.indexOf(',');
       String tok = (comma == -1) ? payload : payload.substring(0, comma);
+      payload = (comma == -1) ? String("") : payload.substring(comma + 1);
       tok.trim();
-      keys[n++] = tok.toInt();
-      if (comma == -1) break;
-      payload = payload.substring(comma + 1);
+      if (n >= NUM_INPUTS_MAX) {
+        ok = false;
+        if (badTok == "-") badTok = tok.length() ? tok : String("(empty)");
+        break;
+      }
+      // String::toInt() maps "x" to 0, which would look like a valid
+      // 「不发键」- hence the explicit digit check (no sign, no spaces).
+      bool digits = tok.length() > 0;
+      for (unsigned int c = 0; c < tok.length(); c++) {
+        if (tok[c] < '0' || tok[c] > '9') digits = false;
+      }
+      int v = digits ? tok.toInt() : -1;
+      if (!digits || v < 0 || (v > 255 && !mediaUsageForCode(v, nullptr))) {
+        ok = false;
+        if (badTok == "-") badTok = tok.length() ? tok : String("(empty)");
+      }
+      keys[n++] = v;
     }
     const int need = inputCount();
-    if (n == need || (n == NUM_INPUTS && need > NUM_INPUTS)) {
+    if (ok && (n == need || (n == NUM_INPUTS && need > NUM_INPUTS))) {
       for (int i = 0; i < n; i++) buttonKeys[i] = keys[i];
       for (int i = n; i < need; i++) buttonKeys[i] = DEFAULT_KEYS[i];
       saveConfig();
       log_e("[cfg] keys applied (%d values)", n);
+    } else if (!ok) {
+      log_e("[cfg] keys REJECTED (bad code %s)", badTok.c_str());
     } else {
       log_e("[cfg] keys REJECTED (need %d values, layout=%s)", need,
             encOn ? "encoder" : "12key");
     }
+  } else if (data == "CFG:MEDIA") {
+    // WS-661: read-only capability probe (no parameters). Any deck that
+    // answers `MEDIA:1` accepts the >=256 key-code segment; old firmware only
+    // emits the generic ACK and stays silent, which is how the host decides
+    // to hide the media group and never send such a code.
+    sendToHost("MEDIA:1");
   } else if (data.startsWith("CFG:MODS:")) {
     // CFG:MODS:<mask,...> (WS-546): one mask per input, exactly inputCount()
     // values, each 0..15 (bit0 Ctrl / bit1 Shift / bit2 Alt / bit3 GUI).
@@ -3465,6 +3515,11 @@ static void processCommand(String data) {
     // CFG:ENCDIR; old firmware never sends it, so old hosts that stop
     // reading at CFG_MODS are unaffected.
     sendToHost("CFG_ENCDIR:" + String(encInverted ? 1 : 0));
+    // WS-661: appended after CFG_ENCDIR (again "new line at the end"). Its
+    // presence proves the deck accepts the >=256 media key-code segment, so a
+    // read-back is enough to unlock the host's media group without an extra
+    // CFG:MEDIA round trip. Old firmware never sends it.
+    sendToHost("CFG_MEDIA:1");
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {
