@@ -12,8 +12,10 @@ WS-661 让一个输入可以直接发消费者控制键（播放/暂停、切歌
 2. 下发：``media_supported is True`` 才把 ``>=256`` 的值写进 ``CFG:KEYS:``；
    结论为 False 时该输入以 0（「不发键」）发出，回读行显示「设备拒绝」，其它
    输入照常生效；
-3. 结论未知时 ``apply_device()`` 先探一次 ``CFG:MEDIA``：设备回答就下发，沉默
-   就过滤 —— 绝不把 ``>=256`` 的键码发给没确认过的设备；
+3. 结论未知时 ``apply_device()`` 先探一次 ``CFG:MEDIA``：设备回答就下发；仍然
+   沉默则**整条 ``CFG:KEYS`` 都不发**（不是 0 替换），设备上的键保持原值，
+   结果行标「未确认，请重试」；未定义的 ``>=256`` 值（如 300）在任何设备上
+   都挡在主机侧并置 0，否则固件会整条拒绝、全部按键一起失效；
 4. 回读 ``CFG_KEYS:`` 里的媒体码保留 code 与中文标签，不被当成未知数字；
 5. 导入动作备份：不支持的设备上媒体码不写入，该输入保留原值（不得静默改键）；
 6. 固件侧同一份媒体表（``src/nimble_hid.h`` 的 ``MEDIA_USAGES``）与上位机表
@@ -231,13 +233,34 @@ def test_apply_never_writes_media_codes_when_the_probe_stays_silent():
     sent, result, _box = _apply_with(cfg)      # 不回答 CFG:MEDIA
 
     assert "CFG:MEDIA" in sent
-    keys_line = next(c for c in sent if c.startswith("CFG:KEYS:"))
-    values = keys_line[len("CFG:KEYS:"):].split(",")
-    assert values[0] == "0"
-    assert all(int(v) < 256 for v in values)
-    assert result["media_blocked"] == [1]
+    assert not [c for c in sent if c.startswith("CFG:KEYS:")], \
+        "结论未定论时整条 CFG:KEYS 都不发：0 替换会真的清掉设备上的键"
+    assert all(str(NEXT) not in c for c in sent), "绝不发 >=256 的键码"
+    item = next(i for i in result["items"] if i["field"] == "keys")
+    assert item["status"] == "unconfirmed", "未定论不是「设备拒绝」，要用户重试"
+    assert "未确认" in item["reason"]
+    assert result["media_unconfirmed"] == [1]
+    assert result["media_blocked"] == [], "未定论不能被记成 confirmed unsupported"
     assert cfg.get("media_supported") is None, \
         "一次沉默不构成「不支持」结论（两次才定论，见路由测试）"
+    assert result["ok"] is False
+
+
+def test_apply_keeps_the_line_when_a_media_code_is_undefined():
+    """未定义的 >=256（如 300）绝不下发：固件会整条拒绝，12 个键全都不生效。"""
+    cfg = _device(supported=True)
+    cfg["keys"][0]["code"] = 300
+
+    sent, result, _box = _apply_with(cfg)
+
+    keys_line = next(c for c in sent if c.startswith("CFG:KEYS:"))
+    values = keys_line[len("CFG:KEYS:"):].split(",")
+    assert values[0] == "0", "未定义媒体码要挡在主机侧，不能原样写进 CFG:KEYS"
+    assert all(int(v) < 256 for v in values)
+    assert values[1] == str(0xF1), "其余 11 个键必须照常生效"
+    item = next(i for i in result["items"] if i["field"] == "keys")
+    assert item["status"] == "rejected", "该行要如实显示没生效"
+    assert "未定义" in item["reason"]
 
 
 def test_apply_keeps_the_layout_input_count_with_media_keys():
@@ -376,8 +399,9 @@ def test_import_drops_media_codes_on_unsupported_firmware_and_keeps_the_old_valu
     original = cfg["keys"][0]["code"]
     validated = _validated_import([PLAY_PAUSE, 0xF2])
 
-    filtered, rejected = app.filter_import_media(cfg, validated)
+    filtered, rejected, invalid = app.filter_import_media(cfg, validated)
     assert rejected == [0]
+    assert invalid == []
     assert [e["index"] for e in filtered["inputs"]] == [1]
 
     app.merge_actions_import(cfg, filtered)
@@ -386,10 +410,22 @@ def test_import_drops_media_codes_on_unsupported_firmware_and_keeps_the_old_valu
     assert cfg["keys"][1]["code"] == 0xF2, "其余输入照常导入"
 
 
+def test_import_rejects_an_undefined_media_code_on_every_firmware():
+    """300 不在 7 项表里：无论设备是否支持都不能写进存档，否则整条 CFG:KEYS 被拒。"""
+    validated = _validated_import([300, 0xF2])
+    for verdict in (True, None, False):
+        cfg = _device(supported=verdict)
+        filtered, rejected, invalid = app.filter_import_media(cfg, validated)
+        assert invalid == [0], "未定义媒体码要单独报出来"
+        assert rejected == [], "这不是「固件不支持」，不要混为一谈"
+        assert [e["index"] for e in filtered["inputs"]] == [1]
+
+
 def test_import_keeps_media_codes_when_supported_or_unknown():
     validated = _validated_import([PLAY_PAUSE])
     for verdict in (True, None):
         cfg = _device(supported=verdict)
-        filtered, rejected = app.filter_import_media(cfg, validated)
+        filtered, rejected, invalid = app.filter_import_media(cfg, validated)
         assert rejected == []
+        assert invalid == []
         assert filtered is validated

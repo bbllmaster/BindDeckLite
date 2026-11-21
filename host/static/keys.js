@@ -39,10 +39,10 @@ function keyOptions(selected) {
     ? media
     : media.filter((k) => String(k.code) === String(selected));
   if (shownMedia.length) {
-    html += `<optgroup label="${t("keys.media_group")}">${shownMedia.map(opt).join("")}</optgroup>`;
+    html += `<optgroup data-group="media" label="${t("keys.media_group")}">${shownMedia.map(opt).join("")}</optgroup>`;
   }
   if (special.length) {
-    html += `<optgroup label="${t("keys.special_group")}">${special.map(opt).join("")}</optgroup>`;
+    html += `<optgroup data-group="special" label="${t("keys.special_group")}">${special.map(opt).join("")}</optgroup>`;
   }
   return html;
 }
@@ -284,9 +284,13 @@ function renderKeyDrawer() {
     </div>` : "";
   // WS-661: the probe ruled the media segment out — say why the group is gone
   // instead of leaving the user wondering where 「播放/暂停」 went.
+  // WS-665: a cached False must be recoverable. Two dropped probes can mark a
+  // current firmware as unsupported; without this button the group would stay
+  // hidden forever. Same ?reset=1 probe the modifier row uses (WS-550/618).
   const mediaBlocked = (state.cfg || {}).media_supported === false;
   const mediaHint = mediaBlocked
-    ? `<p class="muted small" id="kdMediaHint" data-i18n="keys.media_unsupported">${t("keys.media_unsupported")}</p>`
+    ? `<p class="muted small" id="kdMediaHint" data-i18n="keys.media_unsupported">${t("keys.media_unsupported")}</p>
+        <button type="button" class="btn secondary sm" id="kdMediaRedetect" data-i18n="keys.mods_redetect">${t("keys.mods_redetect")}</button>`
     : "";
   body.innerHTML = `
     <div class="kd-field">
@@ -342,6 +346,11 @@ function renderKeyDrawer() {
   const redetect = $("#kdModsRedetect");
   if (redetect) redetect.onclick = () => {
     if (typeof redetectModsCapability === "function") redetectModsCapability();
+  };
+  // WS-665：媒体组被缓存成「不支持」时的恢复入口（与修饰键同一套 reset 语义）。
+  const mediaRedetect = $("#kdMediaRedetect");
+  if (mediaRedetect) mediaRedetect.onclick = () => {
+    if (typeof redetectMediaCapability === "function") redetectMediaCapability();
   };
   $("#kdAct").onchange = (e) => {
     item.action = { type: e.target.value, value: "", macro: [] };
@@ -408,10 +417,14 @@ function retranslateKeyDrawer() {
     const opt = $(`#kdAct option[value="${a.id}"]`);
     if (opt) opt.textContent = actionName(a);
   });
-  // HID 下拉的「特殊」分组名是 optgroup 的 label 属性 —— data-i18n 只能改
-  // textContent，改不到属性，切语言不重写就会停在旧语言上（WS-599）。
-  const og = $("#kdHid optgroup");
-  if (og) og.label = t("keys.special_group");
+  // HID 下拉的分组名是 optgroup 的 label 属性 —— data-i18n 只能改 textContent，
+  // 改不到属性，切语言不重写就会停在旧语言上（WS-599）。
+  // WS-665：媒体组与特殊组按 data-group 各取各的。以前只取第一个 optgroup，
+  // 媒体组排在前面时会把「特殊」写到媒体组上，两组一起错位。
+  const mo = $('#kdHid optgroup[data-group="media"]');
+  if (mo) mo.label = t("keys.media_group");
+  const so = $('#kdHid optgroup[data-group="special"]');
+  if (so) so.label = t("keys.special_group");
   // 「无上位机动作」的说明是 JS 拼的 innerHTML（locale 内含 <p> 包裹），
   // 同样不在 data-i18n 覆盖范围，按当前键码重写一遍。
   const action = item.action || { type: "none" };

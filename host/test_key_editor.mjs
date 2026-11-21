@@ -194,6 +194,10 @@ globalThis.__host = {
   // WS-661：旧（修复前）app.js 没有这个函数，导出 null 让用例断言失败，
   // 而不是让整份 harness 在 eval 阶段就抛 ReferenceError。
   ensureMediaCapability: typeof ensureMediaCapability === "function" ? ensureMediaCapability : null,
+  // WS-665：切语言时两组 optgroup 的 label 要分别换，不能只改第一个。
+  retranslateKeyDrawer: typeof retranslateKeyDrawer === "function" ? retranslateKeyDrawer : null,
+  // WS-665：判成不支持后要有「重新检测」入口（?reset=1）。
+  redetectMediaCapability: typeof redetectMediaCapability === "function" ? redetectMediaCapability : null,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -513,7 +517,7 @@ test("WS-661：支持时下拉出现「媒体键」分组，且「特殊」仍�
   host.state.cfg = { media_supported: true, mods_supported: true };
 
   const html = sandbox.keyOptions(240);
-  assert.match(html, /<optgroup label="媒体键">/, "支持的固件要看到媒体分组");
+  assert.match(html, /<optgroup[^>]*label="媒体键">/, "支持的固件要看到媒体分组");
   assert.match(html, /value="461"/, "播放/暂停 = 256 + 0xCD = 461");
   assert.match(html, />播放\/暂停</, "媒体项用中文标签，不显示数字");
   const mediaAt = html.indexOf("媒体键");
@@ -529,7 +533,7 @@ test("WS-661：旧固件（不支持 / 未定论）不列媒体分组，已选�
   for (const verdict of [false, null]) {
     host.state.cfg = { media_supported: verdict, mods_supported: true };
     const html = sandbox.keyOptions(240);
-    assert.doesNotMatch(html, /<optgroup label="媒体键">/,
+    assert.doesNotMatch(html, /<optgroup[^>]*label="媒体键">/,
       "没有明确 MEDIA:1 就不能让用户选媒体键");
     assert.doesNotMatch(html, /value="437"/);
   }
@@ -600,11 +604,84 @@ test("WS-661：能力探测 True 后分组出现，False 后隐藏", async () =>
   };
   await host.ensureMediaCapability();
   assert.equal(host.state.cfg.media_supported, true);
-  assert.match(sandbox.keyOptions(240), /<optgroup label="媒体键">/);
+  assert.match(sandbox.keyOptions(240), /<optgroup[^>]*label="媒体键">/);
 
   host.state.cfg = { media_supported: null, mods_supported: true };
   sandbox.api = async () => ({ sent: true, supported: false });
   await host.ensureMediaCapability();
   assert.equal(host.state.cfg.media_supported, false);
-  assert.doesNotMatch(sandbox.keyOptions(240), /<optgroup label="媒体键">/);
+  assert.doesNotMatch(sandbox.keyOptions(240), /<optgroup[^>]*label="媒体键">/);
+});
+
+/* ---------------- 用例：WS-665 评审修复 ---------------- */
+
+test("WS-665：切语言后「媒体键」与「特殊」两组 label 各自换，不会串组", async () => {
+  // 修复前 retranslateKeyDrawer() 用 $("#kdHid optgroup")（querySelector 取第一个）
+  // 去写「特殊」组；而 keyOptions() 现在先输出媒体组，于是媒体组被写成「特殊」，
+  // 真正的特殊组停在旧语言。这里给两组各注册一个桩，按生产选择器观察。
+  const { host, sandbox, registry } = await loadApp();
+  withMedia(host);
+  const cfg = makeCfg(10);
+  cfg.media_supported = true;
+  cfg.mods_supported = true;
+  host.state.cfg = cfg;
+  host.renderKeys();
+  host.openKeyDrawer(0);
+
+  const body = registry["#keyDrawerBody"][0];
+  assert.match(body.innerHTML, /data-group="media"/, "媒体组要带 data-group 标识");
+  assert.match(body.innerHTML, /data-group="special"/, "特殊组要带 data-group 标识");
+
+  // 生产代码用属性选择器取节点：桩按同一选择器注册，才能观察到属性改写。
+  const mediaOg = makeEl('optgroup[data-group="media"]');
+  const specialOg = makeEl('optgroup[data-group="special"]');
+  mediaOg.label = "媒体键";
+  specialOg.label = "特殊";
+  registry['#kdHid optgroup[data-group="media"]'] = [mediaOg];
+  registry['#kdHid optgroup[data-group="special"]'] = [specialOg];
+
+  const en = JSON.parse(
+    readFileSync(new URL("../locales/en-US.json", STATIC_DIR), "utf8"));
+  sandbox.i18n.setMessages(en, "en-US");
+  host.retranslateKeyDrawer();
+
+  assert.equal(mediaOg.label, "Media keys",
+    "媒体组的 label 必须写成「Media keys」，不能是「Special」");
+  assert.equal(specialOg.label, "Special", "特殊组也要跟着换，并且只改自己");
+});
+
+test("WS-665：判成不支持后有「重新检测」，超时不提前打开门控", async () => {
+  // 修复前只有提示文字，没有调用 /media?reset=1 的入口：两次丢包就永久隐藏媒体组。
+  const { host, sandbox, registry } = await loadApp();
+  withMedia(host);
+  const cfg = makeCfg(10);
+  cfg.media_supported = false;
+  cfg.mods_supported = true;
+  cfg.keys[0] = {
+    code: 461, label: "播放/暂停", mods: 0,
+    action: { type: "none", value: "", macro: [] },
+  };
+  host.state.cfg = cfg;
+  host.renderKeys();
+
+  registry["#kdMediaRedetect"] = [makeEl("#kdMediaRedetect")];
+  host.openKeyDrawer(0);
+  const body = registry["#keyDrawerBody"][0];
+  assert.match(body.innerHTML, /当前固件不支持媒体键/);
+  assert.match(body.innerHTML, /id="kdMediaRedetect"/, "提示旁要有「重新检测」按钮");
+
+  let calledPath = null;
+  sandbox.api = async (path) => {
+    calledPath = String(path);
+    return { sent: true, supported: null, reason: "probe_timeout" };
+  };
+  registry["#kdMediaRedetect"][0].onclick();
+  // 重探是 async：flush 两轮让它跑完。
+  await flush();
+  await flush();
+
+  assert.match(calledPath, /\/media\?reset=1$/, "重新检测要清后端计数（?reset=1）");
+  assert.equal(cfg.media_supported, false,
+    "未定论的重探必须保留原 false 结论，不能暂时放开媒体键");
+  assert.match(registry["#keyDrawerBody"][0].innerHTML, /当前固件不支持媒体键/);
 });

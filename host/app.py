@@ -733,6 +733,21 @@ def is_media_code(code) -> bool:
         return False
 
 
+# WS-665: the segment starts at 256, but only these seven values exist. The
+# firmware rejects the whole CFG:KEYS line for an undefined code, so a stray
+# value (e.g. 300 out of a hand-edited backup) must be caught here — otherwise
+# one bad input silently disables all twelve keys.
+_MEDIA_CODE_SET = frozenset(MEDIA_CODE_BASE + usage for _label, usage in MEDIA_KEYS)
+
+
+def is_known_media_code(code) -> bool:
+    """True when *code* is one of the seven defined media usages."""
+    try:
+        return int(code) in _MEDIA_CODE_SET
+    except (TypeError, ValueError):
+        return False
+
+
 # WS-508: sentinel code 0 = 「不发键」—— 这个键只跑上位机动作，设备不发 HID
 # （固件 v1.3.8 起直接跳过；更早的固件会发一帧全 0 报告，OS 不产生字符）。
 # 必须留在列表末尾：``keyOptions(selected)`` 找不到 selected 时退回第一项，
@@ -1590,29 +1605,38 @@ def validate_actions_import(data) -> dict:
 def filter_import_media(cfg: dict, validated: dict) -> tuple:
     """WS-661: keep media key codes out of a deck that cannot send them.
 
-    Returns ``(filtered, rejected)``: *filtered* is a copy of *validated* whose
-    media-code inputs were dropped, *rejected* the 0-based indices that were
-    dropped. A dropped input keeps its archive value (code / mods / action) —
-    it is never rewritten to a different key — and the import result tells the
-    user those inputs were refused by the device (「设备拒绝」).
+    Returns ``(filtered, rejected, invalid)``: *filtered* is a copy of
+    *validated* whose media-code inputs were dropped, *rejected* the 0-based
+    indices the deck refused (verdict False), *invalid* the indices holding a
+    ``>=256`` value that is not one of the seven defined usages. A dropped
+    input keeps its archive value (code / mods / action) — it is never
+    rewritten to a different key — and the import result tells the user those
+    inputs were refused by the device (「设备拒绝」).
 
-    The filter only bites once the CFG:MEDIA probe concluded "unsupported". An
-    unknown verdict (deck offline) keeps the codes: apply_device() probes
-    again and refuses to write them if the deck still cannot take them.
+    WS-665: ``invalid`` is checked on every verdict. The firmware rejects the
+    entire ``CFG:KEYS`` line for one undefined code, so importing such a value
+    into a capable deck would disable all inputs, not just this one.
+
+    The capability filter only bites once the CFG:MEDIA probe concluded
+    "unsupported". An unknown verdict (deck offline) keeps the codes:
+    apply_device() probes again and refuses to write them if the deck still
+    cannot take them.
     """
-    if (cfg or {}).get("media_supported") is not False:
-        return validated, []
-    kept, rejected = [], []
+    supported = (cfg or {}).get("media_supported") is not False
+    kept, rejected, invalid = [], [], []
     for entry in validated.get("inputs", []):
-        if is_media_code(entry.get("code")):
+        code = entry.get("code")
+        if is_media_code(code) and not is_known_media_code(code):
+            invalid.append(entry["index"])
+        elif is_media_code(code) and not supported:
             rejected.append(entry["index"])
         else:
             kept.append(entry)
-    if not rejected:
-        return validated, []
+    if not rejected and not invalid:
+        return validated, [], []
     out = dict(validated)
     out["inputs"] = kept
-    return out, rejected
+    return out, rejected, invalid
 
 
 def merge_actions_import(cfg: dict, validated: dict) -> tuple:
@@ -2557,10 +2581,17 @@ def apply_device(dev_id: str) -> dict:
     # WS-661: a media code (>=256) may only be written to firmware that
     # answered CFG:MEDIA. When the verdict is still unknown it is probed here:
     # apply is the last gate, and old firmware truncates the code to a
-    # keyboard usage (typing a character). If the deck stays silent the media
-    # code is NOT sent — that input goes out as 0 (「不发键」, the protocol's
-    # explicit "no key" value, never a different key) and the keys row below
-    # is forced to 设备拒绝. Everything else still applies.
+    # keyboard usage (typing a character).
+    #
+    # WS-665: the three outcomes are distinct and must not be collapsed:
+    #   * False (confirmed old firmware) — that input goes out as 0 (「不发键」,
+    #     the protocol's explicit "no key", never a different key) and the keys
+    #     row is forced to 设备拒绝;
+    #   * None (probe stayed silent) — CFG:KEYS is NOT sent at all. Writing 0
+    #     would really clear the keys on a current deck that dropped one
+    #     answer, and calling that "unsupported" is a verdict we do not have;
+    #   * True — write the code, but never an undefined >=256 value: the
+    #     firmware rejects the whole line for one bad code.
     key_codes = [int(k["code"]) for k in cfg.get("keys", [])[:count]]
     media_inputs = [i for i, c in enumerate(key_codes) if c >= MEDIA_CODE_BASE]
     if media_inputs and cfg.get("media_supported") is None:
@@ -2569,14 +2600,33 @@ def apply_device(dev_id: str) -> dict:
             with _lock:
                 cfg["media_supported"] = True
                 save_config()
-    media_blocked = []
-    if media_inputs and cfg.get("media_supported") is not True:
+
+    verdict = cfg.get("media_supported")
+    media_blocked = []      # 1-based inputs: confirmed unsupported, sent as 0
+    media_unconfirmed = []  # 1-based inputs: verdict unknown, CFG:KEYS skipped
+    media_bad = []          # 1-based inputs: undefined >=256 code, sent as 0
+    if media_inputs and verdict is False:
         media_blocked = [i + 1 for i in media_inputs]
         for i in media_inputs:
             key_codes[i] = 0
         add_event("cfg", t("log.media_not_sent",
                            inputs="、".join(str(n) for n in media_blocked)),
                   dev_id, "warn")
+    elif media_inputs and verdict is not True:
+        media_unconfirmed = [i + 1 for i in media_inputs]
+        add_event("cfg", t("log.media_unconfirmed",
+                           inputs="、".join(str(n) for n in media_unconfirmed)),
+                  dev_id, "warn")
+    elif media_inputs:
+        media_bad = [i + 1 for i in media_inputs
+                     if not is_known_media_code(key_codes[i])]
+        if media_bad:
+            for i in media_inputs:
+                if not is_known_media_code(key_codes[i]):
+                    key_codes[i] = 0
+            add_event("cfg", t("log.media_bad_code",
+                               inputs="、".join(str(n) for n in media_bad)),
+                      dev_id, "warn")
     keys = ",".join(str(c) for c in key_codes)
     enc_val = str(int(cfg["encoder"].get("mode", 0)))
     sleep = cfg.get("sleep", {})
@@ -2632,8 +2682,12 @@ def apply_device(dev_id: str) -> dict:
             # Layout first: the key count the deck expects depends on it.
             ("layout", "CFG:LAYOUT:%d" % target_layout),
             ("pins", "CFG:PINS:" + pins),
-            ("keys", "CFG:KEYS:" + keys),
         ]
+        # WS-665: an undecided media verdict means the keys line is skipped
+        # entirely — the device keeps its current codes, and the result row
+        # says "未确认，请重试" instead of claiming a rejection.
+        if not media_unconfirmed:
+            commands.append(("keys", "CFG:KEYS:" + keys))
         # WS-546: right after CFG:KEYS, so a rejected mask line cannot be
         # mistaken for a key-code failure. Skipped entirely on old firmware.
         if send_mods:
@@ -2791,12 +2845,21 @@ def apply_device(dev_id: str) -> dict:
         # must read 设备拒绝 even though the read-back matches the (0-substituted)
         # line — the value the user configured did not reach the deck, and
         # pretending it did would hide a silently disabled key.
-        if media_blocked:
-            for item in items:
-                if item["field"] == "keys" and item["status"] == "ok":
-                    item["status"] = "rejected"
-                    item["reason"] = t("error.media_unsupported")
-                    break
+        # WS-665: an unknown verdict is not a rejection (the line was never
+        # sent), and an undefined code is a different, host-side failure.
+        keys_item = next((i for i in items if i["field"] == "keys"), None)
+        if keys_item is not None:
+            if media_blocked:
+                keys_item["status"] = "rejected"
+                keys_item["reason"] = t("error.media_unsupported")
+            elif media_unconfirmed:
+                keys_item["status"] = "unconfirmed"
+                keys_item["reason"] = t("log.media_unconfirmed",
+                                         inputs="、".join(
+                                             str(n) for n in media_unconfirmed))
+            elif media_bad:
+                keys_item["status"] = "rejected"
+                keys_item["reason"] = t("error.media_bad_code")
 
         ok_all = all(i["status"] == "ok" for i in items)
         # WS-512: only an apply whose every field read back with the value we
@@ -2814,6 +2877,9 @@ def apply_device(dev_id: str) -> dict:
             "items": items,
             # WS-661: 1-based inputs whose media code was not sent.
             "media_blocked": media_blocked,
+            # WS-665: 1-based inputs held back because the verdict is unknown
+            # (CFG:KEYS was not sent at all — retry after the deck answers).
+            "media_unconfirmed": media_unconfirmed,
         }
     finally:
         with _apply_lock:
@@ -4912,7 +4978,7 @@ def api_actions_import(dev_id):
         cfg = device_cfg(dev_id)
         # WS-661: a media code the deck cannot send stays out of the archive;
         # that input keeps its current value and the result names it.
-        mergeable, rejected_media = filter_import_media(cfg, validated)
+        mergeable, rejected_media, invalid_media = filter_import_media(cfg, validated)
         applied, skipped = merge_actions_import(cfg, mergeable)
         saved = save_config()
         if not saved:
@@ -4924,6 +4990,9 @@ def api_actions_import(dev_id):
     return jsonify({"ok": True, "applied": applied,
                     "skipped_extra": skipped,
                     "rejected_media": [i + 1 for i in rejected_media],
+                    # WS-665: undefined >=256 codes are a host-side bad value,
+                    # not a firmware capability verdict.
+                    "invalid_media": [i + 1 for i in invalid_media],
                     "dirty": True})
 
 

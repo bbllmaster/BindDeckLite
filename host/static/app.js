@@ -2217,6 +2217,34 @@ async function ensureMediaCapability() {
   }
 }
 
+/** WS-665：抽屉「重新检测」。清掉后端连续超时计数（?reset=1）再探一次，
+ *  两次丢包被误判成不支持的设备不必等 VERSION 变化才能恢复媒体组。
+ *  与修饰键（WS-618）同一套：探测期间保留原结论，结果未定论时不覆盖 ——
+ *  否则 reset 就成了向旧固件下发媒体码的窗口。 */
+async function redetectMediaCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg || mediaProbing.has(devId)) return;
+  mediaProbing.add(devId);
+  const prev = cfg.media_supported;
+  try {
+    const r = await api(
+      `/api/device/${encodeURIComponent(devId)}/media?reset=1`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return;
+    if (r.supported === true || r.supported === false) {
+      cfg.media_supported = r.supported;
+    } else if (r.supported === null) {
+      cfg.media_supported = prev;
+    }
+    refreshMediaVerdictUi();
+    return cfg.media_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    mediaProbing.delete(devId);
+  }
+}
+
 /** 向设备确认布局与「是否支持 12 键」，不阻塞页面。 */
 async function probeDeviceLayout(devId) {
   if (!devId) return;
@@ -4051,6 +4079,12 @@ async function confirmBackupImport() {
     if (Array.isArray(r.rejected_media) && r.rejected_media.length) {
       resultText += " " + t("ui.backup_import_media_rejected",
                             { inputs: r.rejected_media.join("、") });
+    }
+    // WS-665：未定义的 >=256 键码（多半是手改过的备份）在主机侧就挡掉，
+    // 否则固件会整条拒绝 CFG:KEYS，全部按键一起失效。
+    if (Array.isArray(r.invalid_media) && r.invalid_media.length) {
+      resultText += " " + t("ui.backup_import_media_invalid",
+                            { inputs: r.invalid_media.join("、") });
     }
     $("#backupResultText").textContent = resultText;
     backupPane("result");
