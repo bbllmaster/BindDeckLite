@@ -260,6 +260,13 @@ function collectPending() {
   if (!sameJson(encInverted(cfg), encInverted(base))) {
     out.push({ field: "encdir", label: t("ui.encoder_dir_label"), tab: "encoder" });
   }
+  // WS-672：双击第 10 个输入进配网（设备侧 CFG:GESTURE）同样算待下发。
+  // 取值器与 reconnect_sync.changedFields 共用，旧存档缺字段按「开」处理，
+  // 不会因为字段缺失就提示一项莫名其妙的改动。
+  const gestureOn = window.ReconnectSync.gestureOn;
+  if (!sameJson(gestureOn(cfg), gestureOn(base))) {
+    out.push({ field: "gesture", label: t("ui.gesture_label"), tab: "device" });
+  }
   return out;
 }
 
@@ -470,7 +477,10 @@ function applyReconcileReadback(devId, before, r) {
   // renderEncoderDir），否则「以设备为准」后本机值更新了、控件却停在旧高亮。
   if (layoutChanged || fields.includes("enc") || fields.includes("encdir")) renderEncoder();
   if (layoutChanged || fields.includes("pins")) renderPins();
-  if (layoutChanged || fields.includes("keys") || fields.includes("sleep")) {
+  // WS-672：设备回报的配网手势值变了也要重绘开关（renderDeviceMeta 内部
+  // 会调 renderGestureRow），否则「以设备为准」后本机值更新了、控件停在旧勾选。
+  if (layoutChanged || fields.includes("keys") || fields.includes("sleep")
+      || fields.includes("gesture")) {
     renderDeviceMeta();
   } else {
     renderReadStatus();
@@ -788,6 +798,9 @@ function focusPendingItem(target) {
       target = $("#encoderModes");
     } else if (item.field === "sleep") {
       target = $("#sleepEnabled");
+    } else if (item.field === "gesture") {
+      // WS-672：配网手势开关在设备页「按键布局」卡里。
+      target = $("#gestureToggle");
     } else if (item.field === "layout") {
       target = $("#layoutEncoder");
     }
@@ -1180,6 +1193,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（编码器页行状态已经是对的）。
     ensureEncDirCapability();
+    // WS-672: 同上，确认「双击进配网」开关（旧固件不回 GESTURE: → 置灰）。
+    ensureGestureCapability();
     // WS-661: 媒体键能力（旧固件不回 MEDIA: → 下拉里没有媒体分组）。
     ensureMediaCapability();
     return;
@@ -1216,6 +1231,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（旧固件不回 ENCDIR: → 置灰）。
     ensureEncDirCapability();
+    // WS-672: 同上，确认「双击进配网」开关（旧固件不回 GESTURE: → 置灰）。
+    ensureGestureCapability();
     // WS-661: 同上，确认媒体键能力（旧固件不回 MEDIA: → 整组隐藏）。
     ensureMediaCapability();
   } catch (e) {
@@ -2180,6 +2197,33 @@ async function ensureEncDirCapability() {
   }
 }
 
+/** WS-672：确认设备是否支持 CFG:GESTURE（双击第 10 个输入进配网）。
+ *  未连接时返回 null 且不记结论；已有 True/False 时直接复用缓存（WS-550 三态）。 */
+const gestureProbing = new Set();
+
+async function ensureGestureCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return null;
+  if (cfg.gesture_supported === true || cfg.gesture_supported === false) {
+    return cfg.gesture_supported;
+  }
+  if (gestureProbing.has(devId)) return null;
+  gestureProbing.add(devId);
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/gesture`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return null;
+    if (!r.sent) return null;               // 链路不通 = 结论未知，保持现状
+    cfg.gesture_supported = r.supported;    // 三态 True / False / null
+    renderGestureRow();
+    return cfg.gesture_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    gestureProbing.delete(devId);
+  }
+}
+
 /** WS-661：媒体键能力（CFG:MEDIA）。三态，和修饰键 / 方向反转同一套规则：
  *  只有设备明确回 MEDIA:1 才把下拉里的「媒体键」分组放出来；旧固件连续两次
  *  无应答才判不支持（整组隐藏 + 提示升级）；链路不通 / 单次丢包 = 未定论，
@@ -2317,6 +2361,38 @@ function setLayout(value) {
   markDirty();
 }
 
+/** WS-672：双击第 10 个输入进配网（设备侧 CFG:GESTURE）。默认开；
+ *  旧固件不回 GESTURE:（gesture_supported === false）时整行置灰、说明原因，
+ *  apply_device 也不会下发。关闭只拦「重启进配网」，按键照常发 HID / BTN:。 */
+function renderGestureRow() {
+  const toggle = $("#gestureToggle");
+  const hint = $("#gestureHint");
+  if (!toggle) return;
+  const on = window.ReconnectSync.gestureOn(state.cfg);
+  const unsupported = (state.cfg || {}).gesture_supported === false;
+  toggle.checked = on;
+  toggle.disabled = unsupported;
+  // 事件每次渲染时重挂：renderGestureRow 是这一行唯一的渲染入口，
+  // 测试也点真实渲染出来的 handler，而不是在本文件外再拼一份。
+  toggle.onchange = () => setGesture(toggle.checked);
+  if (hint) hint.textContent = unsupported
+    ? t("ui.gesture_unsupported")
+    : t("ui.gesture_hint");
+}
+
+/** 用户点了开关。置灰时只提示，不改本地值（与 apply 的门控一致）。 */
+function setGesture(value) {
+  if (!state.cfg) return;
+  if (state.cfg.gesture_supported === false) {
+    toast(t("ui.gesture_unsupported"), "warn");
+    renderGestureRow();
+    return;
+  }
+  state.cfg.gesture = !!value;
+  renderGestureRow();
+  markDirty();
+}
+
 function renderDeviceMeta() {
   if (!state.cfg) return;
   const chip = state.cfg.chip || "ESP32";
@@ -2338,6 +2414,8 @@ function renderDeviceMeta() {
     layoutEl.textContent = is12Key() ? t("ui.layout_12key_name") : t("ui.layout_encoder_name");
   }
   renderLayoutCard();
+  // WS-672：配网手势开关跟随设备页一起重绘（含「固件不支持」置灰态）。
+  renderGestureRow();
   $("#sleepEnabled").checked = !!(state.cfg.sleep && state.cfg.sleep.enabled);
   $("#sleepMinutes").value = (state.cfg.sleep && state.cfg.sleep.minutes) || 5;
 
@@ -2960,6 +3038,10 @@ function highlightFormField(field) {
       break;
     case "sleep":
       $("#sleepEnabled").classList.add("field-highlight");
+      break;
+    case "gesture":
+      // WS-672：开关被设备拒绝时高亮那一行，与浮层里的 gesture 行一致。
+      $("#gestureToggle").classList.add("field-highlight");
       break;
     case "tz":
       // No direct tz control in the UI; the hint text stays as-is.
@@ -4378,6 +4460,7 @@ async function init() {
       setLayout(Number(el.value) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER);
     };
   });
+  // WS-672：双击进配网开关的事件由 renderGestureRow 自行挂载（与渲染同源）。
   $("#btnPing").onclick = () => devAction("ping", t("ui.ping_sent"));
   // 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
   $("#btnSysRefresh").onclick = async () => {

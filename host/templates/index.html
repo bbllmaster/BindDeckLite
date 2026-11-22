@@ -242,6 +242,13 @@
               <span data-i18n="ui.layout_12key">12 键（无编码器，原 A / B / 按压 三脚各接一键）</span>
             </label>
             <p class="muted small" id="layoutHint"></p>
+            <!-- WS-672：双击第 10 个输入进配网可关。关闭只拦「重启进配网」，
+                 按键本身照常发 HID / BTN:；旧固件不回 GESTURE: 时整行置灰。 -->
+            <label class="row" id="gestureRow">
+              <input type="checkbox" id="gestureToggle">
+              <span data-i18n="ui.gesture_label">双击编码器按压进入配网</span>
+            </label>
+            <p class="muted small" id="gestureHint"></p>
           </div>
 
           <div class="card">

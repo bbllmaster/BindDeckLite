@@ -102,10 +102,10 @@ jobs:
         run: python tools/check_i18n.py
 
 
-      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic + WS-420 OTA flash guard + encoder rotation actions + WS-476 pin validation + WS-484 macro summary + WS-495 stop running action + WS-499 12-key layout + WS-508 no-key sentinel + WS-512 device trust + WS-523 online update + WS-529 i18n + WS-542 sleep wake inputs + WS-546 key modifiers + WS-570 update script + WS-619 action backup io + WS-624 packaging pin guard + WS-626 encoder direction inversion + WS-641 encoder self-check counters + WS-645 log export + WS-661 media keys + WS-666 config deepcopy)
+      - name: Unit tests (close_decision + macro parse + WS-378 OTA diagnostic + WS-420 OTA flash guard + encoder rotation actions + WS-476 pin validation + WS-484 macro summary + WS-495 stop running action + WS-499 12-key layout + WS-508 no-key sentinel + WS-512 device trust + WS-523 online update + WS-529 i18n + WS-542 sleep wake inputs + WS-546 key modifiers + WS-570 update script + WS-619 action backup io + WS-624 packaging pin guard + WS-626 encoder direction inversion + WS-641 encoder self-check counters + WS-645 log export + WS-661 media keys + WS-666 config deepcopy + WS-672 portal gesture switch)
         working-directory: host
         run: |
-          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_key_mods.py test_device_trust.py test_app_update.py test_update_script_windows.py test_fw_update.py test_release_pipeline.py test_i18n.py test_sleep_wake.py test_actions_io.py test_build_deps.py test_encoder_dir.py test_encoder_stats.py test_log_export.py test_media_keys.py test_cfg_deepcopy.py -v
+          python -m pytest test_close_decision.py test_macro_parse.py test_ota_diag.py test_ota_flash_guard.py test_encoder_actions.py test_pin_validation.py test_macro_summary.py test_action_cancel.py test_layout.py test_keycode_none.py test_key_mods.py test_device_trust.py test_app_update.py test_update_script_windows.py test_fw_update.py test_release_pipeline.py test_i18n.py test_sleep_wake.py test_actions_io.py test_build_deps.py test_encoder_dir.py test_encoder_stats.py test_log_export.py test_media_keys.py test_cfg_deepcopy.py test_gesture_toggle.py -v
 
 
       # WS-558: rolling release notes list only the increment since the
@@ -147,10 +147,11 @@ jobs:
       #   test_encoder_stats.mjs       WS-641 encoder self-check counts / 5 s window / clear baseline / freeze
       #   test_log_export.mjs          WS-645 log export header / visible rows / button state / file name
       #   test_macro_record.mjs        WS-651 macro Key step record / key-name parity with app.py
+      #   test_gesture_ui.mjs          WS-672 portal gesture switch render / disabled / dirty
       - name: Front-end regression tests (node --test)
         working-directory: host
         run: |
-          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs test_portal_wifi_state.mjs test_actions_import_preview.mjs test_encoder_dir_ui.mjs test_portal_scan.mjs test_device_row_view.mjs test_encoder_stats.mjs test_log_export.mjs test_macro_record.mjs
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs test_portal_wifi_state.mjs test_actions_import_preview.mjs test_encoder_dir_ui.mjs test_portal_scan.mjs test_device_row_view.mjs test_encoder_stats.mjs test_log_export.mjs test_macro_record.mjs test_gesture_ui.mjs
 
       # WS-569: exactly one upload per artifact name. A second upload of the
       # same name fails the job with 409 Conflict, which turned every PR into

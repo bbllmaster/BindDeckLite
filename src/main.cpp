@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.13"  // WS-661: 按键媒体键（>=256 键码段 + CFG:MEDIA）；1.3.12 为 WS-635
+#define FW_VERSION "1.3.14"  // WS-672: 双击进配网可关（CFG:GESTURE）；1.3.13 为 WS-661
 
 #define FW_MODEL   "Lite"
 
@@ -153,6 +153,10 @@ bool encInverted = false;
 // Stored as NVS key "encOn", independent of CFG_SCHEMA (see the note above).
 bool encOn = true;
 bool sleepEnabled = true;
+// WS-672: allow the encoder double-click (input 9) to restart into the portal.
+// Stored in NVS; default true = unchanged behaviour. Turning it off only skips
+// the BOOT_CFG arm - the press still sends its HID key and BTN: event.
+bool gestureEnabled = true;
 unsigned long sleepTimeoutMs = 300000;
 char tzString[64] = "CET-1CEST,M3.5.0,M10.5.0/3";
 
@@ -549,6 +553,9 @@ static void saveConfig() {
   // WS-499: layout flag, stored on its own so adding it never bumps the schema.
   preferences.putBool("encOn", encOn);
   preferences.putBool("sleepEnabled", sleepEnabled);
+  // WS-672: portal-gesture switch, independent of CFG_SCHEMA (same rule as
+  // encOn / encInverted: a missing key means "on").
+  preferences.putBool("gestureEnabled", gestureEnabled);
   preferences.putULong("sleepTimeoutMs", sleepTimeoutMs);
   preferences.putString("tz", tzString);
   for (int i = 0; i < NUM_BUTTONS; i++) {
@@ -607,6 +614,8 @@ static void loadConfig() {
   // pins are legal button pins in the 12-key layout only.
   encOn = preferences.getBool("encOn", true);
   sleepEnabled = preferences.getBool("sleepEnabled", true);
+  // WS-672: missing key -> true, so an upgraded deck keeps today's gesture.
+  gestureEnabled = preferences.getBool("gestureEnabled", true);
   sleepTimeoutMs = preferences.getULong("sleepTimeoutMs", 300000);
   if (sleepTimeoutMs < 60000) sleepTimeoutMs = 300000;
 
@@ -3435,6 +3444,26 @@ static void processCommand(String data) {
     // old firmware stays silent (it only emits the generic ACK:), which is
     // how the host tells supported from unsupported without a version number.
     sendToHost("ENCDIR:" + String(encInverted ? 1 : 0));
+  } else if (data.startsWith("CFG:GESTURE:")) {
+    // WS-672: CFG:GESTURE:0|1 - whether the encoder double-click may restart
+    // into the portal. Same strict parse as CFG:ENCDIR: exactly "0" or "1";
+    // anything else (empty / 2 / abc) rejects the whole line and keeps the
+    // stored value, so a bad write can never corrupt NVS.
+    String v = data.substring(12);   // "CFG:GESTURE:" is 12 chars
+    v.trim();
+    if (v == "0" || v == "1") {
+      gestureEnabled = (v == "1");
+      saveConfig();
+      log_e("[cfg] gesture applied (%d)", gestureEnabled ? 1 : 0);
+    } else {
+      log_e("[cfg] gesture REJECTED (bad=%s, keeping %d)",
+            v.length() ? v.c_str() : "(empty)", gestureEnabled ? 1 : 0);
+    }
+  } else if (data == "CFG:GESTURE") {
+    // WS-672: read-only capability probe, same shape as CFG:ENCDIR. A deck
+    // that answers GESTURE:<0|1> speaks CFG:GESTURE; old firmware stays
+    // silent (only the generic ACK:), which is how the host disables the row.
+    sendToHost("GESTURE:" + String(gestureEnabled ? 1 : 0));
   } else if (data.startsWith("CFG:ENC:")) {
     encMode = data.substring(8).toInt();
     if (encMode < 0 || encMode > 4) encMode = 0;
@@ -3491,9 +3520,9 @@ static void processCommand(String data) {
     // "设备未回报该字段" report can be checked against what the deck actually
     // held without a BLE sniffer. Logging happens before the notifications so
     // the line is on the CDC console even if a notify fails.
-    log_e("[cfg] GET_CFG -> keys=%s pins=%s enc=%d encdir=%d sleep=%d,%lu tz=%s",
+    log_e("[cfg] GET_CFG -> keys=%s pins=%s enc=%d encdir=%d sleep=%d,%lu tz=%s gesture=%d",
           keys.c_str(), pins.c_str(), encMode, (int)encInverted, (int)sleepEnabled,
-          (unsigned long)(sleepTimeoutMs / 60000UL), tzString);
+          (unsigned long)(sleepTimeoutMs / 60000UL), tzString, (int)gestureEnabled);
     sendToHost("CFG_KEYS:" + keys);
     sendToHost("CFG_PINS:" + pins);
     sendToHost("CFG_ENC:" + String(encMode));
@@ -3520,6 +3549,10 @@ static void processCommand(String data) {
     // read-back is enough to unlock the host's media group without an extra
     // CFG:MEDIA round trip. Old firmware never sends it.
     sendToHost("CFG_MEDIA:1");
+    // WS-672: appended after CFG_MEDIA, again "new line at the end". Its
+    // presence marks a deck that speaks CFG:GESTURE; old firmware never sends
+    // it, so old hosts that stop reading earlier are unaffected.
+    sendToHost("CFG_GESTURE:" + String(gestureEnabled ? 1 : 0));
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {
@@ -4298,7 +4331,11 @@ void loop() {
         // Never restart during the first 10 s of a boot: even a wiring fault
         // must not be able to turn the device into a reset loop.
         bool armed = g_encSeenIdle && !g_safeMode && millis() > 10000;
-        if (armed && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
+        // WS-672: gestureEnabled only gates the BOOT_CFG arm below. Debounce,
+        // lastPressAt, the HID key and the BTN: report stay untouched, so a
+        // deck with the gesture off behaves like any other button here.
+        if (armed && gestureEnabled && lastPressAt != 0 &&
+            (now - lastPressAt) <= DOUBLE_CLICK_MS) {
           log_e("[cfg] encoder double-click -> reboot into portal");
           // WS-366: this runs on the esp_timer task. Only arm the deferred boot;
           // loop() writes forceCfg and restarts from the safe Arduino task.
@@ -4307,7 +4344,13 @@ void loop() {
         lastPressAt = now;
         g_lastActivity = now;
         bleKeyboard.notifyUserActivity();   // WS-429: user present -> resume advertising
-        log_e("[btn] input 9%s", encOn ? " (encoder push)" : " (button 10)");
+        if (!gestureEnabled) {
+          // One short line so a field report can tell "gesture off" apart from
+          // "double-click did nothing".
+          log_e("[btn] input 9 (portal gesture disabled)");
+        } else {
+          log_e("[btn] input 9%s", encOn ? " (encoder push)" : " (button 10)");
+        }
         sendKeyForInput(9);
         sendToHost("BTN:" + g_devId + ":9");
       }
