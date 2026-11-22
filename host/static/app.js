@@ -260,6 +260,12 @@ function collectPending() {
   if (!sameJson(encInverted(cfg), encInverted(base))) {
     out.push({ field: "encdir", label: t("ui.encoder_dir_label"), tab: "encoder" });
   }
+  // WS-672：双击第 10 个输入进配网（设备侧 CFG:GESTURE）。取值器与
+  // changedFields 共用，避免「关了开关却算 0 项」。
+  const gestureEnabled = window.ReconnectSync.gestureEnabled;
+  if (!sameJson(gestureEnabled(cfg), gestureEnabled(base))) {
+    out.push({ field: "gesture", label: t("ui.layout_gesture_label"), tab: "device" });
+  }
   return out;
 }
 
@@ -790,6 +796,8 @@ function focusPendingItem(target) {
       target = $("#sleepEnabled");
     } else if (item.field === "layout") {
       target = $("#layoutEncoder");
+    } else if (item.field === "gesture") {
+      target = $("#layoutGesture");
     }
     if (!target) return;
     target.scrollIntoView({ block: "center" });
@@ -1180,6 +1188,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（编码器页行状态已经是对的）。
     ensureEncDirCapability();
+    // WS-672: 同上，确认手势开关能力（旧固件不回 GESTURE: → 置灰）。
+    ensureGestureCapability();
     // WS-661: 媒体键能力（旧固件不回 MEDIA: → 下拉里没有媒体分组）。
     ensureMediaCapability();
     return;
@@ -1216,6 +1226,8 @@ async function selectDevice(devId) {
     ensureModsCapability();
     // WS-626: 同上，确认编码器方向反转能力（旧固件不回 ENCDIR: → 置灰）。
     ensureEncDirCapability();
+    // WS-672: 同上，确认手势开关能力（旧固件不回 GESTURE: → 置灰）。
+    ensureGestureCapability();
     // WS-661: 同上，确认媒体键能力（旧固件不回 MEDIA: → 整组隐藏）。
     ensureMediaCapability();
   } catch (e) {
@@ -2180,6 +2192,42 @@ async function ensureEncDirCapability() {
   }
 }
 
+/** WS-672：确认设备是否支持 CFG:GESTURE（能力探测，绝不写死版本号）。
+ *  未连接时返回 null 且不记结论；已有 True/False 时直接复用缓存（WS-550 三态）。 */
+const gestureProbing = new Set();
+
+async function ensureGestureCapability() {
+  const devId = state.selected;
+  const cfg = state.cfg;
+  if (!devId || !cfg) return null;
+  if (cfg.gesture_supported === true || cfg.gesture_supported === false) {
+    return cfg.gesture_supported;
+  }
+  if (gestureProbing.has(devId)) return null;
+  gestureProbing.add(devId);
+  try {
+    const r = await api(`/api/device/${encodeURIComponent(devId)}/gesture`, { method: "POST" });
+    if (state.selected !== devId || state.cfg !== cfg) return null;
+    if (!r.sent) return null;                    // 链路不通 = 结论未知，保持现状
+    let supported = r.supported;                 // 三态 True / False / null
+    // WS-679：首屏只有这一次探测，单次丢包（WS-550：不是结论）会让旧固件停在
+    // null 可用态，验收「旧固件打开设备页即置灰」就不成立。这里补探一次——后端
+    // 连续两次沉默才判不支持，链路断了就继续停在 null。
+    if (supported === null) {
+      const again = await api(`/api/device/${encodeURIComponent(devId)}/gesture`, { method: "POST" });
+      if (state.selected !== devId || state.cfg !== cfg) return null;
+      if (again.sent) supported = again.supported;
+    }
+    cfg.gesture_supported = supported;           // 结论写回（可能仍是 null）
+    renderLayoutCard();                          // 置灰 / 去提示
+    return cfg.gesture_supported;
+  } catch (_) {
+    return null;
+  } finally {
+    gestureProbing.delete(devId);
+  }
+}
+
 /** WS-661：媒体键能力（CFG:MEDIA）。三态，和修饰键 / 方向反转同一套规则：
  *  只有设备明确回 MEDIA:1 才把下拉里的「媒体键」分组放出来；旧固件连续两次
  *  无应答才判不支持（整组隐藏 + 提示升级）；链路不通 / 单次丢包 = 未定论，
@@ -2297,6 +2345,21 @@ function renderLayoutCard() {
   } else {
     enc.checked = !is12Key();
     twelve.checked = is12Key();
+  }
+  // WS-672：双击第 10 个输入进配网。12 键布局同样有第 10 个输入，所以不按
+  // 布局置灰；只有固件明确不支持（旧固件不回 GESTURE:）才禁用整行。
+  // 选中态取自设备值，缺省按开（与固件 / 后端默认一致）。
+  const gesture = $("#layoutGesture");
+  const gestureHint = $("#gestureHint");
+  if (gesture) {
+    const gestureUnsupported = (state.cfg || {}).gesture_supported === false;
+    gesture.disabled = gestureUnsupported;
+    gesture.checked = window.ReconnectSync.gestureEnabled(state.cfg);
+    if (gestureHint) {
+      gestureHint.textContent = gestureUnsupported
+        ? t("ui.gesture_unsupported")
+        : t("ui.layout_gesture_hint");
+    }
   }
   if (blocked) {
     hint.textContent = t("ui.layout_unsupported_old");
@@ -3731,6 +3794,8 @@ function bindTabs() {
     if (tab.dataset.tab === "log") syncLogFollowUi({ stick: true });
     // WS-626：打开编码器页时探测反转能力（旧固件连续两次无应答 → 置灰）。
     if (tab.dataset.tab === "encoder") ensureEncDirCapability();
+    // WS-672：设备页的「按键布局」卡带手势开关，打开时探测一次。
+    if (tab.dataset.tab === "device") ensureGestureCapability();
   };
 
   tabs.forEach((tab, i) => {
@@ -4378,6 +4443,16 @@ async function init() {
       setLayout(Number(el.value) === LAYOUT_12KEY ? LAYOUT_12KEY : LAYOUT_ENCODER);
     };
   });
+  // WS-672：手势开关同样只改本地配置（CFG:GESTURE 由「应用配置」下发），
+  // 关掉后双击第 10 个输入只当普通按键，不再重启进配网。
+  const gestureToggle = $("#layoutGesture");
+  if (gestureToggle) {
+    gestureToggle.onchange = () => {
+      if (!state.cfg) return;
+      state.cfg.gesture_enabled = !!gestureToggle.checked;
+      markDirty();
+    };
+  }
   $("#btnPing").onclick = () => devAction("ping", t("ui.ping_sent"));
   // 手动刷新运行状态（等待设备回 SYS: 行，不弹 toast）。
   $("#btnSysRefresh").onclick = async () => {

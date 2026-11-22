@@ -24,6 +24,13 @@ jobs:
       - name: Portal key self-check wiring
         run: python tools/check_key_selfcheck.py
 
+      # WS-672: the portal gesture switch must gate only the reboot - the key
+      # press and its BTN: report stay unconditional. Fails on the pre-WS-672
+      # tree (no gestureEnabled / CFG:GESTURE) and if a later change moves the
+      # key report inside the gate.
+      - name: Portal gesture gate (WS-672)
+        run: python tools/check_gesture_gate.py
+
       - name: Portal key self-check page script
         run: node --test host/test_portal_selfcheck.mjs
 
