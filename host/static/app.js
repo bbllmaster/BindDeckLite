@@ -2209,7 +2209,16 @@ async function ensureGestureCapability() {
     const r = await api(`/api/device/${encodeURIComponent(devId)}/gesture`, { method: "POST" });
     if (state.selected !== devId || state.cfg !== cfg) return null;
     if (!r.sent) return null;                    // 链路不通 = 结论未知，保持现状
-    cfg.gesture_supported = r.supported;         // 三态 True / False / null
+    let supported = r.supported;                 // 三态 True / False / null
+    // WS-679：首屏只有这一次探测，单次丢包（WS-550：不是结论）会让旧固件停在
+    // null 可用态，验收「旧固件打开设备页即置灰」就不成立。这里补探一次——后端
+    // 连续两次沉默才判不支持，链路断了就继续停在 null。
+    if (supported === null) {
+      const again = await api(`/api/device/${encodeURIComponent(devId)}/gesture`, { method: "POST" });
+      if (state.selected !== devId || state.cfg !== cfg) return null;
+      if (again.sent) supported = again.supported;
+    }
+    cfg.gesture_supported = supported;           // 结论写回（可能仍是 null）
     renderLayoutCard();                          // 置灰 / 去提示
     return cfg.gesture_supported;
   } catch (_) {

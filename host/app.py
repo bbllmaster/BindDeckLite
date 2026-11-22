@@ -2775,16 +2775,20 @@ def apply_device(dev_id: str) -> dict:
     send_encdir = (encdir_applicable(cfg)
                    and (encdir_supported is True or inverted))
 
-    # WS-672: same shape once more. Never send CFG:GESTURE to firmware the
-    # probe ruled out; with an undecided verdict, only send when the user
-    # actually wants the gesture OFF (a non-default value). The default "on"
-    # is what old firmware already does, so skipping it keeps the apply result
-    # free of a bogus "not reported" row and never delays the layout command.
+    # WS-672/WS-679: the gesture line goes only to firmware that actually
+    # *answered* the probe. An unknown verdict (first screen, a single dropped
+    # probe, link down) is not a verdict: writing CFG:GESTURE into that state
+    # would either make an old deck swallow an unknown command or come back as
+    # a bogus "this field was not reported" row - the very noise WS-546
+    # removed. A user who asked for OFF on such a deck gets an explicit
+    # "unconfirmed" row instead of a silently dropped request.
     gesture_enabled = bool(cfg.get("gesture_enabled", True))
     gesture_val = "1" if gesture_enabled else "0"
     gesture_supported = cfg.get("gesture_supported")
-    send_gesture = (gesture_applicable(cfg)
-                    and (gesture_supported is True or not gesture_enabled))
+    send_gesture = gesture_applicable(cfg) and gesture_supported is True
+    gesture_unconfirmed = (not send_gesture
+                           and gesture_supported is None
+                           and not gesture_enabled)
 
     snapshot = {
         "pins": pins,
@@ -3005,6 +3009,20 @@ def apply_device(dev_id: str) -> dict:
                 with _lock:
                     cfg["gesture_supported"] = True
                     save_config()
+
+        # WS-679: the user asked for OFF but nothing was sent because the deck
+        # never confirmed it speaks CFG:GESTURE. Say so plainly — an
+        # "unverified / field not reported" row would claim the deck rejected
+        # a line it was never given.
+        if gesture_unconfirmed:
+            items.append({
+                "field": "gesture",
+                "label": t("ui.layout_gesture_label"),
+                "status": "unconfirmed",
+                "expected": gesture_val,
+                "actual": "",
+                "reason": t("log.gesture_unconfirmed"),
+            })
 
         # WS-661: when a media code was filtered out of the line, the keys row
         # must read 设备拒绝 even though the read-back matches the (0-substituted)

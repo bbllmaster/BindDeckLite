@@ -427,6 +427,7 @@
   "log.layout_rejected": "设备拒绝（布局仍是原来的）",
   "log.media_not_sent": "输入 {inputs} 的媒体键未下发（固件不支持媒体键）",
   "log.media_unconfirmed": "输入 {inputs} 的媒体键未下发：设备未确认支持媒体键，请重试（设备上的键值保持不变）",
+  "log.gesture_unconfirmed": "设备未确认是否支持该开关，未下发；请重新连接后再试",
   "log.media_bad_code": "输入 {inputs} 的媒体键码未定义，未下发",
   "log.layout_unsupported": "当前固件不支持 12 键布局（需要 v1.3.7 及以上），请先在配网页面或通过 OTA 升级固件",
   "log.macro_app_bad_cmd": "app: {reason}，本步跳过，继续执行后续步骤",

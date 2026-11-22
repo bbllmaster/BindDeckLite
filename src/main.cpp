@@ -4341,7 +4341,8 @@ void loop() {
         lastPressAt = now;
         g_lastActivity = now;
         bleKeyboard.notifyUserActivity();   // WS-429: user present -> resume advertising
-        log_e("[btn] input 9%s", encOn ? " (encoder push)" : " (button 10)");
+        log_e("[btn] input 9%s%s", encOn ? " (encoder push)" : " (button 10)",
+              gestureEnabled ? "" : " (portal gesture disabled)");
         sendKeyForInput(9);
         sendToHost("BTN:" + g_devId + ":9");
       }

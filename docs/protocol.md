@@ -219,7 +219,7 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG_LAYOUT:` | `CFG_LAYOUT:0` | `CMD:GET_CFG` 应答（追加在最后，WS-499）；旧固件不发这一行 |
 | `CFG_MODS:` | `CFG_MODS:1,0,0,0,0,0,0,0,0,6` | `CMD:GET_CFG` 应答（追加在 `CFG_LAYOUT:` 之后，WS-546）；个数同当前布局；旧固件不发这一行 |
 | `ENCDIR:` | `ENCDIR:1` | `CFG:ENCDIR` 的应答；`0` = 默认，`1` = 反转（WS-626）；旧固件不回这一行 |
-| `CFG_ENCDIR:` | `CFG_ENCDIR:1` | `CMD:GET_CFG` 应答（追加在 `CFG_MODS:` **之后**，即最末行，WS-626）；`0` = 默认，`1` = 反转；旧固件不发这一行 |
+| `CFG_ENCDIR:` | `CFG_ENCDIR:1` | `CMD:GET_CFG` 应答（追加在 `CFG_MODS:` **之后**，WS-626；后来 `CFG_MEDIA:` / `CFG_GESTURE:` 又追加在它后面，当前末行是 `CFG_GESTURE:`）；`0` = 默认，`1` = 反转；旧固件不发这一行 |
 | `MEDIA:` | `MEDIA:1` | `CFG:MEDIA` 的应答；表示固件接受 `>=256` 的媒体键码段（WS-661）；旧固件不回这一行 |
 | `CFG_MEDIA:` | `CFG_MEDIA:1` | `CMD:GET_CFG` 应答（追加在 `CFG_ENCDIR:` 之后，WS-661）；旧固件不发这一行 |
 | `GESTURE:` | `GESTURE:1` | `CFG:GESTURE` 的应答；`1` = 双击第 10 个输入可进配网，`0` = 已关闭（WS-672）；旧固件不回这一行 |

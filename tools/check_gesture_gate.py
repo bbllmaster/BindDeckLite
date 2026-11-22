@@ -130,6 +130,20 @@ def check_source(raw: str) -> list[str]:
                  "input 9 must still report BTN:<id>:9 on every press")
         _require(failures, "lastPressAt = now;" in press, "press",
                  "lastPressAt must keep tracking every press (handfeel/window)")
+        # 开关在这个块里只允许两处：双击条件（门控重启）和那行诊断日志
+        # （`(portal gesture disabled)`）。再多一次只可能是 `if
+        # (!gestureEnabled) return;` 这类提前返回——那正是把「关掉双击」
+        # 写成「关掉按键」的 bug，必须让脚本变红。
+        used = press.count("gestureEnabled")
+        _require(failures, used == 2, "press",
+                 "gestureEnabled must appear exactly twice in the press block "
+                 "(the double-click condition + the diagnostic log); found %d — "
+                 "an extra use can only be an early return that swallows the key"
+                 % used)
+        _require(failures, "return" not in press, "press",
+                 "the input-9 press block must never return early — a guarded "
+                 "return would skip sendKeyForInput(9) / BTN: when the gesture "
+                 "is switched off")
 
     # 3. strict parser: 0|1 only, rejection keeps the value, no NVS write on it.
     probe_at = src.find('data == "CFG:GESTURE"')

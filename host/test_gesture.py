@@ -255,6 +255,43 @@ def test_old_firmware_two_silent_probes_conclude_unsupported_and_apply_skips():
         "没发就不该出现在逐项校验里"
 
 
+# --- 3b. 未知能力：一条都不发（WS-679 M1）---------------------------------
+
+def test_unknown_capability_with_gesture_off_sends_nothing_and_says_unconfirmed():
+    """WS-679：能力未定论（None）+ 用户明确要求关闭 → 不发、报 unconfirmed。
+
+    这条路径真实可达：1.3.13 打开设备页只探一次（supported=None）→ 用户把
+    开关关掉 → 点「应用配置」。修复前会下发 ``CFG:GESTURE:0``，设备不回
+    ``CFG_GESTURE:``，逐项结果变成 ``unverified`` +「设备未回报该字段」——
+    对一条从没发出去的行说「未回报」是假话；修复后一条都不发，并明确告诉
+    用户「设备未确认」，重连后再试。
+    """
+    # reported_gesture=None = 旧固件：探针沉默、GET_CFG 也没有 CFG_GESTURE 尾行。
+    sent, result = _apply(enabled=False, supported=None, reported_gesture=None)
+
+    assert not [c for c in sent if c.startswith("CFG:GESTURE:")], \
+        "能力未定论时一条 CFG:GESTURE 都不能发（不能再拿「用户想要关」当下发理由）"
+    assert "CMD:GET_CFG" in sent, "其余配置照常下发 / 回读"
+
+    item = next((i for i in result["items"] if i["field"] == "gesture"), None)
+    assert item is not None, "明确要求关闭时必须给出一行结果，不能静默丢掉"
+    assert item["status"] == "unconfirmed", item
+    assert item["expected"] == "0"
+    assert item["actual"] == ""
+    assert item["reason"] == app.t("log.gesture_unconfirmed")
+    assert item["reason"] != app.t("log.field_not_reported"), \
+        "不得再出现「设备未回报该字段」——那条行根本没发出去"
+    assert result["ok"] is False, "未确认不能算全部生效"
+
+
+def test_unknown_capability_with_default_on_stays_silent_without_noise():
+    """默认「开」+ 能力未知（新固件尚未探测）：保持原样，不发也不报。"""
+    sent, result = _apply(enabled=True, supported=None, reported_gesture=None)
+    assert not [c for c in sent if c.startswith("CFG:GESTURE:")]
+    assert not [i for i in result["items"] if i["field"] == "gesture"], \
+        "默认值不需要下发，也不该在逐项结果里占一行"
+
+
 # --- 4. 非法回读：整条拒绝、不改本地状态 ----------------------------------
 
 def test_invalid_gesture_readback_is_rejected_and_keeps_local_state():

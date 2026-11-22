@@ -427,6 +427,7 @@
   "log.layout_rejected": "Rejected by device (layout unchanged)",
   "log.media_not_sent": "Media key for input {inputs} was not sent (firmware does not support media keys)",
   "log.media_unconfirmed": "Media key for input {inputs} was not sent: the deck did not confirm media-key support, please retry (its key values were left unchanged)",
+  "log.gesture_unconfirmed": "The deck has not confirmed whether it supports this switch, so it was not sent; reconnect and try again",
   "log.media_bad_code": "Media key code for input {inputs} is undefined and was not sent",
   "log.layout_unsupported": "The current firmware does not support the 12-key layout (v1.3.7 or newer is required); update the firmware from the config page or over OTA first",
   "log.macro_app_bad_cmd": "app: {reason}; skipping this step and continuing",
