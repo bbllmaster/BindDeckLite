@@ -37,6 +37,14 @@
     return !!(((cfg || {}).encoder || {}).inverted);
   }
 
+  // WS-672：双击第 10 个输入进配网（设备侧 CFG:GESTURE）存在
+  // `cfg.gesture_enabled`。旧存档没有该字段时按 true（默认开）处理，与后端
+  // 和固件缺省值一致；缺失与显式 true 视为同一个值，不算「有改动」。
+  function gestureEnabled(cfg) {
+    const value = (cfg || {}).gesture_enabled;
+    return value === undefined || value === null ? true : !!value;
+  }
+
   // 参与对账比较的几组配置，顺序即日志里的字段顺序（与后端一致）。
   // `key` 是后端 CFG: 的组名（也是回读字段名）；`value` 是取该组参与比较
   // 的值的函数，缺省时取同名字段。给了取值器的组按取值结果比较，不做整对象比。
@@ -47,6 +55,8 @@
     { key: "sleep" },
     // WS-629：手机配网页 / 旧上位机改了设备侧方向后，对账日志要点名该字段。
     { key: "encdir", value: encoderInverted },
+    // WS-672：手势开关也是设备侧配置，重连对账同样要点名。
+    { key: "gesture", value: gestureEnabled },
   ];
 
   /**
@@ -60,6 +70,8 @@
     sleep: "ui.group_sleep",
     // WS-629：方向反转对账日志用的组名（复用编码器页「旋转方向」文案）。
     encdir: "ui.encoder_dir_label",
+    // WS-672：手势开关。
+    gesture: "ui.layout_gesture_label",
   };
 
   /**
@@ -116,6 +128,7 @@
     LABEL_KEYS,
     encoderMode,
     encoderInverted,
+    gestureEnabled,
     shouldReconcile,
     changedFields,
     syncSummary,

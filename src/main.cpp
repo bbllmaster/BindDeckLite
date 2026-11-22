@@ -53,7 +53,7 @@
 
 // === Identity =============================================================
 
-#define FW_VERSION "1.3.13"  // WS-661: 按键媒体键（>=256 键码段 + CFG:MEDIA）；1.3.12 为 WS-635
+#define FW_VERSION "1.3.14"  // WS-672: 双击第 10 个输入进配网可关（CFG:GESTURE）；1.3.13 为 WS-661
 
 #define FW_MODEL   "Lite"
 
@@ -149,6 +149,10 @@ int encMode = 0;
 // WS-626: invert the rotation direction at the single flip point in
 // handleEncoderAction(). Stored in NVS; default false = unchanged behaviour.
 bool encInverted = false;
+// WS-672: allow the "double-click input 10 -> reboot into the portal" gesture.
+// Default true keeps the 1.3.13 behaviour (and the upgrade path) unchanged;
+// stored in NVS. When false the second press is just a normal key press.
+bool gestureEnabled = true;
 // WS-499: true = encoder layout (10 inputs), false = 12-key layout.
 // Stored as NVS key "encOn", independent of CFG_SCHEMA (see the note above).
 bool encOn = true;
@@ -545,6 +549,9 @@ static void saveConfig() {
   preferences.putInt("encMode", encMode);
   // WS-626: direction flag lives next to encMode (same NVS namespace).
   preferences.putBool("encInverted", encInverted);
+  // WS-672: portal-gesture switch. Default 1 at load time, so an upgraded deck
+  // and a deck that never heard of CFG:GESTURE behave exactly the same.
+  preferences.putBool("gestureEnabled", gestureEnabled);
   preferences.putInt("cfgVer", CFG_SCHEMA);
   // WS-499: layout flag, stored on its own so adding it never bumps the schema.
   preferences.putBool("encOn", encOn);
@@ -603,6 +610,9 @@ static void loadConfig() {
   // out-of-range / dirty byte (2, 255, ...) all fall back to false (default,
   // no inversion) - the same "bad value -> default" rule as encMode above.
   encInverted = preferences.getBool("encInverted", false);
+  // WS-672: a missing key (upgrade from <=1.3.13) or a dirty byte both mean
+  // "gesture on" - the default must never change behaviour on an old deck.
+  gestureEnabled = preferences.getBool("gestureEnabled", true);
   // WS-499: must be known before the pin set is validated - the three encoder
   // pins are legal button pins in the 12-key layout only.
   encOn = preferences.getBool("encOn", true);
@@ -3435,6 +3445,26 @@ static void processCommand(String data) {
     // old firmware stays silent (it only emits the generic ACK:), which is
     // how the host tells supported from unsupported without a version number.
     sendToHost("ENCDIR:" + String(encInverted ? 1 : 0));
+  } else if (data == "CFG:GESTURE") {
+    // WS-672: read-only capability probe. New firmware answers GESTURE:0|1;
+    // old firmware stays silent (it only emits the generic ACK:), which is how
+    // the host tells supported from unsupported without a version number.
+    sendToHost("GESTURE:" + String(gestureEnabled ? 1 : 0));
+  } else if (data.startsWith("CFG:GESTURE:")) {
+    // WS-672: CFG:GESTURE:0|1 - allow / forbid the "double-click input 10 ->
+    // reboot into the portal" gesture. Same strict rule as CFG:ENCDIR: only
+    // the exact single digit is accepted; a malformed / empty / out-of-range
+    // value keeps the stored one, so a bad write can never corrupt NVS.
+    String v = data.substring(12);   // "CFG:GESTURE:" is 12 chars
+    v.trim();
+    if (v == "0" || v == "1") {
+      gestureEnabled = (v == "1");
+      saveConfig();
+      log_e("[cfg] gesture applied (%d)", gestureEnabled ? 1 : 0);
+    } else {
+      log_e("[cfg] gesture REJECTED (bad=%s, keeping %d)",
+            v.length() ? v.c_str() : "(empty)", gestureEnabled ? 1 : 0);
+    }
   } else if (data.startsWith("CFG:ENC:")) {
     encMode = data.substring(8).toInt();
     if (encMode < 0 || encMode > 4) encMode = 0;
@@ -3520,6 +3550,10 @@ static void processCommand(String data) {
     // read-back is enough to unlock the host's media group without an extra
     // CFG:MEDIA round trip. Old firmware never sends it.
     sendToHost("CFG_MEDIA:1");
+    // WS-672: appended after CFG_MEDIA - new lines only ever go at the end, so
+    // the order of every existing line (and old hosts reading them) stays the
+    // same. Its presence marks a deck that speaks CFG:GESTURE.
+    sendToHost("CFG_GESTURE:" + String(gestureEnabled ? 1 : 0));
   } else if (data.startsWith("CMD:GET_TZ")) {
     sendToHost("TZ_INFO:" + String(tzString));
   } else if (data.startsWith("CMD:GET_WIFI")) {
@@ -4298,7 +4332,7 @@ void loop() {
         // Never restart during the first 10 s of a boot: even a wiring fault
         // must not be able to turn the device into a reset loop.
         bool armed = g_encSeenIdle && !g_safeMode && millis() > 10000;
-        if (armed && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
+        if (armed && gestureEnabled && lastPressAt != 0 && (now - lastPressAt) <= DOUBLE_CLICK_MS) {
           log_e("[cfg] encoder double-click -> reboot into portal");
           // WS-366: this runs on the esp_timer task. Only arm the deferred boot;
           // loop() writes forceCfg and restarts from the safe Arduino task.

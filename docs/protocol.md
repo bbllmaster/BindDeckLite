@@ -32,6 +32,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `CFG:ENC:` | `CFG:ENC:0` | 编码器模式 0–4 |
 | `CFG:ENCDIR:` | `CFG:ENCDIR:1` | 编码器旋转方向反转（WS-626）：`0` = 默认，`1` = 反转（顺/逆时针互换，5 个模式一起翻面）。**设备侧设置**，存 NVS；只接受 `0`/`1`，其它值（非法 / 空 / 非数字）整条拒绝并保持原值，日志为 `[cfg] encdir REJECTED`。缺省 `0`，与引入前完全一致 |
 | `CFG:ENCDIR` | | 查询旋转方向，回一行 `ENCDIR:<0\|1>`；旧固件不回该行（WS-626，供三态能力探测） |
+| `CFG:GESTURE:` | `CFG:GESTURE:0` | 双击第 10 个输入进配网开关（WS-672）：`1` = 允许（缺省），`0` = 关闭（快速连按两次只当普通按键，不重启）。**设备侧设置**，存 NVS；只接受 `0`/`1`，其它值（空 / `2` / `abc` / `01`）整条拒绝并保持原值，日志为 `[cfg] gesture REJECTED (bad=<原文或(empty)>, keeping <0\|1>)`。关闭不影响上电按住 0.2 秒与 `CMD:BOOT_CFG` 两条入口 |
+| `CFG:GESTURE` | | 查询该开关，回一行 `GESTURE:<0\|1>`；旧固件不回该行（WS-672，供三态能力探测） |
 | `CFG:SLEEP:` | `CFG:SLEEP:1,5` | 启用休眠, 分钟（最小 1） |
 | `CFG:TZ:` | `CFG:TZ:CST-8` | POSIX 时区串（NTP） |
 | `CFG:WIFI:` | `CFG:WIFI:ssid\|password` | 保存并连接 WiFi（配网模式） |
@@ -196,6 +198,8 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 
 旋转方向反转（`CFG:ENCDIR`，WS-626）是**设备侧设置**：翻转点在 `handleEncoderAction()` 入口，设备直发的 HID 键与 `ENC:` 方向字一起翻面，断开上位机（只留 BLE）仍生效。新固件缺省 `0`，与旧行为完全一致；旧上位机不发该命令，设备沿用 NVS 里的值（可能为 `1`），此时 `ENC:` 已翻但旧界面不显示该开关、也不会覆盖它。12 键布局没有旋转编码器，该开关在上位机置灰且不生效。
 
+双击第 10 个输入进配网（`CFG:GESTURE`，WS-672）同样是**设备侧设置**，但只门控「第二次按下 → 重启进配网」这一步：开关为 `0` 时消抖、`sendKeyForInput(9)`、`BTN:<id>:9` 上报与计时全部照旧，两次按下都作为普通按键发出（绝不吞键）。关闭不影响另外两条入口——上电按住第 10 个输入 0.2 秒、`CMD:BOOT_CFG`（上位机「进入配网模式」）；上电后前 10 秒的武装窗口与安全模式判断也不变。缺省 `1`，与 1.3.13 行为一致；旧固件不认识该命令，旧上位机也不会发。
+
 ## 设备 → 上位机
 
 | 消息 | 示例 | 说明 |
@@ -217,7 +221,9 @@ RX / TX 需要已配对（加密）连接；上位机首次写入会自动配对
 | `ENCDIR:` | `ENCDIR:1` | `CFG:ENCDIR` 的应答；`0` = 默认，`1` = 反转（WS-626）；旧固件不回这一行 |
 | `CFG_ENCDIR:` | `CFG_ENCDIR:1` | `CMD:GET_CFG` 应答（追加在 `CFG_MODS:` **之后**，即最末行，WS-626）；`0` = 默认，`1` = 反转；旧固件不发这一行 |
 | `MEDIA:` | `MEDIA:1` | `CFG:MEDIA` 的应答；表示固件接受 `>=256` 的媒体键码段（WS-661）；旧固件不回这一行 |
-| `CFG_MEDIA:` | `CFG_MEDIA:1` | `CMD:GET_CFG` 应答（追加在 `CFG_ENCDIR:` 之后，即最末行，WS-661）；旧固件不发这一行 |
+| `CFG_MEDIA:` | `CFG_MEDIA:1` | `CMD:GET_CFG` 应答（追加在 `CFG_ENCDIR:` 之后，WS-661）；旧固件不发这一行 |
+| `GESTURE:` | `GESTURE:1` | `CFG:GESTURE` 的应答；`1` = 双击第 10 个输入可进配网，`0` = 已关闭（WS-672）；旧固件不回这一行 |
+| `CFG_GESTURE:` | `CFG_GESTURE:1` | `CMD:GET_CFG` 应答（追加在 `CFG_MEDIA:` **之后**，即最末行，WS-672）；旧固件不发这一行 |
 | `TZ_INFO:` | `TZ_INFO:CST-8` | `CMD:GET_TZ` 应答 |
 | `WIFI_INFO:` | `WIFI_INFO:home,192.168.1.42` | `CMD:GET_WIFI` 应答；未连接为 `DISCONNECTED,0.0.0.0` |
 | `BOND_STATUS:` | `BOND_STATUS:bound,A1B2:**:**:**:**` | `CMD:GET_BOND` 应答；地址脱敏，只保留前两字节 |

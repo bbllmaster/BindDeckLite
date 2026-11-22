@@ -904,6 +904,18 @@ _media_lock = threading.RLock()
 MEDIA_UNSUPPORTED_AFTER = 2
 _media_misses: dict = {}
 
+# WS-672: one pending CFG:GESTURE probe per device. Same tri-state idea as the
+# ENCDIR / MODS / MEDIA probes: a deck that answers ``GESTURE:<0|1>`` supports
+# the portal-gesture switch, one that stays silent predates it. Capability is
+# decided by that answer, never by a version number.
+_gesture_windows: dict = {}
+_gesture_lock = threading.RLock()
+
+# WS-550 rule again: a single dropped 1.5 s reply is not a verdict - only a
+# run of consecutive silent probes concludes "unsupported".
+GESTURE_UNSUPPORTED_AFTER = 2
+_gesture_misses: dict = {}
+
 # Per-device record of the last explicit read-back (WS-409): when it happened
 # and which config groups the device actually reported.  It lives outside the
 # device config so a failed read leaves the stored config untouched.
@@ -983,6 +995,9 @@ _CFG_OPTIONAL_FIELDS = [
     # WS-626: CFG_ENCDIR:0|1 is the very last CMD:GET_CFG tail line. Its mere
     # presence marks a deck that speaks CFG:ENCDIR (see probe_encdir).
     ("encdir", "ENCDIR", t("ui.encoder_dir_label")),
+    # WS-672: CFG_GESTURE:0|1 is the very last CMD:GET_CFG tail line. Its mere
+    # presence marks a deck that speaks CFG:GESTURE (see probe_gesture).
+    ("gesture", "GESTURE", t("ui.layout_gesture_label")),
 ]
 _ALL_CFG_FIELDS = _CFG_READBACK_FIELDS + _CFG_OPTIONAL_FIELDS
 
@@ -1225,6 +1240,18 @@ def _apply_cfg_field(cfg: dict, field: str, raw: str) -> bool:
         cfg.setdefault("encoder", {})["inverted"] = (raw == "1")
         # The device just told us it speaks CFG:ENCDIR - a capability fact.
         cfg["encdir_supported"] = True
+        return True
+    if field == "gesture":
+        # WS-672: ``CFG_GESTURE:`` / ``GESTURE:`` - the portal-gesture switch.
+        # Only the exact string 0 or 1 is accepted; a malformed / empty /
+        # out-of-range value returns False WITHOUT touching the stored config,
+        # so a bad read-back cannot corrupt the local state.
+        raw = raw.strip()
+        if raw not in ("0", "1"):
+            return False
+        cfg["gesture_enabled"] = (raw == "1")
+        # The device just told us it speaks CFG:GESTURE - a capability fact.
+        cfg["gesture_supported"] = True
         return True
     if field == "pins":
         vals = [v for v in raw.split(",") if v.strip()]
@@ -1701,6 +1728,10 @@ def new_device_cfg(chip: str = "ESP32", name: str = "") -> dict:
         # WS-499: a new deck is an encoder deck (10 inputs) until it says
         # otherwise, so the shipped card count does not change.
         "layout": LAYOUT_ENCODER,
+        # WS-672: the portal-gesture switch (double-click input 10 -> portal).
+        # Default on, matching the firmware; None = capability not probed yet.
+        "gesture_enabled": True,
+        "gesture_supported": None,
         "pins": list(DEFAULT_PINS.get(chip, DEFAULT_PINS["ESP32"])),
         # 12 entries are kept so a layout switch to 12 keys has codes ready;
         # input_count() decides how many the UI shows.
@@ -1734,6 +1765,10 @@ def device_cfg(dev_id: str, chip: str = "", name: str = "") -> dict:
             # only fills the in-memory copy — a legacy config.json must not be
             # rewritten just because someone opened the page.
             cfg.setdefault("trusted", True)
+            # WS-672: an archive written before the gesture switch existed
+            # keeps the firmware default (on) without rewriting the file.
+            cfg.setdefault("gesture_enabled", True)
+            cfg.setdefault("gesture_supported", None)
         # WS-503: historical devices only have 10 key entries (v1.3.6). Pad on
         # every access so apply/read-back/UI all see the same 12-entry list.
         ensure_key_items(cfg)
@@ -2140,6 +2175,18 @@ def _on_line(dev_id: str, line: str):
             box["value"] = raw
             event.set()
         return
+    if line.startswith("GESTURE:"):
+        # WS-672: answer to the CFG:GESTURE capability probe. Only the probe
+        # records it - the value is capability evidence, not a config write
+        # (the switch itself lands from the CFG_GESTURE tail line).
+        raw = line[len("GESTURE:"):].strip()
+        with _gesture_lock:
+            pending = _gesture_windows.get(dev_id)
+        if pending is not None:
+            event, box = pending
+            box["value"] = raw
+            event.set()
+        return
     if line.startswith("ENC:"):
         parts = line.split(":")
         direction = parts[-1] if parts else ""
@@ -2178,6 +2225,8 @@ def _on_line(dev_id: str, line: str):
                 # WS-661: same for media keys - a new firmware may accept the
                 # >=256 segment, so the cached verdict must not survive an OTA.
                 cfg["media_supported"] = None
+                # WS-672: same for the portal-gesture switch capability.
+                cfg["gesture_supported"] = None
                 # WS-550: a new firmware must not inherit the old deck's
                 # consecutive-timeout count, else one dropped probe right
                 # after the OTA would immediately re-conclude "unsupported".
@@ -2187,6 +2236,8 @@ def _on_line(dev_id: str, line: str):
                     _encdir_misses.pop(dev_id, None)
                 with _media_lock:
                     _media_misses.pop(dev_id, None)
+                with _gesture_lock:
+                    _gesture_misses.pop(dev_id, None)
             cfg["fw"] = {"version": new_version,
                          "model": fields[1] if len(fields) > 1 else "",
                          "chip": chip,
@@ -2299,6 +2350,17 @@ def _on_line(dev_id: str, line: str):
                 save_config()
         with _media_lock:
             _media_misses.pop(dev_id, None)
+        return
+    if line.startswith("CFG_GESTURE:"):
+        # WS-672: CMD:GET_CFG tail line. Its presence marks the deck as
+        # supporting CFG:GESTURE and writes cfg.gesture_enabled (see
+        # _apply_cfg_field). Old firmware never sends this line.
+        cfg = device_cfg(dev_id)
+        with _lock:
+            _apply_cfg_field(cfg, "gesture", line[len("CFG_GESTURE:"):])
+            save_config()
+        with _gesture_lock:
+            _gesture_misses.pop(dev_id, None)
         return
     # OTA window: capture ACK:CMD:OTA / ACK:OTA:* / ACK:OTA:ERROR:* lines.
     # These arrive during a host-driven firmware push (CMD:OTA); the push
@@ -2560,6 +2622,47 @@ def probe_media(dev_id: str, timeout: float = 1.5) -> dict:
             "value": box["value"]}
 
 
+def gesture_applicable(cfg: dict) -> bool:
+    """WS-672: whether the portal-gesture switch is usable for *cfg*.
+
+    Only a probe that concluded "unsupported" (old firmware that never answers
+    ``GESTURE:``) disables it. The layout is deliberately NOT consulted: the
+    12-key layout still has input 10 (the former encoder push), and it is the
+    one where a fast double press is most likely to be a real key, so the
+    switch must work there too. A link-down / single-timeout verdict (None)
+    stays usable so a transient BLE drop does not flash "update firmware".
+    This is the single gate shared by the UI and by apply_device.
+    """
+    return cfg.get("gesture_supported") is not False
+
+
+def probe_gesture(dev_id: str, timeout: float = 1.5) -> dict:
+    """Ask one deck whether it speaks ``CFG:GESTURE`` (WS-672).
+
+    Returns ``{"sent", "answered", "gesture"}``. ``answered`` means the deck
+    replied with ``GESTURE:<0|1>`` - i.e. it supports the switch. ``sent``
+    False means the link was down, which is "unknown", NOT "unsupported".
+    This is the only place capability is decided, so the UI can grey the row
+    out for old firmware without hard-coding any version number.
+    """
+    event = threading.Event()
+    box = {"value": None}
+    sent = False
+    with _gesture_lock:
+        _gesture_windows[dev_id] = (event, box)
+    try:
+        result = send(dev_id, "CFG:GESTURE")
+        sent = bool((result or {}).get("sent"))
+        if sent:
+            event.wait(timeout)
+    finally:
+        with _gesture_lock:
+            _gesture_windows.pop(dev_id, None)
+    return {"sent": sent,
+            "answered": box["value"] is not None,
+            "gesture": box["value"]}
+
+
 def apply_device(dev_id: str) -> dict:
     cfg = device_cfg(dev_id)
     target_layout = layout_of(cfg)
@@ -2672,6 +2775,17 @@ def apply_device(dev_id: str) -> dict:
     send_encdir = (encdir_applicable(cfg)
                    and (encdir_supported is True or inverted))
 
+    # WS-672: same shape once more. Never send CFG:GESTURE to firmware the
+    # probe ruled out; with an undecided verdict, only send when the user
+    # actually wants the gesture OFF (a non-default value). The default "on"
+    # is what old firmware already does, so skipping it keeps the apply result
+    # free of a bogus "not reported" row and never delays the layout command.
+    gesture_enabled = bool(cfg.get("gesture_enabled", True))
+    gesture_val = "1" if gesture_enabled else "0"
+    gesture_supported = cfg.get("gesture_supported")
+    send_gesture = (gesture_applicable(cfg)
+                    and (gesture_supported is True or not gesture_enabled))
+
     snapshot = {
         "pins": pins,
         "keys": keys,
@@ -2684,6 +2798,8 @@ def apply_device(dev_id: str) -> dict:
         snapshot["mods"] = mods
     if send_encdir:
         snapshot["encdir"] = encdir_val
+    if send_gesture:
+        snapshot["gesture"] = gesture_val
 
     # Create the per-device apply window before sending anything.
     window = ApplyWindow(dev_id, snapshot)
@@ -2717,6 +2833,10 @@ def apply_device(dev_id: str) -> dict:
         # every existing line - and old hosts reading them - is unchanged.
         if send_encdir:
             commands.append(("encdir", "CFG:ENCDIR:" + encdir_val))
+        # WS-672: the very last line, after CFG:ENCDIR - same "append only"
+        # convention, skipped entirely on firmware the probe ruled out.
+        if send_gesture:
+            commands.append(("gesture", "CFG:GESTURE:" + gesture_val))
 
         any_sent = False
         for field, cmd in commands:
@@ -2853,6 +2973,37 @@ def apply_device(dev_id: str) -> dict:
             if actual and cfg.get("encdir_supported") is not True:
                 with _lock:
                     cfg["encdir_supported"] = True
+                    save_config()
+
+        # WS-672: the gesture switch is compared only when we sent it. A deck
+        # that reports CFG_GESTURE is gesture-capable from now on.
+        if "gesture" in snapshot:
+            expected = snapshot["gesture"]
+            actual = window.readback.get("gesture", "")
+            ack_ok = window._ack_ok.get("gesture", False)
+            if not ack_ok:
+                status = "unconfirmed"
+                reason = t("log.not_connected") if not any_sent else t("log.connection_lost")
+            elif not actual:
+                status = "unverified"
+                reason = t("log.field_not_reported")
+            elif actual == expected:
+                status = "ok"
+                reason = ""
+            else:
+                status = "rejected"
+                reason = _rejection_reason("gesture", expected, actual)
+            items.append({
+                "field": "gesture",
+                "label": t("ui.layout_gesture_label"),
+                "status": status,
+                "expected": expected,
+                "actual": actual,
+                "reason": reason,
+            })
+            if actual and cfg.get("gesture_supported") is not True:
+                with _lock:
+                    cfg["gesture_supported"] = True
                     save_config()
 
         # WS-661: when a media code was filtered out of the line, the keys row
@@ -5353,6 +5504,60 @@ def api_device_encdir(dev_id):
             else:
                 reason = "probe_timeout"
         supported = cfg.get("encdir_supported")  # True / False / None
+        if changed:
+            save_config()
+        payload = {"dev_id": dev_id,
+                   "supported": supported,
+                   "sent": probe["sent"],
+                   "reason": reason,
+                   "retryable": supported is not True}
+    return jsonify(payload)
+
+
+@app.route("/api/device/<dev_id>/gesture", methods=["POST"])
+def api_device_gesture(dev_id):
+    """WS-672: ask the deck whether it supports CFG:GESTURE.
+
+    Three verdicts, all reflected in the tri-state ``supported`` payload:
+      * supported (True)   - the deck answered ``GESTURE:<0|1>``;
+      * unsupported (False) - GESTURE_UNSUPPORTED_AFTER consecutive silent
+        probes (old firmware), so apply_device() keeps skipping the line;
+      * unknown (None)     - link down, or a *single* dropped probe (WS-550).
+
+    ``?reset=1`` clears the cached verdict and the miss counter before
+    re-probing, so a firmware upgrade can recover without a restart.
+    """
+    cfg = device_cfg(dev_id)
+    if request.args.get("reset") == "1":
+        with _lock:
+            cfg["gesture_supported"] = None
+            save_config()
+        with _gesture_lock:
+            _gesture_misses.pop(dev_id, None)
+
+    probe = probe_gesture(dev_id)
+    changed = False
+    with _lock:
+        if probe["answered"]:
+            cfg["gesture_supported"] = True
+            reason = "supported"
+            changed = True
+            with _gesture_lock:
+                _gesture_misses.pop(dev_id, None)
+        elif not probe["sent"]:
+            reason = "link_down"
+        else:
+            with _gesture_lock:
+                misses = _gesture_misses.get(dev_id, 0) + 1
+                _gesture_misses[dev_id] = misses
+            known_supported = cfg.get("gesture_supported") is True
+            if misses >= GESTURE_UNSUPPORTED_AFTER and not known_supported:
+                cfg["gesture_supported"] = False
+                reason = "unsupported"
+                changed = True
+            else:
+                reason = "probe_timeout"
+        supported = cfg.get("gesture_supported")  # True / False / None
         if changed:
             save_config()
         payload = {"dev_id": dev_id,
