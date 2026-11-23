@@ -157,6 +157,18 @@ function fakeOtaFile(name, version) {
 
 async function loadApp() {
   const registry = {};
+  // setTimeout 排队而不是丢弃：focusPendingItem 的延迟回调（app.js:783，负责
+  // 打开按键抽屉）必须能被真正执行，否则「点条目 → 打开输入 N 的抽屉」这条
+  // 验收只证明了向导关闭（WS-688 should fix）。测试用 runTimers() 手动冲刷。
+  const timers = [];
+  let timerSeq = 0;
+  const clearTimers = () => { timers.length = 0; };
+  const runTimers = () => {
+    // 一次取一批：回调里再排的定时器留给下一次冲刷，避免 pollStatus 之类的
+    // 自我续期把这里变成死循环。
+    const batch = timers.splice(0, timers.length);
+    batch.forEach(({ fn }) => { if (typeof fn === "function") fn(); });
+  };
   const document = {
     body: makeEl("body"),
     documentElement: makeEl("html"),
@@ -183,8 +195,11 @@ async function loadApp() {
     document,
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     console,
-    setTimeout: () => 0,
-    clearTimeout() {},
+    setTimeout: (fn) => { timerSeq += 1; timers.push({ id: timerSeq, fn }); return timerSeq; },
+    clearTimeout(id) {
+      const i = timers.findIndex((x) => x.id === id);
+      if (i >= 0) timers.splice(i, 1);
+    },
     setInterval: () => 0,
     clearInterval() {},
     fetch: async () => { throw new Error("no network in the harness"); },
@@ -195,6 +210,8 @@ async function loadApp() {
     addEventListener() {}, removeEventListener() {},
     URLSearchParams,
     TextEncoder,
+    __clearTimers: clearTimers,
+    __runTimers: runTimers,
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -217,6 +234,8 @@ async function loadApp() {
   vm.runInContext(readFileSync(new URL("app.js", STATIC_DIR), "utf8") + `
 globalThis.__host = {
   state, handleOtaFile, renderOta, retryOta, refreshOtaRisk, otaRiskUnacked,
+  bucketFor, collectPending, closeOtaWizard, openOtaWizard,
+  clearTimers: __clearTimers, runTimers: __runTimers,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -294,15 +313,63 @@ test("选 v1.3.12：兼容性区块为 block 且列出三行，#btnOtaNext 禁�
     "确认页取消勾选后「开始升级」必须禁用");
 });
 
-test("受影响行是可点按钮：点「按键 5」关闭向导并跳到输入 4", async () => {
+test("受影响行是可点按钮：点「按键 5」关闭向导并打开输入 4 的抽屉", async () => {
   const { host, registry } = await loadApp();
   await host.handleOtaFile(fakeOtaFile("ota_binddecklite_c3_v1.3.12.bin", "1.3.12"));
 
-  registry["#btnOtaNext"][0].disabled = false;   // 模拟已勾选后进入确认
+  host.clearTimers();   // 丢掉加载期排的杂项，只验这一跳
   const row = registry["#otaCompatList"][0].children[0];
   assert.equal(row.dataset.idx, "4");
   row.onclick();
   assert.equal(registry["#otaModal"][0].hidden, true, "点条目后应关闭 OTA 向导");
+  assert.equal(host.state.editingKey, null, "进抽屉发生在延迟回调里，点完当下还没进");
+
+  host.runTimers();     // 真执行 focusPendingItem 的延迟回调
+  assert.equal(host.state.editingKey, 4, "延迟回调必须真的打开输入 4 的抽屉");
+});
+
+test("判定只认设备快照：草稿改了没下发仍 block，applied 更新后才 ok", async () => {
+  const { host, registry } = await loadApp();
+  const bucket = host.bucketFor("d1");
+  bucket.applied = JSON.parse(JSON.stringify(host.state.cfg));  // 设备现状：4/7/9 是媒体键
+
+  // 照着提示把三个媒体键改成键盘键，但**不点「应用配置」**：设备 NVS 仍是媒体键。
+  [4, 7, 9].forEach((i, n) => { host.state.cfg.keys[i].code = 104 + n; });
+  assert.deepEqual(Array.from(host.collectPending(), (x) => x.field), ["keys"],
+    "前提：草稿确实还没下发");
+
+  await host.handleOtaFile(fakeOtaFile("ota_binddecklite_c3_v1.3.12.bin", "1.3.12"));
+  assert.equal(host.state.ota.risk.level, "block", "未下发的草稿不能解除拦截");
+  assert.deepEqual(Array.from(host.state.ota.risk.affected, (a) => a.idx), [4, 7, 9],
+    "受影响输入要按设备现状点名");
+  assert.equal(registry["#btnOtaNext"][0].disabled, true);
+
+  // 上一轮退回的复现路径：关掉向导再打开，仍要按设备快照拦。
+  host.closeOtaWizard();
+  host.openOtaWizard();
+  assert.equal(host.state.ota.risk.level, "block", "重开向导不能拿草稿放行");
+  assert.equal(registry["#btnOtaNext"][0].disabled, true);
+
+  // 应用成功 = applied 换成下发后的草稿；此后重开向导才放行。
+  bucket.applied = JSON.parse(JSON.stringify(host.state.cfg));
+  host.closeOtaWizard();
+  host.openOtaWizard();
+  assert.equal(host.state.ota.risk.level, "ok", "设备真值已无媒体键，不该再拦");
+  assert.equal(registry["#btnOtaNext"][0].disabled, false);
+});
+
+test("反向也不误拦：草稿里刚选媒体键但没下发 → ok", async () => {
+  const { host, registry } = await loadApp();
+  const bucket = host.bucketFor("d1");
+  bucket.applied = JSON.parse(JSON.stringify(host.state.cfg));   // 设备现状：全是键盘键
+  [4, 7, 9].forEach((i, n) => { bucket.applied.keys[i].code = 104 + n; });
+  // 抽屉里刚选成媒体键，没下发。
+  [4, 7, 9].forEach((i, n) => { host.state.cfg.keys[i].code = 320 + n; });
+
+  await host.handleOtaFile(fakeOtaFile("ota_binddecklite_c3_v1.3.12.bin", "1.3.12"));
+  assert.equal(host.state.ota.risk.level, "ok", "设备上还没有媒体键，不该误拦");
+  assert.equal(registry["#otaCompat"][0].hidden, true);
+  assert.equal(registry["#btnOtaNext"][0].disabled, false);
 });
 
 test("「重试升级」回确认页也挡：未勾选时 #btnOtaStart 仍禁用", async () => {

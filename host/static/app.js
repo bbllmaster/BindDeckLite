@@ -65,11 +65,17 @@ function inputCount() {
   return is12Key() ? INPUT_COUNT_12KEY : INPUT_COUNT_ENCODER;
 }
 
-/** 第 i 个输入的显示名（0 起）；第 10 个在两种布局下含义不同。 */
-function inputTitle(i) {
+/**
+ * 第 i 个输入的显示名（0 起）；第 10 个在两种布局下含义不同。
+ *
+ * `cfg` 可选：OTA 风险列表要按**设备快照**的布局取名字，不能被抽屉里未下发的
+ * 布局草稿带偏（WS-688）。不传时仍用当前编辑中的配置。
+ */
+function inputTitle(i, cfg) {
+  const layout12 = Number(((cfg || state.cfg) || {}).layout) === LAYOUT_12KEY;
   if (i < 9) return t("ui.input_button_n_js", { n: i + 1 });
-  if (i === 9) return is12Key() ? t("ui.input_button_10_config") : t("ui.input_encoder_press");
-  return is12Key()
+  if (i === 9) return layout12 ? t("ui.input_button_10_config") : t("ui.input_encoder_press");
+  return layout12
     ? t("ui.input_button_extra_js", { n: i + 1 })
     : t("ui.input_button_n_js", { n: i + 1 });
 }
@@ -4633,17 +4639,29 @@ function otaCfgUsable() {
   return !(cfg.trusted === false && !state.sessionRead[state.selected]);
 }
 
-/** 目标版本的降级风险。存档不可信时按「缺存档」判，交给 UI 提示去读设备。 */
+/**
+ * 目标版本的降级风险。
+ *
+ * 判定只认**设备现状**（`bucketFor(id).applied`：全量生效或读设备后写回的
+ * 快照），不读按键抽屉里未下发的草稿。否则用户照提示把媒体键改成键盘键、
+ * 却没点「应用配置」，重开向导拦截就消失，而设备 NVS 仍是媒体键，降级后
+ * 照样打出错字符（WS-688）；反向也会误拦刚选媒体键但未下发的草稿。
+ * 没有快照时才退回本机存档，存档同样不可用时按「缺存档」判，交给 UI 提示。
+ */
 function otaRiskFor(ota) {
   if (!ota) return null;
-  const usable = otaCfgUsable();
+  const b = state.selected ? bucketFor(state.selected) : null;
+  const snapshot = (b && b.applied) || null;
+  const usable = !!snapshot || otaCfgUsable();
+  const cfgForRisk = snapshot || (usable ? state.cfg : null);
   const risk = window.OtaCompat.otaMediaDowngradeRisk(
     ota.version,
-    usable ? state.cfg : null,
+    cfgForRisk,
     state.mediaBase,
     {
       // 文案复用现有函数：inputTitle 给「按键 4」，keyHidText 给「播放/暂停」。
-      title: (i) => inputTitle(i),
+      // 标题也要取快照：12 键 / 编码器两种布局下第 10 个输入的名字不同。
+      title: (i) => inputTitle(i, cfgForRisk),
       label: (item) => keyHidText(item),
     },
   );
