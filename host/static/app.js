@@ -4651,8 +4651,13 @@ function otaCfgUsable() {
 function otaRiskFor(ota) {
   if (!ota) return null;
   const b = state.selected ? bucketFor(state.selected) : null;
-  const snapshot = (b && b.applied) || null;
-  const usable = !!snapshot || otaCfgUsable();
+  // 信任门必须先过，再把快照当设备真值（WS-689）：首次打开一台没有存档的设备
+  // 时，/api/config 返回的是 host 默认配置（`trusted:false`），前端会立刻把它
+  // 种进 `applied`（见 :1219 与设备切换分支）。若先看 `applied` 再判信任，
+  // `snapshot` 永远存在 —— 「无法判断」这条真实页面里再也出不来，还可能拿
+  // 未确认的默认值下 block/ok 的确定结论。
+  const usable = otaCfgUsable();
+  const snapshot = (usable && b && b.applied) || null;
   const cfgForRisk = snapshot || (usable ? state.cfg : null);
   const risk = window.OtaCompat.otaMediaDowngradeRisk(
     ota.version,

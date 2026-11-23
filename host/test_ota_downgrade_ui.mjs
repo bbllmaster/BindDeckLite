@@ -234,7 +234,7 @@ async function loadApp() {
   vm.runInContext(readFileSync(new URL("app.js", STATIC_DIR), "utf8") + `
 globalThis.__host = {
   state, handleOtaFile, renderOta, retryOta, refreshOtaRisk, otaRiskUnacked,
-  bucketFor, collectPending, closeOtaWizard, openOtaWizard,
+  bucketFor, collectPending, closeOtaWizard, openOtaWizard, snapshotCfg,
   clearTimers: __clearTimers, runTimers: __runTimers,
 };
 `, sandbox, { filename: "app.js" });
@@ -438,4 +438,48 @@ test("存档不可信：提示「无法判断」+ 读取按钮，读成功后按
   assert.equal(host.state.sessionRead.d1, true, "读取成功要记进本会话");
   assert.equal(host.state.ota.risk.level, "block", "读完后必须按设备真值重算");
   assert.equal(registry["#btnOtaNext"][0].disabled, true);
+});
+
+test("存档不可信 + applied 已种成 host 默认快照 → 仍「无法判断」（生产形态）", async () => {
+  // 真实页面：首次打开一台没有存档的设备，/api/config 返回 host 默认
+  // （keys = DEFAULT_KEYS 240–251、trusted:false），前端立刻种进 applied。
+  // 判定必须先过信任门，不能因为 applied 存在就把默认值当设备真值。
+  const { host, registry } = await loadApp();
+  host.state.cfg.trusted = false;
+  host.state.sessionRead = {};
+  host.state.cfg.keys = Array.from({ length: 12 }, (_, i) => ({
+    code: 240 + i, mods: 0, action: { type: "none" },
+  }));
+  host.bucketFor("d1").applied = host.snapshotCfg(host.state.cfg);   // 生产快照函数
+
+  await host.handleOtaFile(fakeOtaFile("ota_binddecklite_c3_v1.3.12.bin", "1.3.12"));
+
+  assert.equal(host.state.ota.risk.level, "unknown",
+    "设备真值未知时不能因为 applied 存在就判 ok");
+  assert.equal(host.state.ota.risk.reason, "untrusted");
+  assert.equal(registry["#btnOtaCompatRead"][0].hidden, false,
+    "必须给「读取设备配置」");
+  assert.match(registry["#otaCompatTitle"][0].textContent, /没有这台设备的配置存档/);
+  assert.equal(registry["#btnOtaNext"][0].disabled, false, "存档不可信只提示，不误拦");
+});
+
+test("存档不可信 + 默认快照里带媒体键 → 也只判 untrusted，不拿未确认数据下 block", async () => {
+  // 反向：默认快照恰好含媒体键（换过 pin/键码的机器）时，不能凭它断定
+  // 「降级会丢媒体键」——用户先要读设备才有判断依据。
+  const { host, registry } = await loadApp();
+  host.state.cfg.trusted = false;
+  host.state.sessionRead = {};
+  host.state.cfg.keys = Array.from({ length: 12 }, (_, i) => ({
+    code: i === 4 ? 320 : 240 + i, mods: 0, action: { type: "none" },
+  }));
+  host.bucketFor("d1").applied = host.snapshotCfg(host.state.cfg);
+
+  await host.handleOtaFile(fakeOtaFile("ota_binddecklite_c3_v1.3.12.bin", "1.3.12"));
+
+  assert.equal(host.state.ota.risk.level, "unknown",
+    "未确认的数据不能得出 block 结论");
+  assert.equal(host.state.ota.risk.reason, "untrusted");
+  assert.deepEqual(Array.from(host.state.ota.risk.affected), []);
+  assert.equal(registry["#btnOtaCompatRead"][0].hidden, false);
+  assert.equal(registry["#btnOtaNext"][0].disabled, false);
 });
