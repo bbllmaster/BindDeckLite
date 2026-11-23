@@ -3090,6 +3090,8 @@ async function readDeviceConfig(devId) {
     applyReadback(r);
     // WS-512：本次会话确实从设备读到过配置 → 后面的下发不再重复确认。
     state.sessionRead[devId] = true;
+    // WS-684：存档刚被设备真值覆盖，OTA 兼容性判定要重算（不轮询）。
+    refreshOtaRisk();
     return r;
   } catch (e) {
     if (wasDirty) armPendingSave();
@@ -4618,6 +4620,128 @@ function showOtaPane(step) {
   });
 }
 
+/* ---------- WS-684：OTA 降级前的媒体键兼容性 ----------
+ *
+ * 判定本身在 static/ota_compat.js（纯函数，Node 测试直接 import）。这里只做
+ * 三件事：把页面状态喂进去、把结果记到 state.ota.risk、按结果渲染两处 UI。
+ * 全程不发 CFG: / CMD:，也不改 /api/ota 契约。 */
+
+/** 本机存档能否作为判定依据：没有存档，或存档未确认且本会话没读过设备 → 不能。 */
+function otaCfgUsable() {
+  const cfg = state.cfg;
+  if (!cfg) return false;
+  return !(cfg.trusted === false && !state.sessionRead[state.selected]);
+}
+
+/** 目标版本的降级风险。存档不可信时按「缺存档」判，交给 UI 提示去读设备。 */
+function otaRiskFor(ota) {
+  if (!ota) return null;
+  const usable = otaCfgUsable();
+  const risk = window.OtaCompat.otaMediaDowngradeRisk(
+    ota.version,
+    usable ? state.cfg : null,
+    state.mediaBase,
+    {
+      // 文案复用现有函数：inputTitle 给「按键 4」，keyHidText 给「播放/暂停」。
+      title: (i) => inputTitle(i),
+      label: (item) => keyHidText(item),
+    },
+  );
+  if (!usable && risk.level === "unknown") risk.reason = "untrusted";
+  return risk;
+}
+
+/** 重算并写回 state.ota.risk；受影响输入变了就要求重新勾选（旧勾选不再作数）。 */
+function recomputeOtaRisk(ota) {
+  const target = ota || state.ota;
+  if (!target) return;
+  const sig = (r) => (r && r.level === "block" ? r.affected.map((a) => a.idx).join(",") : r ? r.level : "");
+  const before = sig(target.risk);
+  target.risk = otaRiskFor(target);
+  if (before !== sig(target.risk)) target.ack = false;
+}
+
+/** block 且未勾选 —— 两处按钮与三条入口（下一步 / 开始 / 重试）共用的唯一判据。 */
+function otaRiskUnacked(ota) {
+  return !!(ota && ota.risk && ota.risk.level === "block" && !ota.ack);
+}
+
+/** 读到设备真值后重算风险（由 readDeviceConfig 的成功分支调用，不轮询）。 */
+function refreshOtaRisk() {
+  if (!state.ota || otaBusy()) return;
+  recomputeOtaRisk(state.ota);
+  const modal = $("#otaModal");
+  if (modal && !modal.hidden) renderOta();
+}
+
+/** 校验步骤的兼容性区块 + 确认页的兜底红字。 */
+function renderOtaCompat(ota, connected) {
+  const box = $("#otaCompat");
+  if (!box) return;
+  const risk = ota && ota.risk ? ota.risk : null;
+  const level = risk ? risk.level : "ok";
+  const affected = (risk && risk.affected) || [];
+
+  box.dataset.state = level;
+  box.hidden = level === "ok";
+  $("#otaCompatList").textContent = "";
+  $("#otaRiskAckRow").hidden = true;
+  $("#btnOtaCompatRead").hidden = true;
+
+  const title = $("#otaCompatTitle");
+  const body = $("#otaCompatBody");
+  const hint = $("#otaCompatHint");
+  title.textContent = "";
+  body.textContent = "";
+  hint.textContent = "";
+
+  if (level === "block") {
+    title.textContent = t("ota.compat_block_title", {
+      version: fmtVersion(ota.version),
+    });
+    body.textContent = t("ota.compat_block_body");
+    hint.textContent = t("ota.compat_block_hint");
+    const list = $("#otaCompatList");
+    affected.forEach((it) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ota-compat-item";
+      btn.dataset.idx = String(it.idx);
+      btn.textContent = it.title + " · " + it.keyLabel;
+      btn.onclick = () => {
+        // 先关向导再跳：抽屉在按键页上，向导留着会挡视线、也会让焦点打偏。
+        closeOtaWizard();
+        focusPendingItem({ field: "keys", tab: "keys", index: it.idx });
+      };
+      list.appendChild(btn);
+    });
+    $("#otaRiskAckRow").hidden = false;
+    $("#otaRiskAck").checked = !!ota.ack;
+  } else if (level === "unknown") {
+    const untrusted = risk.reason === "untrusted";
+    title.textContent = t(untrusted ? "ota.compat_untrusted_title" : "ota.compat_unknown_title");
+    body.textContent = t(untrusted ? "ota.compat_untrusted_body" : "ota.compat_unknown_body");
+    if (untrusted) {
+      const read = $("#btnOtaCompatRead");
+      read.hidden = false;
+      // 离线时按本机存档判定没有意义，但按钮留着说明原因（title）。
+      read.disabled = !connected;
+      read.title = connected ? "" : t("ota.compat_read_offline");
+    }
+  }
+
+  const confirmEl = $("#otaConfirmCompat");
+  if (!confirmEl) return;
+  const blocked = level === "block" && affected.length > 0;
+  confirmEl.hidden = !blocked;
+  confirmEl.textContent = blocked
+    ? t("ota.compat_confirm", {
+      version: fmtVersion(ota.version),
+      count: affected.length,
+    })
+    : "";
+}
+
 function renderOta() {
   const modal = $("#otaModal");
   const ota = state.ota;
@@ -4655,7 +4779,9 @@ function renderOta() {
   $("#otaCheckState").className = "ota-check-state " + (bad ? "bad" : ota.status === "ready" ? "ok" : "");
   $("#otaCheckError").hidden = !bad;
   $("#otaCheckError").textContent = ota.imageError || "";
-  $("#btnOtaNext").disabled = ota.status !== "ready";
+  // WS-684：目标固件不支持媒体键时，勾选前不允许进确认页。
+  $("#btnOtaNext").disabled = ota.status !== "ready" || otaRiskUnacked(ota);
+  renderOtaCompat(ota, connected);
 
   /* 3. 确认页：设备名 + 当前版本 → 新版本 + 不可断电提示 */
   const devName = (state.cfg && state.cfg.name) || (sel && sel.name) || state.selected || "—";
@@ -4666,7 +4792,7 @@ function renderOta() {
     `${fmtVersion(currentVersion)} → ${ota.version ? fmtVersion(ota.version) : t("ota.version_not_in_name")}`;
   $("#otaConfirmFile").textContent = `${ota.filename || "—"} · ${formatBytes(ota.total)}`;
   $("#otaConfirmSha").textContent = ota.sha256 || "—";
-  $("#btnOtaStart").disabled = !connected;
+  $("#btnOtaStart").disabled = !connected || otaRiskUnacked(ota);
 
   /* 4. 上传 / 结果 */
   const shaLine = ota.sha256 ? ` · SHA256 ${ota.sha256}` : "";
@@ -4790,6 +4916,9 @@ async function handleOtaFile(file) {
     filename: file.name,
     sha256: "",
     version: otaVersionFromName(file.name),
+    // WS-684：换文件 = 重新开始，旧的「我了解风险」勾选一律作废。
+    ack: false,
+    risk: null,
   };
   state.ota = otaObj;
   state.otaFile = file;
@@ -4825,6 +4954,8 @@ async function handleOtaFile(file) {
   otaObj.imageError = error;
   otaObj.version = parseOtaVersion(buffer) || otaObj.version;
   otaObj.status = error ? "invalid" : "ready";
+  // WS-684：版本号已确定（镜像描述符优先），才算得出降级风险。
+  recomputeOtaRisk(otaObj);
   renderOta();
 }
 
@@ -4860,6 +4991,11 @@ function openOtaWizard() {
   } else {
     state.otaStep = "check";
   }
+  // WS-684：期间可能改过按键（例如照着受影响列表把媒体键改成键盘键），
+  // 重新打开向导时按当前存档重算一次，避免拿旧结论拦人。
+  if (state.ota && state.ota.status === "ready" && !otaBusy()) {
+    recomputeOtaRisk(state.ota);
+  }
   const modal = $("#otaModal");
   modal.hidden = false;
   syncModalOpenClass();
@@ -4889,6 +5025,9 @@ function retryOta() {
     acked: 0,
     percent: 0,
   });
+  // WS-684：重试回确认页，但仍按当前存档判定 —— 未勾选时「开始升级」保持
+  // 禁用，不能靠重试绕过校验页。
+  recomputeOtaRisk(state.ota);
   state.otaStep = "confirm";
   renderOta();
 }
@@ -4918,9 +5057,19 @@ function bindOtaWizard() {
   $("#btnOtaPick").onclick = pick;
   $("#btnOtaRepick").onclick = pick;
   $("#btnOtaNext").onclick = () => {
-    if (!state.ota || state.ota.status !== "ready") return;
+    if (!state.ota || state.ota.status !== "ready" || otaRiskUnacked(state.ota)) return;
     state.otaStep = "confirm";
     renderOta();
+  };
+  // WS-684：勾选只解除本文件的拦截；换文件在 handleOtaFile 里复位。
+  $("#otaRiskAck").onchange = (e) => {
+    if (!state.ota) return;
+    state.ota.ack = !!(e && e.target && e.target.checked);
+    renderOta();
+  };
+  $("#btnOtaCompatRead").onclick = () => {
+    // 读成功由 readDeviceConfig 的完成分支重算风险（refreshOtaRisk）。
+    readDeviceConfig(state.selected);
   };
   $("#btnOtaBack").onclick = () => {
     state.otaStep = "check";
@@ -4949,6 +5098,11 @@ async function startOta() {
   }
   if (!state.ota || state.ota.status !== "ready" || !state.otaFile) {
     toast(t("ota.verify_first"), "bad");
+    return;
+  }
+  // 兜底：按钮可能被脚本/键盘事件绕过，真正发请求前再判一次。
+  if (otaRiskUnacked(state.ota)) {
+    toast(t("ota.compat_ack_required"), "bad");
     return;
   }
   const btn = $("#btnOtaStart");

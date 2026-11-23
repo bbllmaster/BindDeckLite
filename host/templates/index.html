@@ -481,6 +481,20 @@
           <span class="k" data-i18n="ui.file_size">大小</span><span class="v" id="otaCheckSize">—</span>
           <span class="k">SHA256</span><span class="v mono" id="otaCheckSha" data-i18n="ui.calculating">计算中…</span>
         </div>
+        <!-- WS-684：目标固件不支持媒体键时，先点名受影响的输入并要求显式勾选。
+             data-state 取 ok / block / unknown；ok 时整块隐藏，与今天一致。 -->
+        <div class="ota-compat" id="otaCompat" data-state="ok" hidden>
+          <p class="ota-compat-title" id="otaCompatTitle"></p>
+          <p class="ota-compat-body" id="otaCompatBody"></p>
+          <div class="ota-compat-list" id="otaCompatList"></div>
+          <p class="ota-compat-hint" id="otaCompatHint"></p>
+          <label class="ota-compat-ack" id="otaRiskAckRow" hidden>
+            <input type="checkbox" id="otaRiskAck">
+            <span data-i18n="ota.risk_ack">我了解风险，仍然继续</span>
+          </label>
+          <button type="button" class="btn sm" id="btnOtaCompatRead" hidden
+                  data-i18n="ui.read_device_config">读取设备配置</button>
+        </div>
         <p class="ota-check-state" id="otaCheckState"></p>
         <p class="ota-error" id="otaCheckError" hidden></p>
         <div class="btn-row">
@@ -496,6 +510,8 @@
           <span class="k" data-i18n="ui.file">文件</span><span class="v" id="otaConfirmFile">—</span>
           <span class="k">SHA256</span><span class="v mono" id="otaConfirmSha">—</span>
         </div>
+        <!-- WS-684：确认页兜底，block 时红字点明受影响数量。 -->
+        <p class="ota-error" id="otaConfirmCompat" hidden></p>
         <div class="ota-warning" role="alert">
           <b data-i18n="ui.ota_warn_title">升级期间请勿断电或拔线。</b><span data-i18n="ui.ota_warn_body">上传中断可能让设备停在 bootloader；确认设备已连接稳定电源后再开始。</span>
         </div>
@@ -733,6 +749,7 @@
 <script src="/static/device_row.js"></script>
 <script src="/static/encoder_stats.js"></script>
 <script src="/static/actions_io_preview.js"></script>
+<script src="/static/ota_compat.js"></script>
 <script src="/static/keys.js"></script>
 <script src="/static/app.js"></script>
 </body>
