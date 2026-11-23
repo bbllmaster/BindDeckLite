@@ -1750,6 +1750,37 @@ body.modal-open .main { overflow: hidden; }
 .ota-check-state { font-size: var(--fs-sm); color: var(--muted); }
 .ota-check-state.ok { color: var(--ok); }
 .ota-check-state.bad { color: var(--danger); }
+/* WS-684：降级前的媒体键兼容性区块。block 用警示色、unknown 用灰色，
+   ok 时整块 hidden（data-state 仍是 ok，便于测试与将来扩展）。 */
+.ota-compat {
+  margin-top: var(--sp-3); padding: var(--sp-3);
+  border: 1px solid var(--state-danger-bd); border-radius: var(--r-control);
+  background: var(--state-danger-bg); color: var(--text);
+  font-size: var(--fs-sm); line-height: 1.6;
+}
+.ota-compat[hidden] { display: none; }
+.ota-compat-title { font-weight: 600; color: var(--danger); }
+.ota-compat[data-state="unknown"] {
+  border-color: var(--line); background: var(--surface-sunken); color: var(--muted);
+}
+.ota-compat[data-state="unknown"] .ota-compat-title { color: var(--muted); }
+.ota-compat-body { margin-top: var(--sp-1); }
+.ota-compat-hint { margin-top: var(--sp-2); }
+.ota-compat-list { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
+.ota-compat-list:empty { display: none; }
+.ota-compat-item {
+  padding: var(--sp-1) var(--sp-3); border: 1px solid var(--line);
+  border-radius: var(--r-control); background: var(--card);
+  color: var(--text); font: inherit; cursor: pointer;
+}
+.ota-compat-item:hover { border-color: var(--accent); color: var(--accent); }
+.ota-compat-ack {
+  display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3);
+  cursor: pointer;
+}
+.ota-compat-ack[hidden] { display: none; }
+.ota-compat #btnOtaCompatRead { margin-top: var(--sp-3); }
+.ota-compat #btnOtaCompatRead[hidden] { display: none; }
 .ota-error {
   margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--state-danger-bd); border-radius: var(--r-control);
