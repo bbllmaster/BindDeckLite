@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import socket
 import subprocess
@@ -707,7 +708,265 @@ def _serve_headless(server, flask_thread, url, use_tray):
     return 0
 
 
-def make_on_closing(state, close_ref, use_tray, url, window_ref):
+# WS-691: window geometry memory.  Sizes/positions are stored in the same
+# logical pixels pywebview reports, so high-DPI screens need no conversion.
+DEFAULT_WINDOW_WIDTH = 1280
+DEFAULT_WINDOW_HEIGHT = 800
+# Smallest size the native window enforces by default.  It must never exceed
+# the size we ask for: a 1024x560 work area converges to 921x504, and a fixed
+# 960x600 minimum would let WinForms grow the window back past the taskbar.
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 600
+# A converged (or default) window takes at most 90% of a work area, leaving
+# room for the taskbar and a bit of desktop around it.
+WINDOW_WORKAREA_RATIO = 0.9
+# Windows reports a minimized window's position as -32000; such a reading
+# must never be persisted as the user's chosen position.
+MINIMIZED_POSITION = -30000
+
+
+def _geometry_int(value):
+    """Return *value* as ``int``, or ``None`` when it is not a finite number.
+
+    Booleans and numeric strings are rejected on purpose: a corrupted
+    ``config.json`` must fall back to the default window, not "1100" → 1100.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return int(round(number))
+
+
+def _intersects(geo, area) -> bool:
+    """True when the window rectangle *geo* overlaps the work area *area*."""
+    try:
+        ax, ay = int(area["x"]), int(area["y"])
+        aw, ah = int(area["w"]), int(area["h"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if aw <= 0 or ah <= 0:
+        return False
+    return (geo["x"] < ax + aw and ax < geo["x"] + geo["w"]
+            and geo["y"] < ay + ah and ay < geo["y"] + geo["h"])
+
+
+def normalize_window_geometry(saved, workareas, default=(DEFAULT_WINDOW_WIDTH,
+                                                        DEFAULT_WINDOW_HEIGHT)):
+    """Turn the persisted ``settings.window`` into usable window geometry.
+
+    *saved* is the dict read from ``config.json`` (``{"w", "h", "x", "y"}``);
+    *workareas* is a list of ``{"x", "y", "w", "h"}`` rectangles in pywebview
+    logical pixels, primary screen first.  Returns
+    ``{"w", "h", "x", "y", "reason"}``:
+
+    * ``"missing"`` / ``"invalid"`` — nothing usable was stored (absent or
+      ``None`` fields vs. non-numeric / non-positive ones).  The default size
+      is used, centred on the primary work area and shrunk to fit it so a
+      1366x768 laptop still shows the log page's last line;
+    * ``"offscreen"`` — the stored rectangle intersects no work area (second
+      screen unplugged, resolution shrunk).  Its size is kept up to 90% of the
+      primary work area and centred there;
+    * ``""`` — the rectangle intersects at least one work area and is used as
+      stored.  Negative coordinates are legal (a screen left of the primary).
+
+    With no *workareas* (headless box, pywebview unavailable) placement is
+    left to the OS: ``x`` / ``y`` come back as ``None`` and a stored rectangle
+    is trusted as is, since there is nothing to validate it against.
+    """
+    areas = [a for a in (workareas or []) if isinstance(a, dict)]
+    primary = areas[0] if areas else None
+
+    def _fit_in_primary(w, h):
+        if primary is None:
+            return w, h, None, None
+        pw = max(1, int(primary.get("w") or 0))
+        ph = max(1, int(primary.get("h") or 0))
+        w = max(1, min(w, int(pw * WINDOW_WORKAREA_RATIO)))
+        h = max(1, min(h, int(ph * WINDOW_WORKAREA_RATIO)))
+        x = int(primary.get("x", 0)) + (pw - w) // 2
+        y = int(primary.get("y", 0)) + (ph - h) // 2
+        return w, h, x, y
+
+    stored = saved if isinstance(saved, dict) else {}
+    values = {}
+    missing = False
+    invalid = False
+    for key in ("w", "h", "x", "y"):
+        if stored.get(key) is None:
+            missing = True
+            values[key] = None
+            continue
+        number = _geometry_int(stored[key])
+        if number is None:
+            invalid = True
+        values[key] = number
+
+    if missing or invalid:
+        reason = "invalid" if invalid else "missing"
+        w, h, x, y = _fit_in_primary(int(default[0]), int(default[1]))
+        return {"w": w, "h": h, "x": x, "y": y, "reason": reason}
+
+    if values["w"] <= 0 or values["h"] <= 0:
+        w, h, x, y = _fit_in_primary(int(default[0]), int(default[1]))
+        return {"w": w, "h": h, "x": x, "y": y, "reason": "invalid"}
+
+    geo = {"w": values["w"], "h": values["h"], "x": values["x"], "y": values["y"]}
+    if not areas or any(_intersects(geo, area) for area in areas):
+        return {**geo, "reason": ""}
+
+    w, h, x, y = _fit_in_primary(geo["w"], geo["h"])
+    return {"w": w, "h": h, "x": x, "y": y, "reason": "offscreen"}
+
+
+def looks_maximized(geo, workareas, tolerance=16) -> bool:
+    """True when *geo* covers a whole work area (maximized or fullscreen).
+
+    pywebview exposes no maximize flag and reports the maximized size while
+    maximized, so saving that reading would make the next launch start
+    full-screen — the parent task explicitly excludes remembering it.
+
+    Windows gives a maximized WinForms window a frame *larger* than the work
+    area: on a 1920x1040 work area ``get_size``/``get_position`` report
+    1936x1056 at (-8, -8).  Equality with a small tolerance therefore never
+    matches, so the test is containment within *tolerance* on every side, and
+    the default tolerance (>= the 8 px frame on each edge) absorbs that
+    overhang.  A window that merely *fills* the work area also counts — it is
+    indistinguishable from maximized through these readings, and saving it
+    would restore a near-full-screen window.
+    """
+    for area in workareas or []:
+        try:
+            ax, ay = int(area["x"]), int(area["y"])
+            aw, ah = int(area["w"]), int(area["h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if aw <= 0 or ah <= 0:
+            continue
+        try:
+            if (geo["x"] <= ax + tolerance
+                    and geo["y"] <= ay + tolerance
+                    and geo["x"] + geo["w"] >= ax + aw - tolerance
+                    and geo["y"] + geo["h"] >= ay + ah - tolerance):
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
+def _frame_geometry(frame):
+    """Pull ``(x, y, w, h)`` out of a pywebview ``Screen.frame``.
+
+    Windows hands over the *work area* (screen minus taskbar) as a WinForms
+    ``Rectangle`` with upper-case ``X/Y/Width/Height``; GTK/Qt pass a toolkit
+    rectangle with lower-case attributes.  ``None`` when unusable.
+    """
+    if frame is None:
+        return None
+    for names in (("X", "Y", "Width", "Height"), ("x", "y", "width", "height")):
+        try:
+            x, y, w, h = (int(getattr(frame, name)) for name in names)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if w > 0 and h > 0:
+            return {"x": x, "y": y, "w": w, "h": h}
+    return None
+
+
+def screen_workareas():
+    """Screen work areas in pywebview logical pixels, primary screen first.
+
+    ``webview.screens`` needs a loaded GUI backend, so this returns ``[]`` on
+    headless boxes and when pywebview is missing; the caller then lets the OS
+    place the window.  The primary screen is the work area containing the
+    origin, moved to the front so "converge to the main screen" never depends
+    on enumeration order (pywebview exposes no is-primary flag).
+    """
+    try:
+        import webview
+        screens = list(webview.screens)
+    except Exception as e:  # noqa: BLE001
+        print("[desktop] screen list unavailable:", e)
+        return []
+
+    areas = []
+    seen = set()
+    for screen in screens:
+        rect = _frame_geometry(getattr(screen, "frame", None))
+        if rect is None:
+            try:
+                rect = {"x": int(screen.x), "y": int(screen.y),
+                        "w": int(screen.width), "h": int(screen.height)}
+            except Exception:  # noqa: BLE001
+                continue
+        key = (rect["x"], rect["y"], rect["w"], rect["h"])
+        if key in seen:
+            continue
+        seen.add(key)
+        areas.append(rect)
+
+    for index, rect in enumerate(areas):
+        if (rect["x"] <= 0 < rect["x"] + rect["w"]
+                and rect["y"] <= 0 < rect["y"] + rect["h"]):
+            areas.insert(0, areas.pop(index))
+            break
+    return areas
+
+
+def resolve_window_geometry(saved):
+    """Normalize *saved* against the live screens and log the outcome."""
+    geo = normalize_window_geometry(saved, screen_workareas())
+    if geo["reason"]:
+        print(f"[desktop] window geometry ignored ({geo['reason']})")
+    else:
+        print(f"[desktop] window geometry restored w={geo['w']} h={geo['h']} "
+              f"x={geo['x']} y={geo['y']}")
+    return geo
+
+
+def window_geometry(window):
+    """Read ``w/h/x/y`` off a live pywebview window, or ``None`` if unusable.
+
+    A minimized window reports a sentinel position (``-32000``); persisting it
+    would park the next launch off-screen, so it is treated as unreadable.
+    """
+    if window is None:
+        return None
+    try:
+        geo = {"w": int(window.width), "h": int(window.height),
+               "x": int(window.x), "y": int(window.y)}
+    except Exception as e:  # noqa: BLE001
+        print("[desktop] window geometry unreadable:", e)
+        return None
+    if geo["w"] <= 0 or geo["h"] <= 0:
+        return None
+    if geo["x"] <= MINIMIZED_POSITION or geo["y"] <= MINIMIZED_POSITION:
+        return None
+    return geo
+
+
+def window_min_size(geo=None):
+    """The ``min_size`` to pass to ``create_window`` for the geometry *geo*.
+
+    Clamped to the window we are about to create so a 90%-converged window on
+    a small screen (1024x560 → 921x504) is not grown back by WinForms past the
+    taskbar; on a normal screen it stays the historical 960x600.
+    """
+    def _int(value, fallback):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if number > 0 else fallback
+
+    geo = geo if isinstance(geo, dict) else {}
+    w = _int(geo.get("w"), DEFAULT_WINDOW_WIDTH)
+    h = _int(geo.get("h"), DEFAULT_WINDOW_HEIGHT)
+    return (max(1, min(MIN_WINDOW_WIDTH, w)), max(1, min(MIN_WINDOW_HEIGHT, h)))
+
+
+def make_on_closing(state, close_ref, use_tray, url, window_ref, geometry_save=None):
     """Factory for the window-close handler registered on
     ``window.events.closing``.
 
@@ -720,7 +979,48 @@ def make_on_closing(state, close_ref, use_tray, url, window_ref):
     value discarded, making ``set()`` report "no cancel" and the window
     closes anyway.  ``window_ref[0]`` is the same ``Window`` object the
     handler would have received had pywebview injected it.
+
+    ``geometry_save`` (WS-691) is the app's persistence callback: it is called
+    with ``{"w", "h", "x", "y"}`` for the last *visible* window geometry, so
+    the next launch reopens at the same size and place.  Hiding to the tray
+    samples once *before* ``hide()`` and caches the reading in
+    ``STATE["window_geometry_cache"]`` — after hiding, width/height no longer
+    describe what the user chose, yet the tray's later "退出" must still
+    persist that last visible value.  A window that was only ever hidden
+    (start minimized) has no cached reading and saves nothing.
     """
+    def _visible_geometry():
+        """Sample the visible window; ``None`` when unreadable or maximized."""
+        geo = window_geometry(window_ref[0])
+        if geo is None:
+            return None
+        if looks_maximized(geo, screen_workareas()):
+            # Maximized: pywebview reports the maximized size, so saving it
+            # would start the next launch full-screen.  Skip and keep the
+            # previously stored normal geometry.
+            print("[desktop] window maximized; geometry not saved")
+            return None
+        return geo
+
+    def _finish_close():
+        """Sample or reuse the last visible geometry (WS-691) and close."""
+        if geometry_save is not None:
+            if STATE.get("window_hidden"):
+                # Hidden in the tray: the live size is the hidden one, so use
+                # what was sampled while the window was still visible.
+                geo = STATE.pop("window_geometry_cache", None)
+            else:
+                geo = _visible_geometry()
+            if geo is not None:
+                try:
+                    geometry_save(geo)
+                    print(f"[desktop] window geometry saved w={geo['w']} "
+                          f"h={geo['h']} x={geo['x']} y={geo['y']}")
+                except Exception as e:  # noqa: BLE001
+                    # A failed config write must not block the exit.
+                    print("[desktop] window geometry save failed:", e)
+        return True
+
     def _on_closing():
         allow_close, hide_window = close_decision(
             state["force_quit"], close_ref["behavior"], use_tray
@@ -730,27 +1030,36 @@ def make_on_closing(state, close_ref, use_tray, url, window_ref):
                 # Frozen desktop app without a tray: hiding would leave no
                 # native way back, and a browser tab is not a desktop UI.
                 # Close instead.
-                return True
+                return _finish_close()
+            # Sample before hide(): while visible the reading is the user's
+            # choice; afterwards the tray "退出" path would only see the
+            # hidden geometry, and with behavior=minimize no other close ever
+            # runs, so nothing would be persisted at all.
+            if geometry_save is not None:
+                STATE["window_geometry_cache"] = _visible_geometry()
             try:
                 window_ref[0].hide()
             except Exception:
                 # Hide failed: the window stays on screen and clicks on X do
                 # nothing.  Let the close proceed instead of trapping the
                 # user in an unresponsive window (WS-374 review #4).
-                return True
+                STATE["window_geometry_cache"] = None
+                return _finish_close()
             STATE["window_hidden"] = True
             # No tray icon to click later — open the web UI in a browser so the
             # user actually sees the recovery path (显示窗口 / 退出上位机).
             if not STATE.get("tray_active"):
                 open_url(url)
             return False
-        return True
+        return _finish_close()
     return _on_closing
 
 
 def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
                 use_tray: bool = True, log_path: str = "",
-                close_ref: dict | None = None, elevated: bool = False) -> int:
+                close_ref: dict | None = None, elevated: bool = False,
+                geometry: dict | None = None,
+                geometry_save=None) -> int:
     """Serve Flask behind a native pywebview window — the real desktop app.
 
     Unlike ``run_desktop`` (tray + browser), this renders the existing Web UI
@@ -769,12 +1078,18 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     normal-permission one: it must not fall back to "open the browser" when
     the port is still taken, but report the conflict instead (WS-457).
 
+    ``geometry`` (WS-691) is the already normalized ``{"w", "h", "x", "y"}``
+    from ``app.resolve_window_geometry``: its size and position go straight to
+    ``create_window``.  ``geometry_save`` is the app's persistence callback,
+    invoked when a visible window closes.
+
     When pywebview or its GUI backend is unavailable (headless Linux, or
     Windows without pythonnet) it falls back to ``_serve_headless`` so
     ``python app.py --desktop`` keeps working without a console crash.
     """
     STATE["desktop"] = True
     STATE["url"] = url
+    STATE["window_geometry_cache"] = None
     if log_path:
         setup_stdio(log_path)
 
@@ -844,11 +1159,17 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     use_tray = use_tray and tray_ok
 
     # 3. Create the native window (hidden when the user asked to start minimized).
+    #    WS-691: reuse the remembered size/position; ``x``/``y`` stay None when
+    #    the screens could not be probed, so the OS still centres the window.
+    geo = geometry or {}
     try:
         import webview
         window = webview.create_window(
             "BindDeckLite", url,
-            width=1280, height=800, min_size=(960, 600),
+            width=int(geo.get("w") or DEFAULT_WINDOW_WIDTH),
+            height=int(geo.get("h") or DEFAULT_WINDOW_HEIGHT),
+            x=geo.get("x"), y=geo.get("y"),
+            min_size=window_min_size(geo),
             hidden=start_minimized,
         )
     except Exception as e:  # noqa: BLE001
@@ -874,7 +1195,8 @@ def run_webview(flask_app, port: int, url: str, start_minimized: bool = False,
     if close_ref is None:
         close_ref = {"behavior": "minimize"}
 
-    _on_closing = make_on_closing(state, close_ref, use_tray, url, window_ref)
+    _on_closing = make_on_closing(state, close_ref, use_tray, url, window_ref,
+                                  geometry_save=geometry_save)
     window.events.closing += _on_closing
 
     # 4. Start the tray icon (if available).  pywebview's

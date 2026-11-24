@@ -247,6 +247,7 @@ build.bat
 - 托盘菜单：**显示控制台**（单击托盘图标同样打开）与 **退出 BindDeckLite**。关闭浏览器标签页不会退出程序，退出请用托盘菜单。
 - 如果机器上装不了 pystray / Pillow（或没有图形会话），不会隐藏控制台，也不会把程序留在无法退出的后台；「设备 → 桌面应用 → 退出上位机」始终可用。
 - 重复双击 exe 不会启动第二份：检测到 8788 端口已监听时只打开浏览器。
+- 原生窗口会记住上次的大小和位置（`config.json` 的 `settings.window`）：改完尺寸、拖到副屏后关闭，下次启动回到原样；副屏被拔掉或换了更小的屏幕时自动收进主屏可见区域；首次启动 1280×800 居中，屏幕放不下（如 1366×768）时按工作区缩小，底部日志不会被挡。隐藏到托盘或最小化退出不改写已记住的位置。
 - 「设备 → 桌面应用」可开关 **开机自启动** 与 **开机启动时最小化到托盘**。自启动方式：
   Windows 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，Linux 写 `~/.config/autostart/binddecklite.desktop`，macOS 写 `~/Library/LaunchAgents/com.binddecklite.host.plist`。
   Windows 若需要提权启动（让宏能输入到以管理员运行的程序），改用登录计划任务，见下方「以管理员身份运行」。
