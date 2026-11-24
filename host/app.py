@@ -1414,6 +1414,24 @@ def save_config():
         return False
 
 
+def save_window_geometry(geo):
+    """Persist the desktop window geometry (WS-691).
+
+    Only the desktop shell calls this, so ``settings.window`` never appears in
+    a browser / tray / headless config.  The key is written on demand rather
+    than declared in the ``settings`` defaults for the same reason: an old
+    ``config.json`` is read as "no geometry" and nothing else is touched.
+    """
+    with _lock:
+        _config["settings"]["window"] = {
+            "w": int(geo["w"]), "h": int(geo["h"]),
+            "x": int(geo["x"]), "y": int(geo["y"]),
+        }
+        saved = save_config()
+    if not saved:
+        print("[app] window geometry not saved (config write failed)")
+
+
 def _atomic_write_json(path: str, payload) -> None:
     """Write *payload* via a temp file + ``os.replace`` (WS-623).
 
@@ -7434,12 +7452,17 @@ def main(argv=None):
 
     if desktop_mode:
         _close_behavior_ref["behavior"] = _config["settings"].get("close_button_behavior", "minimize")
+        # WS-691: restore the last window size/position; a stored rectangle
+        # that no longer intersects any screen converges to the primary one.
+        geometry = desktop.resolve_window_geometry(_config["settings"].get("window"))
         return desktop.run_webview(app, PORT, url,
                                    start_minimized=bool(args.minimized),
                                    use_tray=not args.no_tray,
                                    close_ref=_close_behavior_ref,
                                    log_path=os.path.join(DATA_DIR, "host.log"),
-                                   elevated=bool(args.elevated))
+                                   elevated=bool(args.elevated),
+                                   geometry=geometry,
+                                   geometry_save=save_window_geometry)
 
     if os.environ.get("BINDDECKLITE_NO_BROWSER") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
