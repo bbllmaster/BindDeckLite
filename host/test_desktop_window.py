@@ -136,6 +136,19 @@ def test_looks_maximized_detects_a_full_work_area():
                            [PRIMARY_1080]) is True
 
 
+def test_looks_maximized_detects_the_real_win32_maximized_frame():
+    """Windows maximized: 1936x1056 at (-8,-8) on a 1920x1040 work area."""
+    assert looks_maximized({"w": 1936, "h": 1056, "x": -8, "y": -8},
+                           [PRIMARY_1080]) is True
+
+
+def test_looks_maximized_ignores_a_large_window_that_is_not_full():
+    assert looks_maximized({"w": 1600, "h": 900, "x": 100, "y": 80},
+                           [PRIMARY_1080]) is False
+    assert looks_maximized({"w": 1920, "h": 1040, "x": 200, "y": 0},
+                           [PRIMARY_1080]) is False
+
+
 def test_looks_maximized_ignores_normal_windows():
     assert looks_maximized({"w": 1100, "h": 700, "x": 40, "y": 60},
                            [PRIMARY_1080]) is False
@@ -144,6 +157,22 @@ def test_looks_maximized_ignores_normal_windows():
 class _FakeWindow:
     def __init__(self, w, h, x, y):
         self.width, self.height, self.x, self.y = w, h, x, y
+
+    def hide(self):  # pragma: no cover - only used by _HideableWindow
+        raise AssertionError("plain _FakeWindow cannot hide")
+
+
+class _HideableWindow(_FakeWindow):
+    """A window whose geometry becomes unreadable once hidden, like Windows."""
+
+    def __init__(self, w, h, x, y):
+        super().__init__(w, h, x, y)
+        self.hidden = False
+
+    def hide(self):
+        self.hidden = True
+        self.width = self.height = 0
+        self.x = self.y = -32000
 
 
 class _FakeRect:
@@ -209,7 +238,8 @@ def test_window_geometry_rejects_zero_size():
 
 
 def _close_window(window, geometry_save, hidden=False, force_quit=False,
-                  workareas=(PRIMARY_1080,)):
+                  workareas=(PRIMARY_1080,), behavior="exit", use_tray=False,
+                  tray_active=False):
     """Run the real ``_on_closing`` handler and return what it did.
 
     ``STATE`` is patched for the whole call (the handler reads
@@ -217,11 +247,13 @@ def _close_window(window, geometry_save, hidden=False, force_quit=False,
     stubbed so no GUI backend is needed.
     """
     state = {"force_quit": force_quit}
-    handler = make_on_closing(state, {"behavior": "exit"}, False,
+    handler = make_on_closing(state, {"behavior": behavior}, use_tray,
                               "http://127.0.0.1:8788", [window],
                               geometry_save=geometry_save)
     with mock.patch.dict(desktop.STATE,
-                         {"tray_active": False, "window_hidden": hidden}):
+                         {"tray_active": tray_active, "window_hidden": hidden,
+                          "window_geometry_cache": None,
+                          "tray_available": tray_active}):
         with mock.patch.object(desktop, "screen_workareas",
                                return_value=list(workareas)):
             return handler()
@@ -234,17 +266,66 @@ def test_visible_close_saves_geometry():
     assert saved == [{"w": 1100, "h": 700, "x": 40, "y": 60}]
 
 
-def test_tray_hidden_close_does_not_save():
-    """Hidden in the tray: the stored geometry must stay the last visible one."""
+def test_hidden_exit_without_a_visible_sample_saves_nothing():
+    """Start-minimized: no visible reading was ever taken, so nothing is saved."""
     saved = []
     assert _close_window(_FakeWindow(1100, 700, 40, 60), saved.append,
                          hidden=True) is True
     assert saved == []
 
 
-def test_maximized_close_does_not_save():
+def test_minimize_to_tray_caches_visible_geometry_then_saves_on_exit():
+    """Default setting (behavior=minimize + tray): X hides, tray exit persists.
+
+    Sampling must happen *before* ``hide()`` — after it the fake reports the
+    hidden (0x0 @ -32000) reading, which must never reach the config.
+    """
     saved = []
-    assert _close_window(_FakeWindow(1920, 1040, 0, 0), saved.append,
+    window = _HideableWindow(1100, 700, 40, 60)
+    state = {"force_quit": False}
+    handler = make_on_closing(state, {"behavior": "minimize"}, True,
+                              "http://127.0.0.1:8788", [window],
+                              geometry_save=saved.append)
+    with mock.patch.dict(desktop.STATE,
+                         {"tray_active": True, "window_hidden": False,
+                          "window_geometry_cache": None}):
+        with mock.patch.object(desktop, "screen_workareas",
+                               return_value=[PRIMARY_1080]):
+            assert handler() is False
+            assert window.hidden is True
+            assert saved == []  # hiding alone must not write
+            assert desktop.STATE["window_geometry_cache"] == {
+                "w": 1100, "h": 700, "x": 40, "y": 60}
+            # Tray "退出": stop_all() sets force_quit and destroys the window.
+            state["force_quit"] = True
+            assert handler() is True
+    assert saved == [{"w": 1100, "h": 700, "x": 40, "y": 60}]
+
+
+def test_maximized_minimize_to_tray_still_saves_nothing():
+    """A maximized window hidden to the tray must not cache its maximized size."""
+    saved = []
+    window = _HideableWindow(1936, 1056, -8, -8)
+    state = {"force_quit": False}
+    handler = make_on_closing(state, {"behavior": "minimize"}, True,
+                              "http://127.0.0.1:8788", [window],
+                              geometry_save=saved.append)
+    with mock.patch.dict(desktop.STATE,
+                         {"tray_active": True, "window_hidden": False,
+                          "window_geometry_cache": None}):
+        with mock.patch.object(desktop, "screen_workareas",
+                               return_value=[PRIMARY_1080]):
+            assert handler() is False
+            assert desktop.STATE["window_geometry_cache"] is None
+            state["force_quit"] = True
+            assert handler() is True
+    assert saved == []
+
+
+def test_maximized_close_does_not_save():
+    """Real Win32 maximized frame (8 px overhang per edge) must not be stored."""
+    saved = []
+    assert _close_window(_FakeWindow(1936, 1056, -8, -8), saved.append,
                          force_quit=True) is True
     assert saved == []
 
@@ -255,3 +336,17 @@ def test_failing_save_does_not_block_the_close():
         raise OSError("disk full")
 
     assert _close_window(_FakeWindow(1100, 700, 40, 60), _boom) is True
+
+
+def test_window_min_size_is_clamped_to_the_small_converged_geometry():
+    """1024x560 → 921x504; a 960x600 minimum would grow it past the taskbar."""
+    geo = normalize_window_geometry(None, [{"x": 0, "y": 0, "w": 1024, "h": 560}])
+    assert (geo["w"], geo["h"]) == (921, 504)
+    min_w, min_h = desktop.window_min_size(geo)
+    assert min_w <= geo["w"] and min_h <= geo["h"]
+    assert (min_w, min_h) == (921, 504)
+
+
+def test_window_min_size_keeps_the_historical_floor_on_a_normal_screen():
+    assert desktop.window_min_size({"w": 1100, "h": 700}) == (960, 600)
+    assert desktop.window_min_size(None) == (960, 600)
