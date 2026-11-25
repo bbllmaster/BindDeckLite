@@ -141,7 +141,10 @@ async function testKeyAction(item, idx, card) {
   let r = null;
   try {
     r = await api(`/api/action/test/${encodeURIComponent(devId)}/${idx}`, { method: "POST" });
-    if (r.ok) {
+    if (r.ok && r.started) {
+      // WS-696：命令只承诺「已启动」，真实结果由服务端的退出码行补上。
+      toast(t("ui.command_started"), "ok");
+    } else if (r.ok) {
       const used = r.browser_used && r.browser_used !== "default" ? ` · ${r.browser_used}` : "";
       toast(t("ui.action_ok_prefix") + (item.action.type || "") + used, "ok");
     } else if (r.cancelled) {

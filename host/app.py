@@ -4338,11 +4338,61 @@ def _macro_cancelled(action: dict, step: int, total: int,
             "total_steps": total}
 
 
-def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
+def _command_creationflags() -> int:
+    """Process flags for ``subprocess.Popen`` of a ``command`` action (WS-696).
+
+    A windowed desktop build (``console=False``) has no console of its own, so
+    Windows allocates a fresh one for every ``shell=True`` child — a black
+    ``cmd.exe`` window flashed on each key press and stayed for long-running
+    commands.  ``CREATE_NO_WINDOW`` reuses the flag ``autostart`` already
+    resolved cross-platform instead of defining a second copy.
+
+    Non-Windows returns 0 on purpose: run from a terminal (``python app.py``),
+    command output must stay visible in that terminal.
+    """
+    if sys.platform.startswith("win"):
+        return autostart.CREATE_NO_WINDOW
+    return 0
+
+
+def _wait_command(proc, dev_id: str, idx: int, label: str, cmd: str, t0: float):
+    """Reap one launched command and log its real exit code (WS-696).
+
+    Runs in a daemon thread so a long-lived command (``ping -t``, ``ffmpeg``)
+    never blocks the key handler, the HTTP route or interpreter shutdown.
+    ``dev_id`` is the snapshot taken when the action fired, so a device switch
+    while the command runs cannot re-attribute the row.
+
+    Never raises: a failure to wait is logged as a ``warn`` row instead of
+    reaching the thread excepthook, which the windowed build cannot show.
+    """
+    try:
+        rc = proc.wait()
+        elapsed = time.time() - t0
+        level = "ok" if rc == 0 else "warn"
+        add_event("action",
+                  t("log.command_finished", label=label, code=rc,
+                    seconds=f"{elapsed:.1f}"),
+                  dev_id, level)
+    except Exception as e:  # noqa: BLE001 — a thread must never raise upward
+        add_event("action",
+                  t("log.action_failed", label=label, type="command",
+                    target=cmd, error=f"{type(e).__name__}: {e}"),
+                  dev_id, "warn")
+
+
+def run_action(action: dict, dev_id: str = "", cancel=None,
+               idx: int = -1, label: str = "") -> dict:
     """Execute one host-side action and return a structured result.
+
+    ``idx`` / ``label`` only name the input in the log row a ``command``
+    writes when it exits (WS-696); encoder actions are not one of the 10
+    button indices, so they pass an explicit ``label``.
 
     Returns ``{ok: bool, error: str, action_type: str, target: str}`` where
     ``error`` is a human-readable failure reason (empty when ``ok`` is True).
+    A ``command`` that spawned successfully also carries ``started: True`` —
+    its exit code arrives later from ``_wait_command``, not in this object.
     ``dev_id`` only tags inner log rows (clipboard/paste warnings) with the
     device they came from.
 
@@ -4387,15 +4437,36 @@ def run_action(action: dict, dev_id: str = "", cancel=None) -> dict:
                     "action_type": kind, "target": target}
 
     if kind == "command":
+        row_label = label or _action_label(idx, dev_id)
+        started_at = time.time()
         try:
-            subprocess.Popen(value, shell=True)
-            return {"ok": True, "error": "", "action_type": kind, "target": target}
+            proc = subprocess.Popen(value, shell=True,
+                                    creationflags=_command_creationflags())
         except (FileNotFoundError, PermissionError, OSError) as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
                     "action_type": kind, "target": target}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"{type(e).__name__}: {e}",
                     "action_type": kind, "target": target}
+        # WS-696: "started" is the only immediate claim.  The start row is
+        # written here, before the waiter exists, so a fast command can never
+        # log its exit code ahead of "命令已启动".
+        add_event("action",
+                  t("log.command_started", label=row_label, cmd=target),
+                  dev_id, "info")
+        waiter = threading.Thread(
+            target=_wait_command,
+            args=(proc, dev_id, idx, row_label, value, started_at),
+            daemon=True)
+        try:
+            waiter.start()
+        except Exception as e:  # noqa: BLE001 — the command still runs
+            add_event("action",
+                      t("log.action_failed", label=row_label, type="command",
+                        target=target, error=f"{type(e).__name__}: {e}"),
+                      dev_id, "warn")
+        return {"ok": True, "started": True, "error": "",
+                "action_type": kind, "target": target}
 
     if kind == "macro":
         kb = _load_keyboard()
@@ -4640,6 +4711,11 @@ def _record_action_result(dev_id: str, idx: int, action: dict, result: dict,
             where = t("log.step_where", step=result.get("step", 0), total=total)
         add_event("action", t("log.action_stopped", label=label, where=where), dev_id, "warn")
         return
+    if result.get("started"):
+        # WS-696: a launched command is not a finished action.  ``run_action``
+        # already wrote the "命令已启动" row (and the exit code follows from the
+        # waiter); writing "动作成功" here would repeat the old fake success.
+        return
     if result["ok"]:
         add_event("action", t("log.action_ok", label=label, type=atype, target=target), dev_id, "ok")
         return
@@ -4838,7 +4914,7 @@ def _run_action_for(dev_id: str, idx: int):
 
     def _do():
         try:
-            result = run_action(action, dev_id, cancel=cancel)
+            result = run_action(action, dev_id, cancel=cancel, idx=idx)
             _record_action_result(dev_id, idx, action, result)
         finally:
             # Release even when run_action raised; otherwise the card would
@@ -4993,7 +5069,7 @@ def _run_encoder_action(dev_id: str, direction: str):
 
     def _do():
         try:
-            result = run_action(action, dev_id)
+            result = run_action(action, dev_id, label=label)
             _record_action_result(dev_id, -1, action, result, label=label)
         finally:
             _end_encoder_action(dev_id, direction, token)
@@ -5229,7 +5305,7 @@ def api_action_test(dev_id, idx):
     def _worker():
         try:
             try:
-                result = run_action(action, dev_id, cancel=cancel)
+                result = run_action(action, dev_id, cancel=cancel, idx=idx)
             except Exception as e:  # noqa: BLE001
                 result = {"ok": False, "error": f"{type(e).__name__}: {e}",
                           "action_type": action.get("type", ""),
@@ -5328,7 +5404,8 @@ def api_encoder_action_test(dev_id, direction):
 
     def _worker():
         try:
-            result_queue.put(run_action(action, dev_id))
+            result_queue.put(run_action(action, dev_id,
+                                        label=_encoder_action_label(direction)))
         except Exception as e:  # noqa: BLE001
             result_queue.put({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "action_type": action.get("type", ""),
