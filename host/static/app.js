@@ -1943,7 +1943,10 @@ function renderEncoderActions() {
       try {
         r = await api(`/api/encoder/action/test/${encodeURIComponent(devId)}/${dir}`,
                       { method: "POST" });
-        if (r.ok) {
+        if (r.ok && r.started) {
+          // WS-696：命令只承诺「已启动」，真实结果由服务端的退出码行补上。
+          toast(t("ui.command_started"), "ok");
+        } else if (r.ok) {
           const used = r.browser_used && r.browser_used !== "default"
             ? ` · ${r.browser_used}` : "";
           toast(t("ui.action_ok_prefix") + actions[dir].type + used, "ok");

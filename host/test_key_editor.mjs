@@ -180,7 +180,7 @@ async function loadApp() {
     registry[sel] = [m];
   });
   ["#keyHint", "#keyDrawer", "#keyDrawerBody", "#keyDrawerTitle", "#kdTest",
-    "#btnKeyDrawerClose", "#keyDrawerBackdrop"].forEach((sel) => {
+    "#btnKeyDrawerClose", "#keyDrawerBackdrop", "#noticeCenter"].forEach((sel) => {
     registry[sel] = [makeEl(sel)];
   });
   registry["#keyDrawerBackdrop"][0].hidden = true;
@@ -198,6 +198,8 @@ globalThis.__host = {
   retranslateKeyDrawer: typeof retranslateKeyDrawer === "function" ? retranslateKeyDrawer : null,
   // WS-665：判成不支持后要有「重新检测」入口（?reset=1）。
   redetectMediaCapability: typeof redetectMediaCapability === "function" ? redetectMediaCapability : null,
+  // WS-696：命令动作只回 started，toast 走单独的文案分支。
+  testKeyAction: typeof testKeyAction === "function" ? testKeyAction : null,
 };
 `, sandbox, { filename: "app.js" });
 
@@ -418,6 +420,44 @@ test("running：执行中的行带 running 且行尾变成停止，结束后复�
   host.applyRunningState();
   assert.ok(!card.classList.contains("running"));
   assert.equal(card.querySelector(".test").textContent, "测试动作");
+});
+
+/* ---------------- 用例：WS-696 命令只回「已启动」 ---------------- */
+
+/** 取最近一条 toast 的文案与级别（生产 showNotice 渲染进 #noticeCenter）。 */
+function lastNotice(registry) {
+  const center = registry["#noticeCenter"][0];
+  const item = center.children[center.children.length - 1];
+  return { text: item.children[0].textContent, kind: item.classList.contains("ok") ? "ok" : "" };
+}
+
+test("WS-696：命令动作只回 started 时，toast 是「已启动」而不是「动作执行成功」", async () => {
+  // 生产入口：keys.js 的 testKeyAction（vm 桩加载，不是副本）。
+  // 修复前它只看 r.ok，会在命令还没跑完时弹「动作执行成功：command」。
+  const { host, sandbox, registry } = await loadApp();
+  host.state.cfg = makeCfg(10);
+  host.state.selected = "t1";
+  host.state.running = {};
+  sandbox.api = async () => ({ ok: true, started: true, error: "" });
+
+  await host.testKeyAction(
+    { action: { type: "command", value: "ping -n 3 127.0.0.1" } }, 2, null);
+
+  assert.deepEqual(lastNotice(registry), {
+    text: "命令已启动，结果稍后写入日志", kind: "ok",
+  });
+});
+
+test("WS-696：非命令动作仍用原「动作执行成功」toast（逐字不变）", async () => {
+  const { host, sandbox, registry } = await loadApp();
+  host.state.cfg = makeCfg(10);
+  host.state.selected = "t1";
+  host.state.running = {};
+  sandbox.api = async () => ({ ok: true, error: "" });
+
+  await host.testKeyAction({ action: { type: "url", value: "https://example.com" } }, 2, null);
+
+  assert.deepEqual(lastNotice(registry), { text: "动作执行成功：url", kind: "ok" });
 });
 
 /* ---------------- 用例：WS-550 门控为 False 时摘要一致性 ---------------- */

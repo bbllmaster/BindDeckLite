@@ -88,7 +88,9 @@ class _StubbedAction:
     def __enter__(self):
         self._original = app.run_action
 
-        def _run(action, dev_id=""):
+        # Mirrors the production signature: WS-696 added ``idx`` / ``label``
+        # so the command exit row can name the input that fired it.
+        def _run(action, dev_id="", cancel=None, idx=-1, label=""):
             self.calls.append((dev_id, dict(action)))
             if self.delay:
                 time.sleep(self.delay)

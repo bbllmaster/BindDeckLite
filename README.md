@@ -289,7 +289,7 @@ schtasks /delete /tn BindDeckLite /f      :: 删掉计划任务
 | 仅 HID 按键 | 设备自己发键，上位机不做任何事 |
 | 启动程序 / 文件 | 本地路径；可用「浏览…」调系统文件对话框，最近用过的路径会出现在输入框候选里（Windows 用 `os.startfile`） |
 | 打开网址 | 默认浏览器 |
-| 执行命令 | `shell=True`，请只填可信命令 |
+| 执行命令 | `shell=True`，静默运行（Windows 桌面版不弹黑框），命令退出后把真实退出码写入日志；请只填可信命令 |
 | 媒体键 | 上位机侧媒体键：音量 / 播放 / 上下曲（需 `keyboard`）。设备直发的媒体键是 HID 下拉里的「媒体键」分组，不需要上位机 |
 | 宏 | 每行一步：`key:ctrl+alt+t`、`text:hello`（逐字符，默认 20ms 间隔）、`text!80:hello`（自定义逐字符延迟毫秒）、`paste:文本`（走剪贴板 + Ctrl/Cmd+V，中文/符号/密码框用这个）、`wait:200`、`url:https://…`、`browser:chrome`（指定后续 `url:` 用 Chrome / Firefox / Edge / Safari，未安装时回退默认浏览器）、`app:C:\path\app.exe --arg`（启动桌面应用程序，支持 PATH 程序名与环境变量写法，含空格的路径/参数用引号包裹（如 `--title="My App"`），Windows 会等待窗口到前台）；键名可用 `Tab` / `PageUp` / `LCtrl` 等界面名称（对照表见上位机右上角「帮助」） |
 

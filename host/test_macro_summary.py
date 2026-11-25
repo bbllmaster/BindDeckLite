@@ -22,6 +22,7 @@ Run::
 
 import os
 import sys
+import time
 from unittest import mock
 
 # host/ is not a package on its own; import the module by path.
@@ -61,6 +62,20 @@ class _StubKeyboard:
         pass
 
 
+class _FakeProc:
+    """A ``Popen`` stand-in whose ``wait()`` returns 0 immediately.
+
+    WS-700: since WS-696 the command branch starts a daemon waiter thread that
+    logs the exit code.  A bare ``MagicMock`` returns *another* ``MagicMock``
+    from ``wait()``, so the thread appended a junk row —
+    「命令结束: … 退出码 <MagicMock name='Popen().wait()' …> · 0.0 s」 — to the
+    global event log.  A real integer keeps that row well-formed.
+    """
+
+    def wait(self):
+        return 0
+
+
 def _run_action(action, keyboard=None):
     """Run one action through the production ``run_action``.
 
@@ -72,7 +87,8 @@ def _run_action(action, keyboard=None):
     with mock.patch.object(host_app, "_load_keyboard", return_value=kb):
         with mock.patch.object(host_app, "_paste_text", return_value=True):
             with mock.patch.object(host_app, "_open_target") as open_mock:
-                with mock.patch.object(host_app.subprocess, "Popen"):
+                with mock.patch.object(host_app.subprocess, "Popen",
+                                       return_value=_FakeProc()):
                     return host_app.run_action(action, dev_id="dev-1")
 
 
@@ -272,10 +288,18 @@ def test_failure_row_falls_back_without_step_info():
 
 def test_non_macro_actions_keep_their_original_target():
     """A command / launch action still logs its original text."""
+    host_app._events.clear()
     result = _run_action({"type": "command", "value": "notepad.exe"})
 
     assert result["ok"] is True, result
     assert result["target"] == "notepad.exe", result
+    # The waiter thread writes 「命令结束」 asynchronously; let it land, then
+    # drop it so this module never leaves rows behind for the next test file.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not any(
+            "命令结束" in t for t in _texts()):
+        time.sleep(0.01)
+    host_app._events.clear()
 
 
 # --- URL userinfo redaction ------------------------------------------------
