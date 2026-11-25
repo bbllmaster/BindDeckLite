@@ -4355,7 +4355,7 @@ def _command_creationflags() -> int:
     return 0
 
 
-def _wait_command(proc, dev_id: str, idx: int, label: str, cmd: str, t0: float):
+def _wait_command(proc, dev_id: str, label: str, cmd: str, t0: float):
     """Reap one launched command and log its real exit code (WS-696).
 
     Runs in a daemon thread so a long-lived command (``ping -t``, ``ffmpeg``)
@@ -4368,7 +4368,9 @@ def _wait_command(proc, dev_id: str, idx: int, label: str, cmd: str, t0: float):
     """
     try:
         rc = proc.wait()
-        elapsed = time.time() - t0
+        # WS-700: monotonic, not wall clock — a system time jump must not turn
+        # a 1.4 s command into a negative or absurd duration.
+        elapsed = time.monotonic() - t0
         level = "ok" if rc == 0 else "warn"
         add_event("action",
                   t("log.command_finished", label=label, code=rc,
@@ -4438,7 +4440,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None,
 
     if kind == "command":
         row_label = label or _action_label(idx, dev_id)
-        started_at = time.time()
+        started_at = time.monotonic()
         try:
             proc = subprocess.Popen(value, shell=True,
                                     creationflags=_command_creationflags())
@@ -4456,7 +4458,7 @@ def run_action(action: dict, dev_id: str = "", cancel=None,
                   dev_id, "info")
         waiter = threading.Thread(
             target=_wait_command,
-            args=(proc, dev_id, idx, row_label, value, started_at),
+            args=(proc, dev_id, row_label, value, started_at),
             daemon=True)
         try:
             waiter.start()
@@ -5334,10 +5336,16 @@ def api_action_test(dev_id, idx):
         return jsonify({"ok": False, **_err(t("log.action_still_running")), "running": True}), 200
 
     _end_action(dev_id, idx, token)
-    return jsonify({"ok": result["ok"], "error": result["error"],
-                    # WS-495: additive — a stop is not a failure.
-                    "cancelled": bool(result.get("cancelled")),
-                    "browser_used": result.get("browser_used", "")})
+    body = {"ok": result["ok"], "error": result["error"],
+            # WS-495: additive — a stop is not a failure.
+            "cancelled": bool(result.get("cancelled")),
+            "browser_used": result.get("browser_used", "")}
+    if result.get("started"):
+        # WS-696: without this the UI could not tell "started" from "done" and
+        # fell back to 「动作执行成功」.  Only a ``command`` sets it, so every
+        # other action type keeps exactly the old response shape.
+        body["started"] = True
+    return jsonify(body)
 
 
 @app.route("/api/action/cancel/<dev_id>/<int:idx>", methods=["POST"])
@@ -5430,8 +5438,12 @@ def api_encoder_action_test(dev_id, direction):
     _end_encoder_action(dev_id, direction, token)
     _record_action_result(dev_id, -1, action, result,
                           label=_encoder_action_label(direction))
-    return jsonify({"ok": result["ok"], "error": result["error"],
-                    "browser_used": result.get("browser_used", "")})
+    body = {"ok": result["ok"], "error": result["error"],
+            "browser_used": result.get("browser_used", "")}
+    if result.get("started"):
+        # WS-696: same as api_action_test — the encoder test toast reads it.
+        body["started"] = True
+    return jsonify(body)
 
 
 @app.route("/api/device/<dev_id>/<action>", methods=["POST"])

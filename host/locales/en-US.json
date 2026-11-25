@@ -394,7 +394,7 @@
   "log.cfg_unparseable": "The configuration reported by the device could not be parsed",
   "log.clipboard_paste_skipped": "Clipboard unavailable; the paste step was skipped (falling back to typing)",
   "log.close_behavior": "Close button behaviour set to {mode}",
-  "log.command_finished": "Command finished: {label} · exit code {code} · {seconds}s",
+  "log.command_finished": "Command finished: {label} · exit code {code} · {seconds} s",
   "log.command_started": "Command started: {label} · {cmd}",
   "log.connection_lost": "Connection lost",
   "log.device_asleep": "The deck is asleep, not hung",

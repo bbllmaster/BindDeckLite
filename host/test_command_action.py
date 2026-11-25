@@ -231,3 +231,87 @@ def test_popen_failure_stays_an_error_and_writes_no_started_row():
     assert not any("命令已启动" in r["text"] for r in rows), rows
     assert rows[-1]["level"] == "error", rows
     assert rows[-1]["text"].startswith("动作失败: 按键 3 · command"), rows
+
+
+# --- the HTTP "测试动作" routes (WS-700) -----------------------------------
+#
+# WS-696's visible promise is the toast on 「测试动作」: it reads
+# ``r.ok && r.started``.  ``run_action`` already returned ``started``, but both
+# test routes rebuilt the JSON body by hand and dropped the field, so the UI
+# kept showing the old 「动作执行成功」.  These two tests go through the real
+# Flask routes (only ``Popen`` / the browser opener are faked), which is the
+# layer the earlier tests never touched.
+
+class _StubKeyboard:
+    """Minimal ``keyboard`` stand-in so a ``macro`` action can succeed."""
+
+    def send(self, *args, **kwargs):
+        pass
+
+    def write(self, *args, **kwargs):
+        pass
+
+
+def _device_with(action, encoder_action=None, dev_id="t1"):
+    """Register a device whose key 3 (and encoder CW) run ``action``."""
+    with host_app._lock:
+        host_app._action_running.clear()
+        host_app._encoder_action_running.clear()
+    host_app._events.clear()
+    host_app._config = {"devices": {}, "settings": {"actions_enabled": True}}
+    cfg = host_app.new_device_cfg("ESP32", dev_id)
+    cfg["keys"][2]["action"] = dict(action)
+    if encoder_action is not None:
+        cfg["encoder"]["mode"] = 4
+        cfg["encoder"]["actions"]["CW"] = dict(encoder_action)
+    host_app._config["devices"][dev_id] = cfg
+    return cfg
+
+
+def test_http_test_routes_report_started_for_a_command():
+    """Both 「测试动作」 endpoints must expose ``started`` for a command."""
+    _device_with({"type": "command", "value": CMD},
+                 {"type": "command", "value": CMD})
+    client = host_app.app.test_client()
+
+    with mock.patch.object(host_app.subprocess, "Popen",
+                           return_value=_FakeProc(rc=0)):
+        key_body = client.post("/api/action/test/t1/2").get_json()
+        enc_body = client.post("/api/encoder/action/test/t1/CW").get_json()
+
+    # Without this the toast falls through to 「动作执行成功」 — the fake
+    # success WS-696 exists to remove.
+    assert key_body["ok"] is True, key_body
+    assert key_body["started"] is True, key_body
+    assert enc_body["ok"] is True, enc_body
+    assert enc_body["started"] is True, enc_body
+
+
+def test_http_test_routes_omit_started_for_non_command_actions():
+    """Other action types keep the exact old response shape (no ``started``)."""
+    client = host_app.app.test_client()
+
+    _device_with({"type": "url", "value": "https://example.com"},
+                 {"type": "url", "value": "https://example.com"})
+    with mock.patch.object(host_app, "_open_target"):
+        url_key = client.post("/api/action/test/t1/2").get_json()
+        url_enc = client.post("/api/encoder/action/test/t1/CW").get_json()
+
+    assert url_key["ok"] is True, url_key
+    assert url_enc["ok"] is True, url_enc
+    assert "started" not in url_key, url_key
+    assert "started" not in url_enc, url_enc
+
+    _device_with({"type": "macro", "value": "m",
+                  "macro": [{"type": "key", "value": "enter"}]},
+                 {"type": "macro", "value": "m",
+                  "macro": [{"type": "key", "value": "enter"}]})
+    with mock.patch.object(host_app, "_load_keyboard",
+                           return_value=_StubKeyboard()):
+        macro_key = client.post("/api/action/test/t1/2").get_json()
+        macro_enc = client.post("/api/encoder/action/test/t1/CW").get_json()
+
+    assert macro_key["ok"] is True, macro_key
+    assert macro_enc["ok"] is True, macro_enc
+    assert "started" not in macro_key, macro_key
+    assert "started" not in macro_enc, macro_enc
