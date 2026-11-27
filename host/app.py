@@ -149,6 +149,9 @@ _config = {"devices": {}, "settings": {
     "udp_fallback": True,
     "start_minimized": True,
     "close_button_behavior": "minimize",
+    # WS-702: notify when a deck drops while the window sits in the tray.
+    # Missing from an older config.json means "on" (see desktop_payload).
+    "notify_on_disconnect": True,
     "admin_autostart": False,
     "recent_paths": [],
 },
@@ -1844,6 +1847,195 @@ def _on_ble_diag(dev_id: str, text: str, level: str):
     add_event("ble", text, dev_id, level)
 
 
+# --- WS-702: connection watchdog (drop / reconnect is no longer silent) ----
+# The BLE layer prints a disconnect and retries, but a packaged windowed exe
+# has no console and the log page never learns about a *clean* drop.  A 2 s
+# sampler over ``ble.devices()`` turns the edge into one log line (and, when
+# the app sits in the tray, one system notification).
+LINK_STABLE_SECONDS = 60.0      # a link must have held this long to notify
+LINK_NOTIFY_COOLDOWN_S = 300.0  # at most one notification per deck per 5 min
+LINK_ACTIVE_WINDOW_S = 20.0     # a self-initiated drop is expected for 20 s
+LINK_SAMPLE_SECONDS = 2.0
+
+# Commands after which a disconnect is *expected*: the deck reboots or drops
+# the bond.  Their log line gets 「（本站操作触发）」 and never notifies.
+_ACTIVE_DISCONNECT_CMDS = ("CMD:REBOOT", "CMD:BOOT_CFG", "CMD:CLEARBOND")
+
+# key (dev_id or BLE address) -> {"connected", "since", "notified_at", "noticed", "name"}
+_link_state = {}
+# dev_id -> monotonic-ish wall time before which a drop counts as self-inflicted.
+_link_active_until = {}
+# ``send("", ...)`` has no dev_id to attribute to (UDP fallback); apply there.
+_link_active_global_until = 0.0
+_link_watch_quit = False
+_link_watch_thread = None
+
+
+def disconnect_notice(prev_connected, now_connected, conn_since, now,
+                      last_notified, suppress_until, notify_enabled,
+                      tray_active, window_hidden) -> dict:
+    """Decide what one watchdog sample means for one deck (WS-702).
+
+    Pure on purpose: the caller owns the timer and the device list, so every
+    acceptance branch (edge only, 60 s stability, 5 min cooldown, active
+    window, tray/visibility/switch gating) is testable without BLE or a GUI.
+
+    ``prev_connected`` is ``None`` on the first sample: a deck that has never
+    been seen connected must not produce a 「已断开」 line, and ``suppress_until``
+    is the end of the self-initiated-drop window.
+
+    Returns ``{"log": "disconnect"|"reconnect"|None, "level", "notify",
+    "notify_reason", "active"}``.  A reconnect edge never notifies.
+    """
+    out = {"log": None, "level": "info", "notify": False,
+           "notify_reason": "no_edge", "active": False}
+    if prev_connected is None:
+        out["notify_reason"] = "first_sample"
+        return out
+    if bool(prev_connected) == bool(now_connected):
+        return out  # every 2 s sample would otherwise repeat the line
+
+    if now_connected:
+        out["log"] = "reconnect"
+        out["notify_reason"] = "reconnect"
+        return out
+
+    out["log"] = "disconnect"
+    out["level"] = "warn"
+    active = suppress_until is not None and now < suppress_until
+    out["active"] = bool(active)
+
+    if not notify_enabled:
+        out["notify_reason"] = "disabled"
+    elif not tray_active:
+        out["notify_reason"] = "no_tray"
+    elif not window_hidden:
+        out["notify_reason"] = "window_visible"
+    elif conn_since is None or now - conn_since < LINK_STABLE_SECONDS:
+        out["notify_reason"] = "unstable"
+    elif last_notified is not None and now - last_notified < LINK_NOTIFY_COOLDOWN_S:
+        out["notify_reason"] = "cooldown"
+    elif active:
+        out["notify_reason"] = "active_disconnect"
+    else:
+        out["notify"] = True
+        out["notify_reason"] = "notified"
+    return out
+
+
+def note_active_disconnect(dev_id: str) -> None:
+    """Remember that *we* asked this deck to reboot / drop the link (WS-702)."""
+    global _link_active_global_until
+    until = time.time() + LINK_ACTIVE_WINDOW_S
+    with _lock:
+        if dev_id:
+            _link_active_until[dev_id] = until
+        else:
+            _link_active_global_until = until
+
+
+def _link_watch_sample(now=None, devices=None) -> list:
+    """Run one watchdog pass and return the rendered log rows (for tests).
+
+    ``devices`` is normally ``ble.devices()``; tests hand in a plain list so
+    the state machine (edges, cooldown, dedupe with ``_note_link_connected``)
+    runs against production code with no BLE stack.
+    """
+    now = time.time() if now is None else now
+    devs = ble.devices() if devices is None else devices
+    with _lock:
+        notify_enabled = bool(_config["settings"].get("notify_on_disconnect", True))
+    if _link_watch_quit:
+        notify_enabled = False
+    tray_active = bool(desktop.STATE.get("tray_active"))
+    window_hidden = bool(desktop.STATE.get("window_hidden"))
+
+    rows = []
+    for dev in devs:
+        dev_id = dev.get("dev_id") or ""
+        key = dev_id or dev.get("address") or ""
+        if not key:
+            continue
+        name = dev.get("name") or key
+        connected = bool(dev.get("connected"))
+        with _lock:
+            st = _link_state.get(key)
+            if st is None:
+                st = {"connected": None, "since": None, "notified_at": None,
+                      "noticed": False, "name": name}
+                _link_state[key] = st
+            prev = st["connected"]
+            suppress = max(_link_active_until.get(key, 0.0),
+                           _link_active_until.get(dev_id, 0.0),
+                           _link_active_global_until)
+            decision = disconnect_notice(
+                prev, connected, st["since"], now, st["notified_at"], suppress,
+                notify_enabled, tray_active, window_hidden)
+
+            st["name"] = name
+            st["connected"] = connected
+            if decision["log"] == "reconnect":
+                # Only the watchdog's own recorded drop justifies 「已重新连接」;
+                # an existing 「连接已恢复」 from _note_link_connected() stays the
+                # single line for a connect-failure recovery.
+                if not st["noticed"]:
+                    decision = dict(decision, log=None, notify_reason="recovered_elsewhere")
+                else:
+                    st["noticed"] = False
+                st["since"] = now
+            elif decision["log"] == "disconnect":
+                st["noticed"] = True
+                st["since"] = None
+            elif prev is None and connected:
+                st["since"] = now
+            if decision["notify"]:
+                # Count the attempt, not the delivery: a backend that raises or
+                # a Focus-Assist block must not retry every 2 seconds.
+                st["notified_at"] = now
+
+        if decision["log"] == "disconnect":
+            err = dev.get("last_error") or {}
+            reason = err.get("text") if isinstance(err, dict) else ""
+            if not reason:
+                reason = t("log.link_no_error")
+            text = t("log.link_disconnected", name=name, reason=reason)
+            if decision["active"]:
+                text += t("log.link_active_suffix")
+        elif decision["log"] == "reconnect":
+            text = t("log.link_reconnected", name=name)
+        else:
+            continue
+        add_event("ble", text, dev_id, decision["level"])
+        rows.append({"dev": dev_id, "name": name, "level": decision["level"],
+                     "text": str(text), "notify": decision["notify"]})
+        if decision["notify"]:
+            desktop.notify(t("notify.disconnect_title"),
+                           t("notify.disconnect_body", name=name))
+    return rows
+
+
+def _link_watch_loop() -> None:
+    while not _link_watch_quit:
+        try:
+            _link_watch_sample()
+        except Exception as e:  # noqa: BLE001 - a watchdog must never kill the host
+            print("[app] link watchdog:", e)
+        for _ in range(int(LINK_SAMPLE_SECONDS / 0.1)):
+            if _link_watch_quit:
+                return
+            time.sleep(0.1)
+
+
+def start_link_watchdog() -> None:
+    """Start the 2 s sampler (idempotent; never in tests / imports)."""
+    global _link_watch_thread
+    if _link_watch_thread is not None:
+        return
+    _link_watch_thread = threading.Thread(target=_link_watch_loop,
+                                          name="link-watch", daemon=True)
+    _link_watch_thread.start()
+
+
 def parse_bond_status(payload: str) -> dict:
     """Split a ``BOND_STATUS:`` payload into ``{"bound": bool, "addr": str}``.
 
@@ -2514,6 +2706,10 @@ def send(dev_id: str, cmd: str) -> dict:
         via.append("udp")
     if cmd.startswith(("CFG:", "CMD:")):
         add_event("tx", cmd[:90], dev_id, "ok" if via else "warn")
+    if via and cmd in _ACTIVE_DISCONNECT_CMDS:
+        # WS-702: the drop that follows is ours; the watchdog marks the log
+        # line and keeps the notification quiet for the next 20 s.
+        note_active_disconnect(dev_id)
     return {"sent": bool(via), "via": via}
 
 
@@ -6067,6 +6263,9 @@ def _ota_push(dev_id: str, filename: str, file_data: bytes,
         if not ble.send(dev_id, "CMD:OTA_END"):
             _fail(t("error.ota_link_lost"))
             return
+        # WS-702: the deck reboots to apply the image, so its drop is expected;
+        # keep the watchdog from notifying and mark the log line.
+        note_active_disconnect(dev_id)
         _wait_until(lambda: window.ack_line == "ACK:OTA:DONE"
                             or bool(window.ack_error)
                             or window.status == "cancelled",
@@ -7126,6 +7325,8 @@ def desktop_payload() -> dict:
         recent = list(_config["settings"].get("recent_paths") or [])
         start_minimized = bool(_config["settings"].get("start_minimized", True))
         close_behavior = _config["settings"].get("close_button_behavior", "minimize")
+        # WS-702: 旧 config.json 没有这个键 → 默认开，不回写文件。
+        notify_on_disconnect = bool(_config["settings"].get("notify_on_disconnect", True))
     return {
         "platform": sys.platform,
         "frozen": desktop.is_frozen(),
@@ -7139,6 +7340,7 @@ def desktop_payload() -> dict:
         "autostart": autostart.status(),
         "start_minimized": start_minimized,
         "close_button_behavior": close_behavior,
+        "notify_on_disconnect": notify_on_disconnect,
         "recent_paths": recent,
         # WS-529: 语言入口在「设备 → 桌面应用」。lang 是持久化偏好，
         # lang_effective 是当前实际生效的 locale。
@@ -7181,6 +7383,13 @@ def api_desktop():
             value = bool(data["start_minimized"])
             with _lock:
                 _config["settings"]["start_minimized"] = value
+            save_config()
+        if "notify_on_disconnect" in data:
+            # WS-702: 掉线通知开关。只有 JSON 布尔值算数，字符串 "false" 不当假
+            # （浏览器 checkbox 我们总是传 true/false）。
+            value = bool(data["notify_on_disconnect"])
+            with _lock:
+                _config["settings"]["notify_on_disconnect"] = value
             save_config()
         if "lang" in data:
             # Only the three known preferences may be persisted: a stray
@@ -7308,7 +7517,9 @@ def _exit_for_restart() -> bool:
     browser mode shuts its own server down.  Never ``os._exit`` - the window
     and the tray have to be cleaned up.
     """
+    global _link_watch_quit
     if desktop.request_quit():
+        _link_watch_quit = True
         return True
     server = _web_server.get("server")
     if server is None:
@@ -7318,6 +7529,7 @@ def _exit_for_restart() -> bool:
         time.sleep(0.4)  # let the HTTP response reach the browser first
         server.shutdown()
 
+    _link_watch_quit = True
     threading.Thread(target=_run, name="quit", daemon=True).start()
     return True
 
@@ -7379,7 +7591,11 @@ def api_browse():
 
 @app.route("/api/quit", methods=["POST"])
 def api_quit():
+    global _link_watch_quit
+    # WS-702: quitting is not a drop worth a notification (and the tray is
+    # about to disappear). Only stop the sampler once the quit really starts.
     if desktop.request_quit():
+        _link_watch_quit = True
         add_event("desktop", t("log.quit_requested"))
         return jsonify({"ok": True})
     return jsonify({"ok": False, **_err(t("error.quit_not_desktop"))}), 409
@@ -7537,6 +7753,8 @@ def main(argv=None):
     if not started:
         add_event("error", t("log.ble_unavailable") + str(ble.error), level="warn")
         print("[app] BLE unavailable:", ble.error)
+    # WS-702: 掉线不再静默。看门狗只在真正运行时启动，测试 import 不会起线程。
+    start_link_watchdog()
     print(f"[app] BindDeckLite host running at {url}")
 
     if desktop_mode:

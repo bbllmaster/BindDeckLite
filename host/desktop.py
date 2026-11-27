@@ -489,6 +489,31 @@ def browse(kind: str = "file", default_name: str = "") -> dict:
 
 
 # --- tray -----------------------------------------------------------------
+# WS-702: the pystray icon must stay reachable from Flask threads so the link
+# watchdog can raise a notification.  Set by ``_build_tray``; ``STATE``
+# (``tray_active``) is what decides whether it may be used.
+_tray_icon = None
+
+
+def notify(title: str, body: str) -> bool:
+    """Show one system notification through the tray icon (WS-702).
+
+    Silent on every failure path: no tray, a platform without notification
+    support, a backend that raises, or Focus Assist swallowing it must not
+    show an error dialog - the log line written by the caller is the fallback.
+    Returns whether the call was handed to pystray.
+    """
+    icon = _tray_icon
+    if icon is None or not STATE.get("tray_active"):
+        return False
+    try:
+        icon.notify(str(body), str(title))
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("[desktop] tray notify failed:", e)
+        return False
+
+
 def _icon_image(size: int = 64):
     from PIL import Image, ImageDraw
 
@@ -515,6 +540,7 @@ def _build_tray(url: str, on_quit, window=None):
     ``window`` is the native pywebview window when running in windowed mode;
     the "显示窗口" item then raises it instead of opening a browser tab.
     """
+    global _tray_icon
     import pystray
 
     def show(_icon=None, _item=None):
@@ -539,7 +565,8 @@ def _build_tray(url: str, on_quit, window=None):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t("tray.quit"), quit_app),
     )
-    return pystray.Icon("BindDeckLite", _icon_image(), t("tray.tooltip"), menu)
+    _tray_icon = pystray.Icon("BindDeckLite", _icon_image(), t("tray.tooltip"), menu)
+    return _tray_icon
 
 
 def _serve_forever(thread) -> None:

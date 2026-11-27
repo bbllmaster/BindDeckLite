@@ -2743,6 +2743,11 @@ function renderDesktop() {
   $("#minimizedToggle").checked = !!d.start_minimized;
   // close_button_behavior: "minimize" (default) → checked, "exit" → unchecked
   $("#closeMinimizeToggle").checked = (d.close_button_behavior || "minimize") === "minimize";
+  // WS-702: 掉线通知只在托盘可用时有意义（浏览器模式 / 托盘不可用整块隐藏）。
+  // 同 .row，[hidden] 会被 display:flex 覆盖，直接改 style.display。
+  $("#notifyDisconnectBlock").style.display = d.tray_active ? "" : "none";
+  // 旧 config.json 没有这个字段 → 默认开。
+  $("#notifyDisconnectToggle").checked = d.notify_on_disconnect !== false;
   $("#btnQuitHost").hidden = !d.desktop_mode;
   // Show "显示窗口" only when the native window exists but is hidden
   // (minimize-to-tray with no tray available — recovery path).
@@ -4386,6 +4391,20 @@ async function init() {
       toast(minimize ? t("ui.close_minimize_toast") : t("ui.close_exit_toast"));
     } catch (err) {
       target.checked = !minimize;
+      toast(err.message, "bad");
+    } finally {
+      target.disabled = false;
+    }
+  };
+  $("#notifyDisconnectToggle").onchange = async (e) => {
+    const target = e.target;
+    const want = target.checked;
+    target.disabled = true;
+    try {
+      await updateDesktop({ notify_on_disconnect: want });
+      toast(want ? t("ui.notify_disconnect_on_toast") : t("ui.notify_disconnect_off_toast"));
+    } catch (err) {
+      target.checked = !want;
       toast(err.message, "bad");
     } finally {
       target.disabled = false;
