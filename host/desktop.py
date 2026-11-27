@@ -49,6 +49,10 @@ STATE = {
     "url": "",
     "error": "",
     "window_hidden": False,  # True while the native window is hidden (minimized w/o tray)
+    # WS-706: set the moment a quit starts. The tray menu's 退出 calls stop_all
+    # directly (never /api/quit), so the watchdog cannot rely on the app-side
+    # flag alone: notify() stays silent while the tray is being torn down.
+    "quitting": False,
 }
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
@@ -291,8 +295,24 @@ def show_console() -> None:
 
 
 def set_quit_callback(callback) -> None:
+    """Register how the tray (or ``request_quit``) tears the app down.
+
+    WS-706: wrap it so *every* shutdown route marks ``STATE["quitting"]``
+    first.  The tray menu's 退出 calls the callback directly, bypassing
+    ``/api/quit``, and a drop sampled during the ~1 s teardown must not
+    raise a notification for a deck the user just closed the app on.
+    """
     global _quit_callback
-    _quit_callback = callback
+    if callback is None:
+        _quit_callback = None
+        return
+
+    def _wrapped():
+        STATE["quitting"] = True
+        callback()
+
+    STATE["quitting"] = False  # a fresh run mode starts accepting notifications
+    _quit_callback = _wrapped
 
 
 def request_quit() -> bool:
@@ -489,6 +509,31 @@ def browse(kind: str = "file", default_name: str = "") -> dict:
 
 
 # --- tray -----------------------------------------------------------------
+# WS-702: the pystray icon must stay reachable from Flask threads so the link
+# watchdog can raise a notification.  Set by ``_build_tray``; ``STATE``
+# (``tray_active``) is what decides whether it may be used.
+_tray_icon = None
+
+
+def notify(title: str, body: str) -> bool:
+    """Show one system notification through the tray icon (WS-702).
+
+    Silent on every failure path: no tray, a platform without notification
+    support, a backend that raises, or Focus Assist swallowing it must not
+    show an error dialog - the log line written by the caller is the fallback.
+    Returns whether the call was handed to pystray.
+    """
+    icon = _tray_icon
+    if icon is None or not STATE.get("tray_active") or STATE.get("quitting"):
+        return False
+    try:
+        icon.notify(str(body), str(title))
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("[desktop] tray notify failed:", e)
+        return False
+
+
 def _icon_image(size: int = 64):
     from PIL import Image, ImageDraw
 
@@ -515,6 +560,7 @@ def _build_tray(url: str, on_quit, window=None):
     ``window`` is the native pywebview window when running in windowed mode;
     the "显示窗口" item then raises it instead of opening a browser tab.
     """
+    global _tray_icon
     import pystray
 
     def show(_icon=None, _item=None):
@@ -539,7 +585,8 @@ def _build_tray(url: str, on_quit, window=None):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(t("tray.quit"), quit_app),
     )
-    return pystray.Icon("BindDeckLite", _icon_image(), t("tray.tooltip"), menu)
+    _tray_icon = pystray.Icon("BindDeckLite", _icon_image(), t("tray.tooltip"), menu)
+    return _tray_icon
 
 
 def _serve_forever(thread) -> None:

@@ -99,6 +99,8 @@ export function loadApp(opts = {}) {
     "#logSearch", "#logLevelChips", "#btnLogFilterReset", "#btnLogEmptyReset",
     "#btnLogMoreFilters", "#logMoreFilters", "#btnLogExport", "#helpModal",
     "#btnHelp", "#btnHelpClose", "#helpSearch", "#helpToc",
+    // WS-706: 掉线通知那一块（模板里带 hidden，渲染时按 tray_active 翻转）。
+    "#notifyDisconnectBlock", "#notifyDisconnectToggle",
   ].forEach(reg);
 
   const sections = [
@@ -164,7 +166,7 @@ export function loadApp(opts = {}) {
 globalThis.__host = {
   state, bindLogFilters, bindHelp, setLogMoreFiltersOpen, resetLogFilters,
   syncLogFilterChrome, filterHelp, logFilterActive, buildLogRow,
-  exportVisibleLog, retranslateLog, applyLogFilter,
+  exportVisibleLog, retranslateLog, applyLogFilter, renderDesktop,
   isLogExportBusy: () => logExportBusy,
 };
 `, sandbox, { filename: "app.js" });
