@@ -2744,8 +2744,9 @@ function renderDesktop() {
   // close_button_behavior: "minimize" (default) → checked, "exit" → unchecked
   $("#closeMinimizeToggle").checked = (d.close_button_behavior || "minimize") === "minimize";
   // WS-702: 掉线通知只在托盘可用时有意义（浏览器模式 / 托盘不可用整块隐藏）。
-  // 同 .row，[hidden] 会被 display:flex 覆盖，直接改 style.display。
-  $("#notifyDisconnectBlock").style.display = d.tray_active ? "" : "none";
+  // 这个 div 没有 .row，UA 的 [hidden]{display:none} 生效，所以必须改 hidden
+  // 本身：只清掉 style.display 不会让 hidden 属性失效（WS-706）。
+  $("#notifyDisconnectBlock").hidden = !d.tray_active;
   // 旧 config.json 没有这个字段 → 默认开。
   $("#notifyDisconnectToggle").checked = d.notify_on_disconnect !== false;
   $("#btnQuitHost").hidden = !d.desktop_mode;

@@ -1845,6 +1845,11 @@ def _on_ble_diag(dev_id: str, text: str, level: str):
     exe does not even have).
     """
     add_event("ble", text, dev_id, level)
+    if text == t("log.ble_connected_again"):
+        # WS-706: remember that this recovery already owns the log line, so
+        # the watchdog's 「已重新连接」 does not repeat it seconds later.
+        with _lock:
+            _link_recovered_at[dev_id or ""] = time.time()
 
 
 # --- WS-702: connection watchdog (drop / reconnect is no longer silent) ----
@@ -1856,6 +1861,9 @@ LINK_STABLE_SECONDS = 60.0      # a link must have held this long to notify
 LINK_NOTIFY_COOLDOWN_S = 300.0  # at most one notification per deck per 5 min
 LINK_ACTIVE_WINDOW_S = 20.0     # a self-initiated drop is expected for 20 s
 LINK_SAMPLE_SECONDS = 2.0
+# WS-706: a 「连接已恢复」 written by the BLE layer this recently already
+# reports the reconnect; the watchdog's own line would be a duplicate.
+LINK_RECOVERY_DEDUPE_S = 5.0
 
 # Commands after which a disconnect is *expected*: the deck reboots or drops
 # the bond.  Their log line gets 「（本站操作触发）」 and never notifies.
@@ -1863,6 +1871,8 @@ _ACTIVE_DISCONNECT_CMDS = ("CMD:REBOOT", "CMD:BOOT_CFG", "CMD:CLEARBOND")
 
 # key (dev_id or BLE address) -> {"connected", "since", "notified_at", "noticed", "name"}
 _link_state = {}
+# key (dev_id or "") -> when ``_on_ble_diag`` last wrote 「连接已恢复」 (WS-706).
+_link_recovered_at = {}
 # dev_id -> monotonic-ish wall time before which a drop counts as self-inflicted.
 _link_active_until = {}
 # ``send("", ...)`` has no dev_id to attribute to (UDP fallback); apply there.
@@ -1977,11 +1987,16 @@ def _link_watch_sample(now=None, devices=None) -> list:
             if decision["log"] == "reconnect":
                 # Only the watchdog's own recorded drop justifies 「已重新连接」;
                 # an existing 「连接已恢复」 from _note_link_connected() stays the
-                # single line for a connect-failure recovery.
-                if not st["noticed"]:
+                # single line for a connect-failure recovery (WS-706: a drop
+                # followed by failed retries reaches us through *both* paths).
+                recovered = False
+                for k in (dev_id, key):
+                    at = _link_recovered_at.pop(k, None)
+                    if at is not None and 0.0 <= now - at <= LINK_RECOVERY_DEDUPE_S:
+                        recovered = True
+                if not st["noticed"] or recovered:
                     decision = dict(decision, log=None, notify_reason="recovered_elsewhere")
-                else:
-                    st["noticed"] = False
+                st["noticed"] = False
                 st["since"] = now
             elif decision["log"] == "disconnect":
                 st["noticed"] = True

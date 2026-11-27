@@ -49,6 +49,10 @@ STATE = {
     "url": "",
     "error": "",
     "window_hidden": False,  # True while the native window is hidden (minimized w/o tray)
+    # WS-706: set the moment a quit starts. The tray menu's 退出 calls stop_all
+    # directly (never /api/quit), so the watchdog cannot rely on the app-side
+    # flag alone: notify() stays silent while the tray is being torn down.
+    "quitting": False,
 }
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
@@ -291,8 +295,24 @@ def show_console() -> None:
 
 
 def set_quit_callback(callback) -> None:
+    """Register how the tray (or ``request_quit``) tears the app down.
+
+    WS-706: wrap it so *every* shutdown route marks ``STATE["quitting"]``
+    first.  The tray menu's 退出 calls the callback directly, bypassing
+    ``/api/quit``, and a drop sampled during the ~1 s teardown must not
+    raise a notification for a deck the user just closed the app on.
+    """
     global _quit_callback
-    _quit_callback = callback
+    if callback is None:
+        _quit_callback = None
+        return
+
+    def _wrapped():
+        STATE["quitting"] = True
+        callback()
+
+    STATE["quitting"] = False  # a fresh run mode starts accepting notifications
+    _quit_callback = _wrapped
 
 
 def request_quit() -> bool:
@@ -504,7 +524,7 @@ def notify(title: str, body: str) -> bool:
     Returns whether the call was handed to pystray.
     """
     icon = _tray_icon
-    if icon is None or not STATE.get("tray_active"):
+    if icon is None or not STATE.get("tray_active") or STATE.get("quitting"):
         return False
     try:
         icon.notify(str(body), str(title))

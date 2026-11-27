@@ -150,10 +150,11 @@ jobs:
       #   test_macro_record.mjs        WS-651 macro Key step record / key-name parity with app.py
       #   test_gesture_ui.mjs          WS-672/679 portal-gesture switch: first-screen re-probe + greyed row
       #   test_ota_downgrade_ui.mjs    WS-684 OTA downgrade: media-key risk blocks Next/Start until acked
+      #   test_desktop_notify_ui.mjs   WS-706 tray-only notify switch really visible (hidden attr)
       - name: Front-end regression tests (node --test)
         working-directory: host
         run: |
-          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs test_portal_wifi_state.mjs test_actions_import_preview.mjs test_encoder_dir_ui.mjs test_portal_scan.mjs test_device_row_view.mjs test_encoder_stats.mjs test_log_export.mjs test_macro_record.mjs test_gesture_ui.mjs test_ota_downgrade_ui.mjs
+          node --test test_log_follow.mjs test_portal_ota_progress.mjs test_portal_exit.mjs test_stop_button.mjs test_update_progress.mjs test_app_update_confirm.mjs test_i18n_params.mjs test_log_device.mjs test_portal_wake.mjs test_reconnect_sync.mjs test_reconnect_pending.mjs test_portal_dirty.mjs test_update_popup.mjs test_cfg_status.mjs test_key_editor.mjs test_device_encoder.mjs test_ui_p1_4.mjs test_portal_wifi_secret.mjs test_ui_leftovers.mjs test_portal_clock.mjs test_portal_wifi_state.mjs test_actions_import_preview.mjs test_encoder_dir_ui.mjs test_portal_scan.mjs test_device_row_view.mjs test_encoder_stats.mjs test_log_export.mjs test_macro_record.mjs test_gesture_ui.mjs test_ota_downgrade_ui.mjs test_desktop_notify_ui.mjs
 
       # WS-569: exactly one upload per artifact name. A second upload of the
       # same name fails the job with 409 Conflict, which turned every PR into

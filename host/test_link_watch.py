@@ -18,6 +18,7 @@ import time
 import pytest
 
 import app as app_module
+import ble_link
 import desktop
 import i18n
 
@@ -32,6 +33,7 @@ def _clean_watch_state():
     i18n.set_lang("zh-CN")
     app_module._link_state.clear()
     app_module._link_active_until.clear()
+    getattr(app_module, "_link_recovered_at", {}).clear()
     app_module._link_active_global_until = 0.0
     app_module._link_watch_quit = False
     try:
@@ -39,6 +41,7 @@ def _clean_watch_state():
     finally:
         app_module._link_state.clear()
         app_module._link_active_until.clear()
+        getattr(app_module, "_link_recovered_at", {}).clear()
         app_module._link_active_global_until = 0.0
         app_module._link_watch_quit = False
         app_module._config["settings"] = saved_settings
@@ -202,6 +205,43 @@ def test_a_reconnect_is_silent_when_the_drop_was_never_seen(monkeypatch):
     assert rows == []
 
 
+def test_a_ble_recovery_owns_the_reconnect_line(monkeypatch, tmp_path):
+    """WS-706: drop -> failed retries -> back is ONE event, so ONE line.
+
+    The real path: the deck drops (watchdog records it), every retry fails
+    through ``_note_link_error`` and finally ``_note_link_connected`` writes
+    「连接已恢复」; two seconds later the watchdog sees the same edge.  Both
+    rows used to appear.  Wired here exactly as app.py wires it
+    (``on_diag=_on_ble_diag``) - production methods, not copies.
+    """
+    rows, _ = _record(monkeypatch)
+    manager = ble_link.BleLinkManager(cache_path=str(tmp_path / "ble-cache.json"))
+    manager._on_diag = app_module._on_ble_diag
+    link = ble_link.BleLink("AA:BB", "d1", "Deck", manager)
+
+    now = time.time()
+    app_module._link_watch_sample(now=now, devices=[_dev(True)])
+    app_module._link_watch_sample(
+        now=now + 61,
+        devices=[_dev(False, error={"at": now, "kind": "X", "text": "连接超时"})])
+    manager._note_link_error(link, RuntimeError("connect timeout"))
+    manager._note_link_connected(link)
+    app_module._link_watch_sample(now=time.time() + 2, devices=[_dev(True)])
+
+    texts = [r["text"] for r in rows]
+    assert texts[0].startswith("设备已断开")
+    assert "连接已恢复" in texts[-1]
+    assert not [x for x in texts if x.startswith("设备已重新连接")], texts
+
+    # The marker is consumed: a later drop/reconnect with no BLE recovery line
+    # still gets its own 「已重新连接」 (the suppression must not be permanent).
+    t2 = time.time() + 3
+    app_module._link_watch_sample(now=t2, devices=[_dev(False)])
+    app_module._link_watch_sample(now=t2 + 1, devices=[_dev(True)])
+    reconnects = [r["text"] for r in rows if r["text"].startswith("设备已重新连接")]
+    assert reconnects == ["设备已重新连接：Deck"]
+
+
 def test_an_active_reboot_appends_the_suffix_and_stays_quiet(monkeypatch):
     rows, notes = _record(monkeypatch)
     now = time.time()
@@ -236,6 +276,37 @@ def test_notify_swallows_a_backend_error(monkeypatch):
     monkeypatch.setattr(desktop, "_tray_icon", _Broken())
     desktop.STATE["tray_active"] = True
     assert desktop.notify("BindDeckLite", "body") is False  # no exception
+
+
+def test_a_tray_quit_silences_notifications(monkeypatch):
+    """WS-706: 托盘菜单「退出」直接调 stop_all，不经过 /api/quit.
+
+    The teardown takes ~1 s, and a drop sampled in that window must not pop a
+    notification for the app the user just closed.  The registered callback
+    marks the shutdown *before* tearing anything down, so ``notify`` refuses.
+    """
+
+    class _Icon:
+        def __init__(self):
+            self.calls = []
+
+        def notify(self, body, title):
+            self.calls.append((title, body))
+
+    icon = _Icon()
+    monkeypatch.setattr(desktop, "_tray_icon", icon)
+    desktop.STATE["tray_active"] = True
+    ran = []
+    desktop.set_quit_callback(lambda: ran.append(True))
+    try:
+        assert desktop.notify("BindDeckLite", "body") is True  # still alive
+        desktop._quit_callback()  # what the tray menu invokes
+        assert ran == [True]
+        assert desktop.STATE["quitting"] is True
+        assert desktop.notify("BindDeckLite", "body") is False
+        assert len(icon.calls) == 1
+    finally:
+        desktop.set_quit_callback(None)
 
 
 # --- settings --------------------------------------------------------------
